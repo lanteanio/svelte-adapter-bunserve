@@ -1,0 +1,21 @@
+bunserve static fixture file
+This file is served from the in-memory precompressed static cache. It is
+deliberately longer than one kilobyte so the build-time precompression step
+produces .br and .gz variants next to it, which the adapter serves when the
+request advertises the matching Accept-Encoding. The mutable-asset headers on
+this file (weak ETag from mtime and size, cache-control no-cache) make it the
+conditional-request and range-request test subject: If-None-Match with the
+served ETag must produce a 304 with no body, a valid single byte range must
+produce a 206 with the exact slice and a content-range header, a syntactically
+valid but unsatisfiable range must produce a 416 with the total size, and a
+malformed range header must be ignored in favor of a full 200 response. The
+remaining lines repeat filler text to cross the size threshold.
+filler filler filler filler filler filler filler filler filler filler filler
+filler filler filler filler filler filler filler filler filler filler filler
+filler filler filler filler filler filler filler filler filler filler filler
+filler filler filler filler filler filler filler filler filler filler filler
+filler filler filler filler filler filler filler filler filler filler filler
+filler filler filler filler filler filler filler filler filler filler filler
+filler filler filler filler filler filler filler filler filler filler filler
+filler filler filler filler filler filler filler filler filler filler filler
+end of fixture file
