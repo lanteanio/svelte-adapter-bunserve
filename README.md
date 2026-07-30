@@ -2,12 +2,18 @@
 
 > **Status: pre-alpha prototype. Nothing here is usable yet. Do not install.**
 
-A SvelteKit adapter for [Bun](https://bun.com) - built on `Bun.serve`, delivering
-the same realtime developer experience as
-[svelte-adapter-uws](https://github.com/lanteanio/svelte-adapter-uws): the same
-`platform.*` surface, the same plugins, the same client, the same clustering
-extensions. The adapter swap is one line in `svelte.config.js`; app code is
+A SvelteKit adapter for [Bun](https://bun.com), built on `Bun.serve`: it follows
+[svelte-adapter-uws](https://github.com/lanteanio/svelte-adapter-uws) and works
+with the same ecosystem around it -
+[svelte-realtime](https://github.com/lanteanio/svelte-realtime) for the client
+stores and
+[svelte-adapter-uws-extensions](https://github.com/lanteanio/svelte-adapter-uws-extensions)
+for clustering, presence and cursors. Same `platform.*` surface, same plugins,
+same client. The adapter swap is one line in `svelte.config.js`; app code is
 unchanged.
+
+(One caveat while this is pre-alpha: the extensions package does not work
+against this adapter yet - see [Current state](#current-state).)
 
 ## Why this exists
 
