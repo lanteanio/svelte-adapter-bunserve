@@ -374,7 +374,7 @@ bounded twice over, and `bench/control-egress.mjs` measures both: no batch frame
 can be answered with more than 256 frames (48 KB at the worst shape, 256
 one-character entries with a maximal ref; 20 KB for a full batch of ordinary
 topic names), and the ACK CHANNEL as a whole gets 4 MB per 10 s per connection
-(`maxControlEgressBytes`) - 88 of those worst-shaped frames - after which the
+(`maxControlEgressBytes`) - 86 of those worst-shaped frames - after which the
 connection is closed with `CONTROL_FLOOD` and close code 4429. 4429 rather than
 1008 because the family clients treat 1008 as terminal and stop reconnecting for
 good, while 4429 is their throttle code.
@@ -419,6 +419,18 @@ under Node, not Bun:
 
 ```sh
 npm test   # requires Node 22+ for the test-runner glob
+```
+
+The live lane asserts the WebSocket wire contract end to end, which the unit
+suite cannot: it builds the fixture, boots the built output under Bun, and
+drives real WebSocket clients against it. It covers the subscribe, batch, and
+unsubscribe frames, the subscription cap under pipelined frames, Origin
+enforcement on the upgrade, and a no-handler build proving the HTTP surface is
+untouched when no realtime is configured. It needs Bun and the fixture's
+dependencies (`npm install` in `test/fixture` once):
+
+```sh
+npm run test:live   # builds test/fixture twice and runs the suites in test/live/
 ```
 
 ## License

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- README: the 4 MiB control-egress budget admits 86 worst-shaped batch
+  answers per window, not 88.
+
 ## [0.0.1] - 2026-07-30
 
 First release, and a pre-alpha one: the package exists so the name is taken and
