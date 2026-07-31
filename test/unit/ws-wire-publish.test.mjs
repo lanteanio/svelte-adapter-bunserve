@@ -352,6 +352,60 @@ test('publishWire reports true when a subscriber actually receives it', () => {
 	});
 });
 
+test('publishWireBatch reports false when its walk reaches no recipient', () => {
+	setServer(fakeServer());
+	// A capable connection exists (so the stateful walk runs rather than the
+	// fast path) but subscribes elsewhere: nothing is delivered, and the
+	// return must say so - the twin of the publishWire case.
+	const capableElsewhere = fakeWs({ topics: ['other'], caps: [CAP] });
+	const wire = {
+		capability: CAP,
+		schemaVersion: 3,
+		encode: () => new Uint8Array([1]),
+		state: { onAttach: () => ({}) }
+	};
+	withConnections([capableElsewhere], () => {
+		const ok = platform.publishWireBatch('room', 'moved', [{ data: { x: 1 } }], wire);
+		assert.equal(ok, false, 'no subscriber on the topic -> false');
+	});
+});
+
+test('publishWireBatch reports true once a subscriber receives it', () => {
+	setServer(fakeServer());
+	const capable = fakeWs({ topics: ['room'], caps: [CAP] });
+	const wire = {
+		capability: CAP,
+		schemaVersion: 3,
+		encode: () => new Uint8Array([1]),
+		state: { onAttach: () => ({}) }
+	};
+	withConnections([capable], () => {
+		assert.equal(
+			platform.publishWireBatch('room', 'moved', [{ data: { x: 1 } }], wire),
+			true
+		);
+	});
+});
+
+test('a declined batch that falls back to JSON still reports delivery', () => {
+	setServer(fakeServer());
+	// The per-entry fallback path sends envelopes directly; it must count as
+	// delivery, or the return under-reports frames the client actually got.
+	const capable = fakeWs({ topics: ['room'], caps: [CAP] });
+	const wire = {
+		capability: CAP,
+		schemaVersion: 3,
+		// Declines both the batch form and every entry -> pure JSON fallback.
+		encode: () => null,
+		state: { onAttach: () => ({}) }
+	};
+	withConnections([capable], () => {
+		const ok = platform.publishWireBatch('room', 'moved', [{ data: { x: 1 } }], wire);
+		assert.equal(ok, true, 'JSON envelopes are delivery too');
+		assert.ok(capable.sent.some((s) => typeof s.payload === 'string'));
+	});
+});
+
 test('a nullish wire falls back to a plain publish rather than crashing', () => {
 	const server = fakeServer();
 	setServer(server);

@@ -249,6 +249,26 @@ test('a declined batch falls back to per-entry encodes with per-entry JSON', () 
 	assert.ok(parseBinaryFrame(ws.sent[3].payload));
 });
 
+test('a STATELESS codec batches as per-entry binary, not JSON', () => {
+	// A stateless codec has no -batch form, so sendWireBatch routes each entry
+	// through sendWire. Dumping to JSON here would hand a capable client JSON
+	// from sendWireBatch while sendWire sent it binary for the same codec.
+	const ws = capable(fakeWs());
+	const result = platform.sendWireBatch(
+		ws,
+		'room',
+		'moved',
+		[{ data: { x: 1 } }, { data: { x: 2 } }],
+		statelessCodec()
+	);
+	assert.equal(result, 1);
+	// announce + one binary frame per entry.
+	assert.equal(ws.sent.length, 3);
+	assert.equal(typeof ws.sent[0].payload, 'string', 'the announce');
+	assert.ok(parseBinaryFrame(ws.sent[1].payload), 'entry 1 is binary');
+	assert.ok(parseBinaryFrame(ws.sent[2].payload), 'entry 2 is binary');
+});
+
 test('a caps-less batch is N JSON envelopes; an empty batch is a 1 no-op', () => {
 	const ws = fakeWs();
 	const result = platform.sendWireBatch(

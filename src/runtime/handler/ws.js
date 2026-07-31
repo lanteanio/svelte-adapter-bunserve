@@ -558,7 +558,7 @@ export const websocketHandlers = {
 						// unchecked (the recover lane validates its offset for the
 						// same reason).
 						const v = msg.lastSeenSeqs[t];
-						if (typeof v === 'number' && Number.isFinite(v)) resumeSeqs[t] = v;
+						if (typeof v === 'number' && Number.isFinite(v) && v >= 0) resumeSeqs[t] = v;
 					}
 					const lastSeenEpochs =
 						msg.lastSeenEpochs && typeof msg.lastSeenEpochs === 'object' && !Array.isArray(msg.lastSeenEpochs)

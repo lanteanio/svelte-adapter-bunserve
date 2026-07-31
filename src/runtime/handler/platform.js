@@ -1003,6 +1003,7 @@ export const platform = {
 						try {
 							if (ws.send(envList[i], false, compress) !== SEND_DROPPED) {
 								bumpOut(ws, envList[i]);
+								delivered = true;
 							}
 						} catch {
 							wsCounters.closedWsAborts++;
@@ -1055,7 +1056,7 @@ export const platform = {
 			// never saw - JSON until reconnect.
 			if (result === SEND_DROPPED) poisonWireState(ws, ud, wire.capability);
 		}
-		return true;
+		return delivered;
 	},
 
 	/**
