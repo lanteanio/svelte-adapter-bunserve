@@ -239,20 +239,45 @@ test('the demux answers a subscribe-batch per entry', async () => {
 	};
 	withHooks(hooks);
 	const raw = openSocket(hooks);
+
+	// Held BEFORE the batch, so the batch's already-held short-circuit is one of
+	// the branches under test rather than an untaken one.
+	await send(raw, { type: 'subscribe', topic: 'held:1' });
+	await settle();
 	raw.sent.length = 0;
 
-	await send(raw, { type: 'subscribe-batch', topics: ['room:1', 'denied:1', 'room:2'], ref: 7 });
+	// Four entries covering four different answer branches: a plain allow, an
+	// app denial, a topic that fails wire validation, and one already held.
+	// Each has its own frame-building site in the batch path, and each has to
+	// name its topic - a summary frame or a null topic in ANY of them is the
+	// defect that has reached review twice.
+	await send(raw, {
+		type: 'subscribe-batch',
+		topics: ['room:1', 'denied:1', '__nope', 'held:1'],
+		ref: 7
+	});
 	await settle();
 
 	const frames = raw.sent.map((f) => JSON.parse(f));
 	const answers = frames.filter((f) => f.type === 'subscribed' || f.type === 'subscribe-denied');
-	assert.equal(answers.length, 3, JSON.stringify(frames));
+	assert.equal(answers.length, 4, JSON.stringify(frames));
 	// Every answer names its own topic, which is what the client correlates on.
 	assert.deepEqual(
 		answers.map((f) => f.topic).sort(),
-		['denied:1', 'room:1', 'room:2']
+		['__nope', 'denied:1', 'held:1', 'room:1']
 	);
+	// And none of them carries a non-string topic, which is the exact shape the
+	// family client discards silently.
+	assert.deepEqual(answers.filter((f) => typeof f.topic !== 'string'), []);
+
 	const denial = answers.find((f) => f.topic === 'denied:1');
 	assert.equal(denial.type, 'subscribe-denied');
 	assert.equal(denial.reason, 'FORBIDDEN');
+
+	const invalid = answers.find((f) => f.topic === '__nope');
+	assert.equal(invalid.type, 'subscribe-denied');
+	assert.equal(invalid.reason, 'INVALID_TOPIC');
+
+	const held = answers.find((f) => f.topic === 'held:1');
+	assert.equal(held.type, 'subscribed', JSON.stringify(held));
 });

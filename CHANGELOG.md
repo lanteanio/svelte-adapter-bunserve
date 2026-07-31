@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A CI workflow (`.github/workflows/ci.yml`) running the unit suite and the
+  live lane on Linux. The graceful-shutdown SIGNAL path is asserted there and
+  only there: on Windows a `SIGTERM` terminates the built server without the
+  handler running at all, so `test/live/shutdown-check.mjs` skips rather than
+  reporting a failure that says nothing about the code. It asserts that the
+  signal reaches the handler, that clients are advised before being closed
+  1012, that the app's `shutdown` hook runs from that path while its
+  connections still exist, that every close hook completes, and that the
+  process exits 0 inside its deadline.
 - A tracked live test lane (`test/live/`, `npm run test:live`) that asserts the
   WebSocket wire contract end to end against the built fixture: the subscribe,
   batch, and unsubscribe frames, the subscription cap under pipelined frames,

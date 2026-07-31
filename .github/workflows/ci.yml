@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    name: Unit suite (Node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run the unit suite
+        run: npm test
+
+  live:
+    name: Live wire contract (Bun on Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      # The ADAPTER's own dependencies, which the fixture build needs: the
+      # build step imports rollup from src/index.js, and the fixture resolves
+      # it by walking up to this node_modules. Installing only inside
+      # test/fixture leaves it unresolvable and the build dies with
+      # ERR_MODULE_NOT_FOUND before any suite runs.
+      - name: Install the adapter's dependencies
+        run: npm install --no-audit --no-fund
+
+      # The fixture builds against the adapter through a `file:` dependency, so
+      # it installs from the checkout with no registry copy of the package.
+      - name: Install the fixture's dependencies
+        working-directory: test/fixture
+        run: npm install --no-audit --no-fund
+
+      # Runs the WebSocket wire contract, the subscription cap, Origin
+      # enforcement, the no-handler regression, and the graceful-shutdown
+      # SIGNAL path. That last one exists only here: on Windows a SIGTERM
+      # terminates the built server without the handler running at all, so
+      # every assertion about the shutdown ordering is unreachable locally and
+      # this job is the only thing that proves it.
+      - name: Run the live lane
+        run: npm run test:live
