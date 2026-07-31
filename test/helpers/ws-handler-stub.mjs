@@ -20,9 +20,24 @@ export let subscribeBatch;
 /** @type {undefined | ((ws: any, topic: string, ctx: any) => unknown)} */
 export let unsubscribe;
 
-/** @param {{ subscribe?: any, subscribeBatch?: any, unsubscribe?: any }} hooks */
+/** @type {undefined | ((ws: any, ctx: any) => unknown)} */
+export let open;
+
+/** @type {undefined | ((ws: any, ctx: any) => unknown)} */
+export let message;
+
+/** @type {undefined | ((ws: any, ctx: any) => unknown)} */
+export let close;
+
+/**
+ * @param {{ subscribe?: any, subscribeBatch?: any, unsubscribe?: any,
+ *   open?: any, message?: any, close?: any }} hooks
+ */
 export function __setHooks(hooks) {
 	subscribe = hooks.subscribe;
 	subscribeBatch = hooks.subscribeBatch;
 	unsubscribe = hooks.unsubscribe;
+	open = hooks.open;
+	message = hooks.message;
+	close = hooks.close;
 }

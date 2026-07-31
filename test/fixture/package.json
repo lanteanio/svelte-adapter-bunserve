@@ -13,9 +13,6 @@
 		"svelte": "^5.0.0",
 		"svelte-adapter-bunserve": "file:../.."
 	},
-	"optionalDependencies": {
-		"svelte-adapter-uws": "file:../../../svelte-adapter-uws"
-	},
 	"devDependencies": {
 		"@sveltejs/vite-plugin-svelte": "^5.0.0",
 		"vite": "^6.0.0"

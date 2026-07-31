@@ -42,7 +42,15 @@ async function run(label, cmd, opts = {}) {
 // the output the suites assert against untouched - and since those directories
 // are gitignored, a stale one from an earlier run persists indefinitely and the
 // suites pass against a build this lane never produced.
-const buildEnv = { ...process.env, ADAPTER: 'bunserve', NO_WS: '' };
+// NODE_ENV too: vite derives its production mode from it, so an exported
+// development value builds a different bundle than the one this lane claims to
+// be asserting against.
+const buildEnv = {
+	...process.env,
+	ADAPTER: 'bunserve',
+	NO_WS: '',
+	NODE_ENV: 'production'
+};
 
 const built = await run('build fixture', [process.execPath, 'run', 'build'], {
 	cwd: fixtureDir,

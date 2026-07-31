@@ -708,6 +708,16 @@ export const platform = {
 	},
 
 	/**
+	 * Releases whose teardown could not be recorded for the close hook. Any
+	 * non-zero value means an `unsubscribe` hook has been failing persistently
+	 * enough to fill a connection's record, and some per-topic teardown was
+	 * performed by nobody.
+	 */
+	get droppedReleaseRecords() {
+		return wsCounters.droppedReleaseRecords;
+	},
+
+	/**
 	 * A publisher scoped to one topic: `platform.topic('chat').created(data)`.
 	 * Helpers are cached per name, so this allocates once per topic rather than
 	 * once per call.

@@ -198,12 +198,11 @@ test('clearing a connection stops its queued hooks from resuming', async () => {
 	assert.equal(queuedRan, false, 'the close hook does this teardown; the socket is gone');
 });
 
-test('a release whose hook never finished is handed to the close hook', async () => {
-	// The release runs BEFORE the hook is queued and deletes the topic from the
-	// subscription set, which is what the close hook is handed. So a hook still
-	// waiting when the connection dies is dropped by clearUnsubscribeHooks AND
-	// absent from the snapshot, and the app's per-topic state is released by
-	// nobody. This record is what closes that gap.
+test('the pending-release record tracks what is owed and what has settled', async () => {
+	// The bookkeeping in isolation. What the demux does WITH it - which
+	// outcomes settle a debt and which leave it owed - is pinned in
+	// ws-demux.test.mjs against the real message handler, because that is where
+	// the resolve-vs-reject decision is actually made.
 	const ws = fakeWs();
 	const ud = ws.getUserData();
 	assert.deepEqual([...pendingReleaseTopics(ud)], []);

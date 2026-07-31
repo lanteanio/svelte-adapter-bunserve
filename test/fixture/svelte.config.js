@@ -3,10 +3,11 @@
 // the SAME app across svelte-adapter-bunserve (Bun), svelte-adapter-uws
 // (Node), and @sveltejs/adapter-node run under Bun.
 //
-// svelte-adapter-uws is an OPTIONAL dependency resolved from a sibling
-// checkout, so ADAPTER=uws only works where one exists. It has to stay optional
-// for the default build - and therefore the live test lane - to install from a
-// plain clone.
+// svelte-adapter-uws is NOT a dependency: ADAPTER=uws imports it by path from
+// a sibling checkout, overridable with UWS_ADAPTER. Declaring it as one made
+// `npm install` here fail outright on any clone without that sibling three
+// levels up, which took the whole live test lane - the thing that defends the
+// wire contract - with it.
 import bunserve from 'svelte-adapter-bunserve';
 
 const which = process.env.ADAPTER || 'bunserve';
@@ -32,7 +33,8 @@ if (which === 'bunserve' && noWs) {
 	const node = (await import('@sveltejs/adapter-node')).default;
 	adapter = node({ out: 'build-node' });
 } else if (which === 'uws') {
-	const uws = (await import('svelte-adapter-uws')).default;
+	const from = process.env.UWS_ADAPTER || '../../../svelte-adapter-uws/src/index.js';
+	const uws = (await import(from)).default;
 	adapter = uws({ out: 'build-uws' });
 } else {
 	throw new Error(`unknown ADAPTER "${which}" (have: bunserve, node, uws)`);

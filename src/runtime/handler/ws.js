@@ -547,15 +547,21 @@ export const websocketHandlers = {
 					} catch {
 						unsubUd = null;
 					}
-					if (unsubUd) {
+					// Read ONCE and reused for both the record and the dispatch.
+					// Reading it twice lets the two disagree if the binding is
+					// reassigned in between, and the disagreement that matters is
+					// "recorded a debt, then found no hook to discharge it".
+					const unsubscribeHook = wsModule.unsubscribe;
+					// With no hook exported there is no app teardown to run, so the
+					// release must not occupy the deferral queue either. Enqueuing a
+					// no-op per release let a client pipeline past the backlog and be
+					// cut with 4429 over hooks that do not exist.
+					if (unsubUd && typeof unsubscribeHook === 'function') {
 						const releasedTopic = msg.topic;
-						// Recorded only when there is a hook that could still owe
-						// the app a teardown. With none exported there is nothing
-						// to run and nothing to carry to the close hook.
-						const hasUnsubscribeHook = typeof wsModule.unsubscribe === 'function';
-						if (wasHeld && hasUnsubscribeHook) {
-							beginPendingRelease(unsubUd, releasedTopic);
-						}
+						// Only a topic the connection genuinely held can be owed a
+						// teardown; recording what a client can invent is how the
+						// record becomes a memory amplifier.
+						if (wasHeld) beginPendingRelease(unsubUd, releasedTopic);
 						const outcome = runUnsubscribeHook(
 							ws,
 							() => {
@@ -570,19 +576,23 @@ export const websocketHandlers = {
 								// calls-to-a-hook-that-immediately-suspends.
 								let settling;
 								try {
-									settling = wsModule.unsubscribe?.(
+									settling = unsubscribeHook(
 										ws,
 										releasedTopic,
 										{ platform: unsubUd[WS_PLATFORM] }
 									);
+									// Inside the try: reading `then` off a thenable
+									// runs app code (a getter), and a throw from it
+									// has to be reported like any other hook throw
+									// rather than escaping unlogged.
+									if (!settling || typeof settling.then !== 'function') {
+										settlePendingRelease(unsubUd, releasedTopic, true);
+										return undefined;
+									}
 								} catch (err) {
 									// Threw before its first await, so it released
 									// nothing: the topic stays owed.
 									reportHookError('unsubscribe', err);
-									return undefined;
-								}
-								if (!settling || typeof settling.then !== 'function') {
-									settlePendingRelease(unsubUd, releasedTopic, true);
 									return undefined;
 								}
 								return settling.then(

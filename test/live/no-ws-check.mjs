@@ -4,10 +4,10 @@
 // no websocket options and points websocketHandler at a file the fixture does
 // not have - the same no-handler state as an app that never opted in.
 
-import { fileURLToPath } from 'node:url';
+import { assertPortFree, buildPath, serverEnv, waitForServer } from './harness.mjs';
 
 const PORT = 8803;
-const BUILD = fileURLToPath(new URL('../fixture/build-no-ws/index.js', import.meta.url));
+const BUILD = buildPath('build-no-ws');
 
 let passed = 0, failed = 0;
 const failures = [];
@@ -16,26 +16,16 @@ const check = (name, cond, detail) => {
 	else { failed++; failures.push(name + (detail ? ' :: ' + detail : '')); console.log(`FAIL  ${name}${detail ? ' :: ' + detail : ''}`); }
 };
 
+await assertPortFree(PORT);
+
 const proc = Bun.spawn([process.execPath, BUILD], {
-	env: { ...process.env, HOST: '127.0.0.1', PORT: String(PORT) },
+	env: serverEnv({ HOST: '127.0.0.1', PORT: String(PORT) }),
 	stdout: 'pipe',
 	stderr: 'pipe'
 });
 
 try {
-	let up = false;
-	for (let i = 0; i < 100; i++) {
-		if (proc.exitCode !== null) {
-			throw new Error(
-				`the fixture server exited with code ${proc.exitCode} before answering. Something ` +
-				`else may be holding port ${PORT} - a leftover server from an interrupted run, or a ` +
-				'second copy of this lane.'
-			);
-		}
-		try { if ((await fetch(`http://127.0.0.1:${PORT}/healthz`)).ok) { up = true; break; } } catch {}
-		await Bun.sleep(100);
-	}
-	if (!up) throw new Error('server never came up');
+	await waitForServer(proc, PORT);
 
 	// Re-fetched rather than asserting the retry loop's own success: `true` was
 	// a check that could not fail, and a check that cannot fail is not one.

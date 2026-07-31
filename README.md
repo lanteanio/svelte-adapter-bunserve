@@ -296,10 +296,14 @@ are different jobs rather than different sizes of the same one:
   the set handed to the `close` hook, so the app performs that teardown by
   another route.
 
-  **Teardown is at-least-once, so make it idempotent.** A topic the connection
-  held is never left un-torn-down: if its `unsubscribe` hook does not resolve -
-  because it is still queued when the socket dies, or it threw, or it rejected
-  against a backend that is down - the topic is named to the `close` hook. The
+  **Teardown is at-least-once, so make it idempotent.** If a release's
+  `unsubscribe` hook does not resolve - because it is still queued when the
+  socket dies, or it threw, or it rejected against a backend that is down - the
+  topic is named to the `close` hook instead. (The one limit: a connection
+  records at most 2176 topics owed a teardown, which no amount of ordinary
+  concurrency reaches, but a hook failing over and over on one connection can.
+  Past that the release is not recorded, the adapter says so once, and
+  `platform.droppedReleaseRecords` counts it.) The
   cost is that a hook which was mid-await when the connection died can finish
   AND have its topic named there, so a teardown that is not idempotent (a bare
   `roster.decr(topic)`) can run twice. The alternative is dropping the release

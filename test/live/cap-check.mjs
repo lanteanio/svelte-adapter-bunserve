@@ -12,10 +12,10 @@
 //
 // Run the whole live lane with: npm run test:live
 
-import { fileURLToPath } from 'node:url';
+import { assertPortFree, buildPath, serverEnv, waitForServer } from './harness.mjs';
 
 const PORT = 8805;
-const BUILD = fileURLToPath(new URL('../fixture/build/index.js', import.meta.url));
+const BUILD = buildPath();
 const CAP = 20;
 const BLAST = 500;
 
@@ -34,32 +34,18 @@ function check(name, cond, detail) {
 	}
 }
 
+await assertPortFree(PORT);
+
 const proc = Bun.spawn([process.execPath, BUILD], {
-	env: { ...process.env, HOST: '127.0.0.1', PORT: String(PORT) },
+	env: serverEnv({ HOST: '127.0.0.1', PORT: String(PORT) }),
 	stdout: 'pipe',
 	stderr: 'pipe'
 });
 
-async function waitForServer() {
-	for (let i = 0; i < 100; i++) {
-		try {
-		if (proc.exitCode !== null) {
-			throw new Error(
-				`the fixture server exited with code ${proc.exitCode} before answering. Something ` +
-				`else may be holding port ${PORT} - a leftover server from an interrupted run, or a ` +
-				'second copy of this lane.'
-			);
-		}
-			const res = await fetch(`http://127.0.0.1:${PORT}/healthz`);
-			if (res.ok) return true;
-		} catch {}
-		await Bun.sleep(100);
-	}
-	return false;
-}
+
 
 try {
-	if (!(await waitForServer())) throw new Error('server never came up');
+	await waitForServer(proc, PORT);
 
 	const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
 	const acks = { subscribed: 0, denied: 0, rateLimited: 0 };
@@ -102,9 +88,13 @@ try {
 		answered === BLAST,
 		`subscribed=${acks.subscribed} denied=${acks.denied} total=${answered}`
 	);
+	// EXACTLY the cap, not at most it. The correct outcome is deterministic -
+	// 500 pipelined frames against a cap of 20 install 20 - so an upper bound
+	// alone is satisfied by a regression that refuses every subscribe, which
+	// also satisfies every other check in this file.
 	check(
-		`installed subscriptions never exceed the cap of ${CAP}`,
-		acks.subscribed <= CAP,
+		`installed subscriptions fill the cap of ${CAP} exactly`,
+		acks.subscribed === CAP,
 		`installed ${acks.subscribed}, cap ${CAP}`
 	);
 	check(

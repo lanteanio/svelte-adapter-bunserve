@@ -149,6 +149,15 @@ export const wsCounters = {
 	closedWsAborts: 0,
 
 	/**
+	 * Releases whose teardown could not be recorded for the close hook because
+	 * the connection's pending-release record was full. Non-zero means an
+	 * `unsubscribe` hook has been failing persistently and some per-topic
+	 * teardown was not performed by anyone. Exposed as
+	 * `platform.droppedReleaseRecords`.
+	 */
+	droppedReleaseRecords: 0,
+
+	/**
 	 * Topic publishes since boot. Monotonic, NOT windowed - it was called
 	 * `publishCountWindow` while nothing sampled or reset it, which described a
 	 * behaviour that did not exist. Exposed as `platform.publishCount`.
@@ -341,29 +350,41 @@ export function clearUnsubscribeHooks(ud) {
 /**
  * Distinct topics one connection may carry an unowed teardown for.
  *
- * Everything in flight fits with room to spare: the queue admits at most
- * `concurrency + backlog` releases at once, and this is twice that. The slack
- * is for entries an app hook that keeps FAILING leaves behind - those free
- * their queue slot but stay owed, so without a ceiling a connection releasing
- * and re-subscribing in a loop against a broken hook would grow this without
- * limit.
+ * Twice what the queue can hold in flight, so ordinary concurrency never
+ * approaches it: at most `concurrency + backlog` releases exist at once, and
+ * every one of them is recorded.
+ *
+ * The slack exists for entries an app hook that keeps FAILING leaves behind.
+ * Those free their queue slot but stay owed, so they accumulate ON TOP of
+ * whatever is in flight, and without a ceiling a connection that releases and
+ * re-subscribes in a loop against a broken hook would grow this without limit.
+ *
+ * That means the ceiling IS reachable, and reaching it costs teardown coverage
+ * for the releases past it - there is no way around that, since every entry at
+ * that point is a topic genuinely owed something. It takes a hook failing
+ * roughly two thousand times on one connection to get there, it is counted in
+ * `droppedReleaseRecords`, and it says so once.
  */
 const MAX_PENDING_RELEASE_TOPICS =
 	2 * (MAX_CONCURRENT_UNSUBSCRIBE_HOOKS + MAX_QUEUED_UNSUBSCRIBE_HOOKS);
 
 let warnedPendingReleaseFull = false;
 /**
- * One-shot: reaching this means the app's `unsubscribe` hook is failing
- * persistently, which is a static fault, not a per-frame condition.
+ * Warned once, COUNTED every time. The warning describes a static fault - an
+ * `unsubscribe` hook that keeps failing - so repeating it per release adds
+ * nothing, but a connection that hits this an hour after the first one still
+ * has to be visible to an operator, which is what the counter is for.
  */
 function warnPendingReleaseFull() {
+	wsCounters.droppedReleaseRecords++;
 	if (warnedPendingReleaseFull) return;
 	warnedPendingReleaseFull = true;
 	console.error(
 		`[ws] a connection is carrying ${MAX_PENDING_RELEASE_TOPICS} topics whose unsubscribe hook never\n` +
-		'  succeeded, so further releases are no longer recorded for the close hook. The usual cause is\n' +
-		'  an `unsubscribe` hook that throws or rejects on every call - fix that, and check the errors\n' +
-		'  logged above it.'
+		'  succeeded, so further releases are no longer recorded for the close hook and their teardown\n' +
+		'  is not guaranteed. The usual cause is an `unsubscribe` hook that throws or rejects on every\n' +
+		'  call - fix that, and check the errors logged above it. The running total is\n' +
+		'  platform.droppedReleaseRecords.'
 	);
 }
 

@@ -2,10 +2,10 @@
 // Bun, drives a real WebSocket client against it, and asserts the wire
 // protocol end to end. Run the whole live lane with: npm run test:live
 
-import { fileURLToPath } from 'node:url';
+import { assertPortFree, buildPath, serverEnv, waitForServer } from './harness.mjs';
 
 const PORT = 8802;
-const BUILD = fileURLToPath(new URL('../fixture/build/index.js', import.meta.url));
+const BUILD = buildPath();
 
 let passed = 0;
 let failed = 0;
@@ -22,30 +22,15 @@ function check(name, cond, detail) {
 	}
 }
 
+await assertPortFree(PORT);
+
 const proc = Bun.spawn([process.execPath, BUILD], {
-	env: { ...process.env, HOST: '127.0.0.1', PORT: String(PORT) },
+	env: serverEnv({ HOST: '127.0.0.1', PORT: String(PORT) }),
 	stdout: 'pipe',
 	stderr: 'pipe'
 });
 
-// Wait for the port to answer.
-async function waitForServer() {
-	for (let i = 0; i < 100; i++) {
-		if (proc.exitCode !== null) {
-			throw new Error(
-				`the fixture server exited with code ${proc.exitCode} before answering. Something ` +
-				`else may be holding port ${PORT} - a leftover server from an interrupted run, or a ` +
-				'second copy of this lane.'
-			);
-		}
-		try {
-			const res = await fetch(`http://127.0.0.1:${PORT}/healthz`);
-			if (res.ok) return true;
-		} catch {}
-		await Bun.sleep(100);
-	}
-	return false;
-}
+
 
 /** A client that queues frames and lets the test await the next one. */
 function client(query = '') {
@@ -83,7 +68,7 @@ function client(query = '') {
 const j = (raw) => JSON.parse(raw);
 
 try {
-	if (!(await waitForServer())) throw new Error('server never came up');
+	await waitForServer(proc, PORT);
 
 	// --- upgrade lane ------------------------------------------------------
 	const plainGet = await fetch(`http://127.0.0.1:${PORT}/ws`);

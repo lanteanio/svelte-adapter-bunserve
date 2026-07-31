@@ -10,10 +10,10 @@
 // that is not a real handshake and yields 400. So 400 means "the origin check
 // passed", which is exactly what this needs to prove.
 
-import { fileURLToPath } from 'node:url';
+import { assertPortFree, buildPath, serverEnv, waitForServer } from './harness.mjs';
 
 const PORT = 8804;
-const BUILD = fileURLToPath(new URL('../fixture/build/index.js', import.meta.url));
+const BUILD = buildPath();
 const ORIGIN = 'https://app.example';
 
 let passed = 0, failed = 0;
@@ -25,8 +25,10 @@ const check = (name, cond, detail) => {
 
 // TLS is NOT configured, so is_tls is false and a header-derived origin would
 // be http://127.0.0.1:PORT - the proxy-terminated shape this regression covers.
+await assertPortFree(PORT);
+
 const proc = Bun.spawn([process.execPath, BUILD], {
-	env: { ...process.env, HOST: '127.0.0.1', PORT: String(PORT), ORIGIN },
+	env: serverEnv({ HOST: '127.0.0.1', PORT: String(PORT), ORIGIN }),
 	stdout: 'pipe',
 	stderr: 'pipe'
 });
@@ -38,19 +40,7 @@ const upgradeHeaders = (origin) => ({
 });
 
 try {
-	let up = false;
-	for (let i = 0; i < 100; i++) {
-		if (proc.exitCode !== null) {
-			throw new Error(
-				`the fixture server exited with code ${proc.exitCode} before answering. Something ` +
-				`else may be holding port ${PORT} - a leftover server from an interrupted run, or a ` +
-				'second copy of this lane.'
-			);
-		}
-		try { if ((await fetch(`http://127.0.0.1:${PORT}/healthz`)).ok) { up = true; break; } } catch {}
-		await Bun.sleep(100);
-	}
-	if (!up) throw new Error('server never came up');
+	await waitForServer(proc, PORT);
 
 	const matching = await fetch(`http://127.0.0.1:${PORT}/ws`, { headers: upgradeHeaders(ORIGIN) });
 	check('an Origin matching the configured ORIGIN is allowed through',

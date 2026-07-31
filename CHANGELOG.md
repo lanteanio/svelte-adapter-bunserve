@@ -16,8 +16,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   must be untouched. The fixture gained a `NO_WS` build variant
   (`build-no-ws`) for the last of those.
 
+### Added
+
+- `platform.droppedReleaseRecords`, a counter of releases whose teardown could
+  not be recorded for the `close` hook. Any non-zero value means an
+  `unsubscribe` hook has been failing persistently enough to fill a
+  connection's record, and some per-topic teardown was performed by nobody.
+
 ### Fixed
 
+- An app that exports no `unsubscribe` hook no longer queues a no-op per
+  release. It did, so a client that held many topics and pipelined the releases
+  could exhaust the deferral backlog and be cut with 4429 over hooks that do
+  not exist.
 - A release whose `unsubscribe` hook had not finished when the connection
   closed was torn down by nobody. The release removes the topic from the
   subscription set before the hook is dispatched, and that set is what the
@@ -51,12 +62,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   described a measurement taken against the test fixture's deliberately small
   subscription cap, where most answers are denials; a batch that all installs
   is roughly 17 KB.
-- The live test lane could report green against a stale build: `NO_WS` was not
-  pinned when the runner built the fixture, and no suite checked that the
-  server answering its port was the one it spawned, so a leftover server from
-  an interrupted run would be asserted against instead. The fixture's
-  `svelte-adapter-uws` A/B dependency is now optional, so `npm install` in
-  `test/fixture` works on a clone with no sibling checkout.
+- The live test lane could report green against a build it never produced:
+  `NO_WS` and `NODE_ENV` were not pinned when the runner built the fixture, and
+  no suite checked whether something was already serving its port - a leftover
+  server from an interrupted run answers in about a millisecond, long before a
+  fresh one can boot and fail to bind, so the whole suite would assert against
+  the stranger. Each suite now refuses to start on a busy port, fails fast when
+  the server it spawned exits, and starts that server with the runtime's
+  environment variables cleared rather than inherited. The subscription-cap
+  check now asserts the cap is filled exactly, since an upper bound alone was
+  satisfied by a regression that refuses every subscribe.
+- The fixture no longer declares `svelte-adapter-uws` as a dependency, so
+  `npm install` in `test/fixture` works on a clone with no sibling checkout -
+  it previously failed outright, which made the live lane unrunnable anywhere
+  but the author's machine. `ADAPTER=uws` imports it by path, overridable with
+  `UWS_ADAPTER`.
 
 ## [0.0.1] - 2026-07-30
 
