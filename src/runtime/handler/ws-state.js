@@ -10,6 +10,7 @@
 import { ws_options } from './config.js';
 import { createByteBudget } from '../utils/egress-budget.js';
 import { createHookQueue } from '../utils/hook-queue.js';
+import { createCapCounts } from '../utils/wire.js';
 import {
 	beginPending,
 	createPending,
@@ -53,6 +54,21 @@ export const WS_PENDING_RELEASES = Symbol('pendingReleases');
 export const WS_PLATFORM = Symbol('platform');
 export const WS_SESSION_ID = Symbol('sessionId');
 export const WS_STATS = Symbol('stats');
+
+/**
+ * The capability tokens this connection declared in its `hello` frame. Absent
+ * on connections that never sent one - old clients - which is the safe-default
+ * "no opt-in features" signal every capability consumer keys on.
+ */
+export const WS_CAPS = Symbol('caps');
+
+/**
+ * Live per-capability connection counts across the instance, maintained by the
+ * `hello` handler and released on close. The binary publish fast path asks
+ * this ONE question - "does any connected client want binary for this codec?" -
+ * to skip the per-subscriber walk entirely on JSON-only deployments.
+ */
+export const capCounts = createCapCounts();
 
 /**
  * The upgrade-time request id travels as a STRING key, not a Symbol: it is set

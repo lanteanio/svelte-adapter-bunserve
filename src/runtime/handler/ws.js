@@ -70,6 +70,7 @@ import {
 	looksLikeControlFrame
 } from '../utils/control-frame.js';
 import {
+	WS_CAPS,
 	WS_PENDING_SUBSCRIBES,
 	WS_PLATFORM,
 	WS_REQUEST_ID_KEY,
@@ -78,6 +79,7 @@ import {
 	MAX_CONTROL_EGRESS_BYTES,
 	WS_SUBSCRIPTIONS,
 	beginPendingRelease,
+	capCounts,
 	chargeControlEgress,
 	clearPendingReleases,
 	clearUnsubscribeHooks,
@@ -468,6 +470,31 @@ export const websocketHandlers = {
 				}
 				msg = parsed;
 
+				if (msg.type === 'hello' && Array.isArray(msg.caps)) {
+					// Capability negotiation. Old clients never send 'hello', so
+					// the ABSENCE of the WS_CAPS slot is the safe-default "no
+					// opt-in features" signal every capability consumer keys on.
+					// The caps list is bounded by the control-frame byte ceiling
+					// above; non-string entries are dropped rather than refused,
+					// because a partially-understood hello from a newer client
+					// must not cost it the caps this server does understand.
+					const caps = new Set();
+					for (let i = 0; i < msg.caps.length; i++) {
+						if (typeof msg.caps[i] === 'string') caps.add(msg.caps[i]);
+					}
+					let helloUd;
+					try {
+						helloUd = ws.getUserData();
+					} catch {
+						return;
+					}
+					// A re-sent hello REPLACES the prior set, so the live
+					// per-capability counts are diffed, not blindly incremented.
+					capCounts.adjust(helloUd[WS_CAPS], caps);
+					helloUd[WS_CAPS] = caps;
+					return;
+				}
+
 				if (msg.type === 'subscribe' && typeof msg.topic === 'string') {
 					await applySubscribe(ws, msg.topic, isEchoableRef(msg.ref) ? msg.ref : null);
 					return;
@@ -817,6 +844,11 @@ export const websocketHandlers = {
 			// one-directional, and once it exceeds the live total the clamp
 			// above zeroes a count that covers every remaining connection.
 			subscriptions.clear();
+			// Release this connection's capability counts. Skipping it would
+			// leave the binary fast-path gate answering "someone wants binary"
+			// forever after the last capable client left.
+			capCounts.adjust(userData[WS_CAPS], null);
+			userData[WS_CAPS] = undefined;
 			userData[WS_PENDING_SUBSCRIBES] = undefined;
 			// Drop unsubscribe hooks still WAITING. Their topics went into the
 			// snapshot above, so the close hook performs their teardown, and

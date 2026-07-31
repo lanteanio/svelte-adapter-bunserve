@@ -15,7 +15,7 @@
 export const CONTROL_FRAME_LIMIT = 8192;
 
 /** The control types the demux consumes itself. */
-export const CONSUMED_CONTROL_TYPES = ['subscribe', 'unsubscribe', 'subscribe-batch'];
+export const CONSUMED_CONTROL_TYPES = ['subscribe', 'unsubscribe', 'subscribe-batch', 'hello'];
 
 /**
  * Entries one `subscribe-batch` may carry.
