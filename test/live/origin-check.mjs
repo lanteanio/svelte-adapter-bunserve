@@ -40,6 +40,13 @@ const upgradeHeaders = (origin) => ({
 try {
 	let up = false;
 	for (let i = 0; i < 100; i++) {
+		if (proc.exitCode !== null) {
+			throw new Error(
+				`the fixture server exited with code ${proc.exitCode} before answering. Something ` +
+				`else may be holding port ${PORT} - a leftover server from an interrupted run, or a ` +
+				'second copy of this lane.'
+			);
+		}
 		try { if ((await fetch(`http://127.0.0.1:${PORT}/healthz`)).ok) { up = true; break; } } catch {}
 		await Bun.sleep(100);
 	}

@@ -25,8 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped and its topic was absent from the snapshot, leaking whatever
   per-topic state the app holds. A client could drive this deliberately by
   pipelining more releases than the queue carries. Topics the connection held
-  are now recorded until their hook settles and are named in the set handed to
-  the `close` hook.
+  are now recorded until their hook SUCCEEDS and are named in the set handed to
+  the `close` hook - including when the hook threw or rejected, which released
+  nothing. Teardown is therefore at-least-once: a hook that was mid-await when
+  the socket died can complete and also have its topic named to `close`, so an
+  app's teardown must be idempotent. This is documented in the README.
 - The per-topic `subscribe` gate allowed any verdict that was not `false` and
   not a string, so a gate written `return allowed[topic] ? null : 403`, or one
   returning a lookup promise without `await`, denied nothing and handed the
@@ -44,7 +47,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first upgrade that relies on it, and the README says what the default does
   and does not defend against.
 - README: the 4 MiB control-egress budget admits 86 worst-shaped batch
-  answers per window, not 88.
+  answers per window, not 88. The "full batch of ordinary topic names" figure
+  described a measurement taken against the test fixture's deliberately small
+  subscription cap, where most answers are denials; a batch that all installs
+  is roughly 17 KB.
+- The live test lane could report green against a stale build: `NO_WS` was not
+  pinned when the runner built the fixture, and no suite checked that the
+  server answering its port was the one it spawned, so a leftover server from
+  an interrupted run would be asserted against instead. The fixture's
+  `svelte-adapter-uws` A/B dependency is now optional, so `npm install` in
+  `test/fixture` works on a clone with no sibling checkout.
 
 ## [0.0.1] - 2026-07-30
 

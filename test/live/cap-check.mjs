@@ -43,6 +43,13 @@ const proc = Bun.spawn([process.execPath, BUILD], {
 async function waitForServer() {
 	for (let i = 0; i < 100; i++) {
 		try {
+		if (proc.exitCode !== null) {
+			throw new Error(
+				`the fixture server exited with code ${proc.exitCode} before answering. Something ` +
+				`else may be holding port ${PORT} - a leftover server from an interrupted run, or a ` +
+				'second copy of this lane.'
+			);
+		}
 			const res = await fetch(`http://127.0.0.1:${PORT}/healthz`);
 			if (res.ok) return true;
 		} catch {}
@@ -56,10 +63,19 @@ try {
 
 	const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
 	const acks = { subscribed: 0, denied: 0, rateLimited: 0 };
+	// WHICH topics installed, not just how many. The gates resolve concurrently,
+	// so the winners are the first 20 gates to SETTLE, which is not necessarily
+	// topics 0..19 - releasing an assumed range would release topics the
+	// connection never held, return no headroom, and fail against a server that
+	// behaved correctly.
+	const installed = [];
 	ws.onmessage = (e) => {
 		let msg;
 		try { msg = JSON.parse(e.data); } catch { return; }
-		if (msg.type === 'subscribed') acks.subscribed++;
+		if (msg.type === 'subscribed') {
+			acks.subscribed++;
+			if (typeof msg.topic === 'string') installed.push(msg.topic);
+		}
 		else if (msg.type === 'subscribe-denied') {
 			acks.denied++;
 			if (msg.reason === 'RATE_LIMITED') acks.rateLimited++;
@@ -99,10 +115,19 @@ try {
 
 	// The cap must not be a one-way latch: releasing subscriptions has to give
 	// the headroom back, or a long-lived connection degrades permanently.
-	for (let i = 0; i < acks.subscribed; i++) {
-		ws.send(JSON.stringify({ type: 'unsubscribe', topic: `slow:room${i}` }));
+	// Release exactly what installed, read off the acks.
+	const held = installed.slice();
+	check(
+		'the acks name every installed topic',
+		held.length === acks.subscribed,
+		`named ${held.length} of ${acks.subscribed}`
+	);
+	for (const topic of held) {
+		ws.send(JSON.stringify({ type: 'unsubscribe', topic }));
 	}
 	await Bun.sleep(300);
+	// Captured after the releases have settled, so a late ack cannot shift the
+	// baseline out from under the comparison.
 	const before = acks.subscribed;
 	ws.send(JSON.stringify({ type: 'subscribe', topic: 'slow:after-release', ref: 'r' }));
 	await Bun.sleep(500);

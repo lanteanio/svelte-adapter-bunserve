@@ -14,17 +14,35 @@ const suite = (name) => fileURLToPath(new URL(name, import.meta.url));
 
 const failures = [];
 
+// A step that wedges must not wedge the lane with no diagnostic, so every one
+// of them is bounded. The builds and the suites all finish in seconds; this
+// only ever fires on a hang.
+const STEP_TIMEOUT_MS = 180_000;
+
 async function run(label, cmd, opts = {}) {
 	console.log(`\n== ${label}`);
 	const proc = Bun.spawn(cmd, { stdout: 'inherit', stderr: 'inherit', ...opts });
+	let timedOut = false;
+	const timer = setTimeout(() => {
+		timedOut = true;
+		try { proc.kill(); } catch {}
+	}, STEP_TIMEOUT_MS);
 	const code = await proc.exited;
+	clearTimeout(timer);
+	if (timedOut) {
+		failures.push(`${label} (timed out after ${STEP_TIMEOUT_MS / 1000}s)`);
+		return false;
+	}
 	if (code !== 0) failures.push(`${label} (exit ${code})`);
 	return code === 0;
 }
 
-// ADAPTER is pinned so an exported ADAPTER=node in the shell cannot make the
-// lane assert some other adapter's build.
-const buildEnv = { ...process.env, ADAPTER: 'bunserve' };
+// Both build-selecting variables are pinned, not just ADAPTER. Either one left
+// exported in the shell silently redirects the build somewhere else and leaves
+// the output the suites assert against untouched - and since those directories
+// are gitignored, a stale one from an earlier run persists indefinitely and the
+// suites pass against a build this lane never produced.
+const buildEnv = { ...process.env, ADAPTER: 'bunserve', NO_WS: '' };
 
 const built = await run('build fixture', [process.execPath, 'run', 'build'], {
 	cwd: fixtureDir,

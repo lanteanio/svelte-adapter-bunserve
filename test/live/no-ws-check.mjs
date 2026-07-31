@@ -25,12 +25,22 @@ const proc = Bun.spawn([process.execPath, BUILD], {
 try {
 	let up = false;
 	for (let i = 0; i < 100; i++) {
+		if (proc.exitCode !== null) {
+			throw new Error(
+				`the fixture server exited with code ${proc.exitCode} before answering. Something ` +
+				`else may be holding port ${PORT} - a leftover server from an interrupted run, or a ` +
+				'second copy of this lane.'
+			);
+		}
 		try { if ((await fetch(`http://127.0.0.1:${PORT}/healthz`)).ok) { up = true; break; } } catch {}
 		await Bun.sleep(100);
 	}
 	if (!up) throw new Error('server never came up');
 
-	check('health probe still answers', true);
+	// Re-fetched rather than asserting the retry loop's own success: `true` was
+	// a check that could not fail, and a check that cannot fail is not one.
+	const healthz = await fetch(`http://127.0.0.1:${PORT}/healthz`);
+	check('health probe still answers', healthz.status === 200, `got ${healthz.status}`);
 
 	const readyz = await fetch(`http://127.0.0.1:${PORT}/readyz`);
 	check('readiness probe still answers', readyz.status === 200, `got ${readyz.status}`);
@@ -49,11 +59,24 @@ try {
 	const wsPath = await fetch(`http://127.0.0.1:${PORT}/ws`);
 	check('the ws path is NOT hijacked when no handler is configured', wsPath.status === 404, `got ${wsPath.status}`);
 
-	// And an actual upgrade attempt is refused rather than upgraded.
-	const upgradeAttempt = await fetch(`http://127.0.0.1:${PORT}/ws`, {
-		headers: { upgrade: 'websocket', connection: 'Upgrade' }
+	// And a REAL handshake does not connect. `fetch` with upgrade headers never
+	// surfaces a 101 to its caller, so asserting `status !== 101` on one passes
+	// for every outcome including a successful upgrade - it proved nothing. A
+	// genuine WebSocket client can tell the difference: with no handler the
+	// endpoint does not exist, so the connection must fail rather than open.
+	const upgradeOutcome = await new Promise((resolve) => {
+		const probe = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
+		const settle = (what) => {
+			clearTimeout(timer);
+			try { probe.close(); } catch {}
+			resolve(what);
+		};
+		const timer = setTimeout(() => settle('timeout'), 3000);
+		probe.onopen = () => settle('opened');
+		probe.onerror = () => settle('refused');
+		probe.onclose = () => settle('refused');
 	});
-	check('an upgrade attempt does not connect', upgradeAttempt.status !== 101, `got ${upgradeAttempt.status}`);
+	check('a real handshake does not connect', upgradeOutcome === 'refused', `got ${upgradeOutcome}`);
 } catch (err) {
 	failed++;
 	failures.push('THREW: ' + (err?.message ?? String(err)));

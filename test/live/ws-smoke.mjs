@@ -31,6 +31,13 @@ const proc = Bun.spawn([process.execPath, BUILD], {
 // Wait for the port to answer.
 async function waitForServer() {
 	for (let i = 0; i < 100; i++) {
+		if (proc.exitCode !== null) {
+			throw new Error(
+				`the fixture server exited with code ${proc.exitCode} before answering. Something ` +
+				`else may be holding port ${PORT} - a leftover server from an interrupted run, or a ` +
+				'second copy of this lane.'
+			);
+		}
 		try {
 			const res = await fetch(`http://127.0.0.1:${PORT}/healthz`);
 			if (res.ok) return true;

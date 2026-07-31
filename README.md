@@ -292,12 +292,21 @@ are different jobs rather than different sizes of the same one:
   only a speculative release - for a topic this connection was never granted,
   which costs an attacker nothing to invent - yields its place, and a release
   refused there runs no hook at all. A connection that fills even the queue is
-  closed with 4429, and every release whose hook had not finished is named in
+  closed with 4429, and every release whose hook has not SUCCEEDED is named in
   the set handed to the `close` hook, so the app performs that teardown by
-  another route. Note what the guarantee covers: a topic the connection HELD is
-  either released by its own hook or by the close hook, never neither; a
-  speculative release carries no such promise, because recording those would let
-  a client grow the set by naming topics it never had.
+  another route.
+
+  **Teardown is at-least-once, so make it idempotent.** A topic the connection
+  held is never left un-torn-down: if its `unsubscribe` hook does not resolve -
+  because it is still queued when the socket dies, or it threw, or it rejected
+  against a backend that is down - the topic is named to the `close` hook. The
+  cost is that a hook which was mid-await when the connection died can finish
+  AND have its topic named there, so a teardown that is not idempotent (a bare
+  `roster.decr(topic)`) can run twice. The alternative is dropping the release
+  whenever the two race, which leaks silently; running it twice is the failure
+  an app can defend against. A speculative release carries no promise at all,
+  because recording those would let a client grow the record by naming topics it
+  never had.
 - `maxControlEgressBytes` bounds the ACK CHANNEL, in bytes per 10 s. Exceeding
   it closes the connection with `CONTROL_FLOOD` and code 4429.
 
@@ -388,8 +397,9 @@ epochs off those frames and re-subscribes everything as a batch on reconnect, so
 collapsing them loses every denial and degrades resume. What that costs is
 bounded twice over, and `bench/control-egress.mjs` measures both: no batch frame
 can be answered with more than 256 frames (48 KB at the worst shape, 256
-one-character entries with a maximal ref; 20 KB for a full batch of ordinary
-topic names), and the ACK CHANNEL as a whole gets 4 MB per 10 s per connection
+one-character entries with a maximal ref; roughly 17 KB for a full batch of
+ordinary topic names that all install), and the ACK CHANNEL as a whole gets
+4 MB per 10 s per connection
 (`maxControlEgressBytes`) - 86 of those worst-shaped frames - after which the
 connection is closed with `CONTROL_FLOOD` and close code 4429. 4429 rather than
 1008 because the family clients treat 1008 as terminal and stop reconnecting for
@@ -443,7 +453,9 @@ drives real WebSocket clients against it. It covers the subscribe, batch, and
 unsubscribe frames, the subscription cap under pipelined frames, Origin
 enforcement on the upgrade, and a no-handler build proving the HTTP surface is
 untouched when no realtime is configured. It needs Bun and the fixture's
-dependencies (`npm install` in `test/fixture` once):
+dependencies (`npm install` in `test/fixture` once; the `ADAPTER=uws` A/B
+variant resolves from a sibling checkout and is optional, so a plain clone
+installs):
 
 ```sh
 npm run test:live   # builds test/fixture twice and runs the suites in test/live/

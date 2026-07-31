@@ -15,7 +15,7 @@ const {
 	chargeControlEgress,
 	clearPendingReleases,
 	clearUnsubscribeHooks,
-	endPendingRelease,
+	settlePendingRelease,
 	hasGateHeadroom,
 	pendingReleaseTopics,
 	runUnsubscribeHook,
@@ -214,7 +214,7 @@ test('a release whose hook never finished is handed to the close hook', async ()
 
 	// A hook that finishes tears its own topic down, so the close hook must not
 	// be told to do it again.
-	endPendingRelease(ud, 'room:1');
+	settlePendingRelease(ud, 'room:1', true);
 	assert.deepEqual([...pendingReleaseTopics(ud)], ['room:2']);
 
 	// The record is dropped once the close hook has been handed it.
@@ -227,7 +227,7 @@ test('the pending-release record tolerates a connection that never had one', () 
 	// never sent an unsubscribe frame at all.
 	assert.deepEqual([...pendingReleaseTopics({})], []);
 	assert.deepEqual([...pendingReleaseTopics(undefined)], []);
-	endPendingRelease(undefined, 'room:1');
+	settlePendingRelease(undefined, 'room:1', true);
 	clearPendingReleases(undefined);
 });
 
@@ -244,7 +244,7 @@ test('an overflowing queue leaves every dropped release recorded', async () => {
 		const topic = `room:${i}`;
 		beginPendingRelease(ud, topic);
 		outcomes.push(
-			runUnsubscribeHook(ws, () => gate.promise.finally(() => endPendingRelease(ud, topic)), true)
+			runUnsubscribeHook(ws, () => gate.promise.finally(() => settlePendingRelease(ud, topic, true)), true)
 		);
 	}
 	// The bound held: only the concurrency limit ran, the rest are waiting.
@@ -253,7 +253,7 @@ test('an overflowing queue leaves every dropped release recorded', async () => {
 	assert.equal(outcomes.filter((o) => o === 'queued').length, 200 - 64);
 
 	// Nothing has finished, so every topic is still owed a teardown.
-	assert.equal(pendingReleaseTopics(ud).size, 200);
+	assert.equal([...pendingReleaseTopics(ud)].length, 200);
 
 	// The connection dies with all of them outstanding.
 	clearUnsubscribeHooks(ud);
@@ -263,5 +263,66 @@ test('an overflowing queue leaves every dropped release recorded', async () => {
 	// The ones that were RUNNING completed and cleared themselves; the ones the
 	// clear dropped are still recorded, which is what puts them in the close
 	// hook's snapshot.
-	assert.equal(pendingReleaseTopics(ud).size, 200 - 64);
+	assert.equal([...pendingReleaseTopics(ud)].length, 200 - 64);
+});
+
+test('two releases of one topic are both owed until both settle', async () => {
+	// A topic can be owed more than one teardown at a time: release it,
+	// subscribe it again, release it again. Recording membership rather than a
+	// COUNT collapses those into one entry, and the first hook to finish then
+	// deletes it - so the second release is dropped at close and the app never
+	// tears down the state it re-created in between. That is the same leak this
+	// record exists to close, reached by a different route.
+	const ud = fakeWs().getUserData();
+	beginPendingRelease(ud, 'room:1');
+	beginPendingRelease(ud, 'room:1');
+	assert.deepEqual([...pendingReleaseTopics(ud)], ['room:1']);
+
+	// The first hook finishes. One teardown is still owed, so the topic must
+	// still reach the close hook.
+	settlePendingRelease(ud, 'room:1', true);
+	assert.deepEqual([...pendingReleaseTopics(ud)], ['room:1']);
+
+	// Only when the second finishes is nothing owed.
+	settlePendingRelease(ud, 'room:1', true);
+	assert.deepEqual([...pendingReleaseTopics(ud)], []);
+
+	// And settling more times than were begun cannot drive the count negative
+	// into a state where a later release is silently discharged.
+	settlePendingRelease(ud, 'room:1', true);
+	beginPendingRelease(ud, 'room:1');
+	assert.deepEqual([...pendingReleaseTopics(ud)], ['room:1']);
+});
+
+test('a hook that failed leaves its topic owed', async () => {
+	// A hook that threw ran the app's code but did not necessarily release
+	// anything - `await redis.srem(...)` against a backend that is down is the
+	// realistic shape. Discharging the debt on failure means the close hook is
+	// not told either, and one backend blip leaks the entry with no attacker
+	// involved.
+	const ud = fakeWs().getUserData();
+	beginPendingRelease(ud, 'room:1');
+	settlePendingRelease(ud, 'room:1', false);
+	assert.deepEqual([...pendingReleaseTopics(ud)], ['room:1']);
+	// A later successful release of the same topic discharges one debt, not
+	// both: the failed one is still owed.
+	beginPendingRelease(ud, 'room:1');
+	settlePendingRelease(ud, 'room:1', true);
+	assert.deepEqual([...pendingReleaseTopics(ud)], ['room:1']);
+});
+
+test('the pending-release record is bounded', () => {
+	// Otherwise a hook that fails every time turns "release, re-subscribe,
+	// release" into unbounded growth on one connection: a failed hook frees its
+	// queue slot but stays owed, so the queue's own bound does not cover this.
+	const ud = fakeWs().getUserData();
+	for (let i = 0; i < 5000; i++) {
+		beginPendingRelease(ud, `room:${i}`);
+		settlePendingRelease(ud, `room:${i}`, false);
+	}
+	const recorded = [...pendingReleaseTopics(ud)].length;
+	assert.equal(recorded, 2 * (64 + 1024));
+	// Everything in flight still fits: the queue admits at most 64 + 1024 at
+	// once, so the ceiling cannot be reached by legitimate concurrency alone.
+	assert.ok(recorded > 64 + 1024);
 });

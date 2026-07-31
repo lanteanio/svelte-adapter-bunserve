@@ -81,7 +81,7 @@ import {
 	chargeControlEgress,
 	clearPendingReleases,
 	clearUnsubscribeHooks,
-	endPendingRelease,
+	settlePendingRelease,
 	hasGateHeadroom,
 	heldSubscriptions,
 	pendingReleaseTopics,
@@ -549,28 +549,47 @@ export const websocketHandlers = {
 					}
 					if (unsubUd) {
 						const releasedTopic = msg.topic;
-						if (wasHeld) beginPendingRelease(unsubUd, releasedTopic);
+						// Recorded only when there is a hook that could still owe
+						// the app a teardown. With none exported there is nothing
+						// to run and nothing to carry to the close hook.
+						const hasUnsubscribeHook = typeof wsModule.unsubscribe === 'function';
+						if (wasHeld && hasUnsubscribeHook) {
+							beginPendingRelease(unsubUd, releasedTopic);
+						}
 						const outcome = runUnsubscribeHook(
 							ws,
-							() =>
-								// callHook RETURNS the hook's promise, and returning
-								// it is what makes the bound measure concurrent
+							() => {
+								// Not callHook: it converts a rejection into a
+								// resolution, and whether the hook RESOLVED is
+								// exactly what decides if the teardown it was
+								// owed has been performed. The guarantees callHook
+								// provides are kept - a throw never escapes into an
+								// unhandled rejection, and the hook's own promise
+								// is returned so the bound measures concurrent
 								// hooks rather than concurrent
 								// calls-to-a-hook-that-immediately-suspends.
-								(
-									callHook('unsubscribe', () =>
-										wsModule.unsubscribe?.(ws, releasedTopic, { platform: unsubUd[WS_PLATFORM] })
-									) ?? Promise.resolve()
-								).finally(() => {
-									// SETTLED, not merely started: the record has to
-									// outlive the hook's own awaits, or a close
-									// landing mid-hook would find the topic gone and
-									// skip the teardown this exists to guarantee.
-									// A hook that threw still ran the app's code, and
-									// the close hook re-running it would be the
-									// duplicate this record is meant to avoid.
-									endPendingRelease(unsubUd, releasedTopic);
-								}),
+								let settling;
+								try {
+									settling = wsModule.unsubscribe?.(
+										ws,
+										releasedTopic,
+										{ platform: unsubUd[WS_PLATFORM] }
+									);
+								} catch (err) {
+									// Threw before its first await, so it released
+									// nothing: the topic stays owed.
+									reportHookError('unsubscribe', err);
+									return undefined;
+								}
+								if (!settling || typeof settling.then !== 'function') {
+									settlePendingRelease(unsubUd, releasedTopic, true);
+									return undefined;
+								}
+								return settling.then(
+									() => settlePendingRelease(unsubUd, releasedTopic, true),
+									(/** @type {unknown} */ err) => reportHookError('unsubscribe', err)
+								);
+							},
 							wasHeld
 						);
 						// Even the queue is full, and this release cannot be
@@ -729,15 +748,21 @@ export const websocketHandlers = {
 		// ZERO topics and leaked every roster entry for the connection, silently.
 		// The clear still has to happen (see the note on it below), so the two
 		// requirements are met by handing out a copy.
-		const heldSubscriptions = new Set(subscriptions);
-		// Plus every topic whose release hook never finished. Those are already
-		// out of `subscriptions` - the release runs before the hook is queued -
-		// so without this the app would never be told to tear them down: the
+		const teardownTopics = new Set(subscriptions);
+		// Plus every topic still owed a teardown. Those are already out of
+		// `subscriptions` - the release runs before the hook is queued - so
+		// without this the app would never be told to tear them down: the
 		// waiting hooks are dropped just below, and the snapshot would not name
 		// them. They are NOT added to the counter arithmetic in the `finally`,
 		// which is settled against the live set; these were subtracted when they
 		// were released.
-		for (const topic of pendingReleaseTopics(userData)) heldSubscriptions.add(topic);
+		//
+		// A hook that was mid-await when the socket died can therefore finish AND
+		// have its topic named here, so teardown is AT LEAST once. That is the
+		// deliberate trade: the alternative is dropping the release whenever the
+		// two race, which is the leak this record exists to close. The app's
+		// teardown has to be idempotent, and the README says so.
+		for (const topic of pendingReleaseTopics(userData)) teardownTopics.add(topic);
 
 		const stats = userData[WS_STATS];
 		const closePlatform = userData[WS_PLATFORM];
@@ -746,7 +771,7 @@ export const websocketHandlers = {
 				code,
 				message,
 				platform: closePlatform,
-				subscriptions: heldSubscriptions,
+				subscriptions: teardownTopics,
 				id: userData[WS_SESSION_ID],
 				duration: performance.now() - stats.openedAt,
 				messagesIn: stats.messagesIn,
@@ -754,7 +779,7 @@ export const websocketHandlers = {
 				bytesIn: stats.bytesIn,
 				bytesOut: stats.bytesOut
 			}
-			: { code, message, platform: closePlatform, subscriptions: heldSubscriptions };
+			: { code, message, platform: closePlatform, subscriptions: teardownTopics };
 
 		try {
 			// Tracked, not fire-and-forget: the shutdown drain waits on these so

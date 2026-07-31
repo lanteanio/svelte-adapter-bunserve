@@ -339,8 +339,36 @@ export function clearUnsubscribeHooks(ud) {
 }
 
 /**
- * Topics whose `unsubscribe` hook has been handed to the queue but has not
- * finished.
+ * Distinct topics one connection may carry an unowed teardown for.
+ *
+ * Everything in flight fits with room to spare: the queue admits at most
+ * `concurrency + backlog` releases at once, and this is twice that. The slack
+ * is for entries an app hook that keeps FAILING leaves behind - those free
+ * their queue slot but stay owed, so without a ceiling a connection releasing
+ * and re-subscribing in a loop against a broken hook would grow this without
+ * limit.
+ */
+const MAX_PENDING_RELEASE_TOPICS =
+	2 * (MAX_CONCURRENT_UNSUBSCRIBE_HOOKS + MAX_QUEUED_UNSUBSCRIBE_HOOKS);
+
+let warnedPendingReleaseFull = false;
+/**
+ * One-shot: reaching this means the app's `unsubscribe` hook is failing
+ * persistently, which is a static fault, not a per-frame condition.
+ */
+function warnPendingReleaseFull() {
+	if (warnedPendingReleaseFull) return;
+	warnedPendingReleaseFull = true;
+	console.error(
+		`[ws] a connection is carrying ${MAX_PENDING_RELEASE_TOPICS} topics whose unsubscribe hook never\n` +
+		'  succeeded, so further releases are no longer recorded for the close hook. The usual cause is\n' +
+		'  an `unsubscribe` hook that throws or rejects on every call - fix that, and check the errors\n' +
+		'  logged above it.'
+	);
+}
+
+/**
+ * Record that a topic is owed a teardown the app has not performed yet.
  *
  * The release itself runs BEFORE the hook is queued, and it deletes the topic
  * from the subscription set. That set is what the close hook is handed, so
@@ -350,8 +378,14 @@ export function clearUnsubscribeHooks(ud) {
  * cursor attachment) would then be released by nobody. A client can drive that
  * on purpose by pipelining more releases than the queue holds.
  *
- * Only topics the connection GENUINELY held are recorded, so this is bounded by
- * the subscription cap rather than by what a client can invent.
+ * COUNTED, not a plain set membership. One topic can be owed more than one
+ * teardown at a time - release it, subscribe it again, release it again - and
+ * a set collapses those into one entry that the first hook to finish then
+ * deletes, dropping the teardown still owed for the second. The count is what
+ * makes "two owed, one settled" expressible.
+ *
+ * Only topics the connection GENUINELY held are recorded, so a client cannot
+ * grow this by naming topics it never had.
  *
  * @param {any} ud
  * @param {string} topic
@@ -359,31 +393,56 @@ export function clearUnsubscribeHooks(ud) {
 export function beginPendingRelease(ud, topic) {
 	let pending = ud[WS_PENDING_RELEASES];
 	if (pending === undefined) {
-		pending = new Set();
+		pending = new Map();
 		ud[WS_PENDING_RELEASES] = pending;
 	}
-	pending.add(topic);
+	const owed = pending.get(topic);
+	if (owed === undefined && pending.size >= MAX_PENDING_RELEASE_TOPICS) {
+		warnPendingReleaseFull();
+		return;
+	}
+	pending.set(topic, (owed ?? 0) + 1);
 }
 
 /**
- * Mark a release's hook as finished, so the close hook is not handed a topic
- * the app has already torn down.
+ * Settle one owed teardown for a topic.
+ *
+ * Only a hook that RESOLVED discharges what it was owed. A hook that threw or
+ * rejected ran the app's code but did not necessarily release anything - the
+ * realistic shape is `await redis.srem(...)` against a backend that is down -
+ * so its topic stays owed and the close hook is told to tear it down. That
+ * makes teardown AT LEAST once rather than exactly once; see the note on
+ * `pendingReleaseTopics`.
  *
  * @param {any} ud
  * @param {string} topic
+ * @param {boolean} released - did the hook resolve?
  */
-export function endPendingRelease(ud, topic) {
-	ud?.[WS_PENDING_RELEASES]?.delete(topic);
+export function settlePendingRelease(ud, topic, released) {
+	if (!released) return;
+	const pending = ud?.[WS_PENDING_RELEASES];
+	if (pending === undefined) return;
+	const owed = pending.get(topic);
+	if (owed === undefined) return;
+	if (owed <= 1) pending.delete(topic);
+	else pending.set(topic, owed - 1);
 }
 
 /**
- * The topics whose release hook never completed, for the close hook's snapshot.
+ * The topics still owed a teardown, for the close hook's snapshot.
+ *
+ * These are handed to the `close` hook IN ADDITION to what the connection still
+ * held, so teardown is at-least-once: a hook that was mid-await when the socket
+ * died can complete AND have its topic named to the close hook. An app's
+ * teardown therefore has to be idempotent, which is documented - the
+ * alternative is dropping the release whenever the two race, which is the leak
+ * this record exists to close.
  *
  * @param {any} ud
- * @returns {Set<string>}
+ * @returns {Iterable<string>}
  */
 export function pendingReleaseTopics(ud) {
-	return ud?.[WS_PENDING_RELEASES] ?? EMPTY_SUBSCRIPTIONS;
+	return ud?.[WS_PENDING_RELEASES]?.keys() ?? EMPTY_SUBSCRIPTIONS;
 }
 
 /**
