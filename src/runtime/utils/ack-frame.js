@@ -41,7 +41,12 @@ const MAX_REF_BYTES = 128;
  * @returns {boolean}
  */
 export function isEchoableRef(ref) {
-	if (typeof ref === 'number') return true;
+	// FINITE numbers only. JSON.stringify writes Infinity and NaN as `null`,
+	// which is the adapter's own spelling for "this frame carries no ref", so
+	// echoing one hands the client an ack it cannot correlate against the
+	// request that caused it. `1e999` parses to Infinity, so a client reaches
+	// this with an ordinary-looking literal.
+	if (typeof ref === 'number') return Number.isFinite(ref);
 	if (typeof ref !== 'string') return false;
 	// The cheap test first: UTF-8 never exceeds 3 bytes per UTF-16 code unit,
 	// so a short enough string is under the cap without measuring it.

@@ -18,6 +18,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A release whose `unsubscribe` hook had not finished when the connection
+  closed was torn down by nobody. The release removes the topic from the
+  subscription set before the hook is dispatched, and that set is what the
+  `close` hook receives - so a hook still queued when the socket died was
+  dropped and its topic was absent from the snapshot, leaking whatever
+  per-topic state the app holds. A client could drive this deliberately by
+  pipelining more releases than the queue carries. Topics the connection held
+  are now recorded until their hook settles and are named in the set handed to
+  the `close` hook.
+- The per-topic `subscribe` gate allowed any verdict that was not `false` and
+  not a string, so a gate written `return allowed[topic] ? null : 403`, or one
+  returning a lookup promise without `await`, denied nothing and handed the
+  client every topic it could name. Unreadable verdicts are now refused with
+  `INTERNAL_ERROR` and a console error, which is what `subscribeBatch` already
+  did - the same hook logic no longer allows through one entry point and denies
+  through the other. `null`, `undefined` and `true` still allow.
+- A non-finite `ref` (`1e999` parses to `Infinity`) was echoed into acks as
+  `null`, the adapter's own spelling for "no ref", so the client received an
+  ack it could not correlate. Only finite numbers are echoable.
+- `allowedOrigins: 'same-origin'` with no `ORIGIN` configured compares the
+  request against an origin derived from its own `Host` header, which a client
+  controls. The behavior is kept (refusing every upgrade on an unconfigured
+  server would break local development) but the adapter now warns once on the
+  first upgrade that relies on it, and the README says what the default does
+  and does not defend against.
 - README: the 4 MiB control-egress budget admits 86 worst-shaped batch
   answers per window, not 88.
 

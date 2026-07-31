@@ -110,3 +110,19 @@ test('numbers always round-trip and other shapes are treated as absent', () => {
 	assert.equal(isEchoableRef(['a']), false);
 	assert.equal(isEchoableRef(true), false);
 });
+
+test('a non-finite ref is not echoable', () => {
+	// JSON.stringify writes Infinity and NaN as `null`, which is this adapter's
+	// own spelling for "no ref", so echoing one hands the client an ack it
+	// cannot tell apart from an unsolicited frame. `1e999` parses to Infinity,
+	// so an ordinary-looking literal reaches this.
+	assert.equal(isEchoableRef(Infinity), false);
+	assert.equal(isEchoableRef(-Infinity), false);
+	assert.equal(isEchoableRef(NaN), false);
+	assert.equal(isEchoableRef(JSON.parse('{"ref":1e999}').ref), false);
+	// Ordinary refs are unaffected, including the falsy one.
+	assert.equal(isEchoableRef(0), true);
+	assert.equal(isEchoableRef(-1), true);
+	assert.equal(isEchoableRef(1.5), true);
+	assert.equal(isEchoableRef(Number.MAX_SAFE_INTEGER), true);
+});

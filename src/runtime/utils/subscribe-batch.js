@@ -40,15 +40,19 @@ function warnUnreadableDenials(denials) {
 }
 
 /**
- * The four shapes a per-topic value may take. Anything else reached
- * `normalizeSubscribeVerdict`, which allows everything that is not `false` and
- * not a string, so an unreadable value was an ALLOW for a topic the hook was
- * trying to deny.
+ * The shapes a verdict may take. Anything else is a value the adapter cannot
+ * read as allow OR deny, so it fails closed rather than becoming an ALLOW for a
+ * topic the hook was trying to deny.
+ *
+ * Shared with the per-topic lane in handler/platform.js. Both gates answer the
+ * same question about the same kind of value, and when they answered it
+ * differently the identical hook logic denied through `subscribeBatch` and
+ * allowed through `subscribe`.
  *
  * @param {unknown} value
  * @returns {boolean}
  */
-function isReadableVerdict(value) {
+export function isReadableVerdict(value) {
 	return (
 		value === false ||
 		value === true ||
@@ -69,18 +73,23 @@ let warnedUnreadableVerdict = false;
  *
  * @param {string} topic
  * @param {unknown} value
+ * @param {string} [hookName] - the gate that returned it
  */
-function warnUnreadableVerdict(topic, value) {
+export function warnUnreadableVerdict(topic, value, hookName = 'subscribeBatch') {
 	if (warnedUnreadableVerdict) return;
 	warnedUnreadableVerdict = true;
 	const kind =
 		value === null ? 'null' : Array.isArray(value) ? 'an array' : `a ${typeof value}`;
+	const example =
+		hookName === 'subscribeBatch'
+			? "    return { 'room:1': 'FORBIDDEN' };\n"
+			: "    return 'FORBIDDEN';\n";
 	console.error(
-		`[ws] subscribeBatch returned ${kind} for the topic ${JSON.stringify(topic)}, which is not a\n` +
+		`[ws] ${hookName} returned ${kind} for the topic ${JSON.stringify(topic)}, which is not a\n` +
 		'  readable verdict, so that subscription is being DENIED with INTERNAL_ERROR. A denial is\n' +
-		'  `false` or a reason STRING; an absent key, `true`, or `undefined` allow:\n' +
-		"    return { 'room:1': 'FORBIDDEN' };\n" +
-		'  A Promise is the usual mistake - an `async` lookup assigned without `await`.'
+		'  `false` or a reason STRING; `true`, `null` and `undefined` allow:\n' +
+		example +
+		'  A Promise is the usual mistake - an `async` lookup returned without `await`.'
 	);
 }
 

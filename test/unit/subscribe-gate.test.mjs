@@ -185,3 +185,54 @@ test('a verdict cannot override wire validation or the system-namespace guard', 
 		assert.deepEqual(ws.installed, []);
 	});
 });
+
+test('a verdict the adapter cannot read denies instead of allowing', async () => {
+	// The per-topic lane allowed everything that was not `false` and not a
+	// string, so a gate written `return allowed[topic] ? null : 403` denied
+	// nothing, and a forgotten `await` handed the client every topic it could
+	// name. The batch lane has always refused these values; both now share
+	// isReadableVerdict, so the same hook logic cannot allow through one entry
+	// point and deny through the other.
+	for (const unreadable of [403, 0, NaN, {}, [], new Error('FORBIDDEN'), Symbol('no'), 12n]) {
+		await withGate({ subscribe: () => unreadable }, async () => {
+			const ws = fakeWs();
+			assert.equal(
+				await platform.subscribe(ws, 'user:42'),
+				'INTERNAL_ERROR',
+				`a verdict of ${String(unreadable)} must not authorize`
+			);
+			assert.deepEqual(ws.installed, []);
+			// checkSubscribe is the same gate, so it must answer the same way.
+			assert.equal(await platform.checkSubscribe(ws, 'user:42'), 'INTERNAL_ERROR');
+		});
+	}
+	// A promise is the shape an `async` gate produces when its result is
+	// returned without being awaited by a synchronous wrapper.
+	await withGate({ subscribe: () => Promise.resolve('FORBIDDEN') }, async () => {
+		const ws = fakeWs();
+		// Awaited by the gate itself, so this one resolves to a real reason.
+		assert.equal(await platform.subscribe(ws, 'user:42'), 'FORBIDDEN');
+		assert.deepEqual(ws.installed, []);
+	});
+	await withGate({ subscribe: () => ({ then: 17 }) }, async () => {
+		const ws = fakeWs();
+		assert.equal(await platform.subscribe(ws, 'user:42'), 'INTERNAL_ERROR');
+		assert.deepEqual(ws.installed, []);
+	});
+});
+
+test('the readable no-opinion shapes still allow', async () => {
+	// The fail-closed rule must not swallow the overwhelmingly common return
+	// from a hook that guards a few topics and ignores the rest.
+	for (const allowing of [null, undefined, true]) {
+		await withGate({ subscribe: () => allowing }, async () => {
+			const ws = fakeWs();
+			assert.equal(
+				await platform.subscribe(ws, 'room:1'),
+				null,
+				`a verdict of ${String(allowing)} must allow`
+			);
+			assert.deepEqual(ws.installed, ['room:1']);
+		});
+	}
+});

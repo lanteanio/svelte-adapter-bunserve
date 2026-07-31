@@ -264,6 +264,27 @@ try {
 	check('the drained connection is then closed with a real code, not a 1006',
 		closeEvt.code === 1012, JSON.stringify(closeEvt));
 
+	// --- a release still in flight when the connection dies ----------------
+	// The release happens BEFORE the app's unsubscribe hook is dispatched, and
+	// it removes the topic from the subscription set the close hook is handed.
+	// So a hook that has not finished when the socket dies is dropped, and
+	// unless the topic is carried across some other way the app is never told
+	// to release its per-topic state at all. `hang:` never settles, so this is
+	// that case exactly.
+	const hangClient = client('?user=hanger');
+	await hangClient.opened;
+	await hangClient.next(); // welcome
+	await hangClient.next(); // opened
+	hangClient.send(JSON.stringify({ type: 'subscribe', topic: 'hang:1', ref: 90 }));
+	const hangSubbed = j(await hangClient.next());
+	check('a hang topic subscribes normally', hangSubbed.type === 'subscribed', JSON.stringify(hangSubbed));
+	hangClient.send(JSON.stringify({ type: 'unsubscribe', topic: 'hang:1', ref: 91 }));
+	const hookFired = j(await hangClient.next());
+	check('the unsubscribe hook ran for the released topic',
+		hookFired.event === 'unsubscribe-hook', JSON.stringify(hookFired));
+	hangClient.close();
+	await Bun.sleep(250);
+
 	a.close();
 	await Bun.sleep(150);
 } catch (err) {
@@ -274,6 +295,11 @@ try {
 	proc.kill();
 	const out = await new Response(proc.stdout).text();
 	const errText = await new Response(proc.stderr).text();
+	// Asserted from the server's own log because the close hook's view is the
+	// thing under test, and no client can observe it.
+	const hangClose = out.split('\n').find((line) => line.includes('[fixture] close') && line.includes('hang:1'));
+	check('a release whose hook never finished still reaches the close hook',
+		Boolean(hangClose), 'no close line named hang:1');
 	if (failed > 0) {
 		console.log('\n--- server stdout ---\n' + out.slice(-3000));
 		if (errText.trim()) console.log('\n--- server stderr ---\n' + errText.slice(-3000));

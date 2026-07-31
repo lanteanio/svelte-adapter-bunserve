@@ -76,13 +76,23 @@ export async function subscribe(ws, topic) {
 	return null;
 }
 
-/** Fires whether or not the connection actually held the subscription. */
+/**
+ * Fires whether or not the connection actually held the subscription.
+ *
+ * A `hang:` topic never settles, which is how the live suite reaches the case
+ * where a connection dies with a release still in flight. The release itself
+ * has already happened by then - the topic is out of the subscription set - so
+ * the only thing that can still tear down the app's per-topic state is the
+ * close hook being told about it.
+ */
 export function unsubscribe(ws, topic, { platform }) {
 	platform.send(ws, '__fixture', 'unsubscribe-hook', { topic });
+	if (topic.startsWith('hang:')) return new Promise(() => {});
 }
 
 export function close(ws, ctx) {
+	const topics = [...ctx.subscriptions].sort().join(',');
 	console.log(
-		`[fixture] close code=${ctx.code} subs=${ctx.subscriptions.size} in=${ctx.messagesIn} out=${ctx.messagesOut}`
+		`[fixture] close code=${ctx.code} subs=${ctx.subscriptions.size} topics=${topics} in=${ctx.messagesIn} out=${ctx.messagesOut}`
 	);
 }

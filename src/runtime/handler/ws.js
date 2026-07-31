@@ -77,10 +77,14 @@ import {
 	WS_STATS,
 	MAX_CONTROL_EGRESS_BYTES,
 	WS_SUBSCRIPTIONS,
+	beginPendingRelease,
 	chargeControlEgress,
+	clearPendingReleases,
 	clearUnsubscribeHooks,
+	endPendingRelease,
 	hasGateHeadroom,
 	heldSubscriptions,
+	pendingReleaseTopics,
 	runUnsubscribeHook,
 	trackCloseHook,
 	withGateCounted,
@@ -519,13 +523,24 @@ export const websocketHandlers = {
 					// dispatched unbounded. The subscription cap limits the SET
 					// SIZE, not the concurrency, and Bun does not await this
 					// handler, so 10,000 held topics released in one read burst
-					// would otherwise land 10,000 concurrent app hooks. `wasHeld`
-					// is also not the same question as "does the app have state
-					// for this topic": the extensions' observer lanes subscribe
-					// with a bare `ws.subscribe`, which this adapter never
-					// records, so their releases arrive on the speculative lane.
-					// The queue is what lets the bound hold without either lane
-					// losing its teardown.
+					// would otherwise land 10,000 concurrent app hooks.
+					//
+					// The two lanes get different guarantees, and the difference
+					// is what a client can invent. A held topic is RECORDED as a
+					// pending release before the hook is queued, so if the
+					// connection dies while the hook is still waiting, the close
+					// hook is handed that topic and tears it down instead. The
+					// speculative lane gets no such record: its topics were never
+					// granted, so recording them would let a client grow the set
+					// by naming topics it never held. It yields under pressure,
+					// and a release refused there runs no hook at all.
+					//
+					// That is a real cost, because `wasHeld` is not the same
+					// question as "does the app have state for this topic": the
+					// extensions' observer lanes subscribe with a bare
+					// `ws.subscribe`, which this adapter never records, so their
+					// releases arrive on the speculative lane and are dropped
+					// while the connection is saturated.
 					let unsubUd;
 					try {
 						unsubUd = ws.getUserData();
@@ -533,6 +548,8 @@ export const websocketHandlers = {
 						unsubUd = null;
 					}
 					if (unsubUd) {
+						const releasedTopic = msg.topic;
+						if (wasHeld) beginPendingRelease(unsubUd, releasedTopic);
 						const outcome = runUnsubscribeHook(
 							ws,
 							() =>
@@ -540,18 +557,29 @@ export const websocketHandlers = {
 								// it is what makes the bound measure concurrent
 								// hooks rather than concurrent
 								// calls-to-a-hook-that-immediately-suspends.
-								callHook('unsubscribe', () =>
-									wsModule.unsubscribe?.(ws, msg.topic, { platform: unsubUd[WS_PLATFORM] })
-								) ?? Promise.resolve(),
+								(
+									callHook('unsubscribe', () =>
+										wsModule.unsubscribe?.(ws, releasedTopic, { platform: unsubUd[WS_PLATFORM] })
+									) ?? Promise.resolve()
+								).finally(() => {
+									// SETTLED, not merely started: the record has to
+									// outlive the hook's own awaits, or a close
+									// landing mid-hook would find the topic gone and
+									// skip the teardown this exists to guarantee.
+									// A hook that threw still ran the app's code, and
+									// the close hook re-running it would be the
+									// duplicate this record is meant to avoid.
+									endPendingRelease(unsubUd, releasedTopic);
+								}),
 							wasHeld
 						);
 						// Even the queue is full, and this release cannot be
 						// dropped. Closing is the honest move rather than the harsh
-						// one: the close handler runs the app's `close` hook with
-						// the whole subscription snapshot, which releases the same
-						// state this task would have. 4429 is the family's throttle
-						// code, so the client reconnects with backoff instead of
-						// giving up.
+						// one: the topic is already recorded as a pending release,
+						// so the close handler hands it to the app's `close` hook
+						// and the same state is released by that route. 4429 is the
+						// family's throttle code, so the client reconnects with
+						// backoff instead of giving up.
 						if (outcome === 'overflow') {
 							warnUnsubscribeOverflow();
 							try {
@@ -702,6 +730,14 @@ export const websocketHandlers = {
 		// The clear still has to happen (see the note on it below), so the two
 		// requirements are met by handing out a copy.
 		const heldSubscriptions = new Set(subscriptions);
+		// Plus every topic whose release hook never finished. Those are already
+		// out of `subscriptions` - the release runs before the hook is queued -
+		// so without this the app would never be told to tear them down: the
+		// waiting hooks are dropped just below, and the snapshot would not name
+		// them. They are NOT added to the counter arithmetic in the `finally`,
+		// which is settled against the live set; these were subtracted when they
+		// were released.
+		for (const topic of pendingReleaseTopics(userData)) heldSubscriptions.add(topic);
 
 		const stats = userData[WS_STATS];
 		const closePlatform = userData[WS_PLATFORM];
@@ -738,12 +774,13 @@ export const websocketHandlers = {
 			// above zeroes a count that covers every remaining connection.
 			subscriptions.clear();
 			userData[WS_PENDING_SUBSCRIBES] = undefined;
-			// Drop unsubscribe hooks still WAITING. The close hook above was
-			// handed the whole subscription set and performs the same teardown,
-			// so draining a per-topic queue afterwards is duplicate work against
-			// a socket that no longer exists - and the ones already running are
-			// left alone, since they hold app state mid-release.
+			// Drop unsubscribe hooks still WAITING. Their topics went into the
+			// snapshot above, so the close hook performs their teardown, and
+			// draining a per-topic queue against a socket that no longer exists
+			// would be duplicate work - the ones already running are left alone,
+			// since they hold app state mid-release.
 			clearUnsubscribeHooks(userData);
+			clearPendingReleases(userData);
 			// RELEASE userData last. Up to here the close hook could read it to
 			// identify the connection; from here a continuation resuming after
 			// its own await gets the throw its rollback is written against.

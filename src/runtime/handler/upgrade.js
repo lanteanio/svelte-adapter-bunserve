@@ -88,6 +88,35 @@ const RESERVED_HEADERS = new Set([
 
 /** Origin refusals, throttled with decay. */
 const originRefusedThrottle = createLogThrottle(() => performance.now());
+
+let warnedDerivedSelfOrigin = false;
+/**
+ * Say that the same-origin check is comparing the client against itself.
+ *
+ * With no ORIGIN configured the server's own origin has to be reconstructed
+ * from the request, and the host in it is the one the CLIENT sent. The check
+ * then reduces to "the Origin header matches the Host header", which any client
+ * can satisfy by setting both - so the CSWSH defense the default advertises is
+ * not actually in force. It still refuses a browser page on another origin that
+ * connects by the server's real name, which is the common case, but it does not
+ * survive a wildcard/multi-tenant deployment or DNS rebinding, where the
+ * attacker controls the host the request arrives under.
+ *
+ * One-shot: it describes the deployment's configuration, not a per-request
+ * condition, and it fires on the first upgrade that actually relies on it
+ * rather than at boot, so an app with no WebSocket traffic stays quiet.
+ */
+function warnDerivedSelfOrigin() {
+	if (warnedDerivedSelfOrigin) return;
+	warnedDerivedSelfOrigin = true;
+	console.warn(
+		'[ws] allowedOrigins is \'same-origin\' but ORIGIN is not set, so the origin an upgrade is\n' +
+		'  compared against is derived from the request\'s own Host header. That check cannot refuse a\n' +
+		'  client that sets both headers, and it does not hold where the host is attacker-controlled\n' +
+		'  (a wildcard or multi-tenant domain, or DNS rebinding). Set ORIGIN to the public origin,\n' +
+		'  e.g. ORIGIN=https://app.example, or pass an explicit allowedOrigins list.'
+	);
+}
 /**
  * Say why an upgrade was refused. Silence here is an operational trap: the page
  * loads, the socket 403s, the server logs nothing, and the fastest thing that
@@ -197,8 +226,15 @@ async function runUpgrade(req, srv) {
 	// and 403 every legitimate upgrade. That failure pushes operators straight
 	// to `allowedOrigins: 'any'`, which disables the defense outright, so a
 	// fail-closed bug here becomes a fail-open configuration.
+	//
+	// With nothing configured the fallback below reconstructs the origin from
+	// the request, whose host the CLIENT chose - so the comparison is between
+	// two values the same peer supplied. It is kept because refusing every
+	// upgrade on an unconfigured server would break local development, but it
+	// is not the defense the default advertises, and it says so out loud once.
 	let selfOrigin = origin || '';
 	if (!selfOrigin) {
+		if (ws_options.allowedOrigins === 'same-origin') warnDerivedSelfOrigin();
 		try {
 			selfOrigin = get_origin(req.headers);
 		} catch {

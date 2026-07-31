@@ -31,7 +31,12 @@ import { completeEnvelope } from '../utils/envelope.js';
 import { isSystemTopic, isValidWireTopic, createTopicHelperCache } from '../utils/topic.js';
 import { SEND_DROPPED } from '../utils/send-result.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
-import { denyAllBatch, mapBatchDenials } from '../utils/subscribe-batch.js';
+import {
+	denyAllBatch,
+	isReadableVerdict,
+	mapBatchDenials,
+	warnUnreadableVerdict
+} from '../utils/subscribe-batch.js';
 import { envelopePrefix } from './envelope-cache.js';
 import { bumpOut } from './ws-stats.js';
 import { wsModule } from '../ws-handler-bridge.js';
@@ -63,15 +68,28 @@ const subscribeThrewThrottle = createLogThrottle(() => performance.now());
  * Fail-OPEN on a nullish verdict is deliberate: "no opinion" is the
  * overwhelmingly common return from a hook that guards a few topics and ignores
  * the rest. A hook that means to deny returns `false` or a reason string;
- * anything else truthy is also "no opinion", so a hook returning an object does
- * not accidentally deny.
+ * `true`, `null` and `undefined` allow.
+ *
+ * Anything else is UNREADABLE and fails closed. Allowing it instead is the
+ * fail-open this reached for first: a hook written
+ * `return allowed[topic] ? null : 403`, or one that returns a lookup promise
+ * without `await`, denies nothing and hands the client every topic it can
+ * name. The batch lane has always refused those values, so the identical hook
+ * logic denied through `subscribeBatch` and allowed through `subscribe`;
+ * `isReadableVerdict` is now the one answer both lanes get.
  *
  * @param {unknown} verdict
+ * @param {string} topic - named in the warning, not in the client's answer
+ * @param {string} hookName - the gate that produced the verdict
  * @returns {string | null} a denial reason, or null to allow
  */
-function normalizeSubscribeVerdict(verdict) {
+function normalizeSubscribeVerdict(verdict, topic, hookName) {
 	if (verdict === false) return 'FORBIDDEN';
 	if (typeof verdict === 'string') return verdict;
+	if (!isReadableVerdict(verdict)) {
+		warnUnreadableVerdict(topic, verdict, hookName);
+		return 'INTERNAL_ERROR';
+	}
 	return null;
 }
 
@@ -153,10 +171,10 @@ let topicHelperCache = null;
  * parameter consumers forward verbatim, and a Symbol key on it is no better,
  * since a Proxy with a catch-all `get` trap answers for a Symbol it cannot
  * name. It cannot be a fourth parameter of `platform.subscribe` either -
- * `normalizeSubscribeVerdict` reads anything that is not `false` and not a
- * string as "allow", so `topics.map(platform.subscribe.bind(platform, ws))`,
- * which supplies `(topic, index, array)`, would pass the array as a verdict and
- * install every topic ungated.
+ * a verdict short-circuits the gate entirely, so
+ * `topics.map(platform.subscribe.bind(platform, ws))`, which supplies
+ * `(topic, index, array)`, would pass the index as a verdict and answer every
+ * topic without ever consulting the app.
  *
  * @param {any} ws
  * @param {string} topic
@@ -183,7 +201,7 @@ async function runSubscribeGate(ws, topic, verdict) {
 	// A verdict the wire batch path already obtained from `subscribeBatch` for
 	// THIS topic, so one `subscribe-batch` frame costs one hook call rather
 	// than one per entry.
-	if (verdict !== undefined) return normalizeSubscribeVerdict(verdict);
+	if (verdict !== undefined) return normalizeSubscribeVerdict(verdict, topic, 'subscribeBatch');
 	// `requireGrant` is the OBSERVER-LANE mode: "may this connection see what
 	// it already holds?" It falls through to the ordinary app gate below.
 	//
@@ -207,7 +225,7 @@ async function runSubscribeGate(ws, topic, verdict) {
 	// running no gate at all for an app that gates with the batch hook.
 	if (typeof wsModule.subscribeBatch === 'function') {
 		const verdicts = await runBatchGate(ws, [topic]);
-		return normalizeSubscribeVerdict(verdicts.get(topic));
+		return normalizeSubscribeVerdict(verdicts.get(topic), topic, 'subscribeBatch');
 	}
 	const hook = wsModule.subscribe;
 	if (typeof hook !== 'function') {
@@ -240,7 +258,11 @@ async function runSubscribeGate(ws, topic, verdict) {
 		} catch {
 			/* closed socket: the shared platform is the honest answer */
 		}
-		return normalizeSubscribeVerdict(await hook(ws, topic, { platform: hookPlatform }));
+		return normalizeSubscribeVerdict(
+			await hook(ws, topic, { platform: hookPlatform }),
+			topic,
+			'subscribe'
+		);
 	} catch (err) {
 		// A THROWING hook is different from one returning no opinion: the
 		// gate reached no decision, so this fails closed. The reason is
@@ -736,16 +758,20 @@ export const platform = {
  * The implementation behind `platform.subscribe`, plus the PRIVATE verdict
  * channel the wire batch path needs.
  *
- * Module-private on purpose. The verdict says "the gate has already run for
- * this topic in this frame, do not run it again", so anything able to supply
- * one can install a subscription the app never authorized. Every previous
- * spelling put it somewhere a caller could reach: a string key on the options
- * bag, then a Symbol on the same bag (forgeable by a Proxy with a catch-all
- * `get`), then a fourth positional parameter of `platform.subscribe` itself -
- * where `topics.map(platform.subscribe.bind(platform, ws))` supplied the array
- * as a verdict and quietly allowed every topic. A parameter of a function that
- * is not a member of the platform object cannot be reached by app code holding
- * the platform.
+ * Kept OFF the platform object on purpose. The verdict says "the gate has
+ * already run for this topic in this frame, do not run it again", so anything
+ * able to supply one can install a subscription the app never authorized. Every
+ * previous spelling put it somewhere a caller could reach: a string key on the
+ * options bag, then a Symbol on the same bag (forgeable by a Proxy with a
+ * catch-all `get`), then a fourth positional parameter of `platform.subscribe`
+ * itself - where `topics.map(platform.subscribe.bind(platform, ws))` supplied
+ * the array as a verdict and quietly allowed every topic.
+ *
+ * What holds now is narrower than "unreachable": this is an exported binding,
+ * so anything that can import this module can call it. It is not a member of
+ * the platform object, which is the surface an app hook, a wrapped bus, or a
+ * `ws` holder is handed - none of those can reach the verdict channel. Only
+ * handler/ws.js imports it, and only for the batch lane it exists to serve.
  *
  * @param {any} ws
  * @param {string} topic

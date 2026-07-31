@@ -45,9 +45,16 @@ export function bumpIn(ws, message) {
 }
 
 /**
- * Count one outbound frame. EVERY send site pairs with this - the adapter's own
- * control frames and the platform's application sends alike - so an app
- * metering egress or billing per byte sees the real number.
+ * Count one outbound frame, for the per-connection counters the close hook
+ * reports.
+ *
+ * PER-SOCKET sends pair with this: the adapter's control frames and the
+ * platform's directed sends alike. Topic fan-out does NOT, and cannot - a
+ * `platform.publish` hands one payload to `server.publish` and Bun writes it to
+ * every subscriber itself, so the adapter never sees the per-connection sends
+ * and has no socket to charge them to. An app metering total egress has to
+ * account for its own publishes; these counters answer "what did this
+ * connection cost me directly", not "what left the process".
  *
  * @param {any} ws
  * @param {string | Uint8Array} payload

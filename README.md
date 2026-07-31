@@ -132,7 +132,9 @@ export function close(ws, { code, subscriptions, messagesIn, bytesOut, platform 
 export function unsubscribe(ws, topic, { platform }) {}
 
 // Authorization gate for every client subscribe. Return a reason string (or
-// false) to deny; return null/undefined to allow.
+// false) to deny; return null, undefined or true to allow. Anything else is
+// not a verdict this can read - `403`, an Error, an un-awaited promise - and
+// is refused with INTERNAL_ERROR and a console error rather than allowed.
 export function subscribe(ws, topic, { platform }) {
 	return topic.startsWith('admin:') ? 'FORBIDDEN' : null;
 }
@@ -288,10 +290,14 @@ are different jobs rather than different sizes of the same one:
   branch for a refusal, so dropping one leaks that state silently. So releases
   past the concurrency bound queue in FIFO order rather than being dropped, and
   only a speculative release - for a topic this connection was never granted,
-  which costs an attacker nothing to invent - yields its place. A connection
-  that fills even the queue is closed with 4429; its `close` hook still runs
-  with the full subscription set, so the app performs the same teardown by
-  another route.
+  which costs an attacker nothing to invent - yields its place, and a release
+  refused there runs no hook at all. A connection that fills even the queue is
+  closed with 4429, and every release whose hook had not finished is named in
+  the set handed to the `close` hook, so the app performs that teardown by
+  another route. Note what the guarantee covers: a topic the connection HELD is
+  either released by its own hook or by the close hook, never neither; a
+  speculative release carries no such promise, because recording those would let
+  a client grow the set by naming topics it never had.
 - `maxControlEgressBytes` bounds the ACK CHANNEL, in bytes per 10 s. Exceeding
   it closes the connection with `CONTROL_FLOOD` and code 4429.
 
@@ -323,6 +329,16 @@ carry cookies, so a page on another origin could otherwise open an authenticated
 socket. A request with NO `Origin` header is allowed - the header is only
 trustworthy because browsers set it and refuse to let script forge it, so
 denying on absence would break non-browser clients while stopping no attack.
+
+**`same-origin` needs `ORIGIN` set to mean anything.** The check compares the
+`Origin` header against the server's own origin, and with `ORIGIN` unset that
+origin has to be reconstructed from the request - whose `Host` header the client
+chose. The comparison is then between two values the same peer supplied, which
+still refuses an ordinary cross-origin page but does not survive a deployment
+where the host is attacker-controlled (a wildcard or multi-tenant domain, or DNS
+rebinding). The adapter warns once on the first upgrade that relies on the
+fallback. Set `ORIGIN=https://app.example` in production, or pass an explicit
+`allowedOrigins` list.
 
 ### Wire protocol
 

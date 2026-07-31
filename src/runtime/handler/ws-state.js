@@ -49,6 +49,7 @@ export function getServer() {
  */
 export const WS_SUBSCRIPTIONS = Symbol('subscriptions');
 export const WS_PENDING_SUBSCRIBES = Symbol('pendingSubscribes');
+export const WS_PENDING_RELEASES = Symbol('pendingReleases');
 export const WS_PLATFORM = Symbol('platform');
 export const WS_SESSION_ID = Symbol('sessionId');
 export const WS_STATS = Symbol('stats');
@@ -327,13 +328,71 @@ export function runUnsubscribeHook(ws, task, required) {
 }
 
 /**
- * Drop this connection's waiting unsubscribe hooks. The close hook receives the
- * whole subscription set and performs the same teardown.
+ * Drop this connection's waiting unsubscribe hooks. Their topics stay in the
+ * pending-release set, so the close hook is handed them and performs the
+ * teardown they did not get to.
  *
  * @param {any} ud
  */
 export function clearUnsubscribeHooks(ud) {
 	ud?.[WS_UNSUB_QUEUE]?.clear();
+}
+
+/**
+ * Topics whose `unsubscribe` hook has been handed to the queue but has not
+ * finished.
+ *
+ * The release itself runs BEFORE the hook is queued, and it deletes the topic
+ * from the subscription set. That set is what the close hook is handed, so
+ * without this record a hook that is still waiting when the connection closes
+ * would be dropped by `clearUnsubscribeHooks` AND be absent from the close
+ * hook's snapshot - the app's per-topic state (a presence roster entry, a
+ * cursor attachment) would then be released by nobody. A client can drive that
+ * on purpose by pipelining more releases than the queue holds.
+ *
+ * Only topics the connection GENUINELY held are recorded, so this is bounded by
+ * the subscription cap rather than by what a client can invent.
+ *
+ * @param {any} ud
+ * @param {string} topic
+ */
+export function beginPendingRelease(ud, topic) {
+	let pending = ud[WS_PENDING_RELEASES];
+	if (pending === undefined) {
+		pending = new Set();
+		ud[WS_PENDING_RELEASES] = pending;
+	}
+	pending.add(topic);
+}
+
+/**
+ * Mark a release's hook as finished, so the close hook is not handed a topic
+ * the app has already torn down.
+ *
+ * @param {any} ud
+ * @param {string} topic
+ */
+export function endPendingRelease(ud, topic) {
+	ud?.[WS_PENDING_RELEASES]?.delete(topic);
+}
+
+/**
+ * The topics whose release hook never completed, for the close hook's snapshot.
+ *
+ * @param {any} ud
+ * @returns {Set<string>}
+ */
+export function pendingReleaseTopics(ud) {
+	return ud?.[WS_PENDING_RELEASES] ?? EMPTY_SUBSCRIPTIONS;
+}
+
+/**
+ * Drop the pending-release record once the close hook has been handed it.
+ *
+ * @param {any} ud
+ */
+export function clearPendingReleases(ud) {
+	if (ud) ud[WS_PENDING_RELEASES] = undefined;
 }
 
 /**
