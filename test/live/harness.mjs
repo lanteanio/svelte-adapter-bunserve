@@ -22,7 +22,11 @@ const RUNTIME_ENV_KEYS = [
 	'SHUTDOWN_RECONNECT_WINDOW_MS',
 	'SSL_CERT',
 	'SSL_KEY',
-	'CLUSTER_WORKERS'
+	'CLUSTER_WORKERS',
+	// Fixture-owned, not runtime-owned, but stripped for the same reason: left
+	// exported in a shell it arms the never-settling shutdown hook in every
+	// fixture server of every suite.
+	'FIXTURE_HANG_SHUTDOWN'
 ];
 
 /**
