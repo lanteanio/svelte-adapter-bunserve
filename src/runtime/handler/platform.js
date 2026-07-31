@@ -1626,14 +1626,26 @@ export async function subscribeWithVerdict(ws, topic, options, verdict) {
 		recover &&
 		typeof wsModule.resume === 'function'
 	) {
+		// The resume hook is app work a client frame triggers, so it runs
+		// under the same per-connection concurrency bound as the gates. The
+		// subscribe gate released its count above; without re-taking one here
+		// a client pipelining recover subscribes to distinct topics would
+		// open one concurrent backend read - and one live-frame buffer - per
+		// frame it can write.
+		if (!hasGateHeadroom(ws)) {
+			settlePendingSubscribe(userData, topic, token);
+			return 'RATE_LIMITED';
+		}
 		recoverCapture = beginResumeCapture([topic], ws);
 		try {
-			recoverCovered = await wsModule.resume(ws, {
-				sessionId: userData[WS_SESSION_ID],
-				lastSeenSeqs: { [topic]: recover.offset },
-				lastSeenEpochs: Number.isInteger(recover.epoch) ? { [topic]: recover.epoch } : undefined,
-				platform: userData[WS_PLATFORM] || platform
-			});
+			recoverCovered = await withGateCounted(ws, () =>
+				wsModule.resume(ws, {
+					sessionId: userData[WS_SESSION_ID],
+					lastSeenSeqs: { [topic]: recover.offset },
+					lastSeenEpochs: Number.isInteger(recover.epoch) ? { [topic]: recover.epoch } : undefined,
+					platform: userData[WS_PLATFORM] || platform
+				})
+			);
 		} catch (err) {
 			console.error('[ws] recover-on-subscribe hook threw:', err);
 		}

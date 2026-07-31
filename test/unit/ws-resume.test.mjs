@@ -237,6 +237,36 @@ test('a hookless resume still acks so the client can go live', async () => {
 	cleanup(raw);
 });
 
+test('pipelined recover subscribes are bounded by the gate counter', async () => {
+	setServer({ publish: () => 0, subscriberCount: () => 0 });
+	let inFlight = 0;
+	let peak = 0;
+	const hooks = {
+		subscribe: () => null,
+		resume: async () => {
+			inFlight++;
+			if (inFlight > peak) peak = inFlight;
+			await tick();
+			inFlight--;
+		}
+	};
+	const raw = openSocket(hooks);
+	// Far more pipelined recover frames than the per-connection gate bound
+	// (64). Without the bound each one opens a concurrent backend read plus a
+	// live-frame buffer.
+	const sends = [];
+	for (let i = 0; i < 80; i++) {
+		sends.push(send(raw, { type: 'subscribe', topic: 'r:' + i, ref: i, recover: { offset: 0 } }));
+	}
+	await Promise.all(sends);
+	assert.ok(peak <= 64, `concurrent resume hooks bounded, saw ${peak}`);
+	const frames = raw.sent.filter((f) => typeof f === 'string').map((f) => JSON.parse(f));
+	const denied = frames.filter((f) => f.type === 'subscribe-denied' && f.reason === 'RATE_LIMITED');
+	assert.ok(denied.length >= 1, 'the overflow is refused, not silently serialized');
+	assert.equal(resumeBuffers.size, 0, 'no buffer leaked');
+	cleanup(raw);
+});
+
 test('publish records the max seen seq; explicit seqs take the monotone guard', () => {
 	setServer({ publish: () => 0, subscriberCount: () => 0 });
 	platform.publish('seen', 'e', 1, { seq: true });
