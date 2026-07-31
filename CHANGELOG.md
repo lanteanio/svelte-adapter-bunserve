@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A zero-length payload sent through the socket facade on a healthy socket was
+  reported as dropped: Bun returns 0 for "zero bytes accepted" even though the
+  empty frame is delivered (probed, pinned in the facts report). The facade
+  now consults the socket's backlog to tell a delivered empty frame from one
+  genuinely dropped past the backpressure limit; a non-empty send is
+  unaffected.
+
 - `SHUTDOWN_RECONNECT_WINDOW_MS` was read at boot but missing from the set of
   names the adapter recognises, so an app using `envPrefix` refused to start
   when it set that documented variable, reporting it as a conflicting one.

@@ -49,15 +49,20 @@ export const SEND_DROPPED = 2;
  * costs a degrade-to-JSON and a resume invalidation that both self-heal. The
  * conservative direction is the one that cannot lose data.
  *
- * A zero-length payload plausibly returns 0 on an OPEN socket (unprobed edge -
- * Bun returns bytes accepted, and zero bytes accepted is zero). That would read
- * here as DROPPED. No caller can produce one: every payload routed through this
- * mapping is either a JSON envelope built by utils/envelope.js or a control
- * frame built by utils/control-frame.js and utils/ack-frame.js, and each of
- * those is a string literal with at least `{"type":` in it. That is a
- * STRUCTURAL property of the builders, not an assertion any of them makes - a
- * future caller that sends a caller-supplied payload must not route it through
- * this mapping without checking the length itself.
+ * A zero-length payload returns 0 on an OPEN socket (probed, pinned in the
+ * report under `send-return-codes`: send("") and a 0-byte binary both return 0
+ * AND both frames are delivered on a healthy socket, while past the
+ * backpressure limit the same call returns 0 and the frame is dropped). So
+ * for empty payloads Bun's 0 is ambiguous a SECOND way, and this mapping
+ * alone reads every empty send as DROPPED. The adapter's own frames never hit
+ * the edge - every JSON envelope from utils/envelope.js and every control
+ * frame from utils/control-frame.js and utils/ack-frame.js is a string with
+ * at least `{"type":` in it - but the facade's send() and publish() route
+ * app-supplied payloads through this mapping, so the edge is reachable from
+ * any app hook (`ws.send('')`). The facade's send() therefore discriminates
+ * empty sends itself, using the socket's backlog (see handler/ws-facade.js);
+ * any OTHER caller that hands this mapping the result of a possibly-empty
+ * send must do the same or accept the conservative DROPPED.
  *
  * @param {unknown} result - the raw return value of Bun's `ws.send()`
  * @returns {0 | 1 | 2} the uWS tri-state

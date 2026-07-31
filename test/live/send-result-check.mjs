@@ -11,7 +11,9 @@
 //     BACKPRESSURE means "enqueued, WILL deliver". If it does not arrive, the
 //     shim is losing frames silently.
 //   - no frame the shim called DROPPED may arrive. If it arrives, the shim
-//     falsely degrades binary subscribers to JSON under transient pressure.
+//     reports delivered frames as lost - today a false loss to any caller that
+//     checks its send result, and the false degrade-to-JSON signal the family
+//     contract keys on once a binary wire tier exists.
 //
 // Those two directions are the exact misreads the shim exists to prevent, and
 // neither is checkable over integer literals - only delivery decides them.
@@ -101,7 +103,12 @@ try {
 	const facade = wsFacade(raw);
 
 	const received = new Set();
+	let emptyToSlow = 0;
 	client.addEventListener('message', (e) => {
+		if (typeof e.data === 'string') {
+			if (e.data.length === 0) emptyToSlow++;
+			return;
+		}
 		received.add(new DataView(e.data).getUint32(0, true));
 	});
 
@@ -112,12 +119,27 @@ try {
 		results.push(facade.send(indexedFrame(i)));
 	}
 
+	// While the socket is still saturated (nothing drains until this synchronous
+	// stretch yields): an empty payload also returns 0 from Bun here, and the
+	// frame is genuinely dropped (probed) - the facade's backlog check must keep
+	// the DROPPED reading rather than misreading it as a healthy empty send.
+	const emptyWhileSaturated = facade.send('');
+	check(
+		'an empty send against the saturated socket maps to DROPPED',
+		emptyWhileSaturated === SEND_DROPPED,
+		`got ${label(emptyWhileSaturated)}`
+	);
+
 	const states = new Set(results);
 	check(
 		'the first frame of the burst maps to SUCCESS',
 		results[0] === SEND_SUCCESS,
 		`got ${label(results[0])}`
 	);
+	// The shape assumes the loopback send buffer is far smaller than the 16MiB
+	// burst, which holds by default everywhere this runs; a host tuned with an
+	// SO_SNDBUF that swallows the whole burst fails this assertion LOUDLY
+	// instead of letting the suite pass without ever saturating.
 	check(
 		'the burst reaches all three tri-states (the consumer was genuinely slow)',
 		states.has(SEND_SUCCESS) && states.has(SEND_BACKPRESSURE) && states.has(SEND_DROPPED),
@@ -138,8 +160,10 @@ try {
 		if (results[i] !== SEND_DROPPED) expected.add(i);
 	}
 
-	// Let the client drain. Bounded: stop as soon as the expected set is in, or
-	// when the received set goes quiet.
+	// Let the client drain. The loop exits early only once every expected frame
+	// is in and one further poll adds nothing; a MISSING frame therefore burns
+	// the full 10s window before the assertion below reports it - slow, but
+	// loud rather than green.
 	let lastSize = -1;
 	for (let i = 0; i < 100; i++) {
 		if (received.size >= expected.size && received.size === lastSize) break;
@@ -159,6 +183,11 @@ try {
 		phantom.length === 0,
 		`frames [${phantom.join(', ')}] arrived despite mapping to DROPPED`
 	);
+	check(
+		'the dropped empty frame is never delivered',
+		emptyToSlow === 0,
+		`${emptyToSlow} zero-length frame(s) arrived`
+	);
 
 	client.close();
 	await Bun.sleep(200);
@@ -171,6 +200,27 @@ try {
 	const clientB = await openClient();
 	const rawB = await openedB;
 	const facadeB = wsFacade(rawB);
+
+	// While this socket is still healthy: an empty send returns 0 from Bun yet
+	// the frame is delivered (probed), so the facade must report SUCCESS - the
+	// backlog is empty - and the client must actually see the frame.
+	let emptyToB = 0;
+	clientB.addEventListener('message', (e) => {
+		const len = typeof e.data === 'string' ? e.data.length : e.data.byteLength;
+		if (len === 0) emptyToB++;
+	});
+	const emptyHealthy = facadeB.send('');
+	check(
+		'an empty send on a healthy socket maps to SUCCESS, not DROPPED',
+		emptyHealthy === SEND_SUCCESS,
+		`got ${label(emptyHealthy)}`
+	);
+	for (let i = 0; i < 30 && emptyToB === 0; i++) await Bun.sleep(50);
+	check(
+		'the healthy empty frame is delivered',
+		emptyToB > 0,
+		'no zero-length frame arrived within 1.5s'
+	);
 
 	clientB.close();
 	for (let i = 0; i < 50 && rawB.readyState === 1; i++) await Bun.sleep(50);

@@ -206,6 +206,39 @@ test('getUserData still reads while the socket is merely closed', () => {
 	assert.throws(() => ws.send('x'), WsClosedError);
 });
 
+test('an empty send on a healthy socket maps to SUCCESS, not DROPPED', () => {
+	// Bun returns 0 for send('') on an open socket because zero bytes were
+	// accepted, but the frame IS delivered (probed). The facade discriminates
+	// via the backlog: nothing buffered means the frame went out.
+	const raw = fakeSocket();
+	const ws = wsFacade(raw);
+	raw.send = () => 0;
+	assert.equal(ws.send(''), 1);
+	assert.equal(ws.send(new Uint8Array(0)), 1);
+});
+
+test('an empty send against a backlog stays DROPPED', () => {
+	// Past the backpressure limit the empty frame is genuinely dropped
+	// (probed: never delivered), and the backlog is what tells the two apart.
+	const raw = fakeSocket({ getBufferedAmount: () => 16 * 1024 });
+	const ws = wsFacade(raw);
+	raw.send = () => 0;
+	assert.equal(ws.send(''), 2);
+	assert.equal(ws.send(new Uint8Array(0)), 2);
+});
+
+test('the empty-send discrimination does not touch non-empty sends', () => {
+	// A NON-empty payload returning 0 is the real rejected case regardless of
+	// backlog; only zero-length payloads consult getBufferedAmount.
+	const raw = fakeSocket();
+	const ws = wsFacade(raw);
+	raw.send = () => 0;
+	assert.equal(ws.send('x'), 2);
+	// And an empty send that reports backpressure keeps the enqueued meaning.
+	raw.send = () => -1;
+	assert.equal(ws.send(''), 0);
+});
+
 test('getUserData throws once the connection is detached', () => {
 	// Consumers build their closed-socket rollback on this throw: the extensions
 	// registry catches it to bail BEFORE registering the connection in shared

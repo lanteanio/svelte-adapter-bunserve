@@ -108,6 +108,24 @@ async function probeSendReturnCodes() {
 		record(section, 'send("ping") on an open socket returns', describeValue(ws.send('ping')));
 		record(section, 'send(64-byte binary) on an open socket returns', describeValue(ws.send(new Uint8Array(64))));
 
+		// Zero-length payloads, while the socket is still open and unburdened:
+		// "bytes accepted" for zero bytes could plausibly be 0, which the
+		// send-result mapping reads as DROPPED - and the facade routes
+		// app-supplied payloads through that mapping, so the edge is reachable
+		// from userland (`ws.send('')`). Delivery is recorded alongside the
+		// return value because they answer different questions: a delivered
+		// empty frame with return 0 means the mapping misreports it as dropped.
+		const emptyFrames = [];
+		client.addEventListener('message', (e) => {
+			const len = typeof e.data === 'string' ? e.data.length : e.data.byteLength;
+			if (len === 0) emptyFrames.push(typeof e.data === 'string' ? 'text' : 'binary');
+		});
+		record(section, 'send("") on an open unburdened socket returns', describeValue(ws.send('')));
+		record(section, 'getBufferedAmount() right after that empty send', callAndDescribe(() => ws.getBufferedAmount()));
+		record(section, 'send(0-byte binary) on an open unburdened socket returns', describeValue(ws.send(new Uint8Array(0))));
+		await sleep(200);
+		record(section, 'zero-length frames the client actually RECEIVED from those two sends', JSON.stringify(emptyFrames));
+
 		// Backpressure: a synchronous burst of 1 MiB frames cannot be drained
 		// mid-loop (client shares this event loop), so the socket buffer fills
 		// within a few iterations. Record every distinct return value.
@@ -141,16 +159,26 @@ async function probeBackpressureLimitAndDrain() {
 	const section = 'backpressure-limit';
 	const { server, firstWs, state } = serveWs({ backpressureLimit: 64 * 1024, closeOnBackpressureLimit: false });
 	try {
-		await openClient(server);
+		const client = await openClient(server);
 		const ws = await firstWs();
+		// Zero-length delivery across the saturated window, for the send-result
+		// mapping's empty-payload case: whether an empty frame sent PAST the
+		// backpressure limit is dropped like a real frame or slips through.
+		const emptyFrames = [];
+		client.addEventListener('message', (e) => {
+			const len = typeof e.data === 'string' ? e.data.length : e.data.byteLength;
+			if (len === 0) emptyFrames.push('empty');
+		});
 		const big = new Uint8Array(1 << 20);
 		const results = [];
 		for (let i = 0; i < 16; i++) results.push(ws.send(big));
 		record(section, 'send() results with backpressureLimit=64KiB during a 16x1MiB burst',
 			[...new Set(results.map(describeValue))].join(', '));
+		record(section, 'send("") on the socket while it is past the backpressure limit returns', describeValue(ws.send('')));
 		await sleep(400); // let the client drain
 		record(section, 'drain() handler invocations after the burst settled', state.drains);
 		record(section, 'getBufferedAmount() after settle', callAndDescribe(() => ws.getBufferedAmount()));
+		record(section, 'zero-length frames the client received after the drain settled', JSON.stringify(emptyFrames));
 	} finally {
 		server.stop(true);
 	}

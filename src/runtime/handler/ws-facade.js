@@ -36,7 +36,15 @@
  * getting them backwards turns every graceful close into a 1006 at the client.
  */
 
-import { mapSendResult } from '../utils/send-result.js';
+import { mapSendResult, SEND_DROPPED, SEND_SUCCESS } from '../utils/send-result.js';
+
+/**
+ * @param {string | Uint8Array | ArrayBuffer} payload
+ * @returns {boolean}
+ */
+function isEmptyPayload(payload) {
+	return typeof payload === 'string' ? payload.length === 0 : payload.byteLength === 0;
+}
 
 /** Bun's ServerWebSocket.readyState value for an open socket. */
 const OPEN = 1;
@@ -167,7 +175,20 @@ export function wsFacade(raw) {
 		send(payload, isBinary, compress) {
 			// ORDERING: closed first, mapping second. See the module comment.
 			assertOpen('send');
-			return mapSendResult(raw.send(payload, compress));
+			const result = raw.send(payload, compress);
+			// A zero-length payload defeats the byte-count mapping: Bun returns
+			// 0 ("zero bytes accepted") both when the empty frame is written to
+			// a healthy socket (probed: delivered, nothing buffered afterwards)
+			// and when it is dropped past the backpressure limit (probed: never
+			// delivered). The backlog is the discriminator - an empty backlog
+			// means the frame went out. A socket with ANY backlog takes the
+			// conservative DROPPED path: past the limit that is the probed
+			// truth, and in the unprobed backpressured-but-under-limit state a
+			// false drop self-heals where a false delivery would not.
+			if (result === 0 && isEmptyPayload(payload)) {
+				return raw.getBufferedAmount() === 0 ? SEND_SUCCESS : SEND_DROPPED;
+			}
+			return mapSendResult(result);
 		},
 
 		/**
@@ -182,6 +203,12 @@ export function wsFacade(raw) {
 		 */
 		publish(topic, payload, isBinary, compress) {
 			assertOpen('publish');
+			// The zero-length discrimination send() applies has no analogue
+			// here: publish fans out to many sockets, so there is no single
+			// backlog to consult, and Bun's 0 already conflates "no
+			// subscribers" with "zero bytes". An empty publish therefore
+			// reports DROPPED - the conservative reading - rather than
+			// guessing at delivery.
 			return mapSendResult(raw.publish(topic, payload, compress));
 		},
 
@@ -248,8 +275,8 @@ export function wsFacade(raw) {
 		 * graceful close and this is the hard cut, the opposite way round from
 		 * Bun. So code written against Bun's own API - `ws.close(1000, 'bye')` -
 		 * arrives here meaning a graceful close with a code, and silently
-		 * dropping both arguments turned every such call into a 1006 with no
-		 * diagnostic. Arguments are therefore honoured as the graceful close the
+		 * dropping the arguments would turn every such call into a 1006 with no
+		 * diagnostic. They are therefore honoured as the graceful close the
 		 * caller plainly meant, with a one-shot note about the spelling; calling
 		 * it with NO arguments keeps the uWS meaning.
 		 *
