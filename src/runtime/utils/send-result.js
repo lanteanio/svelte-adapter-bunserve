@@ -55,9 +55,10 @@ export const SEND_DROPPED = 2;
  * backpressure limit the same call returns 0 and the frame is dropped). So
  * for empty payloads Bun's 0 is ambiguous a SECOND way, and this mapping
  * alone reads every empty send as DROPPED. The adapter's own frames never hit
- * the edge - every JSON envelope from utils/envelope.js and every control
- * frame from utils/control-frame.js and utils/ack-frame.js is a string with
- * at least `{"type":` in it - but the facade's send() and publish() route
+ * the edge - every frame is a non-empty JSON string (envelopes from
+ * utils/envelope.js open with `{"topic":`, control and ack frames from
+ * utils/control-frame.js and utils/ack-frame.js with `{"type":`) - but the
+ * facade's send() and publish() route
  * app-supplied payloads through this mapping, so the edge is reachable from
  * any app hook (`ws.send('')`). The facade's send() therefore discriminates
  * empty sends itself, using the socket's backlog (see handler/ws-facade.js);
