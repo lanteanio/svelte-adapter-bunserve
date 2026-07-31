@@ -382,6 +382,7 @@ client:
 | `{"type":"welcome","sessionId":"..."}` | on open |
 | `{"type":"wire-id","topic":"t","id":N}` | the numeric topic id for `0x03` frames, announced on the same socket before the first binary frame for its topic |
 | `{"type":"resumed"}` | the `resume` frame's gap-fill (if any) has flushed; switch to live |
+| `{"topic":"__replay:t","event":"truncated","data":null}` | the gap-fill for `t` is INCOMPLETE - the buffered window overflowed its cap, or a frame was refused past the backpressure limit. Drop the stored per-topic offset and cold-resync; do not trust the partial flush |
 | binary `[0x03][schemaVersion:u8][topicId:varint][seq:varint][codec payload]` | a codec frame, for connections that declared the codec's capability in `hello` |
 | `{"type":"subscribed","topic":"t","ref":N,"epoch":E}` | a subscription took |
 | `{"type":"subscribe-denied","topic":"t","ref":N,"reason":"..."}` | it did not |

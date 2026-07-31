@@ -31,7 +31,7 @@
 import { completeEnvelope } from '../utils/envelope.js';
 import { isSystemTopic, isValidWireTopic, createTopicHelperCache } from '../utils/topic.js';
 import { SEND_DROPPED } from '../utils/send-result.js';
-import { isValidResumeEpoch } from '../utils/resume-input.js';
+import { isValidResumeEpoch, isValidResumeSeq } from '../utils/resume-input.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
 import {
 	denyAllBatch,
@@ -624,7 +624,7 @@ export const platform = {
 			let sharedEncoded = false;
 			/** @type {Map<number, Uint8Array>} */
 			const sharedFrameById = new Map();
-				let delivered = false;
+			let delivered = false;
 			for (const ws of wsConnections) {
 				if (ws === excludeWs) continue;
 				let ud;
@@ -718,7 +718,7 @@ export const platform = {
 					if (result === SEND_DROPPED) poisonWireState(ws, ud, wire.capability);
 				}
 			}
-				return delivered;
+			return delivered;
 		}
 
 		// Stateless codec: encode once, send many. A null payload (the codec
@@ -1745,6 +1745,11 @@ export async function subscribeWithVerdict(ws, topic, options, verdict) {
 	if (
 		(denial === null || denial === undefined) &&
 		recover &&
+		// The same rule the wire lane applies, for a caller reaching this
+		// through the platform API rather than through a subscribe frame: an
+		// offset the server could not have issued is not a recover, and
+		// subscribing plainly beats gap-filling from a fabricated cursor.
+		isValidResumeSeq(recover.offset) &&
 		typeof wsModule.resume === 'function'
 	) {
 		// The resume hook is app work a client frame triggers, so it runs

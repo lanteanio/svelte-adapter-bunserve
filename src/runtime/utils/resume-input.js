@@ -7,39 +7,52 @@
  * The two lanes hand the hook the SAME argument shape, so a value one lane
  * accepts and the other refuses makes the same client state produce two
  * different gap-fill decisions. They diverged once already - one lane tested
- * `Number.isFinite`, the other `Number.isInteger`, and neither bounded the
- * magnitude - so the rules live here rather than being restated per call site.
+ * `Number.isFinite`, the other `Number.isInteger` - so the rules live here
+ * rather than being restated per call site.
+ *
+ * Both rules are deliberately narrow. Refusing a value here does NOT clamp it:
+ * it drops the topic from the map the hook gap-fills from, and the `resumed`
+ * ack that follows still tells the client to switch to live. An over-strict
+ * rule therefore MANUFACTURES the silent gap the resume barrier exists to
+ * prevent. These check only what the wire itself cannot mean.
  *
  * Pure and dependency-free so the rules are unit-testable without a socket.
  */
 
 /**
- * A watermark the server could actually have issued: a non-negative safe
- * integer.
+ * A watermark the client could legitimately be holding: a finite, non-negative
+ * number.
  *
- * Both bounds carry weight. Seqs are counter-stamped integers, so a fractional
- * watermark is not a value this server ever produced. The safe-integer ceiling
- * is what keeps the resume floor honest: `flushResumeTopic` drops every held
- * frame whose seq is `<= floor`, so a watermark of `1e308` echoed back by a
- * hook as its covered seq silently discards the whole cutover window - the
- * exact silent gap the barrier exists to prevent. Past 2^53 the arithmetic a
- * hook does on it (`seq + 1`) stops being exact anyway.
+ * NOT required to be an integer, and NOT bounded to the safe-integer range.
+ * The `{ seq: true }` counter lane produces small integers, but an explicit
+ * `{ seq: <number> }` publish passes its value through VERBATIM (`stampSeq` in
+ * handler/ws-state.js) - and that is the cluster-authoritative lane, the only
+ * one the resume floor ever dedups against. Apps relay event-store cursors
+ * through it, where snowflake ids, Kafka offsets and log sequence numbers run
+ * past 2^53 as a matter of course. A watermark this server itself put on the
+ * wire has to round-trip.
+ *
+ * Magnitude is the app's business. The place an absurd value actually does
+ * damage is the dedup floor, and that is guarded where the floor is read
+ * (`coveredSeqFor` in handler/resume-buffer.js), not here.
  *
  * @param {unknown} v
  * @returns {v is number}
  */
 export function isValidResumeSeq(v) {
-	return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+	return typeof v === 'number' && Number.isFinite(v) && v >= 0;
 }
 
 /**
- * An epoch the server could actually have issued.
+ * An epoch the server could actually have issued: a non-negative integer.
  *
  * `processEpoch()` is a random uint32 (`crypto.getRandomValues`), so the domain
- * is the non-negative integers. No upper bound is imposed: an app running its
- * own cluster-wide epoch scheme may legitimately number above 2^32, and the
- * value is only ever compared for equality, never used in arithmetic that a
- * large magnitude would corrupt.
+ * is the non-negative integers. Unlike a watermark there is no app-supplied
+ * lane widening it - an epoch is only ever minted by the server and echoed
+ * back - so integrality is safe to require here in a way it is not above. No
+ * ceiling: an app running its own cluster-wide epoch scheme may number past
+ * 2^32, and the value is only ever compared for equality, never used in
+ * arithmetic a large magnitude would corrupt.
  *
  * @param {unknown} e
  * @returns {e is number}

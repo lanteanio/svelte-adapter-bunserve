@@ -30,9 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to run the app's `resume` hook - only after the authorization gate allows -
   before going live, with a live-frame barrier bridging the hook's await
   window so a publish landing mid-resume reaches the client, in order, before
-  its `subscribed` ack. An overflowed window signals `truncated` on the
-  replay channel so the client cold-resyncs instead of trusting a partial
-  flush. The standalone `{"type":"resume"}` frame drives the same hook for
+  its `subscribed` ack. A window that overflows its frame cap, or a gap-fill
+  frame the socket refuses past its backpressure limit, signals `truncated` on
+  the replay channel (`__replay:<topic>`) so the client cold-resyncs instead of
+  trusting a partial flush. The standalone `{"type":"resume"}` frame drives the same hook for
   client-named topics (held to the wire validation and system-topic guard the
   subscribe lanes apply) and always answers `{"type":"resumed"}`.
 - A live wire suite (`test/live/wire-check.mjs`) driving two raw WebSocket

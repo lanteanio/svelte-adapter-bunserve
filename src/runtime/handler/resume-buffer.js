@@ -178,7 +178,7 @@ export function flushResumeTopic(handle, topic, coveredSeq) {
  */
 export function coveredSeqFor(covered, topic) {
 	if (covered == null) return undefined;
-	if (typeof covered === 'number') return covered;
+	if (typeof covered === 'number') return Number.isFinite(covered) ? covered : undefined;
 	if (typeof covered === 'object') {
 		// `covered` is whatever the app's resume hook returned, so this
 		// property read can throw - a getter, a Proxy, a lazy ORM row. A hook
@@ -186,7 +186,12 @@ export function coveredSeqFor(covered, topic) {
 		// the same answer a hook returning a non-number gives.
 		try {
 			const v = /** @type {Record<string, unknown>} */ (covered)[topic];
-			return typeof v === 'number' ? v : undefined;
+			// Finite only. This value becomes the dedup floor, and Infinity there
+			// discards every frame held across the cutover window - a silent gap
+			// produced by the very thing that exists to close one. A hook
+			// reporting a nonsense watermark is treated as reporting nothing, so
+			// the pre-window floor applies and the window re-delivers instead.
+			return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
 		} catch (err) {
 			console.error('[ws] resume hook result read threw for topic', topic, err);
 			return undefined;

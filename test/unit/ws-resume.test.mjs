@@ -91,7 +91,7 @@ const BAD_TOPIC = 'bad"topic';
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
 test('the barrier holds frames across the window and flushes above the floor', () => {
-	const fakeWs = { sent: [], send(p) { this.sent.push(p); return p.length; } };
+	const fakeWs = { sent: [], send(p) { this.sent.push(p); return 1; } };
 	maxSeenSeq.set('room', 5);
 	const cap = beginResumeCapture(['room'], fakeWs);
 	assert.equal(resumeBuffers.size, 1);
@@ -109,7 +109,7 @@ test('the barrier holds frames across the window and flushes above the floor', (
 });
 
 test('a reported watermark overrides the fallback floor', () => {
-	const fakeWs = { sent: [], send(p) { this.sent.push(p); return p.length; } };
+	const fakeWs = { sent: [], send(p) { this.sent.push(p); return 1; } };
 	const cap = beginResumeCapture(['room'], fakeWs);
 	captureResumeFrame('room', 1, 'ENV1', false, null, true);
 	captureResumeFrame('room', 2, 'ENV2', false, null, true);
@@ -118,13 +118,13 @@ test('a reported watermark overrides the fallback floor', () => {
 });
 
 test('seq-less frames always flush; discard delivers nothing', () => {
-	const fakeWs = { sent: [], send(p) { this.sent.push(p); return p.length; } };
+	const fakeWs = { sent: [], send(p) { this.sent.push(p); return 1; } };
 	const cap = beginResumeCapture(['room'], fakeWs);
 	captureResumeFrame('room', null, 'PLAIN', false);
 	flushResumeTopic(cap, 'room', 999);
 	assert.deepEqual(fakeWs.sent, ['PLAIN'], 'a seq-less frame cannot be deduped, so it flushes');
 
-	const fakeWs2 = { sent: [], send(p) { this.sent.push(p); return p.length; } };
+	const fakeWs2 = { sent: [], send(p) { this.sent.push(p); return 1; } };
 	const cap2 = beginResumeCapture(['room'], fakeWs2);
 	captureResumeFrame('room', 1, 'ENV', false);
 	discardResumeCapture(cap2);
@@ -133,7 +133,7 @@ test('seq-less frames always flush; discard delivers nothing', () => {
 });
 
 test('an overflowed window signals truncation FIRST, then best-effort frames', () => {
-	const fakeWs = { sent: [], send(p) { this.sent.push(p); return p.length; } };
+	const fakeWs = { sent: [], send(p) { this.sent.push(p); return 1; } };
 	const cap = beginResumeCapture(['room'], fakeWs);
 	for (let i = 1; i <= MAX_RESUME_BUFFERED_FRAMES + 10; i++) {
 		captureResumeFrame('room', i, 'E' + i, false, null, true);
@@ -165,22 +165,26 @@ test('a refused gap-fill frame stops the flush and signals truncation', () => {
 
 test('an overflowed window that also drops signals exactly once', () => {
 	// The overflow branch already signalled up front; a drop during the
-	// best-effort tail must not send a second marker.
-	const ws = scriptedWs([1, SEND_DROPPED]);
+	// best-effort tail must not send a second marker - AND must still stop the
+	// tail. The floor leaves several frames eligible on purpose: with only one
+	// there is nothing after the drop, so the break itself goes uncovered.
+	const ws = scriptedWs([1, 1, SEND_DROPPED]);
 	const cap = beginResumeCapture(['room'], ws);
 	for (let i = 1; i <= MAX_RESUME_BUFFERED_FRAMES + 10; i++) {
 		captureResumeFrame('room', i, 'E' + i, false, null, true);
 	}
-	flushResumeTopic(cap, 'room', MAX_RESUME_BUFFERED_FRAMES - 1);
+	flushResumeTopic(cap, 'room', MAX_RESUME_BUFFERED_FRAMES - 6);
 	const markers = ws.sent.filter((f) => typeof f === 'string' && f.includes('"truncated"'));
 	assert.equal(markers.length, 1, 'signalled once, up front');
+	// marker, one accepted frame, one refused frame - and then nothing.
+	assert.equal(ws.sent.length, 3, 'the tail stopped at the refusal');
 });
 
 test('a counter frame is never deduped against an explicit floor (no mixed-space gap)', () => {
 	// A topic stamped explicit seq 1000 then a {seq:true} counter frame (seq 1)
 	// during the window: the counter frame lives in a different seq space and
 	// must NOT be dropped by the explicit floor.
-	const fakeWs = { sent: [], send(p) { this.sent.push(p); return p.length; } };
+	const fakeWs = { sent: [], send(p) { this.sent.push(p); return 1; } };
 	const cap = beginResumeCapture(['room'], fakeWs);
 	captureResumeFrame('room', 1, 'COUNTER1', false, null, false);
 	captureResumeFrame('room', 1000, 'EXPLICIT1000', false, null, true);
@@ -190,7 +194,7 @@ test('a counter frame is never deduped against an explicit floor (no mixed-space
 
 test('a publish that excludes the resuming socket does not flush to it', () => {
 	setServer({ publish: () => 0, subscriberCount: () => 0 });
-	const fakeWs = { sent: [], send(p) { this.sent.push(p); return p.length; }, getUserData: () => ({}) };
+	const fakeWs = { sent: [], send(p) { this.sent.push(p); return 1; }, getUserData: () => ({}) };
 	const cap = beginResumeCapture(['room'], fakeWs);
 	// A publish excluding exactly this connection must skip its buffer.
 	captureResumeFrame('room', 1, 'ENV1', false, fakeWs, false);
@@ -208,6 +212,14 @@ test('coveredSeqFor tolerates every hook-return shape', () => {
 	assert.equal(coveredSeqFor('7', 'room'), undefined);
 	const throwing = new Proxy({}, { get() { throw new Error('lazy row'); } });
 	assert.equal(coveredSeqFor(throwing, 'room'), undefined);
+	// A non-finite covered seq becomes the dedup floor, where Infinity discards
+	// every frame held across the cutover window - a silent gap manufactured by
+	// the machinery that exists to close one. Treated as reporting nothing, so
+	// the pre-window floor applies and the window re-delivers instead.
+	assert.equal(coveredSeqFor(Infinity, 'room'), undefined, 'bare Infinity');
+	assert.equal(coveredSeqFor({ room: Infinity }, 'room'), undefined, 'per-topic Infinity');
+	assert.equal(coveredSeqFor({ room: NaN }, 'room'), undefined, 'per-topic NaN');
+	assert.equal(coveredSeqFor({ room: 1e308 }, 'room'), 1e308, 'finite stays: the app owns the space');
 });
 
 test('a publish during an async recover reaches the client before its ack', async () => {
@@ -307,7 +319,7 @@ test('a hookless resume still acks so the client can go live', async () => {
 	cleanup(raw);
 });
 
-test('the resume frame forwards only watermarks the server could have issued', async () => {
+test('the resume frame refuses only watermarks the wire cannot mean', async () => {
 	let ctx = null;
 	const raw = openSocket({ resume: (ws, c) => { ctx = c; } });
 	await send(raw, {
@@ -321,17 +333,19 @@ test('the resume frame forwards only watermarks the server could have issued', a
 			obj: { n: 1 },
 			neg: -1,
 			negFrac: -0.5,
+			// These two SURVIVE. An explicit `{ seq: <number> }` publish is passed
+			// through verbatim, so a fractional cursor or one past 2^53 is a
+			// watermark this server put on the wire. Refusing it would drop the
+			// topic from the map the hook gap-fills from and still ack `resumed`.
 			frac: 2.5,
-			// Refused for a concrete reason, not tidiness: as a resume floor
-			// this discards every frame held across the cutover window.
-			unsafe: 1e308
+			big: 1e308
 		}
 	});
 	assert.ok(ctx, 'hook ran');
 	assert.deepEqual(
 		{ ...ctx.lastSeenSeqs },
-		{ good: 5, zero: 0 },
-		'0 is a legitimate "seen nothing yet"; the rest are values the server never issues'
+		{ good: 5, zero: 0, frac: 2.5, big: 1e308 },
+		'0 is "seen nothing yet"; only what the wire cannot mean is refused'
 	);
 	cleanup(raw);
 });
@@ -377,25 +391,37 @@ test('both resume entry points hold the epoch to the same rule', async () => {
 		});
 	}
 	assert.equal(seen.length, 4, 'both lanes ran the hook for both values');
-	assert.equal(seen[0], undefined, 'recover refuses a negative epoch');
-	assert.deepEqual({ ...seen[1] }, {}, 'and so does resume');
+	// Asserted on the values themselves, not on a spread of them: `{ ...x }` is
+	// `{}` for undefined AND for an empty map, so spreading here would hide the
+	// very difference the test above declares hooks key on.
+	assert.equal(seen[0], undefined, 'recover refuses a negative epoch, reporting absence');
+	assert.notEqual(seen[1], undefined, 'resume sends a map, so the hook sees one');
+	assert.equal(Object.keys(seen[1]).length, 0, 'with the refused entry removed');
 	assert.equal(seen[2], undefined, 'recover refuses a fractional epoch');
-	assert.deepEqual({ ...seen[3] }, {}, 'and so does resume');
+	assert.notEqual(seen[3], undefined);
+	assert.equal(Object.keys(seen[3]).length, 0, 'and so does resume');
 	cleanup(raw);
 });
 
-test('a recover offset the server could not have issued subscribes plainly', async () => {
+test('a recover offset the wire cannot mean subscribes plainly', async () => {
 	// No gap-fill rather than a gap-fill from a fabricated offset: the hook
 	// queries a backend with this value.
 	setServer({ publish: () => 0, subscriberCount: () => 0 });
-	let ran = false;
-	const raw = openSocket({ subscribe: () => null, resume: () => { ran = true; } });
-	await send(raw, { type: 'subscribe', topic: 'room', ref: 1, recover: { offset: 2.5 } });
-	assert.equal(ran, false, 'a fractional offset is not a recover');
-	await send(raw, { type: 'subscribe', topic: 'other', ref: 2, recover: { offset: 1e308 } });
-	assert.equal(ran, false, 'nor is an unsafe-integer one');
-	await send(raw, { type: 'subscribe', topic: 'third', ref: 3, recover: { offset: 0 } });
-	assert.equal(ran, true, 'a real offset still gap-fills');
+	let ran = 0;
+	const raw = openSocket({ subscribe: () => null, resume: () => { ran++; } });
+	await send(raw, { type: 'subscribe', topic: 'a', ref: 1, recover: { offset: -1 } });
+	assert.equal(ran, 0, 'a negative offset is not a recover');
+	await send(raw, { type: 'subscribe', topic: 'b', ref: 2, recover: { offset: 1e999 } });
+	assert.equal(ran, 0, 'nor is a non-finite one');
+	await send(raw, { type: 'subscribe', topic: 'c', ref: 3, recover: { offset: '5' } });
+	assert.equal(ran, 0, 'nor a string');
+	// And the other direction, which is the one that bites: refusing does not
+	// clamp, it skips the gap-fill entirely and still acks. An app cursor must
+	// survive.
+	await send(raw, { type: 'subscribe', topic: 'd', ref: 4, recover: { offset: 2.5 } });
+	assert.equal(ran, 1, 'a fractional app cursor DOES gap-fill');
+	await send(raw, { type: 'subscribe', topic: 'e', ref: 5, recover: { offset: 1e308 } });
+	assert.equal(ran, 2, 'and so does one past 2^53');
 	cleanup(raw);
 });
 

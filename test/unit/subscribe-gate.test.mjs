@@ -40,6 +40,26 @@ async function withGate(hooks, fn) {
 	}
 }
 
+test('a recover offset the wire would refuse does not reach the hook here either', async () => {
+	// platform.subscribe reaches the same recover branch a `subscribe` frame
+	// does, so the offset rule cannot live only in the demux - an app calling the
+	// API directly would otherwise hand the hook a value the wire refuses. The
+	// last case is the one that matters in the other direction: refusing does not
+	// clamp, it skips the gap-fill entirely, so an app cursor has to survive.
+	let ran = 0;
+	await withGate({ subscribe: () => null, resume: () => { ran++; } }, async () => {
+		const ws = fakeWs();
+		await platform.subscribe(ws, 'room:1', { recover: { offset: '5' } });
+		assert.equal(ran, 0, 'a string offset is not a recover');
+		await platform.subscribe(ws, 'room:2', { recover: { offset: -1 } });
+		assert.equal(ran, 0, 'nor a negative one');
+		await platform.subscribe(ws, 'room:3', { recover: { offset: 1e999 } });
+		assert.equal(ran, 0, 'nor a non-finite one');
+		await platform.subscribe(ws, 'room:4', { recover: { offset: 1e308 } });
+		assert.equal(ran, 1, 'an app cursor past 2^53 still gap-fills');
+	});
+});
+
 test('extra arguments to platform.subscribe cannot bypass the gate', async () => {
 	// A batch verdict means "already authorized, install it", and any value that
 	// is not `false` and not a string reads as one. So a fourth parameter on the
