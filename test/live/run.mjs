@@ -1,8 +1,9 @@
-// The live wire-contract lane. Builds the fixture, runs the three WebSocket
-// suites against it, then builds the fixture's NO_WS variant and runs the
-// no-handler regression. Every suite boots its own server from the built
-// output, so this asserts the contract end to end: a change to the demux in
-// handler/ws.js that the unit suite cannot see fails here.
+// The live wire-contract lane. Runs the send-result suite (which boots its own
+// bare Bun.serve and needs no build), then builds the fixture, runs the
+// WebSocket suites against it, then builds the fixture's NO_WS variant and runs
+// the no-handler regression. Every suite boots its own server, so this asserts
+// the contract end to end: a change to the demux in handler/ws.js that the unit
+// suite cannot see fails here.
 //
 // Needs Bun and the fixture's dependencies (`npm install` in test/fixture
 // once). Run with: npm run test:live
@@ -51,6 +52,9 @@ const buildEnv = {
 	NO_WS: '',
 	NODE_ENV: 'production'
 };
+
+// Independent of the fixture: it drives the real facade over its own server.
+await run('send-result-check', [process.execPath, suite('send-result-check.mjs')]);
 
 const built = await run('build fixture', [process.execPath, 'run', 'build'], {
 	cwd: fixtureDir,
