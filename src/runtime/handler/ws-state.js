@@ -361,8 +361,10 @@ export function clearUnsubscribeHooks(ud) {
  *
  * That means the ceiling IS reachable, and reaching it costs teardown coverage
  * for the releases past it - there is no way around that, since every entry at
- * that point is a topic genuinely owed something. It takes a hook failing
- * roughly two thousand times on one connection to get there, it is counted in
+ * that point is a topic genuinely owed something. Getting there takes roughly
+ * two thousand DISTINCT topics on one connection whose hook never resolved -
+ * the record is keyed by topic, so releasing the SAME topic over and over
+ * against a broken hook does not grow it at all. It is counted in
  * `droppedReleaseRecords`, and it says so once.
  */
 const MAX_PENDING_RELEASE_TOPICS =
@@ -380,8 +382,8 @@ function warnPendingReleaseFull() {
 	if (warnedPendingReleaseFull) return;
 	warnedPendingReleaseFull = true;
 	console.error(
-		`[ws] a connection is carrying ${MAX_PENDING_RELEASE_TOPICS} topics whose unsubscribe hook never\n` +
-		'  succeeded, so further releases are no longer recorded for the close hook and their teardown\n' +
+		`[ws] a connection is carrying ${MAX_PENDING_RELEASE_TOPICS} distinct topics whose unsubscribe hook has not\n` +
+		'  succeeded yet, so further releases are no longer recorded for the close hook and their teardown\n' +
 		'  is not guaranteed. The usual cause is an `unsubscribe` hook that throws or rejects on every\n' +
 		'  call - fix that, and check the errors logged above it. The running total is\n' +
 		'  platform.droppedReleaseRecords.'

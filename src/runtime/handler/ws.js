@@ -612,9 +612,12 @@ export const websocketHandlers = {
 						//
 						// The one case that route does not cover is a connection
 						// that has ALSO filled its pending-release record, which
-						// takes an unsubscribe hook failing thousands of times.
-						// Then there is nothing left to hand the close hook, and
-						// `droppedReleaseRecords` is the count of exactly that.
+						// takes thousands of DISTINCT topics whose hook never
+						// resolved. Then there is nothing left to hand the close
+						// hook. `droppedReleaseRecords` counts every refused
+						// record, this case among them - most of what it counts
+						// never reaches here, since a refused record does not
+						// stop the hook from running.
 						if (outcome === 'overflow') {
 							warnUnsubscribeOverflow();
 							try {

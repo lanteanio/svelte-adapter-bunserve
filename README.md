@@ -301,10 +301,12 @@ are different jobs rather than different sizes of the same one:
   `unsubscribe` hook does not resolve - because it is still queued when the
   socket dies, or it threw, or it rejected against a backend that is down - the
   topic is named to the `close` hook instead. (The one limit: a connection
-  records at most 2176 topics owed a teardown, which no amount of ordinary
-  concurrency reaches, but a hook failing over and over on one connection can.
-  Past that the release is not recorded, the adapter says so once, and the
-  instance-wide `platform.droppedReleaseRecords` counts it.) The
+  records at most 2176 DISTINCT topics owed a teardown, which no amount of
+  ordinary concurrency reaches - getting there takes that many different topics
+  on one connection whose hook never resolved, and releasing the same topic
+  repeatedly does not grow it. Past that the release is not recorded, the
+  adapter says so once, and the instance-wide
+  `platform.droppedReleaseRecords` counts it.) The
   cost is that a hook which was mid-await when the connection died can finish
   AND have its topic named there, so a teardown that is not idempotent (a bare
   `roster.decr(topic)`) can run twice. The alternative is dropping the release
