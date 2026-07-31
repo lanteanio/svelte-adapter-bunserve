@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The binary wire tier: `platform.publishWire`, `platform.publishWireBatch`,
+  `platform.sendWire`, `platform.sendWireBatch`, and
+  `platform.registerWireCodec`. Connections that declare a codec's capability
+  in a `{"type":"hello","caps":[...]}` frame receive `0x03` codec frames -
+  `[0x03][schemaVersion][topicId:varint][seq:varint][payload]`, the family
+  layout - with the numeric topic id announced on the same socket before the
+  first frame; everyone else receives exactly the envelope `publish()` would
+  have sent, carrying the SAME seq as the binary frame. When no connected
+  client wants binary for a codec, a wire publish is one native fan-out,
+  byte-identical to `publish()`. A dropped stateful frame (or a dropped
+  announce) permanently degrades that capability to JSON for the connection's
+  life, because the encode already advanced per-connection dictionary state
+  the client can no longer catch up with; backpressure-enqueued frames are
+  delivery, never a drop. Stateless codecs marked `shared` fan out through
+  cohort topics (`topic` + a NUL byte + `bin`/`json`) with a refcounted
+  server-wide wire id, so one publish is two native publishes instead of a
+  per-connection walk.
+- Resume gap-fill: a `subscribe` frame may carry `recover: { offset, epoch? }`
+  to run the app's `resume` hook - only after the authorization gate allows -
+  before going live, with a live-frame barrier bridging the hook's await
+  window so a publish landing mid-resume reaches the client, in order, before
+  its `subscribed` ack. An overflowed window signals `truncated` on the
+  replay channel so the client cold-resyncs instead of trusting a partial
+  flush. The standalone `{"type":"resume"}` frame drives the same hook for
+  client-named topics (held to the wire validation and system-topic guard the
+  subscribe lanes apply) and always answers `{"type":"resumed"}`.
+- A live wire suite (`test/live/wire-check.mjs`) driving two raw WebSocket
+  clients - one capable, one JSON-only - plus a resuming third against the
+  built fixture: the announce, per-connection stateful payloads, seq parity
+  between frame and envelope, the batch fallback, the cohort split with a
+  shared id past the 2^32 partition base, and both resume paths asserted on
+  client-delivered bytes.
+
 - A CI workflow (`.github/workflows/ci.yml`) running the unit suite and the
   live lane on Linux. The graceful-shutdown SIGNAL path is asserted there and
   only there: on Windows a `SIGTERM` terminates the built server without the

@@ -3,11 +3,10 @@
  * code. This is the JSON realtime surface: topic fan-out, per-connection send,
  * brokered subscribe/unsubscribe, and the observability getters.
  *
- * What is deliberately NOT here yet: the binary wire members
- * (publishWire/sendWire and their batch variants, the codec registry, cohort
- * split, resume/seq buffers), the pressure/protection surface, and the
- * deferred JSON-tier members sendCoalesced, topicEpoch, batch, publishBatched,
- * request, and requestTopic. Those are their own slices. They are omitted
+ * What is deliberately NOT here yet: the pressure/protection surface
+ * (onPressure/onPublishRate and flow-control) and the deferred JSON-tier
+ * members sendCoalesced, topicEpoch, batch, publishBatched, request, and
+ * requestTopic. Those are their own slices. They are omitted
  * rather than stubbed - a zero stub reports
  * "supported" to a caller and then silently does nothing, which is worse than
  * an undefined member a caller CAN feature-detect.

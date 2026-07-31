@@ -73,14 +73,18 @@ Prototype phase. The build order:
    wrong one, matching svelte-adapter-uws).
 3. **JSON realtime** (done): the upgrade path, the per-connection platform, and
    topic pub/sub over real WebSockets. See [WebSockets](#websockets) below.
-   Known-open on the realtime tier: the binary wire protocol (`0x03` frames, codecs,
-   cohort split, resume/seq buffers) and the pressure/protection surface are
-   not implemented - those members are ABSENT from the platform rather than
+4. **Binary wire protocol** (done): `0x03` codec frames over
+   `publishWire`/`sendWire` and their batch variants, capability negotiation
+   through the `hello` frame, the per-connection wire-id announce, the shared
+   cohort split for stateless `shared` codecs, degrade-to-JSON on a dropped
+   stateful frame, and resume gap-fill with a live-frame barrier across the
+   cutover.
+   Known-open on the realtime tier: the pressure/protection surface is not
+   implemented - those members are ABSENT from the platform rather than
    stubbed, so nothing reports success while doing nothing. The deferred
    JSON-tier members are likewise absent: `request` and `requestTopic`
    (server-initiated request/reply), the coalescing and batching send variants
    (`sendCoalesced`, `batch`, `publishBatched`), and `topicEpoch`.
-4. Binary wire protocol.
 5. Backpressure/flow-control parity, then the conformance gate against the
    family's deterministic simulation goldens.
 
@@ -208,6 +212,11 @@ export function POST({ platform }) {
 | `topic(name)` | scoped publisher: `platform.topic('chat').created(data)` |
 | `requestId` | per-connection / per-request identity |
 | `now()` / `monotonic()` / `random.float()` `.u32()` `.uuid()` `.bytes(n)` | determinism seams |
+| `publishWire(topic, event, data, wire, options?)` | binary fan-out through a codec: capable clients get the `0x03` frame, everyone else the `publish()` envelope with the SAME seq; `{ seq, compress, excludeWs }` |
+| `publishWireBatch(topic, event, entries, wire, options?)` | one tick's updates as ONE batch frame per capable connection (the codec's `<event>-batch` form), per-entry envelopes and seqs for the rest; per-entry `excludeWs` |
+| `sendWire(ws, topic, event, data, wire, options?)` | single-target codec frame (seq 0), or the JSON envelope for a caps-less / degraded connection; returns the send tri-state |
+| `sendWireBatch(ws, topic, event, entries, wire, options?)` | the per-subscriber twin of `publishWireBatch`, for culled per-viewer walks |
+| `registerWireCodec(wire)` | register a codec under its capability token; idempotent, last-wins |
 
 `platform.subscribe` refuses the adapter's own `__`-prefixed namespace by
 default, because the documented advice is to route server-initiated subscribes
@@ -361,12 +370,19 @@ fallback. Set `ORIGIN=https://app.example` in production, or pass an explicit
 
 ### Wire protocol
 
-Client to server: `subscribe`, `unsubscribe`, `subscribe-batch` (each accepts an
-optional `ref`). Server to client:
+Client to server: `subscribe` (optionally carrying
+`recover: { offset, epoch? }` to gap-fill the missed tail before going live),
+`unsubscribe`, `subscribe-batch` (each accepts an optional `ref`),
+`hello` (`{"caps":[...]}` capability declaration; re-sends replace the set),
+and `resume` (`{"sessionId","lastSeenSeqs",{"lastSeenEpochs"?}}`). Server to
+client:
 
 | frame | when |
 |---|---|
 | `{"type":"welcome","sessionId":"..."}` | on open |
+| `{"type":"wire-id","topic":"t","id":N}` | the numeric topic id for `0x03` frames, announced on the same socket before the first binary frame for its topic |
+| `{"type":"resumed"}` | the `resume` frame's gap-fill (if any) has flushed; switch to live |
+| binary `[0x03][schemaVersion:u8][topicId:varint][seq:varint][codec payload]` | a codec frame, for connections that declared the codec's capability in `hello` |
 | `{"type":"subscribed","topic":"t","ref":N,"epoch":E}` | a subscription took |
 | `{"type":"subscribe-denied","topic":"t","ref":N,"reason":"..."}` | it did not |
 | `{"type":"unsubscribed","topic":"t","ref":N}` | released, whether or not it was held |
@@ -468,9 +484,10 @@ needs no build), then builds the fixture, boots the built output under Bun, and
 drives real WebSocket clients against it. It covers the send-result mapping
 against a real slow consumer, the subscribe, batch, and unsubscribe frames, the
 subscription cap under pipelined frames, Origin enforcement on the upgrade, the
-graceful-shutdown signal path (Linux only; the suite skips on Windows), and a
-no-handler build proving the HTTP surface is untouched when no realtime is
-configured. It needs
+binary wire tier (announce, stateful codec frames, the cohort split, and both
+resume paths), the graceful-shutdown signal path (Linux only; the suite skips
+on Windows), and a no-handler build proving the HTTP surface is untouched when
+no realtime is configured. It needs
 Bun and the fixture's dependencies (`npm install` in `test/fixture` once;
 `ADAPTER=uws` imports a sibling checkout by path and is not a dependency, so a
 plain clone installs):
