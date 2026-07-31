@@ -279,17 +279,15 @@ const WS_GATES = Symbol('inflightGates');
  * Unsubscribe hooks this connection may have running at once, and how many may
  * wait behind them.
  *
- * A THIRD limit, and deliberately not the gate counter. The unsubscribe hook was
- * counted against `WS_GATES` but only CHECKED against it on the speculative lane
- * (a topic the connection never held), which left two defects at once. A client
- * holding the permitted 10,000 subscriptions could pipeline 10,000 `unsubscribe`
- * frames in one read burst and land 10,000 CONCURRENT app hooks - 156x the bound
- * the README advertises - because Bun does not await the message handler. And
- * the increments that were never gated still counted, so an ordinary page
- * unmounting a hundred stores drove the shared counter past 64 and the SUBSCRIBE
- * path answered `RATE_LIMITED` on a connection nowhere near any real limit -
- * a SvelteKit route change, which unmounts the old stores and mounts the new
- * ones in one tick, hit exactly that.
+ * A THIRD limit, and deliberately not the gate counter. Sharing `WS_GATES`
+ * breaks both lanes at once. Bun does not await the message handler, so a
+ * client holding the permitted 10,000 subscriptions can pipeline 10,000
+ * `unsubscribe` frames in one read burst and land that many CONCURRENT app
+ * hooks unless the unsubscribe lane has its own CHECKED bound on every path,
+ * held and speculative alike. And every increment a shared counter takes from
+ * legitimate releases drives the SUBSCRIBE path toward `RATE_LIMITED` on a
+ * connection nowhere near any real limit - a SvelteKit route change unmounts
+ * the old page's stores in one tick, which is exactly such a burst.
  *
  * Separate counters because the two lanes have different rights: a subscribe
  * gate may be REFUSED (the client is told, and its own frame caused it), while

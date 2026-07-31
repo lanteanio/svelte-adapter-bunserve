@@ -157,13 +157,13 @@ function warnReturnedHeaders() {
 	if (warnedReturnedHeaders) return;
 	warnedReturnedHeaders = true;
 	console.warn(
-		'[ws] the upgrade hook returned a `headers` key. Handshake headers are now set on the\n' +
-		'  context instead, and the returned key is being treated as ordinary userData:\n' +
+		'[ws] the upgrade hook returned a `headers` key. Handshake headers belong on the\n' +
+		'  context, and the returned key is treated as ordinary userData:\n' +
 		'    export function upgrade(request, { headers }) {\n' +
 		'      headers[\'sec-websocket-protocol\'] = \'v1\';\n' +
 		'      return { user };\n' +
 		'    }\n' +
-		'  The returned object is frequently built by spreading parsed client input, which made\n' +
+		'  The returned object is frequently built by spreading parsed client input, which makes\n' +
 		'  an in-band `headers` key attacker-settable; the context channel cannot be.'
 	);
 }

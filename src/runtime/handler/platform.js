@@ -70,13 +70,13 @@ const subscribeThrewThrottle = createLogThrottle(() => performance.now());
  * the rest. A hook that means to deny returns `false` or a reason string;
  * `true`, `null` and `undefined` allow.
  *
- * Anything else is UNREADABLE and fails closed. Allowing it instead is the
- * fail-open this reached for first: a hook written
+ * Anything else is UNREADABLE and fails closed. Allowing it would fail open
+ * for exactly the hooks most likely to exist: one written
  * `return allowed[topic] ? null : 403`, or one that returns a lookup promise
  * without `await`, denies nothing and hands the client every topic it can
- * name. The batch lane has always refused those values, so the identical hook
- * logic denied through `subscribeBatch` and allowed through `subscribe`;
- * `isReadableVerdict` is now the one answer both lanes get.
+ * name. Both gate lanes read a verdict through `isReadableVerdict`, so the
+ * identical hook logic cannot be denied through `subscribeBatch` while being
+ * allowed through `subscribe`.
  *
  * @param {unknown} verdict
  * @param {string} topic - named in the warning, not in the client's answer
@@ -625,8 +625,8 @@ export const platform = {
 	/**
 	 * Sum of every live connection's subscription count on this instance.
 	 *
-	 * Maintained on the subscribe/unsubscribe/close paths, so it was being paid
-	 * for on a hot path with nothing able to read it until this getter existed.
+	 * Maintained on the subscribe/unsubscribe/close paths - hot-path work that
+	 * only earns its keep because this getter exposes it.
 	 */
 	get totalSubscriptions() {
 		return wsCounters.totalSubscriptions;
@@ -772,12 +772,12 @@ export const platform = {
  *
  * Kept OFF the platform object on purpose. The verdict says "the gate has
  * already run for this topic in this frame, do not run it again", so anything
- * able to supply one can install a subscription the app never authorized. Every
- * previous spelling put it somewhere a caller could reach: a string key on the
- * options bag, then a Symbol on the same bag (forgeable by a Proxy with a
- * catch-all `get`), then a fourth positional parameter of `platform.subscribe`
- * itself - where `topics.map(platform.subscribe.bind(platform, ws))` supplied
- * the array as a verdict and quietly allowed every topic.
+ * able to supply one can install a subscription the app never authorized - and
+ * every caller-reachable spelling is forgeable: a key on the options bag (a
+ * Proxy with a catch-all `get` answers even a Symbol key), or a trailing
+ * positional parameter of `platform.subscribe` itself, where an ordinary
+ * `topics.map(platform.subscribe.bind(platform, ws))` supplies the array as a
+ * verdict and quietly allows every topic.
  *
  * What holds now is narrower than "unreachable": this is an exported binding,
  * so anything that can import this module can call it. It is not a member of
@@ -846,9 +846,9 @@ export async function subscribeWithVerdict(ws, topic, options, verdict) {
 	// would otherwise survive as a phantom the client believes it cancelled.
 	// The SECOND limit: concurrent gates. The cap above counts distinct
 	// pending topics, so N concurrent subscribes to ONE topic cost 1 against
-	// it - correct for what can install, useless as a bound on app work.
-	// Before this existed, a socket repeating one topic opened a fresh gate
-	// call per frame with nothing to stop it.
+	// it - correct for what can install, useless as a bound on app work:
+	// without this check a socket repeating one topic opens a fresh gate call
+	// per frame with nothing to stop it.
 	if (!hasGateHeadroom(ws)) return 'RATE_LIMITED';
 
 	const token = beginPendingSubscribe(userData, topic);

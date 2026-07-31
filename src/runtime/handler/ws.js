@@ -181,7 +181,7 @@ function sendControl(ws, payload) {
  *
  * Sent once and directly, bypassing the budget it just exhausted, so the client
  * learns why rather than seeing a bare close. See CONTROL_FLOOD_CLOSE_CODE for
- * why the cut is 4429 rather than the 1008 this reached for first.
+ * why the cut is 4429 rather than 1008.
  *
  * @param {any} ws
  */
@@ -309,11 +309,11 @@ async function applySubscribe(ws, topic, ref) {
 function gatedSubscribe(ws, topic, verdict) {
 	// `subscribeWithVerdict`, NOT `platform.subscribe`. The verdict channel is a
 	// parameter of a module-private function precisely so it is not reachable
-	// through the platform object: every earlier spelling put it somewhere a
-	// caller could supply it - a string key on the options bag, then a Symbol on
-	// the same bag, then a fourth positional parameter of the public method,
-	// where an ordinary `topics.map(platform.subscribe.bind(platform, ws))`
-	// passed the array as a verdict and skipped the gate entirely.
+	// through the platform object: any caller-reachable spelling is forgeable -
+	// a key on the options bag (a Proxy with a catch-all `get` answers even a
+	// Symbol), or a trailing positional parameter of the public method, where
+	// an ordinary `topics.map(platform.subscribe.bind(platform, ws))` passes
+	// the array as a verdict and skips the gate entirely.
 	return subscribeWithVerdict(
 		ws,
 		topic,
@@ -553,9 +553,9 @@ export const websocketHandlers = {
 					// "recorded a debt, then found no hook to discharge it".
 					const unsubscribeHook = wsModule.unsubscribe;
 					// With no hook exported there is no app teardown to run, so the
-					// release must not occupy the deferral queue either. Enqueuing a
-					// no-op per release let a client pipeline past the backlog and be
-					// cut with 4429 over hooks that do not exist.
+					// release must not occupy the deferral queue either: a no-op per
+					// release lets a client pipeline past the backlog and be cut
+					// with 4429 over hooks that do not exist.
 					if (unsubUd && typeof unsubscribeHook === 'function') {
 						const releasedTopic = msg.topic;
 						// Only a topic the connection genuinely held can be owed a
