@@ -2,9 +2,64 @@
 // and refuses one topic so the authorization gate is covered by the live smoke
 // test rather than only by unit tests.
 
+/**
+ * A STATEFUL wire codec: the payload's first byte is this connection's own
+ * frame counter, so the live suite can prove each connection was encoded
+ * against its own state. The rest is x/y as big-endian float32. Batch events
+ * are declined, driving the per-entry fallback end to end.
+ */
+const xyWire = {
+	capability: 'fixture.xy:1',
+	schemaVersion: 1,
+	encode(event, data, state) {
+		if (event.endsWith('-batch')) return null;
+		if (!state || typeof data?.x !== 'number' || typeof data?.y !== 'number') return null;
+		const bytes = new Uint8Array(9);
+		bytes[0] = ++state.frames & 0xff;
+		const view = new DataView(bytes.buffer);
+		view.setFloat32(1, data.x, false);
+		view.setFloat32(5, data.y, false);
+		return bytes;
+	},
+	state: {
+		onAttach: () => ({ frames: 0 }),
+		onDetach: () => {}
+	}
+};
+
+/**
+ * A STATELESS shared codec: byte-identical frames for every binary
+ * subscriber, fanned out through the cohort topics.
+ */
+const snapWire = {
+	capability: 'fixture.snap:1',
+	schemaVersion: 1,
+	shared: true,
+	encode: (event, data) => new TextEncoder().encode(JSON.stringify(data ?? null))
+};
+
 /** Once at boot, after the listener is up. The family's arming point. */
 export function init({ platform }) {
+	platform.registerWireCodec(xyWire);
+	platform.registerWireCodec(snapWire);
 	console.log(`[fixture] init connections=${platform.connections}`);
+}
+
+/**
+ * Gap-fill for a recover offset or a standalone resume frame. Awaits a real
+ * timer so the live suite exercises the barrier window the runtime bridges,
+ * sends one identifiable replay frame per topic, and reports the offset as
+ * the covered watermark - anything the runtime buffered past it must then
+ * arrive after these frames and before the ack.
+ */
+export async function resume(ws, { sessionId, lastSeenSeqs, platform }) {
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	const covered = {};
+	for (const [topic, since] of Object.entries(lastSeenSeqs)) {
+		platform.send(ws, topic, 'replayed', { sessionId, since });
+		covered[topic] = typeof since === 'number' ? since : 0;
+	}
+	return covered;
 }
 
 /** Once at graceful shutdown, BEFORE the sockets are drained. */
@@ -58,6 +113,23 @@ export function message(ws, { data, isBinary, msg, platform }) {
 	// A control-shaped frame the adapter did not consume arrives pre-parsed.
 	if (msg && msg.type === 'fixture-publish') {
 		platform.publish(msg.topic, 'said', msg.data, { seq: true });
+		return;
+	}
+	// Wire-tier drivers, one per platform member the wire suite asserts.
+	if (msg && msg.type === 'fixture-wire') {
+		platform.publishWire(msg.topic, 'moved', msg.data, xyWire, { seq: true });
+		return;
+	}
+	if (msg && msg.type === 'fixture-wire-batch') {
+		platform.publishWireBatch(msg.topic, 'moved', msg.entries, xyWire, { seq: true });
+		return;
+	}
+	if (msg && msg.type === 'fixture-sendwire') {
+		platform.sendWire(ws, msg.topic, 'snapshot', msg.data, xyWire);
+		return;
+	}
+	if (msg && msg.type === 'fixture-wire-shared') {
+		platform.publishWire(msg.topic, 'tick', msg.data, snapWire, { seq: true });
 		return;
 	}
 	if (msg && msg.type === 'fixture-stats') {
