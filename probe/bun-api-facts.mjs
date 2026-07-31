@@ -228,6 +228,48 @@ async function probePublish() {
 	}
 }
 
+async function probeWireTransport() {
+	const section = 'wire-transport';
+	const { server, firstWs } = serveWs();
+	try {
+		const client = await openClient(server);
+		const ws = await firstWs();
+
+		// Cohort topics embed a NUL byte ('room\0bin') so they can never collide
+		// with a user topic. That only works if Bun's native topic registry
+		// treats the NUL as an ordinary character end to end.
+		const nulTopic = 'room\0bin';
+		record(section, 'ws.subscribe on a topic containing a NUL byte returns', callAndDescribe(() => ws.subscribe(nulTopic)));
+		record(section, 'ws.isSubscribed on the NUL topic', callAndDescribe(() => ws.isSubscribed(nulTopic)));
+		record(section, 'server.subscriberCount on the NUL topic', callAndDescribe(() => server.subscriberCount(nulTopic)));
+
+		const gotText = [];
+		const gotBinary = [];
+		client.addEventListener('message', (e) => {
+			if (typeof e.data === 'string') gotText.push(e.data);
+			else gotBinary.push(new Uint8Array(e.data));
+		});
+
+		// Binary payloads through the native fan-out: the wire tier publishes
+		// prebuilt 0x03 frames to cohort topics with server.publish.
+		const frame = new Uint8Array([0x03, 1, 5, 42, 7, 7, 7]);
+		record(section, 'server.publish(NUL topic, 7-byte binary) returns', callAndDescribe(() => server.publish(nulTopic, frame)));
+		record(section, 'server.publish(NUL topic, "text") returns', callAndDescribe(() => server.publish(nulTopic, 'text-on-nul-topic')));
+		record(section, 'server.publish(NUL topic, binary, compress=true) returns', callAndDescribe(() => server.publish(nulTopic, frame, true)));
+		await sleep(200);
+		record(
+			section,
+			'what the NUL-topic subscriber received (binary frames byte-exact / text frames)',
+			`binary=${gotBinary.length} byteExact=${gotBinary.every((b) => b.length === frame.length && b.every((v, i) => v === frame[i]))}, text=${JSON.stringify(gotText)}`
+		);
+
+		record(section, 'ws.unsubscribe on the NUL topic returns', callAndDescribe(() => ws.unsubscribe(nulTopic)));
+		record(section, 'server.subscriberCount on the NUL topic after unsubscribe', callAndDescribe(() => server.subscriberCount(nulTopic)));
+	} finally {
+		server.stop(true);
+	}
+}
+
 async function probeCloseVsTerminate() {
 	const section = 'close-vs-terminate';
 	{
@@ -673,6 +715,7 @@ const probes = [
 	probeBackpressureLimitAndDrain,
 	probePublish,
 	probePublishBackpressure,
+	probeWireTransport,
 	probeCloseVsTerminate,
 	probeClosedSocketBehavior,
 	probePrototypePatch,

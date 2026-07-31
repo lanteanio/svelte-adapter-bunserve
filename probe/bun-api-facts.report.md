@@ -1,6 +1,6 @@
 # Bun server API facts
 
-Generated 2026-07-31T12:21:55.518Z by `probe/bun-api-facts.mjs`.
+Generated 2026-07-31T13:10:16.264Z by `probe/bun-api-facts.mjs`.
 
 - Bun version: **1.3.14** (revision 0d9b296af33f2b851fcbf4df3e9ec89751734ba4)
 - Platform: win32/x64
@@ -75,6 +75,27 @@ Re-run after every Bun upgrade; review any diff before trusting the upgrade.
   - returned 1048586
 - server.publish("room", "small") once the socket is saturated
   - returned 5
+
+## wire-transport
+
+- ws.subscribe on a topic containing a NUL byte returns
+  - returned true
+- ws.isSubscribed on the NUL topic
+  - returned true
+- server.subscriberCount on the NUL topic
+  - returned 1
+- server.publish(NUL topic, 7-byte binary) returns
+  - returned 7
+- server.publish(NUL topic, "text") returns
+  - returned 17
+- server.publish(NUL topic, binary, compress=true) returns
+  - returned 7
+- what the NUL-topic subscriber received (binary frames byte-exact / text frames)
+  - binary=2 byteExact=true, text=["text-on-nul-topic"]
+- ws.unsubscribe on the NUL topic returns
+  - returned true
+- server.subscriberCount on the NUL topic after unsubscribe
+  - returned 0
 
 ## close-vs-terminate
 
@@ -155,7 +176,7 @@ Re-run after every Bun upgrade; review any diff before trusting the upgrade.
 - custom upgrade header present on the 101 response
   - true
 - raw 101 status line + headers
-  - HTTP/1.1 101 Switching Protocols | x-probe-upgrade: yes | Upgrade: websocket | Connection: Upgrade | Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo= | Date: Fri, 31 Jul 2026 12:21:50 GMT
+  - HTTP/1.1 101 Switching Protocols | x-probe-upgrade: yes | Upgrade: websocket | Connection: Upgrade | Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo= | Date: Fri, 31 Jul 2026 13:10:12 GMT
 
 ## subprotocol
 
