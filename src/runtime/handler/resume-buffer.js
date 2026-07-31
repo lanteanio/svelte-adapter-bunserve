@@ -14,11 +14,12 @@
 // The window only ever holds frames behind a network-backed resume.
 
 import { ws_compression_on } from './config.js';
+import { SEND_DROPPED } from '../utils/send-result.js';
 import { bumpOut } from './ws-stats.js';
 import { maxSeenSeq, resumeBuffers, wsCounters } from './ws-state.js';
 
 /**
- * @typedef {{ topic: string, buffer: { frames: { seq: number | null, envelope: string, compress: boolean }[], overflow: boolean }, before: number }} ResumeCaptureEntry
+ * @typedef {{ topic: string, buffer: { ws: any, frames: { seq: number | null, envelope: string, compress: boolean, authoritative: boolean }[], overflow: boolean }, before: number }} ResumeCaptureEntry
  * @typedef {{ ws: any, entries: ResumeCaptureEntry[] }} ResumeCaptureHandle
  */
 
@@ -76,6 +77,32 @@ export function discardResumeCapture(handle) {
 }
 
 /**
+ * Tell the client this topic's gap-fill is incomplete, on the replay channel -
+ * the same marker a replay backend emits for an uncoverable range. The client
+ * drops its stale per-topic offset and cold-resyncs.
+ *
+ * Best effort by nature: a socket already past its backpressure limit refuses
+ * this frame too. It gets through for a transient or borderline drop, which is
+ * the common case, and costs one short frame when it does not.
+ *
+ * @param {any} ws
+ * @param {string} topic
+ */
+function sendTruncated(ws, topic) {
+	const marker =
+		'{"topic":' + JSON.stringify('__replay:' + topic) + ',"event":"truncated","data":null}';
+	let result;
+	try {
+		result = ws.send(marker, false, false);
+	} catch {
+		wsCounters.closedWsAborts++;
+		return;
+	}
+	// Only bytes that reached the wire, like every other send site.
+	if (result !== SEND_DROPPED) bumpOut(ws, marker);
+}
+
+/**
  * Flush the frames held for one topic to the connection, in capture (seq)
  * order, skipping any the resume already covered, then close the buffer.
  * `coveredSeq` is the highest seq the resume hook reported delivering for
@@ -102,16 +129,10 @@ export function flushResumeTopic(handle, topic, coveredSeq) {
 		// itself lost behind the backpressure the partial flush below would
 		// build. The client drops its stale per-topic offset and
 		// cold-resyncs; the partial frames are then a best-effort extra.
-		const marker =
-			'{"topic":' + JSON.stringify('__replay:' + topic) + ',"event":"truncated","data":null}';
-		try {
-			ws.send(marker, false, false);
-			bumpOut(ws, marker);
-		} catch {
-			wsCounters.closedWsAborts++;
-		}
+		sendTruncated(ws, topic);
 	}
 	const floor = typeof coveredSeq === 'number' ? coveredSeq : entry.before;
+	let dropped = false;
 	for (const f of entry.buffer.frames) {
 		// Dedup ONLY explicit-seq frames against the floor: they share the
 		// floor's seq space. A counter-stamped live frame is always newer than
@@ -119,14 +140,25 @@ export function flushResumeTopic(handle, topic, coveredSeq) {
 		// drop it wrongly - it always flushes.
 		if (f.authoritative && f.seq !== null && f.seq <= floor) continue;
 		const compress = ws_compression_on && f.compress;
+		let result;
 		try {
-			ws.send(f.envelope, false, compress);
+			result = ws.send(f.envelope, false, compress);
 		} catch {
 			wsCounters.closedWsAborts++;
 			break;
 		}
+		if (result === SEND_DROPPED) {
+			// A refused gap-fill frame is the same silent hole the overflow
+			// branch guards against: the ack that follows tells the client to
+			// go live, with this frame missing and nothing to make it notice.
+			// Stop pushing frames the socket is refusing, and signal.
+			dropped = true;
+			break;
+		}
 		bumpOut(ws, f.envelope);
 	}
+	// Not when the window already overflowed - that path signalled up front.
+	if (dropped && !entry.buffer.overflow) sendTruncated(ws, topic);
 	unregister(handle, entry);
 	// Drop the entry from the handle too, so a repeat flush for this topic is
 	// a no-op and a final-sweep discard only touches un-flushed topics.

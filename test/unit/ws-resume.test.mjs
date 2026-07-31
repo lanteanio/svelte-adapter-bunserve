@@ -31,6 +31,13 @@ const { captureResumeFrame, MAX_RESUME_BUFFERED_FRAMES } = await import(
 	'../../src/runtime/handler/ws-state.js'
 );
 const { __setHooks } = await import('../helpers/ws-handler-stub.mjs');
+const { SEND_DROPPED } = await import('../../src/runtime/utils/send-result.js');
+
+/** A socket whose send results are scripted; anything past the script succeeds. */
+function scriptedWs(script) {
+	const sent = [];
+	return { sent, send(p) { sent.push(p); return script.length ? script.shift() : 1; } };
+}
 
 function rawSocket() {
 	const sent = [];
@@ -135,6 +142,38 @@ test('an overflowed window signals truncation FIRST, then best-effort frames', (
 	assert.ok(fakeWs.sent[0].includes('"__replay:room"'), 'truncation marker first');
 	assert.ok(fakeWs.sent[0].includes('"truncated"'));
 	assert.equal(fakeWs.sent[1], 'E' + MAX_RESUME_BUFFERED_FRAMES, 'then the surviving tail');
+});
+
+test('a refused gap-fill frame stops the flush and signals truncation', () => {
+	// The ack that follows this flush tells the client to go live. A frame the
+	// socket refused past its backpressure limit is a hole the client has no way
+	// to detect, so the flush stops pushing into a refusing socket and says so on
+	// the replay channel instead of going quiet.
+	const ws = scriptedWs([1, SEND_DROPPED]);
+	const cap = beginResumeCapture(['room'], ws);
+	captureResumeFrame('room', 1, 'ENV1', false, null, true);
+	captureResumeFrame('room', 2, 'ENV2', false, null, true);
+	captureResumeFrame('room', 3, 'ENV3', false, null, true);
+	flushResumeTopic(cap, 'room', 0);
+	assert.equal(ws.sent[0], 'ENV1', 'the accepted frame went out');
+	assert.equal(ws.sent[1], 'ENV2', 'the refused frame was attempted once');
+	assert.ok(ws.sent[2] && ws.sent[2].includes('"truncated"'), 'truncation signalled');
+	assert.ok(ws.sent[2].includes('"__replay:room"'), 'on this topic\'s replay channel');
+	assert.equal(ws.sent.length, 3, 'ENV3 was never pushed into a socket already refusing');
+	assert.equal(resumeBuffers.size, 0, 'the buffer still closed');
+});
+
+test('an overflowed window that also drops signals exactly once', () => {
+	// The overflow branch already signalled up front; a drop during the
+	// best-effort tail must not send a second marker.
+	const ws = scriptedWs([1, SEND_DROPPED]);
+	const cap = beginResumeCapture(['room'], ws);
+	for (let i = 1; i <= MAX_RESUME_BUFFERED_FRAMES + 10; i++) {
+		captureResumeFrame('room', i, 'E' + i, false, null, true);
+	}
+	flushResumeTopic(cap, 'room', MAX_RESUME_BUFFERED_FRAMES - 1);
+	const markers = ws.sent.filter((f) => typeof f === 'string' && f.includes('"truncated"'));
+	assert.equal(markers.length, 1, 'signalled once, up front');
 });
 
 test('a counter frame is never deduped against an explicit floor (no mixed-space gap)', () => {
