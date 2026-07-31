@@ -309,6 +309,31 @@ test('detachWireStates disposes each live state once and skips poison sentinels'
 	assert.equal(track2.detached, 1);
 });
 
+test('a dropped announce retires the id so a second codec re-announces', () => {
+	// The id table is per-topic, shared across codecs, but poison is
+	// per-capability. Codec A's announce drops (poison A -> JSON); codec B on
+	// the SAME topic must then re-announce a FRESH id rather than reuse the
+	// one the client never received.
+	const ws = capable(fakeWs([2])); // first send (A's announce) drops
+	ws.ud[WS_CAPS] = new Set(['A', 'B']);
+	const codecA = { capability: 'A', schemaVersion: 1, encode: () => new Uint8Array([1]) };
+	const codecB = { capability: 'B', schemaVersion: 1, encode: () => new Uint8Array([2]) };
+	platform.sendWire(ws, 'room', 'e', { v: 1 }, codecA);
+	assert.equal(typeof ws.sent[1].payload, 'string', 'A degraded to JSON');
+	// B publishes to the same topic. It must announce (fresh id), not ship a
+	// frame under the id A committed and never announced.
+	ws.sent.length = 0;
+	platform.sendWire(ws, 'room', 'e', { v: 2 }, codecB);
+	const announce = ws.sent.find((s) => typeof s.payload === 'string' && s.payload.includes('wire-id'));
+	assert.ok(announce, 'B re-announced the topic id');
+	const reAnnounced = JSON.parse(announce.payload);
+	assert.equal(reAnnounced.topic, 'room');
+	assert.notEqual(reAnnounced.id, 1, 'the dropped id 1 is retired, not reused');
+	const frame = parseBinaryFrame(ws.sent.at(-1).payload);
+	assert.ok(frame, 'B shipped a binary frame');
+	assert.equal(frame.topicId, reAnnounced.id, 'the frame carries the freshly announced id');
+});
+
 test('ensureWireId allocates per connection and re-announces nothing', () => {
 	const ws = capable(fakeWs());
 	assert.equal(ensureWireId(ws, ws.ud, 'a'), 1);

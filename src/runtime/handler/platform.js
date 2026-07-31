@@ -66,8 +66,7 @@ import {
 	beginPendingSubscribe,
 	capCounts,
 	captureResumeFrame,
-	maxSeenSeq,
-	recordSeen,
+	noteMaxSeen,
 	resumeBuffers,
 	sharedTopics,
 	getServer,
@@ -112,9 +111,9 @@ function wireJsonSend(ws, topic, event, data, compress) {
 
 /**
  * Track the highest observed seq for a topic (the resume barrier's fallback
- * dedup floor). An explicit numeric seq is cluster-authoritative and may
- * arrive reordered, so it takes the monotone-max guard; the in-memory counter
- * is monotonic by construction and bare-sets.
+ * dedup floor), LRU-bounded in noteMaxSeen. An explicit numeric seq is
+ * cluster-authoritative and may arrive reordered, so it takes the monotone-max
+ * guard there; the in-memory counter is monotonic by construction.
  *
  * @param {string} topic
  * @param {number | null} seq
@@ -122,8 +121,7 @@ function wireJsonSend(ws, topic, event, data, compress) {
  */
 function recordMaxSeen(topic, seq, options) {
 	if (seq === null) return;
-	if (options && typeof options.seq === 'number') recordSeen(maxSeenSeq, topic, seq);
-	else maxSeenSeq.set(topic, seq);
+	noteMaxSeen(topic, seq, !!(options && typeof options.seq === 'number'));
 }
 
 /**

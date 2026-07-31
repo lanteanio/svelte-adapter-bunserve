@@ -279,3 +279,17 @@ test('publish records the max seen seq; explicit seqs take the monotone guard', 
 	topicSeqs.clear();
 	maxSeenSeq.clear();
 });
+
+test('maxSeenSeq is LRU-bounded so unique-topic publishes do not leak', () => {
+	setServer({ publish: () => 0, subscriberCount: () => 0 });
+	// Far more distinct topics than the cap. A leak would keep every one.
+	for (let i = 0; i < 10_050; i++) {
+		platform.publish('room:' + i, 'e', i, { seq: true });
+	}
+	assert.ok(maxSeenSeq.size <= 10_000, `bounded, saw ${maxSeenSeq.size}`);
+	// The most recent topics survive; the oldest were evicted.
+	assert.ok(maxSeenSeq.has('room:10049'), 'the newest topic is retained');
+	assert.ok(!maxSeenSeq.has('room:0'), 'the oldest topic was evicted');
+	topicSeqs.clear();
+	maxSeenSeq.clear();
+});

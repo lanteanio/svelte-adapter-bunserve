@@ -257,6 +257,27 @@ export function allocWireId(ud, slotKey, topic) {
 }
 
 /**
+ * Retire a topic's binary id after its announce failed to reach the client.
+ *
+ * The id table is per-TOPIC and shared across every codec on the connection,
+ * but a dropped announce only poisons the ONE capability that hit it. Without
+ * this, `allocWireId` keeps returning the committed id as `isNew: false`, so a
+ * DIFFERENT codec publishing to the same topic reuses an id the client was
+ * never told about and its frames become permanently undecodable. Deleting the
+ * name mapping forces the next `ensureWireId` to allocate a FRESH id and
+ * re-announce; `next` is left advanced so the dropped id is never reused, and a
+ * client that saw a partial announce can never have it re-point.
+ *
+ * @param {any} ud - the connection's userData
+ * @param {symbol} slotKey - the WS_TOPIC_IDS symbol
+ * @param {string} topic
+ */
+export function retireWireId(ud, slotKey, topic) {
+	const slot = ud[slotKey];
+	if (slot) slot.byName.delete(topic);
+}
+
+/**
  * Build the `{type:'wire-id'}` control frame announcing which numeric topic-id
  * maps to which topic name, so an inbound `0x03` frame resolves to a topic.
  * @param {string} topic

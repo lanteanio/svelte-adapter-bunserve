@@ -10,7 +10,7 @@
  * why those two must not be conflated.
  */
 
-import { allocWireId, wireIdAnnounce } from '../utils/wire.js';
+import { allocWireId, retireWireId, wireIdAnnounce } from '../utils/wire.js';
 import { SEND_DROPPED } from '../utils/send-result.js';
 import { WS_TOPIC_IDS, WS_WIRE_STATE, wsCounters } from './ws-state.js';
 import { bumpOut } from './ws-stats.js';
@@ -49,7 +49,13 @@ export function ensureWireId(ws, ud, topic) {
 			wsCounters.closedWsAborts++;
 			return id;
 		}
-		if (result === SEND_DROPPED) return -1;
+		if (result === SEND_DROPPED) {
+			// The client never learned this id. Retire it so the next attempt
+			// - from ANY codec on this shared-per-topic id table - re-announces
+			// a fresh one rather than shipping a frame under an id nobody has.
+			retireWireId(ud, WS_TOPIC_IDS, topic);
+			return -1;
+		}
 		bumpOut(ws, announce);
 	}
 	return id;

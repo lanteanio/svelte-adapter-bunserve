@@ -102,26 +102,39 @@ export const sharedTopics = new Map();
 /**
  * The highest sequence number observed per topic, updated at every publish
  * site. The resume barrier reads it when a buffer opens, as the conservative
- * dedup floor for a resume hook that does not report the watermark it
- * covered.
+ * dedup floor for a resume hook that does not report the watermark it covered.
+ *
+ * LRU-bounded exactly like `topicSeqs`, and for the same reason: an app that
+ * publishes `{ seq: true }` to client-named topics (`room:<uuid>`) would
+ * otherwise grow one entry per topic ever published, for the life of the
+ * process. An evicted topic loses its floor and falls back to 0, which at
+ * worst re-delivers a small already-covered window on a resume - the same
+ * tolerance a non-reporting resume hook already carries, never a gap.
  * @type {Map<string, number>}
  */
 export const maxSeenSeq = new Map();
 
 /**
- * Fold one observed seq into a seen-map, keeping the maximum. Used for
- * explicit numeric (cluster-authoritative) seqs, which may arrive reordered -
- * the counter path can bare-set instead because it is monotonic by
- * construction.
+ * Note one observed seq as a topic's max-seen, LRU-bounded. An `authoritative`
+ * (explicit numeric, cluster-stamped) seq may arrive reordered, so it takes
+ * the monotone-max guard; the in-memory counter is monotonic by construction
+ * and simply refreshes recency. Re-inserting on every note keeps iteration
+ * order least-recently-noted first, which makes the eviction a true LRU.
  *
- * @param {Map<string, number>} seenMap
  * @param {string} topic
  * @param {number} seq
+ * @param {boolean} authoritative - true for an explicit numeric `seq`
  */
-export function recordSeen(seenMap, topic, seq) {
+export function noteMaxSeen(topic, seq, authoritative) {
 	if (typeof seq !== 'number') return;
-	const prev = seenMap.get(topic);
-	if (prev === undefined || seq > prev) seenMap.set(topic, seq);
+	const prev = maxSeenSeq.get(topic);
+	const next = authoritative && prev !== undefined && prev > seq ? prev : seq;
+	if (prev !== undefined) maxSeenSeq.delete(topic);
+	maxSeenSeq.set(topic, next);
+	if (maxSeenSeq.size > MAX_SEQ_TOPICS) {
+		const oldest = maxSeenSeq.keys().next().value;
+		if (oldest !== undefined) maxSeenSeq.delete(oldest);
+	}
 }
 
 /**
@@ -266,9 +279,9 @@ export const wsCounters = {
 	droppedReleaseRecords: 0,
 
 	/**
-	 * Topic publishes since boot. Monotonic, NOT windowed - it was called
-	 * `publishCountWindow` while nothing sampled or reset it, which described a
-	 * behaviour that did not exist. Exposed as `platform.publishCount`.
+	 * Topic publishes since boot. Monotonic and never reset, so the name says
+	 * exactly that rather than implying a sampling window. Exposed as
+	 * `platform.publishCount`.
 	 */
 	publishCount: 0,
 
