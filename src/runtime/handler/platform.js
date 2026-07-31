@@ -436,8 +436,8 @@ export const platform = {
 		const doClose = !options || options.close !== false;
 		// A window is what makes an ADVISORY possible; with none there is nothing
 		// to tell the client. But a caller that EXPLICITLY asked to close still
-		// gets the close: this used to return before the loop, so
-		// `adviseReconnect({ close: true })` was a silent no-op - zero advised,
+		// gets the close: returning early here would make
+		// `adviseReconnect({ close: true })` a silent no-op - zero advised,
 		// zero closed, no warning. A bare `adviseReconnect()` still returns 0
 		// without closing anything, because close-defaults-true must not turn an
 		// argument-less call into a mass disconnect.

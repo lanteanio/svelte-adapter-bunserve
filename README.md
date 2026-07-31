@@ -44,8 +44,9 @@ Prototype phase. The build order:
    Bun server API behavior the adapter design relies on - send-result
    semantics, backpressure signals, closed-socket behavior, upgrade flow,
    drain semantics - against a pinned Bun version, and writes a committed
-   facts report. No adapter code is written from documentation memory.
-2. **HTTP half** (done, this is where the repo is now): a built SvelteKit app
+   facts report. The adapter is built against what Bun was measured to do,
+   not against what its documentation says.
+2. **HTTP half** (done): a built SvelteKit app
    serves under `bun build/index.js`. SSR goes straight through
    `server.respond()` (real web Request in, Response out, Bun's own
    backpressure on streams); static assets come from an in-memory
@@ -55,7 +56,7 @@ Prototype phase. The build order:
    response is compressed whole whenever its body completes without waiting,
    so a streaming render reaches the client as it is produced; `/healthz` +
    `/readyz` and graceful drain round it out.
-   Known-open on this slice: the graceful-drain signal path is UNVERIFIED
+   Known-open on the HTTP half: the graceful-drain signal path is UNVERIFIED
    (Windows delivers no real SIGTERM to exercise it; the Linux CI slice will);
    the TLS surface remains unprobed (needs real certificates); a request body
    sent without a Content-Length is capped by Bun rather than by the adapter's
@@ -71,7 +72,7 @@ Prototype phase. The build order:
    wrong one, matching svelte-adapter-uws).
 3. **JSON realtime** (done): the upgrade path, the per-connection platform, and
    topic pub/sub over real WebSockets. See [WebSockets](#websockets) below.
-   Known-open on this slice: the binary wire protocol (`0x03` frames, codecs,
+   Known-open on the realtime tier: the binary wire protocol (`0x03` frames, codecs,
    cohort split, resume/seq buffers) and the pressure/protection surface are
    not implemented - those members are ABSENT from the platform rather than
    stubbed, so nothing reports success while doing nothing. `platform.request`
@@ -89,7 +90,7 @@ Single-process at launch; a multi-process mode is planned.
 `bus.wrap(platform)` binds four members this adapter does not implement yet
 (`sendCoalesced`, `request`, `onPressure`, `onPublishRate`) without
 feature-detecting them, so it throws a `TypeError` at startup against this
-adapter. It needs either those members (slices 4 and 5 above) or the same
+adapter. It needs either those members (steps 4 and 5 above) or the same
 guards it already applies to its other optional members. Until one of those
 lands, treat this adapter as single-node.
 
@@ -166,7 +167,7 @@ returned object is frequently built by spreading parsed client input
 (`return { ...JSON.parse(atob(jwt)), user }`), and an in-band `headers` key on
 that object is therefore attacker-settable - a crafted token claim could put an
 arbitrary `Set-Cookie` on the 101 response. The context channel cannot be named
-by client data. A returned `headers` key is now ordinary userData, and the
+by client data. A returned `headers` key is ordinary userData, and the
 adapter warns once if it sees one.
 
 **`subscribe` is called with the per-connection `platform`**, the same one every
@@ -271,8 +272,8 @@ are different jobs rather than different sizes of the same one:
 
 - `maxSubscriptionsPerConnection` bounds what can INSTALL. It counts installed
   plus DISTINCT pending topics, because N concurrent subscribes to one topic can
-  only ever install one subscription - counting them N times denied requests
-  that were not over any real limit.
+  only ever install one subscription - counting them N times would deny requests
+  that are not over any real limit.
 - `maxConcurrentSubscribeGates` bounds concurrent APP WORK in the SUBSCRIBE
   gate: the `subscribe` / `subscribeBatch` hook, counted for as long as each
   call is suspended. That is where an app does its database round-trip, and
@@ -393,8 +394,8 @@ inbound frame against 4.1-4.8 ns for the prefix compare
 `subscribe-batch` carries at most 256 entries. A batch over that is refused
 WHOLE, with one `BATCH_TOO_LARGE` frame and nothing applied, rather than being
 partly applied and answered per dropped entry: the reply must not scale with the
-inbound frame. An 8 KB frame holds four thousand two-byte entries, and answering
-each one cost ~200 bytes, so the old shape turned one frame into 800 KB. Every
+inbound frame. An 8 KB frame holds four thousand two-byte entries, and at ~200
+bytes per answer a per-entry reply would turn one frame into 800 KB. Every
 client in the family chunks at 200 topics and 8000 bytes to stay under this, so
 none of them can reach the refusal.
 
@@ -452,8 +453,7 @@ under Node, not Bun. It also covers the WebSocket demux and the authorization
 gate, which reach the app through a specifier the build injects: a loader hook
 (`test/helpers/ws-handler-loader.mjs`) resolves that specifier to a stub, so
 `handler/ws.js` and `handler/platform.js` can be driven without a build. Put
-frame-shape and hook-contract assertions there - it is the fast lane, and for a
-long time nothing in it could reach either module:
+frame-shape and hook-contract assertions there - it is the fast lane:
 
 ```sh
 npm test   # requires Node 22+ for the test-runner glob

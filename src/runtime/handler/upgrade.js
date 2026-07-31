@@ -339,8 +339,8 @@ async function runUpgrade(req, srv) {
 				if (key === '__proto__') continue;
 				data[key] = source[key];
 			}
-			// A returned `headers` key is now ordinary userData. That is a silent
-			// behaviour change for a hook written against the old shape, so say
+			// A returned `headers` key is ordinary userData. That silently ignores
+			// the handshake intent of a hook that returns one, so say
 			// so once rather than dropping its cookie on the floor unexplained.
 			if (Object.prototype.hasOwnProperty.call(source, 'headers')) {
 				warnReturnedHeaders();
