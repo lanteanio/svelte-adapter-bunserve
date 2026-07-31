@@ -69,6 +69,7 @@ import {
 	isConsumedControlType,
 	looksLikeControlFrame
 } from '../utils/control-frame.js';
+import { detachWireStates } from './wire-state.js';
 import {
 	WS_CAPS,
 	WS_PENDING_SUBSCRIBES,
@@ -849,6 +850,9 @@ export const websocketHandlers = {
 			// forever after the last capable client left.
 			capCounts.adjust(userData[WS_CAPS], null);
 			userData[WS_CAPS] = undefined;
+			// Dispose per-connection wire-codec state (dictionaries, delta
+			// baselines) exactly once, via each codec's own onDetach.
+			detachWireStates(ws, userData);
 			userData[WS_PENDING_SUBSCRIBES] = undefined;
 			// Drop unsubscribe hooks still WAITING. Their topics went into the
 			// snapshot above, so the close hook performs their teardown, and

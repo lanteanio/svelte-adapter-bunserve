@@ -42,8 +42,17 @@ import {
 import { envelopePrefix } from './envelope-cache.js';
 import { bumpOut } from './ws-stats.js';
 import { wsModule } from '../ws-handler-bridge.js';
+import { buildBinaryFrame } from '../utils/wire.js';
+import { registerWireCodec as _registerWireCodec } from './codec-registry.js';
+import {
+	ensureWireId,
+	ensureWireState,
+	poisonWireState,
+	wireStatePoisoned
+} from './wire-state.js';
 import {
 	MAX_SUBSCRIPTIONS_PER_CONNECTION,
+	WS_CAPS,
 	WS_PLATFORM,
 	WS_SUBSCRIPTIONS,
 	beginPendingSubscribe,
@@ -61,6 +70,31 @@ import { allow_unauthenticated_subscribe, ws_compression_on, ws_options } from '
 
 /** Throws from the app's subscribe hook, throttled with decay. */
 const subscribeThrewThrottle = createLogThrottle(() => performance.now());
+
+/**
+ * The seq-less JSON envelope a wire member falls back to for a caps-less,
+ * poisoned, or codec-declined frame: exactly the shape `send()` produces,
+ * built with the same guarded stringify the family fallback uses.
+ *
+ * @param {any} ws - the socket facade
+ * @param {string} topic
+ * @param {string} event
+ * @param {unknown} data
+ * @param {boolean} compress
+ * @returns {0 | 1 | 2}
+ */
+function wireJsonSend(ws, topic, event, data, compress) {
+	const json = envelopePrefix(topic, event) + JSON.stringify(data ?? null) + '}';
+	let result;
+	try {
+		result = ws.send(json, false, compress);
+	} catch {
+		wsCounters.closedWsAborts++;
+		return SEND_DROPPED;
+	}
+	if (result !== SEND_DROPPED) bumpOut(ws, json);
+	return result;
+}
 
 /**
  * One reading of whatever a subscribe gate returned, shared by the per-topic
@@ -405,6 +439,196 @@ export const platform = {
 			count++;
 		}
 		return count;
+	},
+
+	/**
+	 * Register a plugin's binary wire codec by its capability token.
+	 * Idempotent and last-wins, so a hot-reloading plugin does not accumulate
+	 * entries.
+	 *
+	 * @param {{ capability: string }} wire
+	 */
+	registerWireCodec(wire) {
+		_registerWireCodec(wire);
+	},
+
+	/**
+	 * Single-target send via a plugin-declared binary wire codec. The target
+	 * receives a `0x03` frame when it advertised `wire.capability` and the
+	 * codec can encode this frame; otherwise it receives the JSON envelope
+	 * `send()` would have sent. No seq is stamped (matches `send()`); the
+	 * binary frame carries seq 0 ("no seq"). Used for snapshot/catalog frames.
+	 *
+	 * @param {any} ws
+	 * @param {string} topic
+	 * @param {string} event
+	 * @param {any} data
+	 * @param {{ capability: string, schemaVersion: number, encode: Function, state?: any }} wire
+	 * @param {{ compress?: boolean }} [options] - `{ compress: true }` opts this
+	 *   low-frequency binary frame into permessage-deflate when a compressor is
+	 *   configured (binary frames are uncompressed by default).
+	 * @returns {0 | 1 | 2} the send tri-state, or 2 on a closed socket
+	 */
+	sendWire(ws, topic, event, data, wire, options) {
+		let ud;
+		try {
+			ud = ws.getUserData();
+		} catch {
+			wsCounters.closedWsAborts++;
+			return SEND_DROPPED;
+		}
+		const caps = ud[WS_CAPS];
+		// Binary codec frames compress only when the caller opts in with
+		// `{ compress: true }` AND a compressor is configured: the
+		// high-frequency paths this exists for are exactly the ones per-frame
+		// deflate would tax.
+		const compress = ws_compression_on && !!(options && options.compress === true);
+		let payload = null;
+		let schemaVersion = wire.schemaVersion;
+		// A poisoned capability is served exactly like a caps-less connection:
+		// the JSON envelope, never binary (see handler/wire-state.js).
+		if (caps && caps.has(wire.capability) && !wireStatePoisoned(ud, wire.capability)) {
+			if (wire.state) {
+				// Share the connection's codec state with publishWire so a
+				// snapshot CATALOG interns ids the following BULK (and every
+				// later broadcast) references against the same dictionary.
+				const state = ensureWireState(ws, ud, wire);
+				payload = wire.encode(event, data, state);
+				if (state != null && typeof state.schemaVersion === 'number') {
+					schemaVersion = state.schemaVersion;
+				}
+			} else {
+				payload = wire.encode(event, data);
+			}
+		}
+		if (payload == null) {
+			return wireJsonSend(ws, topic, event, data, compress);
+		}
+		const id = ensureWireId(ws, ud, topic);
+		if (id === -1) {
+			// Dropped wire-id announce: the client can never resolve this
+			// topic's numeric id, so binary for this capability is permanently
+			// undecodable here. JSON for this frame, and poison so every later
+			// frame takes the JSON path too.
+			poisonWireState(ws, ud, wire.capability);
+			return wireJsonSend(ws, topic, event, data, compress);
+		}
+		const frame = buildBinaryFrame(schemaVersion, id, 0, payload);
+		let result;
+		try {
+			result = ws.send(frame, true, compress);
+		} catch {
+			wsCounters.closedWsAborts++;
+			return SEND_DROPPED;
+		}
+		if (result !== SEND_DROPPED) bumpOut(ws, frame);
+		// A dropped STATEFUL frame poisons: the encode already mutated this
+		// connection's dictionary for a frame the client never saw, and that
+		// desync is unrecoverable in-band. Stateless payloads carry no
+		// per-connection state, so a drop costs only the frame.
+		if (result === SEND_DROPPED && wire.state) poisonWireState(ws, ud, wire.capability);
+		return result;
+	},
+
+	/**
+	 * Multi-entry single-target send via a stateful plugin codec: one tick's
+	 * same-event updates for ONE subscriber as a single binary frame (the
+	 * codec's `<event>-batch` form), or the per-entry JSON envelopes when the
+	 * connection has no capability / is poisoned. The per-subscriber twin of
+	 * publishWireBatch, for culled per-viewer delivery walks. No seq is
+	 * stamped (matches `send()` / `sendWire()`); the binary frame carries
+	 * seq 0.
+	 *
+	 * Degradation mirrors sendWire per entry: a declined batch falls back to
+	 * per-entry encodes, a per-entry null to that entry's JSON envelope, and a
+	 * dropped stateful frame poisons the capability to JSON until reconnect.
+	 *
+	 * @param {any} ws
+	 * @param {string} topic
+	 * @param {string} event - the PER-ENTRY event name
+	 * @param {Array<{ data: any }>} entries
+	 * @param {{ capability: string, schemaVersion: number, encode: Function, state?: any }} wire
+	 * @param {{ compress?: boolean }} [options]
+	 * @returns {0 | 1 | 2} the tri-state of the LAST frame sent, 1 for an
+	 *   empty entries array, or 2 on a closed socket
+	 */
+	sendWireBatch(ws, topic, event, entries, wire, options) {
+		if (!Array.isArray(entries) || entries.length === 0) return 1;
+		let ud;
+		try {
+			ud = ws.getUserData();
+		} catch {
+			wsCounters.closedWsAborts++;
+			return SEND_DROPPED;
+		}
+		const caps = ud[WS_CAPS];
+		const compress = ws_compression_on && !!(options && options.compress === true);
+		const sendJsonFrom = (i) => {
+			let result = 1;
+			for (; i < entries.length; i++) {
+				result = wireJsonSend(ws, topic, event, entries[i].data, compress);
+				if (result === SEND_DROPPED && ws._closed) return SEND_DROPPED;
+			}
+			return result;
+		};
+		if (!caps || !caps.has(wire.capability) || wireStatePoisoned(ud, wire.capability) || !wire.state) {
+			return sendJsonFrom(0);
+		}
+		const state = ensureWireState(ws, ud, wire);
+		if (state == null) return sendJsonFrom(0);
+		const updates = new Array(entries.length);
+		for (let i = 0; i < entries.length; i++) updates[i] = entries[i].data;
+		const schemaVersion =
+			typeof state.schemaVersion === 'number' ? state.schemaVersion : wire.schemaVersion;
+		const payload = wire.encode(event + '-batch', { updates }, state);
+		if (payload == null) {
+			// The codec declined the batch (older codec, unrepresentable
+			// entry): the N sendWire bodies this call replaces.
+			let result = 1;
+			for (let i = 0; i < entries.length; i++) {
+				const p = wire.encode(event, entries[i].data, state);
+				if (p == null) {
+					result = wireJsonSend(ws, topic, event, entries[i].data, compress);
+					continue;
+				}
+				const id = ensureWireId(ws, ud, topic);
+				if (id === -1) {
+					poisonWireState(ws, ud, wire.capability);
+					return sendJsonFrom(i);
+				}
+				const frame = buildBinaryFrame(schemaVersion, id, 0, p);
+				try {
+					result = ws.send(frame, true, compress);
+				} catch {
+					wsCounters.closedWsAborts++;
+					return SEND_DROPPED;
+				}
+				if (result !== SEND_DROPPED) bumpOut(ws, frame);
+				if (result === SEND_DROPPED) {
+					poisonWireState(ws, ud, wire.capability);
+					return sendJsonFrom(i + 1);
+				}
+			}
+			return result;
+		}
+		const id = ensureWireId(ws, ud, topic);
+		if (id === -1) {
+			// Dropped wire-id announce; the batch encode already advanced this
+			// connection's dictionaries - the desync the poisoning exists for.
+			poisonWireState(ws, ud, wire.capability);
+			return sendJsonFrom(0);
+		}
+		const frame = buildBinaryFrame(schemaVersion, id, 0, payload);
+		let result;
+		try {
+			result = ws.send(frame, true, compress);
+		} catch {
+			wsCounters.closedWsAborts++;
+			return SEND_DROPPED;
+		}
+		if (result !== SEND_DROPPED) bumpOut(ws, frame);
+		if (result === SEND_DROPPED) poisonWireState(ws, ud, wire.capability);
+		return result;
 	},
 
 	/**

@@ -71,6 +71,26 @@ export const WS_CAPS = Symbol('caps');
 export const capCounts = createCapCounts();
 
 /**
+ * Per-connection binary topic-id slot (`{ byName, next }`), managed by
+ * utils/wire.js allocWireId. Reset with the connection: a reconnect is a new
+ * connection with a fresh id space and fresh announces.
+ */
+export const WS_TOPIC_IDS = Symbol('topicIds');
+
+/**
+ * Per-connection stateful wire-codec entries, keyed by capability:
+ * `{ state, detach }`, or the poisoned sentinel `{ state: null, poisoned }`.
+ * See handler/wire-state.js for the lifecycle.
+ */
+export const WS_WIRE_STATE = Symbol('wireState');
+
+/**
+ * Topics whose SHARED binary cohort this connection joined, so close releases
+ * exactly the shared wire-id refs it acquired and no others.
+ */
+export const WS_SHARED_COHORTS = Symbol('sharedCohorts');
+
+/**
  * The upgrade-time request id travels as a STRING key, not a Symbol: it is set
  * on the object handed to `server.upgrade(req, { data })` before any socket
  * exists, and is promoted to a per-connection platform clone in `open()` and
