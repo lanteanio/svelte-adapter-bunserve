@@ -332,3 +332,34 @@ test('an empty batch publishes nothing and reports false', () => {
 	assert.equal(platform.publishWireBatch('room', 'moved', [], statelessCodec()), false);
 	assert.equal(server.published.length, 0);
 });
+
+test('publishWire reports false when the walk reaches no recipient', () => {
+	setServer(fakeServer());
+	// A capable connection exists (so the walk runs) but subscribes elsewhere,
+	// so this topic has zero recipients - the return must say so, like publish.
+	const capableElsewhere = fakeWs({ topics: ['other'], caps: [CAP] });
+	withConnections([capableElsewhere], () => {
+		const ok = platform.publishWire('room', 'moved', { x: 1 }, statelessCodec());
+		assert.equal(ok, false, 'no subscriber on the topic -> false');
+	});
+});
+
+test('publishWire reports true when a subscriber actually receives it', () => {
+	setServer(fakeServer());
+	const capable = fakeWs({ topics: ['room'], caps: [CAP] });
+	withConnections([capable], () => {
+		assert.equal(platform.publishWire('room', 'moved', { x: 1 }, statelessCodec()), true);
+	});
+});
+
+test('a nullish wire falls back to a plain publish rather than crashing', () => {
+	const server = fakeServer();
+	setServer(server);
+	const jsonOnly = fakeWs({ topics: ['room'] });
+	withConnections([jsonOnly], () => {
+		assert.doesNotThrow(() => platform.publishWire('room', 'moved', { x: 1 }, null));
+		assert.doesNotThrow(() => platform.publishWireBatch('room', 'moved', [{ data: { x: 1 } }], null));
+		assert.ok(server.published.length >= 1, 'the plain publish still fanned out');
+		assert.equal(JSON.parse(server.published[0].payload).topic, 'room');
+	});
+});

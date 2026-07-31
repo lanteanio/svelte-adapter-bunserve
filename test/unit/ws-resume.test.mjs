@@ -83,10 +83,12 @@ test('the barrier holds frames across the window and flushes above the floor', (
 	maxSeenSeq.set('room', 5);
 	const cap = beginResumeCapture(['room'], fakeWs);
 	assert.equal(resumeBuffers.size, 1);
-	captureResumeFrame('room', 5, 'ENV5', false);
-	captureResumeFrame('room', 6, 'ENV6', false);
-	captureResumeFrame('room', 7, 'ENV7', false);
-	captureResumeFrame('other', 1, 'OTHER', false);
+	// Authoritative (explicit-seq) frames: they share the floor's seq space,
+	// so the floor dedups them. A counter frame would never be deduped.
+	captureResumeFrame('room', 5, 'ENV5', false, null, true);
+	captureResumeFrame('room', 6, 'ENV6', false, null, true);
+	captureResumeFrame('room', 7, 'ENV7', false, null, true);
+	captureResumeFrame('other', 1, 'OTHER', false, null, true);
 	// No coveredSeq reported: the pre-window max (5) is the floor.
 	flushResumeTopic(cap, 'room', undefined);
 	assert.deepEqual(fakeWs.sent, ['ENV6', 'ENV7'], 'only frames past the floor, in order');
@@ -97,8 +99,8 @@ test('the barrier holds frames across the window and flushes above the floor', (
 test('a reported watermark overrides the fallback floor', () => {
 	const fakeWs = { sent: [], send(p) { this.sent.push(p); return p.length; } };
 	const cap = beginResumeCapture(['room'], fakeWs);
-	captureResumeFrame('room', 1, 'ENV1', false);
-	captureResumeFrame('room', 2, 'ENV2', false);
+	captureResumeFrame('room', 1, 'ENV1', false, null, true);
+	captureResumeFrame('room', 2, 'ENV2', false, null, true);
 	flushResumeTopic(cap, 'room', coveredSeqFor({ room: 1 }, 'room'));
 	assert.deepEqual(fakeWs.sent, ['ENV2']);
 });
@@ -122,12 +124,36 @@ test('an overflowed window signals truncation FIRST, then best-effort frames', (
 	const fakeWs = { sent: [], send(p) { this.sent.push(p); return p.length; } };
 	const cap = beginResumeCapture(['room'], fakeWs);
 	for (let i = 1; i <= MAX_RESUME_BUFFERED_FRAMES + 10; i++) {
-		captureResumeFrame('room', i, 'E' + i, false);
+		captureResumeFrame('room', i, 'E' + i, false, null, true);
 	}
 	flushResumeTopic(cap, 'room', MAX_RESUME_BUFFERED_FRAMES - 1);
 	assert.ok(fakeWs.sent[0].includes('"__replay:room"'), 'truncation marker first');
 	assert.ok(fakeWs.sent[0].includes('"truncated"'));
 	assert.equal(fakeWs.sent[1], 'E' + MAX_RESUME_BUFFERED_FRAMES, 'then the surviving tail');
+});
+
+test('a counter frame is never deduped against an explicit floor (no mixed-space gap)', () => {
+	// A topic stamped explicit seq 1000 then a {seq:true} counter frame (seq 1)
+	// during the window: the counter frame lives in a different seq space and
+	// must NOT be dropped by the explicit floor.
+	const fakeWs = { sent: [], send(p) { this.sent.push(p); return p.length; } };
+	const cap = beginResumeCapture(['room'], fakeWs);
+	captureResumeFrame('room', 1, 'COUNTER1', false, null, false);
+	captureResumeFrame('room', 1000, 'EXPLICIT1000', false, null, true);
+	flushResumeTopic(cap, 'room', 1000);
+	assert.deepEqual(fakeWs.sent, ['COUNTER1'], 'the counter frame flushes, the explicit one is covered');
+});
+
+test('a publish that excludes the resuming socket does not flush to it', () => {
+	setServer({ publish: () => 0, subscriberCount: () => 0 });
+	const fakeWs = { sent: [], send(p) { this.sent.push(p); return p.length; }, getUserData: () => ({}) };
+	const cap = beginResumeCapture(['room'], fakeWs);
+	// A publish excluding exactly this connection must skip its buffer.
+	captureResumeFrame('room', 1, 'ENV1', false, fakeWs, false);
+	captureResumeFrame('room', 2, 'ENV2', false, null, false);
+	flushResumeTopic(cap, 'room', undefined);
+	assert.deepEqual(fakeWs.sent, ['ENV2'], 'the excluded frame never reached the resuming socket');
+	maxSeenSeq.clear();
 });
 
 test('coveredSeqFor tolerates every hook-return shape', () => {
@@ -234,6 +260,41 @@ test('a hookless resume still acks so the client can go live', async () => {
 	const raw = openSocket({});
 	await send(raw, { type: 'resume', sessionId: 's', lastSeenSeqs: { room: 1 } });
 	assert.ok(raw.sent.some((f) => f === '{"type":"resumed"}'));
+	cleanup(raw);
+});
+
+test('the resume frame forwards only finite numeric watermarks to the hook', async () => {
+	let ctx = null;
+	const raw = openSocket({ resume: (ws, c) => { ctx = c; } });
+	await send(raw, {
+		type: 'resume',
+		sessionId: 's',
+		lastSeenSeqs: { good: 5, bad: 'x', huge: 1e999, obj: { n: 1 } }
+	});
+	assert.deepEqual({ ...ctx.lastSeenSeqs }, { good: 5 }, 'non-finite and non-numeric values dropped');
+	cleanup(raw);
+});
+
+test('pipelined resume frames are bounded by the gate counter', async () => {
+	let inFlight = 0;
+	let peak = 0;
+	const raw = openSocket({
+		resume: async () => {
+			inFlight++;
+			if (inFlight > peak) peak = inFlight;
+			await tick();
+			inFlight--;
+		}
+	});
+	const sends = [];
+	for (let i = 0; i < 80; i++) {
+		sends.push(send(raw, { type: 'resume', sessionId: 's' + i, lastSeenSeqs: { room: i } }));
+	}
+	await Promise.all(sends);
+	assert.ok(peak <= 64, `concurrent resume hooks bounded, saw ${peak}`);
+	// Every frame still acked, even the ones that skipped the hook under load.
+	const acks = raw.sent.filter((f) => f === '{"type":"resumed"}');
+	assert.equal(acks.length, 80, 'every resume frame acked so no client is left hanging');
 	cleanup(raw);
 });
 

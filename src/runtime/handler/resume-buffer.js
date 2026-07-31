@@ -36,7 +36,9 @@ export function beginResumeCapture(topics, ws) {
 	/** @type {ResumeCaptureEntry[]} */
 	const entries = [];
 	for (const topic of topics) {
-		const buffer = { frames: [], overflow: false };
+		// The buffer carries its owning socket so captureResumeFrame can skip
+		// it for a publish that excluded exactly this connection.
+		const buffer = { ws, frames: [], overflow: false };
 		let set = resumeBuffers.get(topic);
 		if (set === undefined) {
 			set = new Set();
@@ -111,7 +113,11 @@ export function flushResumeTopic(handle, topic, coveredSeq) {
 	}
 	const floor = typeof coveredSeq === 'number' ? coveredSeq : entry.before;
 	for (const f of entry.buffer.frames) {
-		if (f.seq !== null && f.seq <= floor) continue; // covered by the resume
+		// Dedup ONLY explicit-seq frames against the floor: they share the
+		// floor's seq space. A counter-stamped live frame is always newer than
+		// the window, so comparing it to an explicit floor could only ever
+		// drop it wrongly - it always flushes.
+		if (f.authoritative && f.seq !== null && f.seq <= floor) continue;
 		const compress = ws_compression_on && f.compress;
 		try {
 			ws.send(f.envelope, false, compress);

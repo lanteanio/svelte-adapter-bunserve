@@ -547,29 +547,44 @@ export const websocketHandlers = {
 					// app's hook, so a topic the wire would refuse must not reach
 					// it. Filtered rather than refused whole - a resume names many
 					// topics at once and a client legitimately holds most of them.
-					/** @type {Record<string, unknown>} */
+					/** @type {Record<string, number>} */
 					const resumeSeqs = Object.create(null);
 					for (const t of Object.keys(msg.lastSeenSeqs)) {
 						if (!isValidWireTopic(t, true)) continue;
 						if (!allow_system_topic_subscribe && isSystemTopic(t)) continue;
-						resumeSeqs[t] = msg.lastSeenSeqs[t];
+						// Only a finite numeric watermark reaches the hook: the
+						// value is client input, and the hook queries a backend
+						// with it, so a crafted shape must never pass through
+						// unchecked (the recover lane validates its offset for the
+						// same reason).
+						const v = msg.lastSeenSeqs[t];
+						if (typeof v === 'number' && Number.isFinite(v)) resumeSeqs[t] = v;
 					}
 					const lastSeenEpochs =
 						msg.lastSeenEpochs && typeof msg.lastSeenEpochs === 'object' && !Array.isArray(msg.lastSeenEpochs)
 							? msg.lastSeenEpochs
 							: undefined;
-					if (typeof wsModule.resume === 'function') {
+					// The resume hook is the most expensive app work a client
+					// frame can trigger (a backend history read), and Bun does
+					// not await the message handler, so a client can pipeline
+					// resume frames to open one concurrent read per frame. Bound
+					// it by the same per-connection gate counter the subscribe
+					// gates use; over the bound the frame still ACKs so the client
+					// goes live, it just does not gap-fill this round.
+					if (typeof wsModule.resume === 'function' && hasGateHeadroom(ws)) {
 						try {
 							// Awaited so per-topic replay flushes its frames before
 							// the ack tells the client to switch to live mode -
 							// otherwise live publishes can arrive ahead of gap-fill
 							// frames and produce out-of-order events.
-							await wsModule.resume(ws, {
-								sessionId: msg.sessionId,
-								lastSeenSeqs: resumeSeqs,
-								lastSeenEpochs,
-								platform: resumeUd[WS_PLATFORM]
-							});
+							await withGateCounted(ws, () =>
+								wsModule.resume(ws, {
+									sessionId: msg.sessionId,
+									lastSeenSeqs: resumeSeqs,
+									lastSeenEpochs,
+									platform: resumeUd[WS_PLATFORM]
+								})
+							);
 						} catch (err) {
 							console.error('[ws] resume hook threw:', err);
 						}

@@ -142,7 +142,7 @@ export function noteMaxSeen(topic, seq, authoritative) {
  * of buffers capturing it. Read by every fan-out site behind a single
  * `.size > 0` guard, so a deployment that never resumes pays one integer
  * compare per publish.
- * @type {Map<string, Set<{ frames: { seq: number | null, envelope: string, compress: boolean }[], overflow: boolean }>>}
+ * @type {Map<string, Set<{ ws: any, frames: { seq: number | null, envelope: string, compress: boolean, authoritative: boolean }[], overflow: boolean }>>}
  */
 export const resumeBuffers = new Map();
 
@@ -158,20 +158,31 @@ export const MAX_RESUME_BUFFERED_FRAMES = 4096;
  * Append one published frame to every open buffer for its topic. Called from
  * the fan-out sites only when some buffer is open.
  *
+ * `excludeWs` is the one socket a publish suppressed (author echo): a buffer
+ * belonging to that connection must not capture the frame, or the flush would
+ * hand a resuming author the very frame it was excluded from. `authoritative`
+ * marks a frame stamped with an explicit numeric seq; only those are deduped
+ * against the flush floor, because a counter-stamped live frame is always
+ * newer than the resume window and lives in a different seq space than an
+ * explicit floor.
+ *
  * @param {string} topic
  * @param {number | null} seq
  * @param {string} envelope
  * @param {boolean} compress
+ * @param {any} [excludeWs]
+ * @param {boolean} [authoritative]
  */
-export function captureResumeFrame(topic, seq, envelope, compress) {
+export function captureResumeFrame(topic, seq, envelope, compress, excludeWs, authoritative) {
 	const set = resumeBuffers.get(topic);
 	if (set === undefined) return;
 	for (const b of set) {
+		if (excludeWs !== undefined && excludeWs !== null && b.ws === excludeWs) continue;
 		if (b.frames.length >= MAX_RESUME_BUFFERED_FRAMES) {
 			b.overflow = true;
 			continue;
 		}
-		b.frames.push({ seq, envelope, compress });
+		b.frames.push({ seq, envelope, compress, authoritative: authoritative === true });
 	}
 }
 
