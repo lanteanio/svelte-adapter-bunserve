@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A tracked live test lane (`test/live/`, `npm run test:live`) that asserts the
+  WebSocket wire contract end to end against the built fixture: the subscribe,
+  batch, and unsubscribe frames, the subscription cap under pipelined frames,
+  Origin enforcement on the upgrade, and a no-handler build whose HTTP surface
+  must be untouched. The fixture gained a `NO_WS` build variant
+  (`build-no-ws`) for the last of those.
+
 ### Fixed
 
 - README: the 4 MiB control-egress budget admits 86 worst-shaped batch
