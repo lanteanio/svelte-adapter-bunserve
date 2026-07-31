@@ -743,8 +743,12 @@ export const platform = {
 				const subs = ud[WS_SUBSCRIPTIONS];
 				if (!subs || !subs.has(topic)) continue;
 				try {
-					if (ws.send(envelope, false, compress) !== SEND_DROPPED) bumpOut(ws, envelope);
-					delivered = true;
+					// Inside the guard: a frame refused past the backpressure
+					// limit never went out, so it is not delivery.
+					if (ws.send(envelope, false, compress) !== SEND_DROPPED) {
+						bumpOut(ws, envelope);
+						delivered = true;
+					}
 				} catch {
 					wsCounters.closedWsAborts++;
 				}
@@ -923,6 +927,12 @@ export const platform = {
 			}
 		}
 
+		// Declared BEFORE the helper that closes over it: a `let` read from a
+		// closure invoked above its declaration throws, so a JSON send added
+		// to the fast path below would turn into a ReferenceError rather than
+		// a wrong count.
+		let delivered = false;
+
 		const sendJson = (ws, list) => {
 			for (let i = 0; i < list.length; i++) {
 				try {
@@ -949,7 +959,6 @@ export const platform = {
 			}
 			return anyBytes;
 		}
-		let delivered = false;
 		for (const ws of wsConnections) {
 			let ud;
 			try {
@@ -961,17 +970,25 @@ export const platform = {
 			const subs = ud[WS_SUBSCRIPTIONS];
 			if (!subs || !subs.has(topic)) continue;
 			// The subset this socket receives: entries not excluded for it.
-			// The no-exclusion common case reuses the shared arrays.
+			// The no-exclusion common case reuses the shared arrays. The seq
+			// list is filtered ALONGSIDE them: the declined-batch lane below
+			// stamps per-entry frames from it, and indexing the unfiltered
+			// array with a subset index stamps one entry's payload with
+			// another's seq - the client then records a watermark that never
+			// matches the frame it holds.
 			let list = entries;
 			let envList = envs;
+			let seqList = seqs;
 			let lastSeq = seqs[entries.length - 1];
 			if (anyExclude) {
 				list = [];
 				envList = [];
+				seqList = [];
 				for (let i = 0; i < entries.length; i++) {
 					if (entries[i].excludeWs === ws) continue;
 					list.push(entries[i]);
 					envList.push(envs[i]);
+					seqList.push(seqs[i]);
 					lastSeq = seqs[i];
 				}
 				if (list.length === 0) continue;
@@ -1017,7 +1034,7 @@ export const platform = {
 						sendJson(ws, envList.slice(i));
 						break;
 					}
-					const frame = buildBinaryFrame(sv, id, seqs[i], p);
+					const frame = buildBinaryFrame(sv, id, seqList[i], p);
 					let result;
 					try {
 						result = ws.send(frame, true, compress);

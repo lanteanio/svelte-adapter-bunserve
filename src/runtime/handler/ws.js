@@ -552,18 +552,34 @@ export const websocketHandlers = {
 					for (const t of Object.keys(msg.lastSeenSeqs)) {
 						if (!isValidWireTopic(t, true)) continue;
 						if (!allow_system_topic_subscribe && isSystemTopic(t)) continue;
-						// Only a finite numeric watermark reaches the hook: the
-						// value is client input, and the hook queries a backend
-						// with it, so a crafted shape must never pass through
-						// unchecked (the recover lane validates its offset for the
-						// same reason).
+						// Only a finite, non-negative numeric watermark reaches the
+						// hook: the value is client input, and the hook queries a
+						// backend with it, so a crafted shape must never pass
+						// through unchecked (the recover lane validates its offset
+						// by the same rule).
 						const v = msg.lastSeenSeqs[t];
 						if (typeof v === 'number' && Number.isFinite(v) && v >= 0) resumeSeqs[t] = v;
 					}
-					const lastSeenEpochs =
-						msg.lastSeenEpochs && typeof msg.lastSeenEpochs === 'object' && !Array.isArray(msg.lastSeenEpochs)
-							? msg.lastSeenEpochs
-							: undefined;
+					// The epoch map rides alongside the watermarks into the same
+					// hook, so it gets the SAME treatment - topic validation, the
+					// system-topic guard, a finite non-negative value, and a null
+					// prototype. Forwarding the raw parse handed the hook topics
+					// the watermark map had already refused, plus whatever
+					// `__proto__` key the client put in it.
+					let lastSeenEpochs;
+					if (
+						msg.lastSeenEpochs &&
+						typeof msg.lastSeenEpochs === 'object' &&
+						!Array.isArray(msg.lastSeenEpochs)
+					) {
+						lastSeenEpochs = Object.create(null);
+						for (const t of Object.keys(msg.lastSeenEpochs)) {
+							if (!isValidWireTopic(t, true)) continue;
+							if (!allow_system_topic_subscribe && isSystemTopic(t)) continue;
+							const e = msg.lastSeenEpochs[t];
+							if (typeof e === 'number' && Number.isFinite(e) && e >= 0) lastSeenEpochs[t] = e;
+						}
+					}
 					// The resume hook is the most expensive app work a client
 					// frame can trigger (a backend history read), and Bun does
 					// not await the message handler, so a client can pipeline

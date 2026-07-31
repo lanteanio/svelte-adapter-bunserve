@@ -76,6 +76,10 @@ function cleanup(raw) {
 	maxSeenSeq.clear();
 }
 
+// A control byte is always illegal in a wire topic. Built with fromCharCode:
+// a literal control character in a source file trips the repo's byte sweep.
+const BAD_TOPIC = 'bad' + String.fromCharCode(0) + 'topic';
+
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
 test('the barrier holds frames across the window and flushes above the floor', () => {
@@ -245,13 +249,13 @@ test('the standalone resume frame filters topics and always acks', async () => {
 	await send(raw, {
 		type: 'resume',
 		sessionId: 'prev-session',
-		lastSeenSeqs: { room: 7, 'bad topic': 1, __system: 2, other: 3 },
+		lastSeenSeqs: { room: 7, [BAD_TOPIC]: 1, __system: 2, other: 3 },
 		lastSeenEpochs: { room: 123 }
 	});
 	assert.ok(ctx, 'hook ran');
 	assert.deepEqual({ ...ctx.lastSeenSeqs }, { room: 7, other: 3 }, 'invalid and system topics filtered');
 	assert.equal(ctx.sessionId, 'prev-session');
-	assert.deepEqual(ctx.lastSeenEpochs, { room: 123 });
+	assert.deepEqual({ ...ctx.lastSeenEpochs }, { room: 123 });
 	assert.ok(raw.sent.some((f) => f === '{"type":"resumed"}'), 'acked');
 	cleanup(raw);
 });
@@ -269,9 +273,33 @@ test('the resume frame forwards only finite numeric watermarks to the hook', asy
 	await send(raw, {
 		type: 'resume',
 		sessionId: 's',
-		lastSeenSeqs: { good: 5, bad: 'x', huge: 1e999, obj: { n: 1 } }
+		lastSeenSeqs: { good: 5, zero: 0, bad: 'x', huge: 1e999, obj: { n: 1 }, neg: -1, negFrac: -0.5 }
 	});
-	assert.deepEqual({ ...ctx.lastSeenSeqs }, { good: 5 }, 'non-finite and non-numeric values dropped');
+	assert.deepEqual(
+		{ ...ctx.lastSeenSeqs },
+		{ good: 5, zero: 0 },
+		'0 is a legitimate "seen nothing yet"; negatives and non-numbers are refused'
+	);
+	cleanup(raw);
+});
+
+test('the epoch map is filtered exactly like the watermark map', async () => {
+	// It rides into the same hook, so it takes the same topic validation,
+	// system-topic guard, value check, and null prototype.
+	let ctx = null;
+	const raw = openSocket({ resume: (ws, c) => { ctx = c; } });
+	await send(raw, {
+		type: 'resume',
+		sessionId: 's',
+		lastSeenSeqs: { room: 1 },
+		lastSeenEpochs: { room: 7, __system: 9, 'bad"topic': 3, neg: -5, str: 'x' }
+	});
+	assert.deepEqual({ ...ctx.lastSeenEpochs }, { room: 7 }, 'only the valid topic and value survive');
+	assert.equal(
+		Object.getPrototypeOf(ctx.lastSeenEpochs),
+		null,
+		'null prototype, so a __proto__ key cannot reach the hook as inherited state'
+	);
 	cleanup(raw);
 });
 

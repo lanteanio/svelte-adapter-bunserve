@@ -406,6 +406,53 @@ test('a declined batch that falls back to JSON still reports delivery', () => {
 	});
 });
 
+test('a declined batch with exclusion stamps each frame with ITS OWN seq', () => {
+	// The subset a socket receives is filtered by excludeWs; the seq list must
+	// be filtered with it. Indexing the unfiltered seqs with a subset index
+	// stamps one entry's payload with another entry's seq, and the client then
+	// records a watermark that never matches the frame it holds.
+	setServer(fakeServer());
+	const author = fakeWs({ topics: ['room'] });
+	const capable = fakeWs({ topics: ['room'], caps: [CAP] });
+	const wire = {
+		capability: CAP,
+		schemaVersion: 3,
+		// Declines the batch form, encodes per entry - the lane under test.
+		encode: (event, data) => (event.endsWith('-batch') ? null : new Uint8Array([data.x])),
+		state: { onAttach: () => ({}) }
+	};
+	withConnections([author, capable], () => {
+		platform.publishWireBatch(
+			'room',
+			'moved',
+			[{ data: { x: 1 }, excludeWs: capable }, { data: { x: 2 } }],
+			wire,
+			{ seq: true }
+		);
+		// `capable` is excluded from entry 1, so it receives only entry 2 -
+		// which was stamped seq 2, not entry 1's seq 1.
+		const frames = capable.sent.map((s) => parseBinaryFrame(s.payload)).filter(Boolean);
+		assert.equal(frames.length, 1, 'exactly the non-excluded entry');
+		assert.deepEqual([...frames[0].payload], [2], 'entry 2 payload');
+		assert.equal(frames[0].seq, 2, 'stamped with entry 2 seq, not entry 1 seq');
+	});
+});
+
+test('a fan-out that only drops frames reports no delivery', () => {
+	// A declining stateless codec with an exclusion takes publishWire's
+	// per-subscriber JSON walk; a subscriber whose send is refused past the
+	// backpressure limit received nothing, so the call delivered nothing.
+	setServer(fakeServer());
+	const author = fakeWs({ topics: ['room'], caps: [CAP] });
+	const dropping = fakeWs({ topics: ['room'], script: [2] });
+	withConnections([author, dropping], () => {
+		const ok = platform.publishWire('room', 'gone', null, statelessCodec(), {
+			excludeWs: author
+		});
+		assert.equal(ok, false, 'every send dropped -> false');
+	});
+});
+
 test('a nullish wire falls back to a plain publish rather than crashing', () => {
 	const server = fakeServer();
 	setServer(server);
