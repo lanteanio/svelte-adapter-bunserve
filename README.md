@@ -76,9 +76,10 @@ Prototype phase. The build order:
    Known-open on the realtime tier: the binary wire protocol (`0x03` frames, codecs,
    cohort split, resume/seq buffers) and the pressure/protection surface are
    not implemented - those members are ABSENT from the platform rather than
-   stubbed, so nothing reports success while doing nothing. `platform.request`
-   (server-initiated request/reply) and the coalescing send variants are
-   likewise still to come.
+   stubbed, so nothing reports success while doing nothing. The deferred
+   JSON-tier members are likewise absent: `request` and `requestTopic`
+   (server-initiated request/reply), the coalescing and batching send variants
+   (`sendCoalesced`, `batch`, `publishBatched`), and `topicEpoch`.
 4. Binary wire protocol.
 5. Backpressure/flow-control parity, then the conformance gate against the
    family's deterministic simulation goldens.
