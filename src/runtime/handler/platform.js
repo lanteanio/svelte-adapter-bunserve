@@ -711,8 +711,9 @@ export const platform = {
 	 * Releases whose teardown could not be recorded for the close hook. Any
 	 * non-zero value means an `unsubscribe` hook has been failing persistently
 	 * enough to fill a connection's record, so those releases lost the
-	 * close-hook fallback: their hook still ran, but if it did not perform the
-	 * teardown, nothing else will.
+	 * close-hook fallback. Their own hook is then the only thing that could
+	 * have torn them down - and if the deferral queue was also full, it did not
+	 * run either.
 	 */
 	get droppedReleaseRecords() {
 		return wsCounters.droppedReleaseRecords;

@@ -604,11 +604,17 @@ export const websocketHandlers = {
 						);
 						// Even the queue is full, and this release cannot be
 						// dropped. Closing is the honest move rather than the harsh
-						// one: the topic is already recorded as a pending release,
-						// so the close handler hands it to the app's `close` hook
-						// and the same state is released by that route. 4429 is the
+						// one: the topic was recorded as a pending release above, so
+						// the close handler hands it to the app's `close` hook and
+						// the same state is released by that route. 4429 is the
 						// family's throttle code, so the client reconnects with
 						// backoff instead of giving up.
+						//
+						// The one case that route does not cover is a connection
+						// that has ALSO filled its pending-release record, which
+						// takes an unsubscribe hook failing thousands of times.
+						// Then there is nothing left to hand the close hook, and
+						// `droppedReleaseRecords` is the count of exactly that.
 						if (outcome === 'overflow') {
 							warnUnsubscribeOverflow();
 							try {

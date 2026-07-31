@@ -151,9 +151,9 @@ export const wsCounters = {
 	/**
 	 * Releases whose teardown could not be recorded for the close hook because
 	 * the connection's pending-release record was full. Non-zero means an
-	 * `unsubscribe` hook has been failing persistently and some per-topic
-	 * teardown was not performed by anyone. Exposed as
-	 * `platform.droppedReleaseRecords`.
+	 * `unsubscribe` hook has been failing persistently, and those releases lost
+	 * the close-hook fallback: nothing covers them if their own hook does not
+	 * perform the teardown. Exposed as `platform.droppedReleaseRecords`.
 	 */
 	droppedReleaseRecords: 0,
 
