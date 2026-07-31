@@ -70,7 +70,8 @@ test('subscribed carries the epoch the client resumes against', () => {
 });
 
 // U+FFFD: three UTF-8 bytes in one UTF-16 unit. Built rather than written
-// literally so this file stays ASCII, which the repo sweep enforces.
+// literally so the byte count under test cannot drift with whatever encoding
+// this file is saved in.
 const WIDE = String.fromCharCode(0xfffd);
 
 test('a ref is capped in BYTES, not UTF-16 units', () => {
