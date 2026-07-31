@@ -43,7 +43,9 @@ import { envelopePrefix } from './envelope-cache.js';
 import { bumpOut } from './ws-stats.js';
 import { wsModule } from '../ws-handler-bridge.js';
 import { buildBinaryFrame } from '../utils/wire.js';
+import { getSharedWireId } from '../utils/shared-wire-id.js';
 import { registerWireCodec as _registerWireCodec } from './codec-registry.js';
+import { cohortTopics, joinSharedCohort, leaveSharedCohort } from './cohort.js';
 import {
 	ensureWireId,
 	ensureWireState,
@@ -56,6 +58,8 @@ import {
 	WS_PLATFORM,
 	WS_SUBSCRIPTIONS,
 	beginPendingSubscribe,
+	capCounts,
+	sharedTopics,
 	getServer,
 	hasGateHeadroom,
 	pendingSubscribeTopics,
@@ -94,6 +98,23 @@ function wireJsonSend(ws, topic, event, data, compress) {
 	}
 	if (result !== SEND_DROPPED) bumpOut(ws, json);
 	return result;
+}
+
+/**
+ * Deliver one prebuilt envelope to one connection inside a fan-out walk:
+ * closed sockets land in the closed lane and only delivered bytes are
+ * charged. The walk continues either way, so nothing is returned.
+ *
+ * @param {any} ws - the socket facade
+ * @param {string} envelope
+ * @param {boolean} compress
+ */
+function wireEnvelopeSend(ws, envelope, compress) {
+	try {
+		if (ws.send(envelope, false, compress) !== SEND_DROPPED) bumpOut(ws, envelope);
+	} catch {
+		wsCounters.closedWsAborts++;
+	}
 }
 
 /**
@@ -450,6 +471,465 @@ export const platform = {
 	 */
 	registerWireCodec(wire) {
 		_registerWireCodec(wire);
+	},
+
+	/**
+	 * Publish to every subscriber of `topic` through a plugin-declared binary
+	 * wire codec: capable connections receive the codec's `0x03` frame,
+	 * everyone else the exact JSON envelope `publish()` would have sent, with
+	 * the SAME seq on both forms - the resume contract requires the binary
+	 * frame and the JSON envelope to carry identical sequence numbers.
+	 *
+	 * A JSON-only deployment pays nothing for this: when no live connection
+	 * advertised the codec's capability and nothing is excluded, this is one
+	 * native fan-out, byte- and instruction-identical to `publish()`.
+	 *
+	 * @param {string} topic
+	 * @param {string} event
+	 * @param {any} data
+	 * @param {{ capability: string, schemaVersion: number, encode: Function, state?: any, shared?: boolean }} wire
+	 * @param {{ seq?: boolean | number, compress?: boolean, excludeWs?: any }} [options]
+	 * @returns {boolean} whether any local subscriber received it
+	 */
+	publishWire(topic, event, data, wire, options) {
+		wsCounters.publishCount++;
+		const seq = stampSeq(options, topic);
+		const envelope = completeEnvelope(envelopePrefix(topic, event), data, seq);
+		// Binary codec frames (and this call's JSON-fallback frames) compress
+		// only when the caller opts in with `{ compress: true }` AND a
+		// compressor is configured. One decision governs the whole call so a
+		// plugin's intent applies to its binary and JSON-fallback frames
+		// alike; off by default keeps the high-frequency path uncompressed.
+		const compress = ws_compression_on && !!(options && options.compress === true);
+
+		// Sender exclusion: when set, this one local socket must never receive
+		// the frame. The single native fan-out cannot skip a socket, so an
+		// excluding publish always takes the per-subscriber walk (the walk
+		// already hands caps-less connections the identical JSON envelope).
+		const excludeWs = (options && options.excludeWs) || null;
+
+		// JSON fast path: no live connection wants binary for this codec.
+		if (excludeWs === null && !capCounts.has(wire.capability)) {
+			const result = getServer().publish(topic, envelope, compress);
+			return typeof result === 'number' && result > 0;
+		}
+
+		const seqOnWire = seq == null ? 0 : seq;
+
+		// Stateful codec (per-connection dictionary / delta baselines): the
+		// encoded payload depends on the recipient's state, so
+		// encode-once-send-many no longer holds for the binary recipients -
+		// each capable connection is encoded against its own state.
+		// Connections whose onAttach returned null (an older client that
+		// negotiated the stateless schema) share one encode at
+		// `wire.schemaVersion`, memoized by topic-id, so a mixed room keeps
+		// the single-encode fan-out for those clients.
+		if (wire.state) {
+			let sharedPayload;
+			let sharedEncoded = false;
+			/** @type {Map<number, Uint8Array>} */
+			const sharedFrameById = new Map();
+			for (const ws of wsConnections) {
+				if (ws === excludeWs) continue;
+				let ud;
+				try {
+					ud = ws.getUserData();
+				} catch {
+					wsCounters.closedWsAborts++;
+					continue;
+				}
+				const subs = ud[WS_SUBSCRIPTIONS];
+				if (!subs || !subs.has(topic)) continue;
+				const caps = ud[WS_CAPS];
+				if (!caps || !caps.has(wire.capability)) {
+					wireEnvelopeSend(ws, envelope, compress);
+					continue;
+				}
+				const state = ensureWireState(ws, ud, wire);
+				if (state == null) {
+					// A poisoned capability is served exactly like a caps-less
+					// connection: the shared JSON envelope, never binary.
+					// Checked only on this null-state branch so the
+					// per-connection hot path pays nothing for it.
+					if (wireStatePoisoned(ud, wire.capability)) {
+						wireEnvelopeSend(ws, envelope, compress);
+						continue;
+					}
+					// Shared encode-once at the codec's baseline schema version.
+					if (!sharedEncoded) {
+						sharedPayload = wire.encode(event, data, null);
+						sharedEncoded = true;
+					}
+					if (sharedPayload == null) {
+						wireEnvelopeSend(ws, envelope, compress);
+						continue;
+					}
+					const id = ensureWireId(ws, ud, topic);
+					if (id === -1) {
+						// Dropped wire-id announce: the client can never resolve
+						// this topic's numeric id, so binary for this capability
+						// is permanently undecodable here. JSON for this frame,
+						// and poison.
+						poisonWireState(ws, ud, wire.capability);
+						wireEnvelopeSend(ws, envelope, compress);
+						continue;
+					}
+					let frame = sharedFrameById.get(id);
+					if (!frame) {
+						frame = buildBinaryFrame(wire.schemaVersion, id, seqOnWire, sharedPayload);
+						sharedFrameById.set(id, frame);
+					}
+					// A dropped shared frame needs no poisoning: the payload was
+					// encoded against no per-connection state, so the client's
+					// decoder stays in sync and the next frame is independent.
+					try {
+						if (ws.send(frame, true, compress) !== SEND_DROPPED) bumpOut(ws, frame);
+					} catch {
+						wsCounters.closedWsAborts++;
+					}
+				} else {
+					// Per-connection encode against this connection's state,
+					// stamped with the schema version that state negotiated.
+					const payload = wire.encode(event, data, state);
+					if (payload == null) {
+						wireEnvelopeSend(ws, envelope, compress);
+						continue;
+					}
+					const sv =
+						typeof state.schemaVersion === 'number' ? state.schemaVersion : wire.schemaVersion;
+					const id = ensureWireId(ws, ud, topic);
+					if (id === -1) {
+						// Dropped wire-id announce (see the shared branch above).
+						// The encode already advanced this connection's codec
+						// state for a frame that will never be sent, which is
+						// exactly the desync poisoning exists for.
+						poisonWireState(ws, ud, wire.capability);
+						wireEnvelopeSend(ws, envelope, compress);
+						continue;
+					}
+					const frame = buildBinaryFrame(sv, id, seqOnWire, payload);
+					let result;
+					try {
+						result = ws.send(frame, true, compress);
+					} catch {
+						wsCounters.closedWsAborts++;
+						continue;
+					}
+					if (result !== SEND_DROPPED) bumpOut(ws, frame);
+					// The encode above already mutated this connection's
+					// dictionary for the dropped frame, so the client decoder
+					// can never catch up - degrade to JSON until reconnect.
+					if (result === SEND_DROPPED) poisonWireState(ws, ud, wire.capability);
+				}
+			}
+			return true;
+		}
+
+		// Stateless codec: encode once, send many. A null payload (the codec
+		// declined this frame) falls through to the single native fan-out,
+		// instruction-identical to publish(). The codec payload is shared
+		// across recipients; only the tiny per-connection frame header
+		// (topic-id + seq) differs, memoized per distinct id so the common
+		// all-same-id case builds one frame and reuses it for every binary
+		// send.
+		const payload = wire.encode(event, data);
+		if (payload == null) {
+			if (excludeWs === null) {
+				const result = getServer().publish(topic, envelope, compress);
+				return typeof result === 'number' && result > 0;
+			}
+			// Declined frame with sender exclusion: the same JSON envelope the
+			// single fan-out would have sent, delivered per subscriber so the
+			// excluded socket is skipped.
+			let delivered = false;
+			for (const ws of wsConnections) {
+				if (ws === excludeWs) continue;
+				let ud;
+				try {
+					ud = ws.getUserData();
+				} catch {
+					wsCounters.closedWsAborts++;
+					continue;
+				}
+				const subs = ud[WS_SUBSCRIPTIONS];
+				if (!subs || !subs.has(topic)) continue;
+				try {
+					if (ws.send(envelope, false, compress) !== SEND_DROPPED) bumpOut(ws, envelope);
+					delivered = true;
+				} catch {
+					wsCounters.closedWsAborts++;
+				}
+			}
+			return delivered;
+		}
+
+		// Shared binary fan-out: a stateless codec marked `shared: true` fans
+		// out via cohort topics - the byte-identical 0x03 frame to
+		// `topic\0bin`, the JSON envelope to `topic\0json` - so this publish
+		// is two native fan-outs, not a per-connection walk. Eligible only
+		// with no sender exclusion (a single native publish cannot skip one
+		// socket; an excluding shared publish falls through to the walk
+		// below). The frame is identical for every binary subscriber because
+		// the topic-id is the server-wide shared id, announced when a
+		// connection joined the binary cohort.
+		if (wire.shared && excludeWs === null) {
+			// Lazy migration: the FIRST shared publish to a topic cohorts its
+			// current subscribers (a one-time walk, paid once per topic), then
+			// marks the topic shared so a later joiner is cohorted at
+			// subscribe time instead.
+			if (!sharedTopics.has(topic)) {
+				for (const ws of wsConnections) {
+					let ud;
+					try {
+						ud = ws.getUserData();
+					} catch {
+						wsCounters.closedWsAborts++;
+						continue;
+					}
+					const subs = ud[WS_SUBSCRIPTIONS];
+					if (!subs || !subs.has(topic)) continue;
+					joinSharedCohort(ws, ud, topic, wire.capability);
+				}
+				sharedTopics.set(topic, wire.capability);
+			}
+			const { bin, json } = cohortTopics(topic);
+			// The binary cohort exists only if a capable client joined it (its
+			// announce succeeded); otherwise this shared topic currently has
+			// only JSON subscribers and skips the binary fan-out entirely.
+			const id = getSharedWireId(topic);
+			const server = getServer();
+			if (id !== undefined) {
+				server.publish(bin, buildBinaryFrame(wire.schemaVersion, id, seqOnWire, payload), compress);
+			}
+			server.publish(json, envelope, compress);
+			return true;
+		}
+
+		/** @type {Map<number, Uint8Array>} */
+		const frameById = new Map();
+		for (const ws of wsConnections) {
+			if (ws === excludeWs) continue;
+			let ud;
+			try {
+				ud = ws.getUserData();
+			} catch {
+				wsCounters.closedWsAborts++;
+				continue;
+			}
+			const subs = ud[WS_SUBSCRIPTIONS];
+			if (!subs || !subs.has(topic)) continue;
+			const caps = ud[WS_CAPS];
+			if (caps && caps.has(wire.capability) && !wireStatePoisoned(ud, wire.capability)) {
+				const id = ensureWireId(ws, ud, topic);
+				if (id === -1) {
+					// Dropped wire-id announce: the topic-id mapping is itself
+					// per-connection state the client now permanently lacks, so
+					// even a stateless codec's frames would be undecodable.
+					// JSON for this frame, and poison. A dropped binary FRAME
+					// below needs no such handling - the shared payload carries
+					// no per-connection state, so a lost frame cannot desync.
+					poisonWireState(ws, ud, wire.capability);
+					wireEnvelopeSend(ws, envelope, compress);
+					continue;
+				}
+				let frame = frameById.get(id);
+				if (!frame) {
+					frame = buildBinaryFrame(wire.schemaVersion, id, seqOnWire, payload);
+					frameById.set(id, frame);
+				}
+				try {
+					if (ws.send(frame, true, compress) !== SEND_DROPPED) bumpOut(ws, frame);
+				} catch {
+					wsCounters.closedWsAborts++;
+				}
+			} else {
+				wireEnvelopeSend(ws, envelope, compress);
+			}
+		}
+		return true;
+	},
+
+	/**
+	 * Multi-entry fan-out via a stateful plugin codec: one tick's same-event
+	 * updates delivered as ONE binary frame per capable connection (the
+	 * codec's `<event>-batch` form) and as the per-entry JSON envelopes -
+	 * byte-identical to N publishWire calls - for everyone else. Each entry
+	 * may carry its own `excludeWs` (per-entry author suppression); an entry
+	 * is withheld from its excluded socket on every delivery path.
+	 *
+	 * Sequencing and accounting match N publishWire calls exactly: one seq
+	 * per entry. The binary batch frame's header seq slot carries the
+	 * subset's LAST entry seq (batch consumers order by the codec's own
+	 * stamp, not the header seq).
+	 *
+	 * Degradation mirrors publishWire per connection: a codec that cannot
+	 * represent the batch (null) falls back to per-entry encodes; a per-entry
+	 * null falls back to that entry's JSON envelope; a dropped frame or
+	 * wire-id announce poisons the capability to JSON until reconnect.
+	 *
+	 * @param {string} topic
+	 * @param {string} event - the PER-ENTRY event name; the codec's batch
+	 *   form is looked up as `<event>-batch` with `{ updates }` data.
+	 * @param {Array<{ data: any, excludeWs?: any }>} entries
+	 * @param {{ capability: string, schemaVersion: number, encode: Function, state?: any }} wire
+	 * @param {{ seq?: boolean, compress?: boolean }} [options]
+	 * @returns {boolean}
+	 */
+	publishWireBatch(topic, event, entries, wire, options) {
+		if (!Array.isArray(entries) || entries.length === 0) return false;
+		// A stateless codec gains nothing from a batched walk (encode-once
+		// already amortizes it) - route through the per-entry path unchanged.
+		if (!wire || !wire.state) {
+			let ok = false;
+			for (let i = 0; i < entries.length; i++) {
+				const per =
+					entries[i].excludeWs !== undefined
+						? { ...(options || {}), excludeWs: entries[i].excludeWs }
+						: options;
+				ok = this.publishWire(topic, event, entries[i].data, wire, per) || ok;
+			}
+			return ok;
+		}
+		wsCounters.publishCount += entries.length;
+		const compress = ws_compression_on && !!(options && options.compress === true);
+
+		// Per-entry seq and envelope - the exact bookkeeping N publishWire
+		// calls would have produced.
+		const envs = new Array(entries.length);
+		const seqs = new Array(entries.length);
+		let anyExclude = false;
+		for (let i = 0; i < entries.length; i++) {
+			const seq = stampSeq(options, topic);
+			seqs[i] = seq == null ? 0 : seq;
+			envs[i] = completeEnvelope(envelopePrefix(topic, event), entries[i].data, seq);
+			if (entries[i].excludeWs !== undefined && entries[i].excludeWs !== null) anyExclude = true;
+		}
+
+		const sendJson = (ws, list) => {
+			for (let i = 0; i < list.length; i++) {
+				try {
+					if (ws.send(list[i], false, compress) !== SEND_DROPPED) bumpOut(ws, list[i]);
+				} catch {
+					wsCounters.closedWsAborts++;
+					return;
+				}
+			}
+		};
+
+		// JSON fast path: no live connection wants binary for this codec and
+		// no entry excludes a socket - N native fan-outs, byte-identical to N
+		// publishWire calls.
+		if (!anyExclude && !capCounts.has(wire.capability)) {
+			const server = getServer();
+			for (let i = 0; i < entries.length; i++) server.publish(topic, envs[i], compress);
+			return true;
+		}
+		for (const ws of wsConnections) {
+			let ud;
+			try {
+				ud = ws.getUserData();
+			} catch {
+				wsCounters.closedWsAborts++;
+				continue;
+			}
+			const subs = ud[WS_SUBSCRIPTIONS];
+			if (!subs || !subs.has(topic)) continue;
+			// The subset this socket receives: entries not excluded for it.
+			// The no-exclusion common case reuses the shared arrays.
+			let list = entries;
+			let envList = envs;
+			let lastSeq = seqs[entries.length - 1];
+			if (anyExclude) {
+				list = [];
+				envList = [];
+				for (let i = 0; i < entries.length; i++) {
+					if (entries[i].excludeWs === ws) continue;
+					list.push(entries[i]);
+					envList.push(envs[i]);
+					lastSeq = seqs[i];
+				}
+				if (list.length === 0) continue;
+			}
+			const caps = ud[WS_CAPS];
+			if (!caps || !caps.has(wire.capability)) {
+				sendJson(ws, envList);
+				continue;
+			}
+			// A poisoned capability reads a null state and is served JSON,
+			// exactly like publishWire's null-state branch.
+			const state = ensureWireState(ws, ud, wire);
+			if (state == null) {
+				sendJson(ws, envList);
+				continue;
+			}
+			const updates = new Array(list.length);
+			for (let i = 0; i < list.length; i++) updates[i] = list[i].data;
+			const payload = wire.encode(event + '-batch', { updates }, state);
+			const sv =
+				typeof state.schemaVersion === 'number' ? state.schemaVersion : wire.schemaVersion;
+			if (payload == null) {
+				// The codec declined the batch (older codec, unrepresentable
+				// entry): per-entry encodes with per-entry JSON fallback - the
+				// N publishWire bodies this call replaces.
+				for (let i = 0; i < list.length; i++) {
+					const p = wire.encode(event, list[i].data, state);
+					if (p == null) {
+						try {
+							if (ws.send(envList[i], false, compress) !== SEND_DROPPED) {
+								bumpOut(ws, envList[i]);
+							}
+						} catch {
+							wsCounters.closedWsAborts++;
+							break;
+						}
+						continue;
+					}
+					const id = ensureWireId(ws, ud, topic);
+					if (id === -1) {
+						poisonWireState(ws, ud, wire.capability);
+						sendJson(ws, envList.slice(i));
+						break;
+					}
+					const frame = buildBinaryFrame(sv, id, seqs[i], p);
+					let result;
+					try {
+						result = ws.send(frame, true, compress);
+					} catch {
+						wsCounters.closedWsAborts++;
+						break;
+					}
+					if (result !== SEND_DROPPED) bumpOut(ws, frame);
+					if (result === SEND_DROPPED) {
+						poisonWireState(ws, ud, wire.capability);
+						sendJson(ws, envList.slice(i + 1));
+						break;
+					}
+				}
+				continue;
+			}
+			const id = ensureWireId(ws, ud, topic);
+			if (id === -1) {
+				// Dropped wire-id announce: binary is permanently undecodable
+				// here, and the batch encode already advanced this
+				// connection's dictionaries - the desync poisoning exists for.
+				poisonWireState(ws, ud, wire.capability);
+				sendJson(ws, envList);
+				continue;
+			}
+			const frame = buildBinaryFrame(sv, id, lastSeq, payload);
+			let result;
+			try {
+				result = ws.send(frame, true, compress);
+			} catch {
+				wsCounters.closedWsAborts++;
+				continue;
+			}
+			if (result !== SEND_DROPPED) bumpOut(ws, frame);
+			// The encode mutated the dictionaries for a frame the client
+			// never saw - JSON until reconnect.
+			if (result === SEND_DROPPED) poisonWireState(ws, ud, wire.capability);
+		}
+		return true;
 	},
 
 	/**
@@ -840,6 +1320,9 @@ export const platform = {
 		}
 		subs.delete(topic);
 		wsCounters.totalSubscriptions--;
+		// A shared topic's cohort membership travels with the logical
+		// subscription; leaving releases the wire-id ref this connection held.
+		if (sharedTopics.has(topic)) leaveSharedCohort(ws, userData, topic);
 		return true;
 	},
 
@@ -1111,5 +1594,9 @@ export async function subscribeWithVerdict(ws, topic, options, verdict) {
 	}
 	subs.add(topic);
 	wsCounters.totalSubscriptions++;
+	// A topic already running shared binary fan-out cohorts its joiners at
+	// subscribe time; the first shared publish cohorted whoever preceded it.
+	const sharedCap = sharedTopics.get(topic);
+	if (sharedCap !== undefined) joinSharedCohort(ws, userData, topic, sharedCap);
 	return null;
 }

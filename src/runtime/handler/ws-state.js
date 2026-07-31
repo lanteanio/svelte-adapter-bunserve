@@ -91,6 +91,15 @@ export const WS_WIRE_STATE = Symbol('wireState');
 export const WS_SHARED_COHORTS = Symbol('sharedCohorts');
 
 /**
+ * Topics running shared binary fan-out, topic -> the capability whose codec
+ * marked them shared. The first shared publish to a topic migrates its
+ * current subscribers into cohorts and records it here, so every later
+ * subscriber is cohorted at subscribe time instead.
+ * @type {Map<string, string>}
+ */
+export const sharedTopics = new Map();
+
+/**
  * The upgrade-time request id travels as a STRING key, not a Symbol: it is set
  * on the object handed to `server.upgrade(req, { data })` before any socket
  * exists, and is promoted to a per-connection platform clone in `open()` and

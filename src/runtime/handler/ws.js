@@ -70,9 +70,11 @@ import {
 	looksLikeControlFrame
 } from '../utils/control-frame.js';
 import { detachWireStates } from './wire-state.js';
+import { releaseSharedWireId } from '../utils/shared-wire-id.js';
 import {
 	WS_CAPS,
 	WS_PENDING_SUBSCRIBES,
+	WS_SHARED_COHORTS,
 	WS_PLATFORM,
 	WS_REQUEST_ID_KEY,
 	WS_SESSION_ID,
@@ -853,6 +855,15 @@ export const websocketHandlers = {
 			// Dispose per-connection wire-codec state (dictionaries, delta
 			// baselines) exactly once, via each codec's own onDetach.
 			detachWireStates(ws, userData);
+			// Release the shared wire-id refs this connection's binary cohorts
+			// held. The cohort subscriptions themselves die with the socket
+			// natively (probed - subscriberCount decrements on close); the
+			// refcount is the only thing Bun cannot release for us.
+			const cohorts = userData[WS_SHARED_COHORTS];
+			if (cohorts) {
+				for (const topic of cohorts) releaseSharedWireId(topic);
+				cohorts.clear();
+			}
 			userData[WS_PENDING_SUBSCRIBES] = undefined;
 			// Drop unsubscribe hooks still WAITING. Their topics went into the
 			// snapshot above, so the close hook performs their teardown, and
