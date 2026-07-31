@@ -56,8 +56,9 @@ Prototype phase. The build order:
    response is compressed whole whenever its body completes without waiting,
    so a streaming render reaches the client as it is produced; `/healthz` +
    `/readyz` and graceful drain round it out.
-   Known-open on the HTTP half: the graceful-drain signal path is UNVERIFIED
-   (Windows delivers no real SIGTERM to exercise it; the Linux CI slice will);
+   Known-open on the HTTP half: the graceful-drain signal path is asserted on
+   Linux only (`test/live/shutdown-check.mjs`, run in CI; Windows delivers no
+   real SIGTERM to exercise it, so the suite skips there);
    the TLS surface remains unprobed (needs real certificates); a request body
    sent without a Content-Length is capped by Bun rather than by the adapter's
    own check, and that path has not been exercised; immutable assets carry
@@ -460,11 +461,15 @@ npm test   # requires Node 22+ for the test-runner glob
 ```
 
 The live lane asserts the same contract end to end against a real server, which
-is what catches everything the stub cannot model: it builds the fixture, boots
-the built output under Bun, and drives real WebSocket clients against it. It
-covers the subscribe, batch, and unsubscribe frames, the subscription cap under
-pipelined frames, Origin enforcement on the upgrade, and a no-handler build
-proving the HTTP surface is untouched when no realtime is configured. It needs
+is what catches everything the stub cannot model: it first drives the real send
+facade over a genuinely saturated Bun socket (the send-result suite, which
+needs no build), then builds the fixture, boots the built output under Bun, and
+drives real WebSocket clients against it. It covers the send-result mapping
+against a real slow consumer, the subscribe, batch, and unsubscribe frames, the
+subscription cap under pipelined frames, Origin enforcement on the upgrade, the
+graceful-shutdown signal path (Linux only; the suite skips on Windows), and a
+no-handler build proving the HTTP surface is untouched when no realtime is
+configured. It needs
 Bun and the fixture's dependencies (`npm install` in `test/fixture` once;
 `ADAPTER=uws` imports a sibling checkout by path and is not a dependency, so a
 plain clone installs):

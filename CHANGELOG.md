@@ -20,12 +20,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   work completes rather than being cut off by the exit, that the process exits
   0 inside its deadline, and that a `shutdown` hook that never settles cannot
   hold the process open past that deadline.
+- A live suite for the send-result mapping (`test/live/send-result-check.mjs`,
+  first step of the live lane, no build needed): the real socket facade driven
+  over a genuinely saturated Bun socket, with the tri-state checked against
+  what the client actually receives - every frame reported delivered or
+  enqueued must arrive, no frame reported dropped may arrive, and a closed
+  socket throws before the mapping runs. Zero-length payloads are covered in
+  both socket states.
+- An A/B benchmark for the userData access strategy
+  (`bench/userdata-strategy.mjs`): the shipped per-connection facade against a
+  prototype-patched read on a real `ServerWebSocket`, with per-message
+  composites at the access counts the handler actually pays.
 - A tracked live test lane (`test/live/`, `npm run test:live`) that asserts the
-  WebSocket wire contract end to end against the built fixture: the subscribe,
-  batch, and unsubscribe frames, the subscription cap under pipelined frames,
-  Origin enforcement on the upgrade, and a no-handler build whose HTTP surface
-  must be untouched. The fixture gained a `NO_WS` build variant
-  (`build-no-ws`) for the last of those.
+  WebSocket wire contract end to end: the send-result mapping against a real
+  slow consumer, then, against the built fixture, the subscribe, batch, and
+  unsubscribe frames, the subscription cap under pipelined frames, Origin
+  enforcement on the upgrade, the graceful-shutdown signal path (Linux only),
+  and a no-handler build whose HTTP surface must be untouched. The fixture
+  gained a `NO_WS` build variant (`build-no-ws`) for the last of those.
 - Unit coverage for the WebSocket demux (`test/unit/ws-demux.test.mjs`). It
   reaches the app through a specifier the build injects, so nothing outside a
   build could import it and every defect in it was found by reading; a loader
