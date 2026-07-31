@@ -100,6 +100,69 @@ export const WS_SHARED_COHORTS = Symbol('sharedCohorts');
 export const sharedTopics = new Map();
 
 /**
+ * The highest sequence number observed per topic, updated at every publish
+ * site. The resume barrier reads it when a buffer opens, as the conservative
+ * dedup floor for a resume hook that does not report the watermark it
+ * covered.
+ * @type {Map<string, number>}
+ */
+export const maxSeenSeq = new Map();
+
+/**
+ * Fold one observed seq into a seen-map, keeping the maximum. Used for
+ * explicit numeric (cluster-authoritative) seqs, which may arrive reordered -
+ * the counter path can bare-set instead because it is monotonic by
+ * construction.
+ *
+ * @param {Map<string, number>} seenMap
+ * @param {string} topic
+ * @param {number} seq
+ */
+export function recordSeen(seenMap, topic, seq) {
+	if (typeof seq !== 'number') return;
+	const prev = seenMap.get(topic);
+	if (prev === undefined || seq > prev) seenMap.set(topic, seq);
+}
+
+/**
+ * Open live-frame buffers per topic with a resume in flight, topic -> the Set
+ * of buffers capturing it. Read by every fan-out site behind a single
+ * `.size > 0` guard, so a deployment that never resumes pays one integer
+ * compare per publish.
+ * @type {Map<string, Set<{ frames: { seq: number | null, envelope: string, compress: boolean }[], overflow: boolean }>>}
+ */
+export const resumeBuffers = new Map();
+
+/**
+ * Frames one resume buffer holds at most. Past it the buffer is marked
+ * overflowed and the flush signals a truncation instead of trusting a partial
+ * window - the client has no gap detection, so a silent hole is the one
+ * outcome this must never produce.
+ */
+export const MAX_RESUME_BUFFERED_FRAMES = 4096;
+
+/**
+ * Append one published frame to every open buffer for its topic. Called from
+ * the fan-out sites only when some buffer is open.
+ *
+ * @param {string} topic
+ * @param {number | null} seq
+ * @param {string} envelope
+ * @param {boolean} compress
+ */
+export function captureResumeFrame(topic, seq, envelope, compress) {
+	const set = resumeBuffers.get(topic);
+	if (set === undefined) return;
+	for (const b of set) {
+		if (b.frames.length >= MAX_RESUME_BUFFERED_FRAMES) {
+			b.overflow = true;
+			continue;
+		}
+		b.frames.push({ seq, envelope, compress });
+	}
+}
+
+/**
  * The upgrade-time request id travels as a STRING key, not a Symbol: it is set
  * on the object handed to `server.upgrade(req, { data })` before any socket
  * exists, and is promoted to a per-connection platform clone in `open()` and

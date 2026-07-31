@@ -53,12 +53,23 @@ import {
 	wireStatePoisoned
 } from './wire-state.js';
 import {
+	beginResumeCapture,
+	coveredSeqFor,
+	discardResumeCapture,
+	flushResumeTopic
+} from './resume-buffer.js';
+import {
 	MAX_SUBSCRIPTIONS_PER_CONNECTION,
 	WS_CAPS,
 	WS_PLATFORM,
+	WS_SESSION_ID,
 	WS_SUBSCRIPTIONS,
 	beginPendingSubscribe,
 	capCounts,
+	captureResumeFrame,
+	maxSeenSeq,
+	recordSeen,
+	resumeBuffers,
 	sharedTopics,
 	getServer,
 	hasGateHeadroom,
@@ -98,6 +109,22 @@ function wireJsonSend(ws, topic, event, data, compress) {
 	}
 	if (result !== SEND_DROPPED) bumpOut(ws, json);
 	return result;
+}
+
+/**
+ * Track the highest observed seq for a topic (the resume barrier's fallback
+ * dedup floor). An explicit numeric seq is cluster-authoritative and may
+ * arrive reordered, so it takes the monotone-max guard; the in-memory counter
+ * is monotonic by construction and bare-sets.
+ *
+ * @param {string} topic
+ * @param {number | null} seq
+ * @param {{ seq?: boolean | number } | undefined} options
+ */
+function recordMaxSeen(topic, seq, options) {
+	if (seq === null) return;
+	if (options && typeof options.seq === 'number') recordSeen(maxSeenSeq, topic, seq);
+	else maxSeenSeq.set(topic, seq);
 }
 
 /**
@@ -353,6 +380,7 @@ export const platform = {
 	publish(topic, event, data, options) {
 		wsCounters.publishCount++;
 		const seq = stampSeq(options, topic);
+		recordMaxSeen(topic, seq, options);
 		// A de-herd window is carried verbatim so each client rolls its own
 		// delay. Rolling one server-side offset instead would defer every
 		// subscriber of this frame by the SAME amount, which is the stampede
@@ -362,6 +390,11 @@ export const platform = {
 			: null;
 		const envelope = completeEnvelope(envelopePrefix(topic, event), data, seq, jitterMs);
 		const compress = ws_compression_on && (!options || options.compress !== false);
+		// A connection still gap-filling this topic (resume cutover in
+		// flight) is not yet subscribed to live, so hold the envelope it
+		// would have received; it flushes once its membership installs. One
+		// guarded size check on the path every publish takes.
+		if (resumeBuffers.size > 0) captureResumeFrame(topic, seq, envelope, compress);
 		const result = getServer().publish(topic, envelope, compress);
 		// Bun returns the byte count on delivery and 0 when the topic has no
 		// subscribers (probed).
@@ -494,6 +527,7 @@ export const platform = {
 	publishWire(topic, event, data, wire, options) {
 		wsCounters.publishCount++;
 		const seq = stampSeq(options, topic);
+		recordMaxSeen(topic, seq, options);
 		const envelope = completeEnvelope(envelopePrefix(topic, event), data, seq);
 		// Binary codec frames (and this call's JSON-fallback frames) compress
 		// only when the caller opts in with `{ compress: true }` AND a
@@ -501,6 +535,10 @@ export const platform = {
 		// plugin's intent applies to its binary and JSON-fallback frames
 		// alike; off by default keeps the high-frequency path uncompressed.
 		const compress = ws_compression_on && !!(options && options.compress === true);
+		// A resuming connection is not yet on the live membership, so it
+		// would receive nothing from any branch below; hold the JSON envelope
+		// it would have received as a caps-less subscriber.
+		if (resumeBuffers.size > 0) captureResumeFrame(topic, seq, envelope, compress);
 
 		// Sender exclusion: when set, this one local socket must never receive
 		// the frame. The single native fan-out cannot skip a socket, so an
@@ -800,9 +838,17 @@ export const platform = {
 		let anyExclude = false;
 		for (let i = 0; i < entries.length; i++) {
 			const seq = stampSeq(options, topic);
+			recordMaxSeen(topic, seq, options);
 			seqs[i] = seq == null ? 0 : seq;
 			envs[i] = completeEnvelope(envelopePrefix(topic, event), entries[i].data, seq);
 			if (entries[i].excludeWs !== undefined && entries[i].excludeWs !== null) anyExclude = true;
+		}
+		// Resume cutover in flight: hold the per-entry JSON envelopes a
+		// caps-less resuming subscriber would receive from this batch.
+		if (resumeBuffers.size > 0) {
+			for (let i = 0; i < entries.length; i++) {
+				captureResumeFrame(topic, seqs[i] === 0 ? null : seqs[i], envs[i], compress);
+			}
 		}
 
 		const sendJson = (ws, list) => {
@@ -1568,6 +1614,31 @@ export async function subscribeWithVerdict(ws, topic, options, verdict) {
 		settlePendingSubscribe(userData, topic, token);
 		throw err;
 	}
+	// Recover gap-fill, only after the gate ALLOWED: a topic's replay history
+	// must never be served ahead of a refusal. The barrier opens BEFORE the
+	// resume await so a publish landing inside the hook's window is held, and
+	// the pending entry stays in flight across the await so an unsubscribe
+	// landing mid-resume still cancels the install below.
+	let recoverCapture = null;
+	let recoverCovered;
+	const recover = options && options.recover;
+	if (
+		(denial === null || denial === undefined) &&
+		recover &&
+		typeof wsModule.resume === 'function'
+	) {
+		recoverCapture = beginResumeCapture([topic], ws);
+		try {
+			recoverCovered = await wsModule.resume(ws, {
+				sessionId: userData[WS_SESSION_ID],
+				lastSeenSeqs: { [topic]: recover.offset },
+				lastSeenEpochs: Number.isInteger(recover.epoch) ? { [topic]: recover.epoch } : undefined,
+				platform: userData[WS_PLATFORM] || platform
+			});
+		} catch (err) {
+			console.error('[ws] recover-on-subscribe hook threw:', err);
+		}
+	}
 	const stillWanted = settlePendingSubscribe(userData, topic, token);
 	// Explicit nullish test, NOT truthiness. checkSubscribe classifies any
 	// string the hook returns as a denial reason, including the empty
@@ -1576,24 +1647,39 @@ export async function subscribeWithVerdict(ws, topic, options, verdict) {
 	// through to the install below and the client got a `subscribed` ack for
 	// a topic the app meant to refuse.
 	if (denial !== null && denial !== undefined) return denial;
-	if (!stillWanted) return 'CANCELLED';
+	if (!stillWanted) {
+		if (recoverCapture) discardResumeCapture(recoverCapture);
+		return 'CANCELLED';
+	}
 
 	// Re-check after the await: a duplicate subscribe may have landed and
-	// completed while this one was in the gate.
-	if (subs.has(topic)) return null;
+	// completed while this one was in the gate. The client is then already
+	// live, so any frames held for it would be duplicates - discard them.
+	if (subs.has(topic)) {
+		if (recoverCapture) discardResumeCapture(recoverCapture);
+		return null;
+	}
 	// And re-check the cap, for the same reason it counts in-flight above:
 	// this gate entered when there was headroom, and any number of others
 	// may have landed while it was awaiting. The pre-gate check bounds how
 	// many hooks run at once; this one bounds what actually installs.
-	if (subs.size >= MAX_SUBSCRIPTIONS_PER_CONNECTION) return 'RATE_LIMITED';
+	if (subs.size >= MAX_SUBSCRIPTIONS_PER_CONNECTION) {
+		if (recoverCapture) discardResumeCapture(recoverCapture);
+		return 'RATE_LIMITED';
+	}
 	try {
 		ws.subscribe(topic);
 	} catch {
+		if (recoverCapture) discardResumeCapture(recoverCapture);
 		wsCounters.closedWsAborts++;
 		return 'CLOSED';
 	}
 	subs.add(topic);
 	wsCounters.totalSubscriptions++;
+	// Live membership is installed: flush any frames held during the resume
+	// window, in order, skipping what the resume already covered, before the
+	// caller sends the ack.
+	if (recoverCapture) flushResumeTopic(recoverCapture, topic, coveredSeqFor(recoverCovered, topic));
 	// A topic already running shared binary fan-out cohorts its joiners at
 	// subscribe time; the first shared publish cohorted whoever preceded it.
 	const sharedCap = sharedTopics.get(topic);

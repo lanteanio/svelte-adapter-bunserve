@@ -285,14 +285,16 @@ function isWireTopicRejected(topic) {
  * @param {any} ws
  * @param {string} topic
  * @param {number | string | null} ref
+ * @param {{ offset: number, epoch?: number } | null} [recover] - gap-fill the
+ *   missed tail through the app's resume hook before going live
  * @returns {Promise<void>}
  */
-async function applySubscribe(ws, topic, ref) {
+async function applySubscribe(ws, topic, ref, recover) {
 	if (isWireTopicRejected(topic)) {
 		sendSubscribeDenied(ws, topic, ref, 'INVALID_TOPIC');
 		return;
 	}
-	settleSubscribeResult(ws, topic, ref, await gatedSubscribe(ws, topic));
+	settleSubscribeResult(ws, topic, ref, await gatedSubscribe(ws, topic, undefined, recover));
 }
 
 /**
@@ -309,9 +311,10 @@ async function applySubscribe(ws, topic, ref) {
  * @param {any} ws
  * @param {string} topic
  * @param {unknown} [verdict] - from a batch gate already run for this frame
+ * @param {{ offset: number, epoch?: number } | null} [recover]
  * @returns {Promise<string | null>}
  */
-function gatedSubscribe(ws, topic, verdict) {
+function gatedSubscribe(ws, topic, verdict, recover) {
 	// `subscribeWithVerdict`, NOT `platform.subscribe`. The verdict channel is a
 	// parameter of a module-private function precisely so it is not reachable
 	// through the platform object: any caller-reachable spelling is forgeable -
@@ -322,7 +325,7 @@ function gatedSubscribe(ws, topic, verdict) {
 	return subscribeWithVerdict(
 		ws,
 		topic,
-		{ allowSystemTopic: allow_system_topic_subscribe },
+		{ allowSystemTopic: allow_system_topic_subscribe, recover: recover ?? undefined },
 		verdict
 	);
 }
@@ -499,7 +502,79 @@ export const websocketHandlers = {
 				}
 
 				if (msg.type === 'subscribe' && typeof msg.topic === 'string') {
-					await applySubscribe(ws, msg.topic, isEchoableRef(msg.ref) ? msg.ref : null);
+					// A recover offset asks for the missed tail (epoch-checked by
+					// the app's resume hook) before going live. Validated to a
+					// finite non-negative number so the hook is never handed a
+					// client-invented shape; anything else subscribes plainly.
+					const recover =
+						msg.recover &&
+						typeof msg.recover === 'object' &&
+						typeof msg.recover.offset === 'number' &&
+						Number.isFinite(msg.recover.offset) &&
+						msg.recover.offset >= 0
+							? {
+								offset: msg.recover.offset,
+								epoch: Number.isInteger(msg.recover.epoch) ? msg.recover.epoch : undefined
+							}
+							: null;
+					await applySubscribe(ws, msg.topic, isEchoableRef(msg.ref) ? msg.ref : null, recover);
+					return;
+				}
+
+				if (
+					msg.type === 'resume' &&
+					typeof msg.sessionId === 'string' &&
+					msg.lastSeenSeqs &&
+					typeof msg.lastSeenSeqs === 'object' &&
+					!Array.isArray(msg.lastSeenSeqs)
+				) {
+					// The client presents its previous session id plus per-topic
+					// lastSeenSeqs so the app's resume hook can fill the gap. The
+					// hook is optional: without one the ack still goes out so the
+					// client can switch to live mode. No recovery barrier here -
+					// this frame installs no live membership, so there is no
+					// cutover window to bridge; a subscribe carrying a recover
+					// offset gets the barrier on that path.
+					let resumeUd;
+					try {
+						resumeUd = ws.getUserData();
+					} catch {
+						return;
+					}
+					// Client-named topics are held to the same wire validation the
+					// subscribe and unsubscribe lanes apply, and to the system-topic
+					// guard: this lane yields a topic's message HISTORY through the
+					// app's hook, so a topic the wire would refuse must not reach
+					// it. Filtered rather than refused whole - a resume names many
+					// topics at once and a client legitimately holds most of them.
+					/** @type {Record<string, unknown>} */
+					const resumeSeqs = Object.create(null);
+					for (const t of Object.keys(msg.lastSeenSeqs)) {
+						if (!isValidWireTopic(t, true)) continue;
+						if (!allow_system_topic_subscribe && isSystemTopic(t)) continue;
+						resumeSeqs[t] = msg.lastSeenSeqs[t];
+					}
+					const lastSeenEpochs =
+						msg.lastSeenEpochs && typeof msg.lastSeenEpochs === 'object' && !Array.isArray(msg.lastSeenEpochs)
+							? msg.lastSeenEpochs
+							: undefined;
+					if (typeof wsModule.resume === 'function') {
+						try {
+							// Awaited so per-topic replay flushes its frames before
+							// the ack tells the client to switch to live mode -
+							// otherwise live publishes can arrive ahead of gap-fill
+							// frames and produce out-of-order events.
+							await wsModule.resume(ws, {
+								sessionId: msg.sessionId,
+								lastSeenSeqs: resumeSeqs,
+								lastSeenEpochs,
+								platform: resumeUd[WS_PLATFORM]
+							});
+						} catch (err) {
+							console.error('[ws] resume hook threw:', err);
+						}
+					}
+					sendControl(ws, '{"type":"resumed"}');
 					return;
 				}
 

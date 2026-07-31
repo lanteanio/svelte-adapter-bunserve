@@ -29,9 +29,12 @@ export let message;
 /** @type {undefined | ((ws: any, ctx: any) => unknown)} */
 export let close;
 
+/** @type {undefined | ((ws: any, ctx: any) => unknown)} */
+export let resume;
+
 /**
  * @param {{ subscribe?: any, subscribeBatch?: any, unsubscribe?: any,
- *   open?: any, message?: any, close?: any }} hooks
+ *   open?: any, message?: any, close?: any, resume?: any }} hooks
  */
 export function __setHooks(hooks) {
 	subscribe = hooks.subscribe;
@@ -40,4 +43,5 @@ export function __setHooks(hooks) {
 	open = hooks.open;
 	message = hooks.message;
 	close = hooks.close;
+	resume = hooks.resume;
 }
