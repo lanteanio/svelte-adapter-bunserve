@@ -84,6 +84,22 @@ try {
 	});
 	check('foreign Origin is refused (CSWSH defense)', foreign.status === 403, `got ${foreign.status}`);
 
+	// The fixture's upgrade hook awaits a real timer, then selects the first
+	// offered subprotocol through its context headers channel - so this one
+	// connection proves both halves end to end: the handshake survives an
+	// awaited hook, and a header the hook set reaches the client on the 101.
+	const proto = new WebSocket(`ws://127.0.0.1:${PORT}/ws?user=proto`, ['alpha', 'beta']);
+	await new Promise((resolve, reject) => {
+		proto.onopen = resolve;
+		proto.onerror = () => reject(new Error('subprotocol client failed to connect'));
+	});
+	check(
+		'an awaited upgrade hook sets the subprotocol through the context headers',
+		proto.protocol === 'alpha',
+		`got "${proto.protocol}"`
+	);
+	proto.close();
+
 	// --- connection lifecycle ---------------------------------------------
 	const a = client('?user=alice');
 	await a.opened;

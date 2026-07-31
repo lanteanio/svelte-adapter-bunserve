@@ -20,11 +20,23 @@ export function shutdown({ platform }) {
  * Runs before the handshake. Whatever object this returns becomes the
  * connection's userData; returning a Response rejects the upgrade with exactly
  * that response.
+ *
+ * Async behind a real timer on purpose: the adapter promises the hook may
+ * await freely, and only an actually-awaited hook makes the live suite prove
+ * the handshake survives it. The subprotocol selection goes through the
+ * context headers channel for the same reason - the client can read the
+ * negotiated protocol off its own socket, so the 101 carrying what this hook
+ * set is observable end to end.
  */
-export function upgrade(request) {
+export async function upgrade(request, { headers }) {
+	await new Promise((resolve) => setTimeout(resolve, 5));
 	const url = new URL(request.url);
 	if (url.searchParams.get('deny') === '1') {
 		return new Response('nope', { status: 401 });
+	}
+	const offered = request.headers.get('sec-websocket-protocol');
+	if (offered) {
+		headers['sec-websocket-protocol'] = offered.split(',')[0].trim();
 	}
 	return { user: url.searchParams.get('user') || 'anon' };
 }
