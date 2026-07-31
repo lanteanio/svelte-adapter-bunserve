@@ -86,8 +86,9 @@ const subscribeThrewThrottle = createLogThrottle(() => performance.now());
 
 /**
  * The seq-less JSON envelope a wire member falls back to for a caps-less,
- * poisoned, or codec-declined frame: exactly the shape `send()` produces,
- * built with the same guarded stringify the family fallback uses.
+ * poisoned, or codec-declined frame: byte-identical to what `send()` produces
+ * (`envelopePrefix + JSON.stringify(data ?? null) + '}'`), so a degraded
+ * connection is indistinguishable from a caps-less one to the app.
  *
  * @param {any} ws - the socket facade
  * @param {string} topic
