@@ -22,7 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `platform.droppedReleaseRecords`, an instance-wide counter of releases whose
   teardown could not be recorded for the `close` hook. Any non-zero value means
   an `unsubscribe` hook has been failing persistently enough to fill a
-  connection's record, and some per-topic teardown was performed by nobody.
+  connection's record, so those releases lost the close-hook fallback: their
+  hook still ran, but nothing covers them if it did not perform the teardown.
 
 ### Fixed
 

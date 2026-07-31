@@ -201,7 +201,7 @@ export function POST({ platform }) {
 | `connections` / `subscribers(topic)` / `forEachSubscriber(topic, fn)` | live counts and the per-subscriber walk |
 | `totalSubscriptions` / `publishCount` | instance-wide subscription total, and publishes since boot |
 | `maxPayloadLength` / `bufferedAmount(ws)` / `closedWsAborts` | limits and backpressure telemetry |
-| `droppedReleaseRecords` | instance-wide; non-zero means an `unsubscribe` hook failed often enough that some per-topic teardown was performed by nobody |
+| `droppedReleaseRecords` | instance-wide; non-zero means an `unsubscribe` hook failed often enough that some releases are no longer covered by the close-hook fallback |
 | `topic(name)` | scoped publisher: `platform.topic('chat').created(data)` |
 | `requestId` | per-connection / per-request identity |
 | `now()` / `monotonic()` / `random.float()` `.u32()` `.uuid()` `.bytes(n)` | determinism seams |
