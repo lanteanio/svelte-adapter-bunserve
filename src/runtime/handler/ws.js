@@ -59,6 +59,7 @@ import {
 } from '../utils/ack-frame.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
 import { SEND_DROPPED } from '../utils/send-result.js';
+import { isValidResumeEpoch, isValidResumeSeq } from '../utils/resume-input.js';
 import {
 	CONTROL_FLOOD_CLOSE_CODE,
 	CONTROL_FRAME_LIMIT,
@@ -503,18 +504,19 @@ export const websocketHandlers = {
 
 				if (msg.type === 'subscribe' && typeof msg.topic === 'string') {
 					// A recover offset asks for the missed tail (epoch-checked by
-					// the app's resume hook) before going live. Validated to a
-					// finite non-negative number so the hook is never handed a
-					// client-invented shape; anything else subscribes plainly.
+					// the app's resume hook) before going live. Offset and epoch take
+					// the SHARED resume-input rules: this lane and the `resume` frame
+					// below feed the hook the same two quantities, so a value one lane
+					// accepts and the other refuses would make identical client state
+					// produce two different gap-fill decisions. Anything else
+					// subscribes plainly.
 					const recover =
 						msg.recover &&
 						typeof msg.recover === 'object' &&
-						typeof msg.recover.offset === 'number' &&
-						Number.isFinite(msg.recover.offset) &&
-						msg.recover.offset >= 0
+						isValidResumeSeq(msg.recover.offset)
 							? {
 								offset: msg.recover.offset,
-								epoch: Number.isInteger(msg.recover.epoch) ? msg.recover.epoch : undefined
+								epoch: isValidResumeEpoch(msg.recover.epoch) ? msg.recover.epoch : undefined
 							}
 							: null;
 					await applySubscribe(ws, msg.topic, isEchoableRef(msg.ref) ? msg.ref : null, recover);
@@ -541,31 +543,33 @@ export const websocketHandlers = {
 					} catch {
 						return;
 					}
-					// Client-named topics are held to the same wire validation the
-					// subscribe and unsubscribe lanes apply, and to the system-topic
-					// guard: this lane yields a topic's message HISTORY through the
-					// app's hook, so a topic the wire would refuse must not reach
-					// it. Filtered rather than refused whole - a resume names many
-					// topics at once and a client legitimately holds most of them.
+					// Client-named topics are held to the wire validation the
+					// unsubscribe lane applies, and to the system-topic guard: this
+					// lane yields a topic's message HISTORY through the app's hook, so
+					// a topic the wire would refuse must not reach it. Filtered rather
+					// than refused whole - a resume names many topics at once and a
+					// client legitimately holds most of them.
 					/** @type {Record<string, number>} */
 					const resumeSeqs = Object.create(null);
 					for (const t of Object.keys(msg.lastSeenSeqs)) {
 						if (!isValidWireTopic(t, true)) continue;
 						if (!allow_system_topic_subscribe && isSystemTopic(t)) continue;
-						// Only a finite, non-negative numeric watermark reaches the
+						// Only a watermark the server could have issued reaches the
 						// hook: the value is client input, and the hook queries a
 						// backend with it, so a crafted shape must never pass
-						// through unchecked (the recover lane validates its offset
-						// by the same rule).
+						// through unchecked. The recover lane holds its offset to the
+						// identical rule, from the same module.
 						const v = msg.lastSeenSeqs[t];
-						if (typeof v === 'number' && Number.isFinite(v) && v >= 0) resumeSeqs[t] = v;
+						if (isValidResumeSeq(v)) resumeSeqs[t] = v;
 					}
 					// The epoch map rides alongside the watermarks into the same
 					// hook, so it gets the SAME treatment - topic validation, the
-					// system-topic guard, a finite non-negative value, and a null
+					// system-topic guard, the shared epoch rule, and a null
 					// prototype. Forwarding the raw parse handed the hook topics
 					// the watermark map had already refused, plus whatever
-					// `__proto__` key the client put in it.
+					// `__proto__` key the client put in it. Absent when the client
+					// sends no map at all - that is how the recover lane reports "no
+					// epoch known", and the hook sees one contract, not two.
 					let lastSeenEpochs;
 					if (
 						msg.lastSeenEpochs &&
@@ -577,7 +581,7 @@ export const websocketHandlers = {
 							if (!isValidWireTopic(t, true)) continue;
 							if (!allow_system_topic_subscribe && isSystemTopic(t)) continue;
 							const e = msg.lastSeenEpochs[t];
-							if (typeof e === 'number' && Number.isFinite(e) && e >= 0) lastSeenEpochs[t] = e;
+							if (isValidResumeEpoch(e)) lastSeenEpochs[t] = e;
 						}
 					}
 					// The resume hook is the most expensive app work a client

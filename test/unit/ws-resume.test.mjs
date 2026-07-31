@@ -76,9 +76,10 @@ function cleanup(raw) {
 	maxSeenSeq.clear();
 }
 
-// A control byte is always illegal in a wire topic. Built with fromCharCode:
-// a literal control character in a source file trips the repo's byte sweep.
-const BAD_TOPIC = 'bad' + String.fromCharCode(0) + 'topic';
+// A double quote is always illegal in a wire topic, and being plain ASCII it
+// stays visible in a diff and in an editor. A control byte here makes git
+// treat the whole file as binary.
+const BAD_TOPIC = 'bad"topic';
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
@@ -267,19 +268,95 @@ test('a hookless resume still acks so the client can go live', async () => {
 	cleanup(raw);
 });
 
-test('the resume frame forwards only finite numeric watermarks to the hook', async () => {
+test('the resume frame forwards only watermarks the server could have issued', async () => {
 	let ctx = null;
 	const raw = openSocket({ resume: (ws, c) => { ctx = c; } });
 	await send(raw, {
 		type: 'resume',
 		sessionId: 's',
-		lastSeenSeqs: { good: 5, zero: 0, bad: 'x', huge: 1e999, obj: { n: 1 }, neg: -1, negFrac: -0.5 }
+		lastSeenSeqs: {
+			good: 5,
+			zero: 0,
+			bad: 'x',
+			huge: 1e999,
+			obj: { n: 1 },
+			neg: -1,
+			negFrac: -0.5,
+			frac: 2.5,
+			// Refused for a concrete reason, not tidiness: as a resume floor
+			// this discards every frame held across the cutover window.
+			unsafe: 1e308
+		}
 	});
+	assert.ok(ctx, 'hook ran');
 	assert.deepEqual(
 		{ ...ctx.lastSeenSeqs },
 		{ good: 5, zero: 0 },
-		'0 is a legitimate "seen nothing yet"; negatives and non-numbers are refused'
+		'0 is a legitimate "seen nothing yet"; the rest are values the server never issues'
 	);
+	cleanup(raw);
+});
+
+test('an omitted epoch map reaches the hook as undefined, not an empty object', async () => {
+	// The recover lane reports "no epoch known" by passing undefined. If this
+	// lane passed {} instead, a hook keying on the difference would read a
+	// client that sent nothing as a client that sent an empty map.
+	let ctx = null;
+	const raw = openSocket({ resume: (ws, c) => { ctx = c; } });
+	await send(raw, { type: 'resume', sessionId: 's', lastSeenSeqs: { room: 1 } });
+	assert.ok(ctx, 'hook ran');
+	assert.equal(ctx.lastSeenEpochs, undefined);
+	cleanup(raw);
+});
+
+test('both resume entry points hold the epoch to the same rule', async () => {
+	// A `resume` frame and a `subscribe` carrying `recover` feed the SAME hook
+	// argument. When the two lanes disagreed, identical client state produced
+	// two different gap-fill decisions depending on which frame carried it:
+	// recover took Number.isInteger (so -5 passed) and resume took
+	// Number.isFinite (so 2.5 passed).
+	setServer({ publish: () => 0, subscriberCount: () => 0 });
+	const seen = [];
+	const raw = openSocket({
+		subscribe: () => null,
+		resume: (ws, c) => { seen.push(c.lastSeenEpochs); }
+	});
+	const epochs = [-5, 2.5];
+	for (let i = 0; i < epochs.length; i++) {
+		const epoch = epochs[i];
+		await send(raw, {
+			type: 'subscribe',
+			topic: 'room' + i,
+			ref: i + 1,
+			recover: { offset: 0, epoch }
+		});
+		await send(raw, {
+			type: 'resume',
+			sessionId: 's',
+			lastSeenSeqs: { room: 0 },
+			lastSeenEpochs: { room: epoch }
+		});
+	}
+	assert.equal(seen.length, 4, 'both lanes ran the hook for both values');
+	assert.equal(seen[0], undefined, 'recover refuses a negative epoch');
+	assert.deepEqual({ ...seen[1] }, {}, 'and so does resume');
+	assert.equal(seen[2], undefined, 'recover refuses a fractional epoch');
+	assert.deepEqual({ ...seen[3] }, {}, 'and so does resume');
+	cleanup(raw);
+});
+
+test('a recover offset the server could not have issued subscribes plainly', async () => {
+	// No gap-fill rather than a gap-fill from a fabricated offset: the hook
+	// queries a backend with this value.
+	setServer({ publish: () => 0, subscriberCount: () => 0 });
+	let ran = false;
+	const raw = openSocket({ subscribe: () => null, resume: () => { ran = true; } });
+	await send(raw, { type: 'subscribe', topic: 'room', ref: 1, recover: { offset: 2.5 } });
+	assert.equal(ran, false, 'a fractional offset is not a recover');
+	await send(raw, { type: 'subscribe', topic: 'other', ref: 2, recover: { offset: 1e308 } });
+	assert.equal(ran, false, 'nor is an unsafe-integer one');
+	await send(raw, { type: 'subscribe', topic: 'third', ref: 3, recover: { offset: 0 } });
+	assert.equal(ran, true, 'a real offset still gap-fills');
 	cleanup(raw);
 });
 
@@ -292,8 +369,9 @@ test('the epoch map is filtered exactly like the watermark map', async () => {
 		type: 'resume',
 		sessionId: 's',
 		lastSeenSeqs: { room: 1 },
-		lastSeenEpochs: { room: 7, __system: 9, 'bad"topic': 3, neg: -5, str: 'x' }
+		lastSeenEpochs: { room: 7, __system: 9, [BAD_TOPIC]: 3, neg: -5, frac: 2.5, str: 'x' }
 	});
+	assert.ok(ctx, 'hook ran');
 	assert.deepEqual({ ...ctx.lastSeenEpochs }, { room: 7 }, 'only the valid topic and value survive');
 	assert.equal(
 		Object.getPrototypeOf(ctx.lastSeenEpochs),

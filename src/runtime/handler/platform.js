@@ -31,6 +31,7 @@
 import { completeEnvelope } from '../utils/envelope.js';
 import { isSystemTopic, isValidWireTopic, createTopicHelperCache } from '../utils/topic.js';
 import { SEND_DROPPED } from '../utils/send-result.js';
+import { isValidResumeEpoch } from '../utils/resume-input.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
 import {
 	denyAllBatch,
@@ -1756,7 +1757,7 @@ export async function subscribeWithVerdict(ws, topic, options, verdict) {
 				wsModule.resume(ws, {
 					sessionId: userData[WS_SESSION_ID],
 					lastSeenSeqs: { [topic]: recover.offset },
-					lastSeenEpochs: Number.isInteger(recover.epoch) ? { [topic]: recover.epoch } : undefined,
+					lastSeenEpochs: isValidResumeEpoch(recover.epoch) ? { [topic]: recover.epoch } : undefined,
 					platform: userData[WS_PLATFORM] || platform
 				})
 			);
