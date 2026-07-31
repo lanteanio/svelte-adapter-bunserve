@@ -4,8 +4,11 @@
 // ws-smoke covers the advisory frames and the 1012 close. What no other test
 // touches is the path FROM the signal handler: whether SIGTERM reaches
 // `graceful_shutdown` at all, whether the app's `shutdown` hook is called from
-// it and in the right order relative to the drain, and whether the process
-// exits 0 within its deadline instead of hanging or being killed.
+// it and in the right order relative to the drain, whether a close hook's
+// ASYNC work survives to completion instead of being cut by process.exit, and
+// whether the process exits 0 within its deadline instead of hanging or being
+// killed. A second server is then spawned with the fixture's shutdown hook
+// armed to hang, proving the deadline - not the hook - releases the shutdown.
 //
 // PLATFORM: this cannot run on Windows. A built server there exits 143 on
 // SIGTERM without the handler running at all - verified by capturing child
@@ -128,12 +131,26 @@ try {
 		shutdownLine ? `connections=${shutdownLine[1]}, expected ${CLIENTS}` : 'no shutdown line'
 	);
 
-	// The close hooks run too, and the drain waits for them rather than letting
-	// process.exit cut them mid-flight.
+	// The close hooks run too. Bun runs them synchronously inside the drain's
+	// own close loop, so this line proves they RUN during a signal shutdown -
+	// the guard against a bare stop(true) guillotine - but not that async work
+	// survives; the completion marker below is what proves that.
 	const closeLines = [...out.matchAll(/\[fixture\] close code=(\d+)/g)];
 	check(
-		`every connection's close hook completes (${closeLines.length}/${CLIENTS})`,
+		`every connection's close hook runs (${closeLines.length}/${CLIENTS})`,
 		closeLines.length === CLIENTS,
+		JSON.stringify(out.slice(-600))
+	);
+
+	// (e) The close hook's ASYNC work completes. The fixture's hook parks its
+	// completion marker behind a 150ms timer, so the marker can only appear if
+	// the drain's settle wait actually holds the process open for the tracked
+	// hook promises - an exit that no longer waits shows up here as missing
+	// lines, not as a slower pass.
+	const closeAsyncLines = [...out.matchAll(/\[fixture\] close-async done/g)];
+	check(
+		`every close hook's async work completes (${closeAsyncLines.length}/${CLIENTS})`,
+		closeAsyncLines.length === CLIENTS,
 		JSON.stringify(out.slice(-600))
 	);
 
@@ -146,24 +163,99 @@ try {
 	);
 	check('shutdown reports completion', /Shutdown complete\./.test(out), JSON.stringify(out.slice(-200)));
 
-	// Ordering: the advisory has to precede the completion line, which is the
-	// whole point of draining before stopping.
-	const drainAt = out.indexOf('[fixture] shutdown');
+	// Ordering: the shutdown hook's line has to precede the completion line -
+	// the hook runs at the top of the shutdown sequence, not as an afterthought
+	// racing process.exit.
+	const hookAt = out.indexOf('[fixture] shutdown');
 	const doneAt = out.indexOf('Shutdown complete.');
 	check(
 		'the shutdown hook runs before the process finishes shutting down',
-		drainAt !== -1 && doneAt !== -1 && drainAt < doneAt,
-		`shutdownHook@${drainAt} complete@${doneAt}`
+		hookAt !== -1 && doneAt !== -1 && hookAt < doneAt,
+		`shutdownHook@${hookAt} complete@${doneAt}`
 	);
 } catch (err) {
 	failed++;
 	failures.push('THREW: ' + (err?.message ?? String(err)));
 	console.log('FAIL threw: ' + (err?.stack ?? err));
 } finally {
-	try { proc.kill(); } catch { /* already gone, which is the expected case */ }
+	// SIGKILL, not the default SIGTERM: a server whose shutdown path is broken
+	// is exactly what this suite exists to catch, and such a server survives a
+	// SIGTERM indefinitely - cleanup must not depend on the path under test.
+	try { proc.kill('SIGKILL'); } catch { /* already gone, which is the expected case */ }
+	// Wait for the port to actually be released before the second server binds it.
+	await Promise.race([proc.exited, Bun.sleep(2000)]);
 	if (failed > 0) {
 		console.log('\n--- server stdout ---\n' + serverOut().slice(-3000));
 		console.log('\n--- server stderr ---\n' + (await new Response(proc.stderr).text()).slice(-1000));
+	}
+}
+
+// A shutdown hook that never settles must not hold the process open. The
+// deadline is the guarantee under test here, so this server gets a short
+// SHUTDOWN_TIMEOUT and the fixture's hook armed to hang: the shutdown must
+// still run to completion and exit 0 - later than a well-behaved one (the
+// deadline is what releases it), but bounded.
+await assertPortFree(PORT);
+const hangProc = Bun.spawn([process.execPath, BUILD], {
+	env: serverEnv({
+		HOST: '127.0.0.1',
+		PORT: String(PORT),
+		SHUTDOWN_TIMEOUT: '4',
+		FIXTURE_HANG_SHUTDOWN: '1'
+	}),
+	stdout: 'pipe',
+	stderr: 'pipe'
+});
+const hangChunks = [];
+const hangStdoutDone = (async () => {
+	for await (const chunk of hangProc.stdout) hangChunks.push(Buffer.from(chunk).toString());
+})();
+
+try {
+	await waitForServer(hangProc, PORT);
+	const hangStartedAt = Date.now();
+	hangProc.kill('SIGTERM');
+	const hangExit = await Promise.race([
+		hangProc.exited,
+		Bun.sleep(15000).then(() => 'timeout')
+	]);
+	const hangElapsed = Date.now() - hangStartedAt;
+	await Promise.race([hangStdoutDone, Bun.sleep(2000)]);
+	const hangOut = hangChunks.join('');
+
+	check(
+		'the hanging shutdown hook is reached from the signal path',
+		/\[fixture\] shutdown connections=/.test(hangOut),
+		JSON.stringify(hangOut.slice(-400))
+	);
+	// SHUTDOWN_TIMEOUT=4 puts the hook's share of the budget at 3s (a quarter
+	// is reserved for the SSR drain), so a run released by the deadline lands
+	// near that mark: well past an instant exit that never awaited the hook,
+	// and well short of the 15s race that catches a process the hook holds
+	// open.
+	check(
+		`the deadline, not the hook, releases the shutdown (exit=${hangExit} after ${hangElapsed}ms)`,
+		hangExit === 0 && hangElapsed >= 2500 && hangElapsed < 10000,
+		`exit=${hangExit} elapsed=${hangElapsed}ms`
+	);
+	check(
+		'shutdown still reports completion with the hook hung',
+		/Shutdown complete\./.test(hangOut),
+		JSON.stringify(hangOut.slice(-200))
+	);
+} catch (err) {
+	failed++;
+	failures.push('THREW (hanging-hook server): ' + (err?.message ?? String(err)));
+	console.log('FAIL threw: ' + (err?.stack ?? err));
+} finally {
+	// SIGKILL for the same reason as above - this server's shutdown hook is
+	// armed to hang, so a graceful signal is the one thing guaranteed not to
+	// end it when the deadline under test is the broken part.
+	try { hangProc.kill('SIGKILL'); } catch { /* already gone, which is the expected case */ }
+	await Promise.race([hangProc.exited, Bun.sleep(2000)]);
+	if (failed > 0) {
+		console.log('\n--- hanging-hook server stdout ---\n' + hangChunks.join('').slice(-1500));
+		console.log('\n--- hanging-hook server stderr ---\n' + (await new Response(hangProc.stderr).text()).slice(-1000));
 	}
 }
 

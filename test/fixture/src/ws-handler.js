@@ -10,6 +10,10 @@ export function init({ platform }) {
 /** Once at graceful shutdown, BEFORE the sockets are drained. */
 export function shutdown({ platform }) {
 	console.log(`[fixture] shutdown connections=${platform.connections}`);
+	// Armed per spawn: a hook that never settles, so the live suite can prove
+	// the shutdown deadline cuts a misbehaving hook instead of letting it hold
+	// the process open.
+	if (process.env.FIXTURE_HANG_SHUTDOWN === '1') return new Promise(() => {});
 }
 
 /**
@@ -90,9 +94,14 @@ export function unsubscribe(ws, topic, { platform }) {
 	if (topic.startsWith('hang:')) return new Promise(() => {});
 }
 
-export function close(ws, ctx) {
+export async function close(ws, ctx) {
 	const topics = [...ctx.subscriptions].sort().join(',');
 	console.log(
 		`[fixture] close code=${ctx.code} subs=${ctx.subscriptions.size} topics=${topics} in=${ctx.messagesIn} out=${ctx.messagesOut}`
 	);
+	// Deferred teardown behind a real timer, not a microtask: an exit that cuts
+	// async close work short is visible as a missing completion line, which is
+	// exactly what the shutdown suite asserts against.
+	await new Promise((resolve) => setTimeout(resolve, 150));
+	console.log(`[fixture] close-async done code=${ctx.code}`);
 }
