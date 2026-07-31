@@ -425,16 +425,49 @@ test('a declined batch with exclusion stamps each frame with ITS OWN seq', () =>
 		platform.publishWireBatch(
 			'room',
 			'moved',
-			[{ data: { x: 1 }, excludeWs: capable }, { data: { x: 2 } }],
+			[{ data: { x: 1 } }, { data: { x: 2 }, excludeWs: capable }, { data: { x: 3 } }],
 			wire,
 			{ seq: true }
 		);
-		// `capable` is excluded from entry 1, so it receives only entry 2 -
-		// which was stamped seq 2, not entry 1's seq 1.
+		// `capable` is excluded from the MIDDLE entry, so its subset is entries 1
+		// and 3 - seqs 1 and 3. Indexing the unfiltered seq array with the subset
+		// index stamps them 1 and 2, so the first frame still looks right and only
+		// the second is wrong. Excluding the FIRST entry instead would leave a
+		// single surviving frame and a weaker assertion.
 		const frames = capable.sent.map((s) => parseBinaryFrame(s.payload)).filter(Boolean);
-		assert.equal(frames.length, 1, 'exactly the non-excluded entry');
-		assert.deepEqual([...frames[0].payload], [2], 'entry 2 payload');
-		assert.equal(frames[0].seq, 2, 'stamped with entry 2 seq, not entry 1 seq');
+		assert.equal(frames.length, 2, 'the two non-excluded entries');
+		assert.deepEqual([...frames[0].payload], [1], 'entry 1 payload');
+		assert.equal(frames[0].seq, 1, 'entry 1 seq');
+		assert.deepEqual([...frames[1].payload], [3], 'entry 3 payload');
+		assert.equal(frames[1].seq, 3, 'entry 3 seq, not entry 2 seq');
+	});
+});
+
+test('a declined batch with no exclusion stamps every frame from the shared list', () => {
+	// The no-exclusion common case reuses the unfiltered arrays rather than
+	// building a subset. Nothing else in this lane covers that default: if it
+	// were wrong, every frame would ship the wire's no-seq sentinel and only the
+	// live wire lane would notice.
+	setServer(fakeServer());
+	const capable = fakeWs({ topics: ['room'], caps: [CAP] });
+	const wire = {
+		capability: CAP,
+		schemaVersion: 3,
+		encode: (event, data) => (event.endsWith('-batch') ? null : new Uint8Array([data.x])),
+		state: { onAttach: () => ({}) }
+	};
+	withConnections([capable], () => {
+		platform.publishWireBatch(
+			'room',
+			'moved',
+			[{ data: { x: 1 } }, { data: { x: 2 } }],
+			wire,
+			{ seq: true }
+		);
+		const frames = capable.sent.map((s) => parseBinaryFrame(s.payload)).filter(Boolean);
+		assert.equal(frames.length, 2, 'both entries');
+		assert.equal(frames[0].seq, 1, 'entry 1 seq');
+		assert.equal(frames[1].seq, 2, 'entry 2 seq');
 	});
 });
 
@@ -450,6 +483,26 @@ test('a fan-out that only drops frames reports no delivery', () => {
 			excludeWs: author
 		});
 		assert.equal(ok, false, 'every send dropped -> false');
+		// Without this the test also passes when the walk never reaches the
+		// socket at all - an inverted subscription check would read as success.
+		assert.equal(dropping.sent.length, 1, 'the subscriber was actually visited');
+	});
+});
+
+test('a fan-out where one send drops and another lands still reports delivery', () => {
+	// The mirror of the all-dropped case: delivery is per call, not per socket,
+	// so one subscriber that received the frame makes the call a delivery.
+	setServer(fakeServer());
+	const author = fakeWs({ topics: ['room'], caps: [CAP] });
+	const dropping = fakeWs({ topics: ['room'], script: [2] });
+	const landing = fakeWs({ topics: ['room'] });
+	withConnections([author, dropping, landing], () => {
+		const ok = platform.publishWire('room', 'gone', null, statelessCodec(), {
+			excludeWs: author
+		});
+		assert.equal(ok, true, 'one delivered subscriber is delivery');
+		assert.equal(dropping.sent.length, 1);
+		assert.equal(landing.sent.length, 1);
 	});
 });
 

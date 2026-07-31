@@ -563,7 +563,13 @@ export const platform = {
 	 * @param {any} data
 	 * @param {{ capability: string, schemaVersion: number, encode: Function, state?: any, shared?: boolean }} wire
 	 * @param {{ seq?: boolean | number, compress?: boolean, excludeWs?: any }} [options]
-	 * @returns {boolean} whether any local subscriber received it
+	 * @returns {boolean} whether any local subscriber received it. Exact on the
+	 *   per-connection walk, which sees each send result; approximate on the
+	 *   native fan-out lanes, where Bun reports a byte count for a saturated
+	 *   subscriber too - so there it answers "a subscriber existed" rather than
+	 *   "bytes reached a socket". Which lane runs depends on whether any live
+	 *   connection advertised the capability, so the same call can answer
+	 *   differently as unrelated connections come and go.
 	 */
 	publishWire(topic, event, data, wire, options) {
 		// A missing or shapeless codec is a caller error, not a crash: fall
@@ -928,10 +934,10 @@ export const platform = {
 			}
 		}
 
-		// Declared BEFORE the helper that closes over it: a `let` read from a
-		// closure invoked above its declaration throws, so a JSON send added
-		// to the fast path below would turn into a ReferenceError rather than
-		// a wrong count.
+		// Declared before the helper that closes over it, so the two can be read
+		// together. Behaviour is unchanged: nothing between the old and new
+		// positions touches the flag, and the fast path below returns its own
+		// byte tally without consulting it.
 		let delivered = false;
 
 		const sendJson = (ws, list) => {
