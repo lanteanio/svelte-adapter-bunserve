@@ -131,25 +131,34 @@ export function flushResumeTopic(handle, topic, coveredSeq) {
 		// cold-resyncs; the partial frames are then a best-effort extra.
 		sendTruncated(ws, topic);
 	}
-	// The dedup floor, and the difference between the three cases below is the
-	// difference between a duplicate and a silent gap.
+	// The dedup floor. A reported watermark is trusted only up to what this
+	// server has actually stamped for the topic: the floor is the hook's RETURN,
+	// echoing the client's own offset back is the natural hook shape, and the
+	// client controls that value - so without a bound an absurd offset becomes a
+	// floor that discards the entire held window.
 	//
-	// A reported watermark is trusted only up to what this server has actually
-	// stamped for the topic. A covered seq ABOVE that high-water mark is one the
-	// hook cannot have delivered from here - an app echoing the client's own
-	// offset back is the natural hook shape, and the client controls that value,
-	// so an absurd one would otherwise become a floor that discards the entire
-	// held window. In a cluster a peer may legitimately be ahead of this node,
-	// which is why an untrusted value falls back to the conservative pre-window
-	// floor: it re-delivers, and re-delivery is what the client tolerates.
+	// The ceiling is the HIGHER of the topic's mark now and its mark at window
+	// open, because the live mark can move DOWN: noteMaxSeen applies its monotone
+	// guard only to explicit seqs, so a `{ seq: true }` publish overwrites it
+	// unconditionally, and LRU eviction can re-seed it low. A ceiling below
+	// `entry.before` would make the fallback HIGHER than the value it rejected,
+	// dropping in-window frames the hook never covered - the precise failure this
+	// bound exists to prevent. Comparison rather than Math.max: a NaN mark must
+	// not become the ceiling, because nothing is ever `>` NaN and every reported
+	// value would then be trusted, including the client echo this guards.
 	//
-	// NaN is deliberately NOT screened out. `NaN > ceiling` is false, so it
-	// reaches the comparison below as a floor nothing is ever `<=`, and every
-	// held frame flushes. A hook that reported nonsense has said nothing about
-	// what it covered, and delivering the window twice beats dropping a frame
-	// captured below the pre-window mark - which a reordered cluster seq can be.
+	// The fallback is the pre-window mark - the same floor a hook that reports
+	// nothing gets. Conservative, NOT lossless: a frame captured BELOW that mark,
+	// which a reordered explicit seq can be, is still deduped away. Bounding in
+	// the authoritative seq space would close that class; the mark is currently
+	// written by both lanes.
+	//
+	// A NaN coveredSeq is deliberately NOT screened out: `NaN > ceiling` is
+	// false, so it arrives below as a floor nothing is ever `<=` and every held
+	// frame flushes. A hook that reported nonsense has said nothing about what it
+	// covered.
 	const seen = maxSeenSeq.get(topic);
-	const ceiling = typeof seen === 'number' ? seen : entry.before;
+	const ceiling = typeof seen === 'number' && seen > entry.before ? seen : entry.before;
 	const floor =
 		coveredSeq === undefined || coveredSeq > ceiling ? entry.before : coveredSeq;
 	let dropped = false;

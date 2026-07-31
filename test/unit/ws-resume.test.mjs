@@ -17,6 +17,7 @@ const { websocketHandlers } = await import('../../src/runtime/handler/ws.js');
 const { platform } = await import('../../src/runtime/handler/platform.js');
 const {
 	maxSeenSeq,
+	noteMaxSeen,
 	resumeBuffers,
 	setServer,
 	topicSeqs
@@ -46,10 +47,10 @@ function scriptedWs(script) {
  * captures without it is testing a state the runtime never reaches.
  */
 function captureLive(topic, seq, envelope, authoritative = true, excludeWs = null) {
-	if (typeof seq === 'number') {
-		const prev = maxSeenSeq.get(topic);
-		maxSeenSeq.set(topic, authoritative && prev !== undefined && prev > seq ? prev : seq);
-	}
+	// noteMaxSeen itself, not a copy of its rule: a reimplementation here would
+	// keep encoding today's rule after the real one changed, and every test in
+	// this file would stay green against a state the runtime no longer reaches.
+	noteMaxSeen(topic, seq, authoritative);
 	captureResumeFrame(topic, seq, envelope, false, excludeWs, authoritative);
 }
 
@@ -187,13 +188,14 @@ test('an overflowed window that also drops signals exactly once', () => {
 	const ws = scriptedWs([1, 1, SEND_DROPPED]);
 	const cap = beginResumeCapture(['room'], ws);
 	for (let i = 1; i <= MAX_RESUME_BUFFERED_FRAMES + 10; i++) {
-		captureResumeFrame('room', i, 'E' + i, false, null, true);
+		captureLive('room', i, 'E' + i);
 	}
 	flushResumeTopic(cap, 'room', MAX_RESUME_BUFFERED_FRAMES - 6);
 	const markers = ws.sent.filter((f) => typeof f === 'string' && f.includes('"truncated"'));
 	assert.equal(markers.length, 1, 'signalled once, up front');
 	// marker, one accepted frame, one refused frame - and then nothing.
 	assert.equal(ws.sent.length, 3, 'the tail stopped at the refusal');
+	maxSeenSeq.clear();
 });
 
 test('a counter frame is never deduped against an explicit floor (no mixed-space gap)', () => {
@@ -220,6 +222,37 @@ test('a covered seq above anything the server stamped cannot wipe the window', (
 	captureLive('room', 11, 'ENV11');
 	flushResumeTopic(cap, 'room', 1e308);
 	assert.deepEqual(ws.sent, ['ENV10', 'ENV11'], 'the window survives an impossible floor');
+	maxSeenSeq.clear();
+});
+
+test('a counter publish cannot lower the ceiling below the pre-window mark', () => {
+	// noteMaxSeen guards monotonicity only for explicit seqs, so a { seq: true }
+	// publish overwrites the mark DOWNWARD. If the ceiling followed it, a
+	// reported watermark would be rejected and the fallback - the pre-window
+	// mark - would sit ABOVE the value it rejected, discarding in-window frames
+	// the hook never covered. That is a silent gap made by the anti-gap guard.
+	const ws = scriptedWs([]);
+	noteMaxSeen('room', 1000, true);
+	const cap = beginResumeCapture(['room'], ws);
+	captureLive('room', 800, 'REORDERED800');
+	noteMaxSeen('room', 3, false);
+	assert.equal(maxSeenSeq.get('room'), 3, 'the counter publish really did lower the mark');
+	// The hook honestly replayed up to 700 and stopped; 800 is past it.
+	flushResumeTopic(cap, 'room', 700);
+	assert.deepEqual(ws.sent, ['REORDERED800'], 'the uncovered frame is delivered, not deduped');
+	maxSeenSeq.clear();
+});
+
+test('a hook returning NaN reaches the flush as a floor, through coveredSeqFor', () => {
+	// End to end, because the flush's own NaN handling is not what changed -
+	// coveredSeqFor no longer screens it out, and that composition is the only
+	// path production takes.
+	const ws = scriptedWs([]);
+	noteMaxSeen('room', 50, true);
+	const cap = beginResumeCapture(['room'], ws);
+	captureLive('room', 40, 'REORDERED40');
+	flushResumeTopic(cap, 'room', coveredSeqFor({ room: NaN }, 'room'));
+	assert.deepEqual(ws.sent, ['REORDERED40'], 'nonsense report dedups nothing');
 	maxSeenSeq.clear();
 });
 

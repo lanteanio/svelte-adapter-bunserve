@@ -404,15 +404,21 @@ carrying a null topic.
 The `resume` hook's RETURN VALUE is the dedup boundary for the gap-fill, so it
 is part of the contract rather than an ignored result. Return the highest seq
 you actually delivered per topic (`{ [topic]: seq }`, or a bare number for a
-single-topic recover); anything else is read as "covered nothing", and the
-frames held across the cutover window are re-delivered rather than skipped.
+single-topic recover).
 
-Do NOT simply echo the client's own offset back. That value is client input,
-and as a boundary it would suppress exactly the frames the barrier is holding
-for this client. A reported boundary above the highest seq the server has
-stamped for the topic is ignored for that reason, so re-delivery is the worst
-case rather than a silent gap - but a hook that reports what it really covered
-is what makes the boundary exact.
+Report nothing and the boundary falls back to the topic's high-water mark as it
+stood when the window opened. That re-delivers most of the window, but it is
+conservative rather than lossless: a frame arriving inside the window carrying
+an OLDER explicit seq than that mark - a reordered cluster seq - is still
+deduped away. Reporting what you actually covered is what makes the boundary
+exact.
+
+The reported boundary is trusted only up to the highest seq this server has
+stamped for the topic. That bound exists because echoing the client's own
+offset straight back is the easiest hook to write and that value is client
+input: unbounded, it would let a client suppress precisely the frames the
+barrier is holding for it. (`test/fixture/src/ws-handler.js` echoes it on
+purpose - it is a controlled test double, not a pattern to copy.)
 
 A control frame is recognized by its `{"type"` prefix, so a control frame must
 put `type` first. Whitespace is stepped over in two bounded runs of 16 - before
