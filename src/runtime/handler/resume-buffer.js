@@ -131,7 +131,27 @@ export function flushResumeTopic(handle, topic, coveredSeq) {
 		// cold-resyncs; the partial frames are then a best-effort extra.
 		sendTruncated(ws, topic);
 	}
-	const floor = typeof coveredSeq === 'number' ? coveredSeq : entry.before;
+	// The dedup floor, and the difference between the three cases below is the
+	// difference between a duplicate and a silent gap.
+	//
+	// A reported watermark is trusted only up to what this server has actually
+	// stamped for the topic. A covered seq ABOVE that high-water mark is one the
+	// hook cannot have delivered from here - an app echoing the client's own
+	// offset back is the natural hook shape, and the client controls that value,
+	// so an absurd one would otherwise become a floor that discards the entire
+	// held window. In a cluster a peer may legitimately be ahead of this node,
+	// which is why an untrusted value falls back to the conservative pre-window
+	// floor: it re-delivers, and re-delivery is what the client tolerates.
+	//
+	// NaN is deliberately NOT screened out. `NaN > ceiling` is false, so it
+	// reaches the comparison below as a floor nothing is ever `<=`, and every
+	// held frame flushes. A hook that reported nonsense has said nothing about
+	// what it covered, and delivering the window twice beats dropping a frame
+	// captured below the pre-window mark - which a reordered cluster seq can be.
+	const seen = maxSeenSeq.get(topic);
+	const ceiling = typeof seen === 'number' ? seen : entry.before;
+	const floor =
+		coveredSeq === undefined || coveredSeq > ceiling ? entry.before : coveredSeq;
 	let dropped = false;
 	for (const f of entry.buffer.frames) {
 		// Dedup ONLY explicit-seq frames against the floor: they share the
@@ -178,7 +198,7 @@ export function flushResumeTopic(handle, topic, coveredSeq) {
  */
 export function coveredSeqFor(covered, topic) {
 	if (covered == null) return undefined;
-	if (typeof covered === 'number') return Number.isFinite(covered) ? covered : undefined;
+	if (typeof covered === 'number') return covered;
 	if (typeof covered === 'object') {
 		// `covered` is whatever the app's resume hook returned, so this
 		// property read can throw - a getter, a Proxy, a lazy ORM row. A hook
@@ -186,12 +206,12 @@ export function coveredSeqFor(covered, topic) {
 		// the same answer a hook returning a non-number gives.
 		try {
 			const v = /** @type {Record<string, unknown>} */ (covered)[topic];
-			// Finite only. This value becomes the dedup floor, and Infinity there
-			// discards every frame held across the cutover window - a silent gap
-			// produced by the very thing that exists to close one. A hook
-			// reporting a nonsense watermark is treated as reporting nothing, so
-			// the pre-window floor applies and the window re-delivers instead.
-			return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+			// Passed through as reported, including a nonsense magnitude: whether
+			// a reported value is USABLE as a dedup floor is decided in
+			// flushResumeTopic, against what this server has actually stamped.
+			// Deciding it here cannot work - the answer depends on the topic's
+			// high-water mark, which this pure helper does not see.
+			return typeof v === 'number' ? v : undefined;
 		} catch (err) {
 			console.error('[ws] resume hook result read threw for topic', topic, err);
 			return undefined;

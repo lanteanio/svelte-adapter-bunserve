@@ -39,6 +39,20 @@ function scriptedWs(script) {
 	return { sent, send(p) { sent.push(p); return script.length ? script.shift() : 1; } };
 }
 
+/**
+ * Capture a frame the way a publish does: the seq is recorded as SEEN before
+ * the frame is buffered. That high-water mark is what lets the flush tell a
+ * watermark the server could have issued from one it could not, so a test that
+ * captures without it is testing a state the runtime never reaches.
+ */
+function captureLive(topic, seq, envelope, authoritative = true, excludeWs = null) {
+	if (typeof seq === 'number') {
+		const prev = maxSeenSeq.get(topic);
+		maxSeenSeq.set(topic, authoritative && prev !== undefined && prev > seq ? prev : seq);
+	}
+	captureResumeFrame(topic, seq, envelope, false, excludeWs, authoritative);
+}
+
 function rawSocket() {
 	const sent = [];
 	const subscribed = new Set();
@@ -111,10 +125,11 @@ test('the barrier holds frames across the window and flushes above the floor', (
 test('a reported watermark overrides the fallback floor', () => {
 	const fakeWs = { sent: [], send(p) { this.sent.push(p); return 1; } };
 	const cap = beginResumeCapture(['room'], fakeWs);
-	captureResumeFrame('room', 1, 'ENV1', false, null, true);
-	captureResumeFrame('room', 2, 'ENV2', false, null, true);
+	captureLive('room', 1, 'ENV1');
+	captureLive('room', 2, 'ENV2');
 	flushResumeTopic(cap, 'room', coveredSeqFor({ room: 1 }, 'room'));
 	assert.deepEqual(fakeWs.sent, ['ENV2']);
+	maxSeenSeq.clear();
 });
 
 test('seq-less frames always flush; discard delivers nothing', () => {
@@ -136,12 +151,13 @@ test('an overflowed window signals truncation FIRST, then best-effort frames', (
 	const fakeWs = { sent: [], send(p) { this.sent.push(p); return 1; } };
 	const cap = beginResumeCapture(['room'], fakeWs);
 	for (let i = 1; i <= MAX_RESUME_BUFFERED_FRAMES + 10; i++) {
-		captureResumeFrame('room', i, 'E' + i, false, null, true);
+		captureLive('room', i, 'E' + i);
 	}
 	flushResumeTopic(cap, 'room', MAX_RESUME_BUFFERED_FRAMES - 1);
 	assert.ok(fakeWs.sent[0].includes('"__replay:room"'), 'truncation marker first');
 	assert.ok(fakeWs.sent[0].includes('"truncated"'));
 	assert.equal(fakeWs.sent[1], 'E' + MAX_RESUME_BUFFERED_FRAMES, 'then the surviving tail');
+	maxSeenSeq.clear();
 });
 
 test('a refused gap-fill frame stops the flush and signals truncation', () => {
@@ -186,10 +202,39 @@ test('a counter frame is never deduped against an explicit floor (no mixed-space
 	// must NOT be dropped by the explicit floor.
 	const fakeWs = { sent: [], send(p) { this.sent.push(p); return 1; } };
 	const cap = beginResumeCapture(['room'], fakeWs);
-	captureResumeFrame('room', 1, 'COUNTER1', false, null, false);
-	captureResumeFrame('room', 1000, 'EXPLICIT1000', false, null, true);
+	captureLive('room', 1, 'COUNTER1', false);
+	captureLive('room', 1000, 'EXPLICIT1000');
 	flushResumeTopic(cap, 'room', 1000);
 	assert.deepEqual(fakeWs.sent, ['COUNTER1'], 'the counter frame flushes, the explicit one is covered');
+	maxSeenSeq.clear();
+});
+
+test('a covered seq above anything the server stamped cannot wipe the window', () => {
+	// The hook's RETURN becomes the dedup floor, and echoing the client's own
+	// offset back is the natural hook shape - this repo's own fixture does it.
+	// So without a ceiling a client sending an absurd offset has its entire held
+	// window discarded, silently, by the machinery that exists to prevent gaps.
+	const ws = scriptedWs([]);
+	const cap = beginResumeCapture(['room'], ws);
+	captureLive('room', 10, 'ENV10');
+	captureLive('room', 11, 'ENV11');
+	flushResumeTopic(cap, 'room', 1e308);
+	assert.deepEqual(ws.sent, ['ENV10', 'ENV11'], 'the window survives an impossible floor');
+	maxSeenSeq.clear();
+});
+
+test('a NaN covered seq deduplicates nothing rather than falling back', () => {
+	// A hook that reported nonsense has said nothing about what it covered. The
+	// conservative pre-window floor would silently DROP a frame captured below
+	// it - which a reordered cluster seq can be - while re-delivering cannot
+	// lose anything.
+	const ws = scriptedWs([]);
+	maxSeenSeq.set('room', 50);
+	const cap = beginResumeCapture(['room'], ws);
+	captureLive('room', 40, 'REORDERED');
+	flushResumeTopic(cap, 'room', NaN);
+	assert.deepEqual(ws.sent, ['REORDERED'], 'delivered, not dropped under the pre-window floor');
+	maxSeenSeq.clear();
 });
 
 test('a publish that excludes the resuming socket does not flush to it', () => {
@@ -212,14 +257,12 @@ test('coveredSeqFor tolerates every hook-return shape', () => {
 	assert.equal(coveredSeqFor('7', 'room'), undefined);
 	const throwing = new Proxy({}, { get() { throw new Error('lazy row'); } });
 	assert.equal(coveredSeqFor(throwing, 'room'), undefined);
-	// A non-finite covered seq becomes the dedup floor, where Infinity discards
-	// every frame held across the cutover window - a silent gap manufactured by
-	// the machinery that exists to close one. Treated as reporting nothing, so
-	// the pre-window floor applies and the window re-delivers instead.
-	assert.equal(coveredSeqFor(Infinity, 'room'), undefined, 'bare Infinity');
-	assert.equal(coveredSeqFor({ room: Infinity }, 'room'), undefined, 'per-topic Infinity');
-	assert.equal(coveredSeqFor({ room: NaN }, 'room'), undefined, 'per-topic NaN');
-	assert.equal(coveredSeqFor({ room: 1e308 }, 'room'), 1e308, 'finite stays: the app owns the space');
+	// Reported values pass through as reported, magnitude and all. Whether one
+	// is USABLE as a dedup floor depends on the topic high-water mark, which
+	// this pure helper cannot see - flushResumeTopic decides that.
+	assert.equal(coveredSeqFor(Infinity, 'room'), Infinity, 'bare Infinity');
+	assert.equal(coveredSeqFor({ room: 1e308 }, 'room'), 1e308, 'per-topic magnitude');
+	assert.ok(Number.isNaN(coveredSeqFor({ room: NaN }, 'room')), 'NaN survives as NaN');
 });
 
 test('a publish during an async recover reaches the client before its ack', async () => {

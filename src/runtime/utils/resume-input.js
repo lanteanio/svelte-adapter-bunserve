@@ -32,9 +32,17 @@
  * past 2^53 as a matter of course. A watermark this server itself put on the
  * wire has to round-trip.
  *
- * Magnitude is the app's business. The place an absurd value actually does
- * damage is the dedup floor, and that is guarded where the floor is read
- * (`coveredSeqFor` in handler/resume-buffer.js), not here.
+ * Magnitude is the app's business, and the wire carries it exactly - the frame
+ * varint round-trips 2^53 and beyond. The place an absurd value does damage is
+ * the dedup floor, and that is bounded where the floor is built
+ * (`flushResumeTopic` in handler/resume-buffer.js), against the topic's own
+ * high-water mark. Not here, because this rule cannot see that mark.
+ *
+ * The lower bound is not symmetry. A negative seq is not merely unusual, it is
+ * unrepresentable: the frame varint encodes -1 and parses it back as 127, so a
+ * negative watermark names a frame no client can be holding. (`stampSeq` will
+ * pass an explicit negative seq through to the wire, which is a defect on the
+ * publish side rather than a reason to accept its echo here.)
  *
  * @param {unknown} v
  * @returns {v is number}

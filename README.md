@@ -401,6 +401,19 @@ why the two frames that answer for no single topic (`BATCH_TOO_LARGE`,
 `CONTROL_FLOOD`) are `error` frames carrying a `code` rather than denials
 carrying a null topic.
 
+The `resume` hook's RETURN VALUE is the dedup boundary for the gap-fill, so it
+is part of the contract rather than an ignored result. Return the highest seq
+you actually delivered per topic (`{ [topic]: seq }`, or a bare number for a
+single-topic recover); anything else is read as "covered nothing", and the
+frames held across the cutover window are re-delivered rather than skipped.
+
+Do NOT simply echo the client's own offset back. That value is client input,
+and as a boundary it would suppress exactly the frames the barrier is holding
+for this client. A reported boundary above the highest seq the server has
+stamped for the topic is ignored for that reason, so re-delivery is the worst
+case rather than a silent gap - but a hook that reports what it really covered
+is what makes the boundary exact.
+
 A control frame is recognized by its `{"type"` prefix, so a control frame must
 put `type` first. Whitespace is stepped over in two bounded runs of 16 - before
 the `{` and between it and the first key - so an ordinarily pretty-printed frame

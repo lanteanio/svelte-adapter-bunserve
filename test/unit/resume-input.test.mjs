@@ -19,7 +19,10 @@ test('a watermark is any finite, non-negative number', () => {
 	assert.equal(isValidResumeSeq(1), true);
 	assert.equal(isValidResumeSeq(-0), true, '-0 === 0 and stringifies as "0"');
 
-	assert.equal(isValidResumeSeq(-1), false, 'the wire has no negative seq');
+	// Unrepresentable, not merely unusual: the frame varint encodes -1 and
+	// parses it back as 127, so a negative watermark names a frame no client
+	// can be holding.
+	assert.equal(isValidResumeSeq(-1), false);
 	assert.equal(isValidResumeSeq(-0.5), false);
 	assert.equal(isValidResumeSeq(Infinity), false);
 	assert.equal(isValidResumeSeq(-Infinity), false);
