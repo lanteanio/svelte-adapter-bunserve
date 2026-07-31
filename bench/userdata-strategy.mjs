@@ -6,8 +6,8 @@
 //      handler does one wsFacade(raw) WeakMap acquisition, then calls
 //      getUserData() on the held facade - a closure method that also carries
 //      the detached check the throw-on-closed contract needs.
-//   B. the prototype patch the probe measured (prototype-patch section of
-//      probe/bun-api-facts.report.md): stamp a getUserData onto the shared
+//   B. the prototype patch the probe verified is possible (prototype-patch
+//      section of probe/bun-api-facts.report.md): stamp a getUserData onto the shared
 //      ServerWebSocket prototype once at boot and call it directly on the raw
 //      socket - zero acquisition, zero per-connection state, and therefore no
 //      place to hang the closed/detached lifecycle the facade exists for.
@@ -17,8 +17,12 @@
 // The per-message cost model differs in shape, not just in per-call price:
 //   facade   = 1 acquisition + K accesses
 //   patch    = K accesses
-// so the composite line below prints both at a representative K as well as the
-// raw per-operation figures.
+// so the composite lines below print both at the two K values the handler
+// actually pays, counted against src/runtime/handler/ws.js and its helpers:
+// K=2 for an app data frame (bumpIn's stats read when a close hook is
+// registered, plus the demux tail's own userData read) and K=7 for a
+// single-subscribe control frame (stats, the gate's headroom and count
+// bookkeeping, the hook context, and the ack's egress charge).
 //
 // Rounds are INTERLEAVED (A, B, A, B, ...) and the median is reported: this
 // machine's runs drift by double-digit percentages, and back-to-back blocks
@@ -31,7 +35,8 @@ import { wsFacade } from '../src/runtime/handler/ws-facade.js';
 const HOST = '127.0.0.1';
 const ITERATIONS = 2_000_000;
 const ROUNDS = 9;
-const ACCESSES_PER_MESSAGE = 4;
+const DATA_FRAME_ACCESSES = 2;
+const CONTROL_FRAME_ACCESSES = 7;
 const CONNECTIONS = 200_000;
 
 let resolveSocket;
@@ -109,12 +114,17 @@ for (const [name, s] of Object.entries(samples)) {
 const acquisition = results['facade acquisition (wsFacade(raw), WeakMap hit)'];
 const facadeAccess = results['facade getUserData() on the held facade'];
 const patchAccess = results['prototype-patched getUserData() on the raw socket'];
-const facadePerMessage = acquisition + ACCESSES_PER_MESSAGE * facadeAccess;
-const patchPerMessage = ACCESSES_PER_MESSAGE * patchAccess;
-console.log(`\nper-message composite at ${ACCESSES_PER_MESSAGE} accesses:`);
-console.log(`  ${facadePerMessage.toFixed(1).padStart(6)} ns  facade (1 acquisition + ${ACCESSES_PER_MESSAGE} accesses)`);
-console.log(`  ${patchPerMessage.toFixed(1).padStart(6)} ns  prototype patch (${ACCESSES_PER_MESSAGE} accesses)`);
-console.log(`  delta ${(facadePerMessage - patchPerMessage).toFixed(1)} ns/message (${(((facadePerMessage / patchPerMessage) - 1) * 100).toFixed(1)}% over the patch)`);
+for (const [pathName, k] of [
+	['app data frame', DATA_FRAME_ACCESSES],
+	['single-subscribe control frame', CONTROL_FRAME_ACCESSES]
+]) {
+	const facadePerMessage = acquisition + k * facadeAccess;
+	const patchPerMessage = k * patchAccess;
+	console.log(`\nper-message composite, ${pathName} (${k} accesses):`);
+	console.log(`  ${facadePerMessage.toFixed(1).padStart(6)} ns  facade (1 acquisition + ${k} accesses)`);
+	console.log(`  ${patchPerMessage.toFixed(1).padStart(6)} ns  prototype patch (${k} accesses)`);
+	console.log(`  delta ${(facadePerMessage - patchPerMessage).toFixed(1)} ns/message (${(((facadePerMessage / patchPerMessage) - 1) * 100).toFixed(1)}% over the patch)`);
+}
 
 // The facade's other cost center: creating one per connection. The patch pays
 // nothing here. Plain objects stand in for sockets - wsFacade only stores the
