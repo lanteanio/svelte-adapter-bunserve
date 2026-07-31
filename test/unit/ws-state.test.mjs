@@ -19,7 +19,8 @@ const {
 	hasGateHeadroom,
 	pendingReleaseTopics,
 	runUnsubscribeHook,
-	withGateCounted
+	withGateCounted,
+	wsCounters
 } =
 	await import('../../src/runtime/handler/ws-state.js');
 
@@ -324,4 +325,46 @@ test('the pending-release record is bounded', () => {
 	// Everything in flight still fits: the queue admits at most 64 + 1024 at
 	// once, so the ceiling cannot be reached by legitimate concurrency alone.
 	assert.ok(recorded > 64 + 1024);
+});
+
+test('what the ceiling refuses to record is counted', async () => {
+	// Past the ceiling a release's teardown is not guaranteed by anyone, which
+	// is the one hole in the at-least-once contract. The warning fires once per
+	// process, so without a counter the second connection to hit this loses
+	// teardowns with no output at all, and an operator has nothing to read.
+	const ud = fakeWs().getUserData();
+	const before = wsCounters.droppedReleaseRecords;
+	const CEILING = 2 * (64 + 1024);
+	for (let i = 0; i < CEILING; i++) {
+		beginPendingRelease(ud, `room:${i}`);
+		settlePendingRelease(ud, `room:${i}`, false);
+	}
+	assert.equal(wsCounters.droppedReleaseRecords, before, 'nothing dropped while there is room');
+
+	beginPendingRelease(ud, 'one-too-many');
+	assert.equal(wsCounters.droppedReleaseRecords, before + 1);
+	assert.equal([...pendingReleaseTopics(ud)].includes('one-too-many'), false);
+});
+
+test('a topic already recorded still takes on another debt at the ceiling', async () => {
+	// The ceiling refuses NEW keys only. Refusing an increment for a topic that
+	// is already recorded would silently drop the second teardown owed for it,
+	// which is the exact leak the count exists to prevent - and dropping the
+	// `owed === undefined` half of that test reads like a simplification.
+	const ud = fakeWs().getUserData();
+	const CEILING = 2 * (64 + 1024);
+	for (let i = 0; i < CEILING; i++) {
+		beginPendingRelease(ud, `room:${i}`);
+		settlePendingRelease(ud, `room:${i}`, false);
+	}
+	const dropped = wsCounters.droppedReleaseRecords;
+
+	// A second release of a topic that is already owed one, at the ceiling.
+	beginPendingRelease(ud, 'room:0');
+	assert.equal(wsCounters.droppedReleaseRecords, dropped, 'an existing key is not a new record');
+	// Two debts now, so one successful hook must not discharge both.
+	settlePendingRelease(ud, 'room:0', true);
+	assert.equal([...pendingReleaseTopics(ud)].includes('room:0'), true);
+	settlePendingRelease(ud, 'room:0', true);
+	assert.equal([...pendingReleaseTopics(ud)].includes('room:0'), false);
 });

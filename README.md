@@ -201,6 +201,7 @@ export function POST({ platform }) {
 | `connections` / `subscribers(topic)` / `forEachSubscriber(topic, fn)` | live counts and the per-subscriber walk |
 | `totalSubscriptions` / `publishCount` | instance-wide subscription total, and publishes since boot |
 | `maxPayloadLength` / `bufferedAmount(ws)` / `closedWsAborts` | limits and backpressure telemetry |
+| `droppedReleaseRecords` | instance-wide; non-zero means an `unsubscribe` hook failed often enough that some per-topic teardown was performed by nobody |
 | `topic(name)` | scoped publisher: `platform.topic('chat').created(data)` |
 | `requestId` | per-connection / per-request identity |
 | `now()` / `monotonic()` / `random.float()` `.u32()` `.uuid()` `.bytes(n)` | determinism seams |
@@ -302,8 +303,8 @@ are different jobs rather than different sizes of the same one:
   topic is named to the `close` hook instead. (The one limit: a connection
   records at most 2176 topics owed a teardown, which no amount of ordinary
   concurrency reaches, but a hook failing over and over on one connection can.
-  Past that the release is not recorded, the adapter says so once, and
-  `platform.droppedReleaseRecords` counts it.) The
+  Past that the release is not recorded, the adapter says so once, and the
+  instance-wide `platform.droppedReleaseRecords` counts it.) The
   cost is that a hook which was mid-await when the connection died can finish
   AND have its topic named there, so a teardown that is not idempotent (a bare
   `roster.decr(topic)`) can run twice. The alternative is dropping the release
@@ -445,21 +446,26 @@ node ../../bench/http-bench.mjs http://127.0.0.1:3000/ 32 8
 
 The unit suite covers the pure decision modules (range parsing, content
 negotiation, path canonicalization, proxy trust, header validation) and runs
-under Node, not Bun:
+under Node, not Bun. It also covers the WebSocket demux and the authorization
+gate, which reach the app through a specifier the build injects: a loader hook
+(`test/helpers/ws-handler-loader.mjs`) resolves that specifier to a stub, so
+`handler/ws.js` and `handler/platform.js` can be driven without a build. Put
+frame-shape and hook-contract assertions there - it is the fast lane, and for a
+long time nothing in it could reach either module:
 
 ```sh
 npm test   # requires Node 22+ for the test-runner glob
 ```
 
-The live lane asserts the WebSocket wire contract end to end, which the unit
-suite cannot: it builds the fixture, boots the built output under Bun, and
-drives real WebSocket clients against it. It covers the subscribe, batch, and
-unsubscribe frames, the subscription cap under pipelined frames, Origin
-enforcement on the upgrade, and a no-handler build proving the HTTP surface is
-untouched when no realtime is configured. It needs Bun and the fixture's
-dependencies (`npm install` in `test/fixture` once; the `ADAPTER=uws` A/B
-variant resolves from a sibling checkout and is optional, so a plain clone
-installs):
+The live lane asserts the same contract end to end against a real server, which
+is what catches everything the stub cannot model: it builds the fixture, boots
+the built output under Bun, and drives real WebSocket clients against it. It
+covers the subscribe, batch, and unsubscribe frames, the subscription cap under
+pipelined frames, Origin enforcement on the upgrade, and a no-handler build
+proving the HTTP surface is untouched when no realtime is configured. It needs
+Bun and the fixture's dependencies (`npm install` in `test/fixture` once;
+`ADAPTER=uws` imports a sibling checkout by path and is not a dependency, so a
+plain clone installs):
 
 ```sh
 npm run test:live   # builds test/fixture twice and runs the suites in test/live/

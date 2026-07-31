@@ -15,7 +15,7 @@ globalThis.WS_PATH = '/ws';
 register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { websocketHandlers } = await import('../../src/runtime/handler/ws.js');
-const { WS_PLATFORM, WS_SUBSCRIPTIONS, pendingReleaseTopics } = await import(
+const { WS_SUBSCRIPTIONS, pendingReleaseTopics } = await import(
 	'../../src/runtime/handler/ws-state.js'
 );
 const { __setHooks } = await import('../helpers/ws-handler-stub.mjs');
@@ -45,11 +45,16 @@ function rawSocket() {
 			return subscribed.delete(topic);
 		},
 		isSubscribed: (topic) => subscribed.has(topic),
-		end(code, reason) {
-			this.ended = { code, reason };
+		// The facade's `end(code, reason)` calls raw.close(code, reason) and its
+		// `close()` calls raw.terminate() - it never calls raw.end. Modelling
+		// this wrong is silent: `close()` discarding its arguments still looks
+		// like a working socket, and the first test to assert a close CODE (the
+		// 4429 control-flood cut, say) would pin 1000 and pass.
+		close(code, reason) {
+			this.ended = this.ended ?? { code, reason };
 		},
-		close() {
-			this.ended = this.ended ?? { code: 1000, reason: '' };
+		terminate() {
+			this.ended = this.ended ?? { code: 1006, reason: 'terminated' };
 		},
 		getBufferedAmount: () => 0,
 		cork: (fn) => fn()
@@ -107,9 +112,15 @@ test('a release whose hook REJECTS is still owed, and the close hook is told', a
 	await send(raw, { type: 'subscribe', topic: 'room:1' });
 	await settle();
 	assert.deepEqual([...raw.data[WS_SUBSCRIPTIONS]], ['room:1']);
+	// NATIVE membership too, not only the adapter's bookkeeping. Installing one
+	// without the other is invisible to every other assertion here: the acks,
+	// the batch answers, the release accounting and the close snapshot all stay
+	// correct while the client receives publishes for nothing.
+	assert.deepEqual([...raw.subscribed], ['room:1']);
 
 	await send(raw, { type: 'unsubscribe', topic: 'room:1' });
 	await settle();
+	assert.deepEqual([...raw.subscribed], [], 'the release reaches the socket, not just the set');
 	// The release itself happened, so the topic is out of the live set...
 	assert.deepEqual([...raw.data[WS_SUBSCRIPTIONS]], []);
 	// ...but the teardown was never performed, so it is still owed.

@@ -15,10 +15,16 @@ const expected = new Set([
 	'BODY_SIZE_LIMIT',
 	'SHUTDOWN_TIMEOUT',
 	'SHUTDOWN_DELAY_MS',
+	'SHUTDOWN_RECONNECT_WINDOW_MS',
 	'SSL_CERT',
 	'SSL_KEY',
 	'CLUSTER_WORKERS'
 ]);
+
+// Every name the runtime reads through env() has to be listed above, or a
+// prefixed deployment setting that documented variable is refused at boot as a
+// conflicting one. Adding an env() call without adding its name here is the way
+// that happens, which is what test/unit/env-names.test.mjs compares.
 
 if (ENV_PREFIX) {
 	for (const name in process.env) {

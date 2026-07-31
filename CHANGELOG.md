@@ -15,15 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Origin enforcement on the upgrade, and a no-handler build whose HTTP surface
   must be untouched. The fixture gained a `NO_WS` build variant
   (`build-no-ws`) for the last of those.
-
-### Added
-
-- `platform.droppedReleaseRecords`, a counter of releases whose teardown could
-  not be recorded for the `close` hook. Any non-zero value means an
-  `unsubscribe` hook has been failing persistently enough to fill a
+- Unit coverage for the WebSocket demux (`test/unit/ws-demux.test.mjs`). It
+  reaches the app through a specifier the build injects, so nothing outside a
+  build could import it and every defect in it was found by reading; a loader
+  hook now resolves that specifier to a stub.
+- `platform.droppedReleaseRecords`, an instance-wide counter of releases whose
+  teardown could not be recorded for the `close` hook. Any non-zero value means
+  an `unsubscribe` hook has been failing persistently enough to fill a
   connection's record, and some per-topic teardown was performed by nobody.
 
 ### Fixed
+
+- `SHUTDOWN_RECONNECT_WINDOW_MS` was read at boot but missing from the set of
+  names the adapter recognises, so an app using `envPrefix` refused to start
+  when it set that documented variable, reporting it as a conflicting one.
 
 - An app that exports no `unsubscribe` hook no longer queues a no-op per
   release. It did, so a client that held many topics and pipelined the releases
