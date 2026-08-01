@@ -25,12 +25,19 @@
  *
  * NOT required to be an integer, and NOT bounded to the safe-integer range.
  * The `{ seq: true }` counter lane produces small integers, but an explicit
- * `{ seq: <number> }` publish passes its value through VERBATIM (`stampSeq` in
- * handler/ws-state.js) - and that is the cluster-authoritative lane, the only
- * one the resume floor ever dedups against. Apps relay event-store cursors
- * through it, where snowflake ids, Kafka offsets and log sequence numbers run
- * past 2^53 as a matter of course. A watermark this server itself put on the
- * wire has to round-trip.
+ * `{ seq: <number> }` publish carries the app's own cursor - and that is the
+ * cluster-authoritative lane, the only one the resume floor ever dedups
+ * against. Apps relay event-store cursors through it, where snowflake ids,
+ * Kafka offsets and log sequence numbers run past 2^53 as a matter of course.
+ * A watermark this server itself put on the wire has to round-trip.
+ *
+ * The publish side is STRICTER than this (utils/publish-seq.js requires a
+ * non-negative integer), and the gap is deliberate rather than an inconsistency
+ * to close. This rule governs what a client may be HOLDING - from an older
+ * build, or from another node in a cluster - so tightening it to match would
+ * drop those topics from the gap-fill map and manufacture the silent gap the
+ * barrier exists to prevent. Refusing on the publish side costs a warning;
+ * refusing here costs a client its history.
  *
  * Magnitude is the app's business, and the wire carries it exactly - the frame
  * varint round-trips 2^53 and beyond. The place an absurd value does damage is
@@ -40,15 +47,49 @@
  *
  * The lower bound is not symmetry. A negative seq is not merely unusual, it is
  * unrepresentable: the frame varint encodes -1 and parses it back as 127, so a
- * negative watermark names a frame no client can be holding. (`stampSeq` will
- * pass an explicit negative seq through to the wire, which is a defect on the
- * publish side rather than a reason to accept its echo here.)
+ * negative watermark names a frame no client can be holding - which is why the
+ * publish side refuses to emit one at all.
  *
  * @param {unknown} v
  * @returns {v is number}
  */
 export function isValidResumeSeq(v) {
 	return typeof v === 'number' && Number.isFinite(v) && v >= 0;
+}
+
+/**
+ * A session id the client could legitimately be presenting: 1 to 128 characters
+ * of printable ASCII, with no quote or backslash.
+ *
+ * The value is opaque to the adapter. Whatever issued the previous session
+ * minted it, and this lane hands it straight to the app's resume hook, which
+ * queries a backend with it - so the rules are the ones that hold whatever the
+ * app does downstream: a length bound, so one frame cannot hand the app
+ * kilobytes of lookup key, and the character scan the topic rule already
+ * applies. 128 is generous against the server's own `crypto.randomUUID()`
+ * at 36, and against every id scheme that reaches for a UUID, a nanoid, hex or
+ * base64.
+ *
+ * Printable ASCII rather than "no control byte", because those are not the same
+ * bound and only the first one closes the class that matters. Barring `< 32`
+ * alone still admits DEL, the C1 block, the bidi overrides and the line
+ * separators U+2028 / U+2029 - which `JSON.stringify` emits RAW - so a value
+ * that survives the scan can still corrupt a log line or a rendered admin
+ * table. It is also what makes the bound unambiguous: over printable ASCII a
+ * character IS a byte, so this cannot be argued past with a multi-byte id the
+ * way a UTF-16 length bound can (`ref` is capped in BYTES for exactly that
+ * reason).
+ *
+ * @param {unknown} v
+ * @returns {v is string}
+ */
+export function isValidResumeSessionId(v) {
+	if (typeof v !== 'string' || v.length === 0 || v.length > 128) return false;
+	for (let i = 0; i < v.length; i++) {
+		const c = v.charCodeAt(i);
+		if (c < 32 || c > 126 || c === 34 || c === 92) return false;
+	}
+	return true;
 }
 
 /**

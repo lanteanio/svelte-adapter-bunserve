@@ -10,14 +10,20 @@
  *   {"type":"subscribe","topic":"t","ref":N?}
  *   {"type":"unsubscribe","topic":"t","ref":N?}
  *   {"type":"subscribe-batch","topics":["a","b"],"ref":N?}
+ *   {"type":"resume","sessionId":"s","lastSeenSeqs":{"t":N},"lastSeenEpochs":{"t":E}?}
  * Server to client:
  *   {"type":"welcome","sessionId":"..."}
  *   {"type":"subscribed","topic":"t","ref":N,"epoch":E}
  *   {"type":"subscribe-denied","topic":"t","ref":N,"reason":"..."}
  *   {"type":"unsubscribed","topic":"t","ref":N}
  *   {"type":"unsubscribe-denied","topic":"t","ref":N,"reason":"..."}
+ *   {"type":"resumed"}
  *   {"type":"error","code":"CONTROL_FRAME_TOO_LARGE","limit":L,"size":N}
  *   {"type":"error","code":"BATCH_TOO_LARGE","limit":L,"size":N}
+ *   {"type":"error","code":"RESUME_TOO_LARGE","limit":L,"size":N}
+ *   {"type":"error","code":"INVALID_SESSION_ID"}
+ *   {"type":"error","code":"RESUME_RATE_LIMITED"}
+ *   {"type":"error","code":"RESUME_FAILED"}
  *   {"type":"error","code":"CONTROL_FLOOD","limit":B}
  *
  * A `subscribe-batch` is answered PER ENTRY, with the same `subscribed` /
@@ -30,7 +36,7 @@
  * Per-entry answers ARE an amplifier, so two separate things bound them: the
  * batch itself is refused whole past MAX_BATCH_TOPICS, which stops the frame
  * count scaling with the inbound frame rather than with the limit, and the ack
- * CHANNEL is budgeted per connection. See sendControl and
+ * CHANNEL is budgeted per connection. See handler/control-egress.js and
  * bench/control-egress.mjs.
  *
  * Control frames must carry `type` as the FIRST key. JSON defines no key order,
@@ -46,7 +52,8 @@
  */
 
 import { wsFacade } from './ws-facade.js';
-import { bumpIn, bumpOut, closeHookRegistered } from './ws-stats.js';
+import { bumpIn, closeHookRegistered } from './ws-stats.js';
+import { sendControl } from './control-egress.js';
 import { platform, runBatchGate, subscribeWithVerdict } from './platform.js';
 import { wsModule } from '../ws-handler-bridge.js';
 import { isSystemTopic, isValidWireTopic } from '../utils/topic.js';
@@ -58,17 +65,23 @@ import {
 	unsubscribedFrame
 } from '../utils/ack-frame.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
-import { SEND_DROPPED } from '../utils/send-result.js';
-import { isValidResumeEpoch, isValidResumeSeq } from '../utils/resume-input.js';
+import {
+	isValidResumeEpoch,
+	isValidResumeSeq,
+	isValidResumeSessionId
+} from '../utils/resume-input.js';
 import {
 	CONTROL_FLOOD_CLOSE_CODE,
 	CONTROL_FRAME_LIMIT,
+	INVALID_SESSION_ID_FRAME,
 	MAX_BATCH_TOPICS,
+	RESUME_FAILED_FRAME,
+	RESUME_RATE_LIMITED_FRAME,
 	batchTooLargeFrame,
-	controlFloodFrame,
 	controlFrameTooLargeFrame,
 	isConsumedControlType,
-	looksLikeControlFrame
+	looksLikeControlFrame,
+	resumeTooLargeFrame
 } from '../utils/control-frame.js';
 import { detachWireStates } from './wire-state.js';
 import { releaseSharedWireId } from '../utils/shared-wire-id.js';
@@ -80,11 +93,9 @@ import {
 	WS_REQUEST_ID_KEY,
 	WS_SESSION_ID,
 	WS_STATS,
-	MAX_CONTROL_EGRESS_BYTES,
 	WS_SUBSCRIPTIONS,
 	beginPendingRelease,
 	capCounts,
-	chargeControlEgress,
 	clearPendingReleases,
 	clearUnsubscribeHooks,
 	settlePendingRelease,
@@ -149,59 +160,6 @@ function callHook(name, fn) {
 	return undefined;
 }
 
-/**
- * Send a control frame, charging a closed socket to the closed lane. Control
- * frames are never compressed: they are short, and deflating them costs more
- * than it saves.
- * @param {any} ws
- * @param {string} payload
- */
-function sendControl(ws, payload) {
-	// Per-connection egress budget for the ACK CHANNEL. Per-entry acks are
-	// what the family client needs (it keys denials and epochs off them, and
-	// it re-subscribes everything as a batch on every reconnect), but they are
-	// also unavoidably an amplifier: a short batch entry buys a whole frame,
-	// and the entries that answer fastest cost the server nothing. The batch
-	// size limit bounds the frame COUNT per inbound frame; this bounds the
-	// bytes over time, which is the part a client can still drive by sending
-	// many legal frames. Both are needed - see bench/control-egress.mjs, which
-	// measures the worst-shaped legal frame as well as the ordinary one.
-	if (!chargeControlEgress(ws, Buffer.byteLength(payload))) {
-		refuseControlFlood(ws);
-		return;
-	}
-	let result;
-	try {
-		result = ws.send(payload, false, false);
-	} catch {
-		wsCounters.closedWsAborts++;
-		return;
-	}
-	// Only bytes that reached the wire, like platform.send. A frame refused
-	// past the backpressure limit never went out.
-	if (result !== SEND_DROPPED) bumpOut(ws, payload);
-}
-
-/**
- * Cut a connection that has blown its control-frame budget.
- *
- * Sent once and directly, bypassing the budget it just exhausted, so the client
- * learns why rather than seeing a bare close. See CONTROL_FLOOD_CLOSE_CODE for
- * why the cut is 4429 rather than 1008.
- *
- * @param {any} ws
- */
-function refuseControlFlood(ws) {
-	try {
-		if (ws._controlFloodSignalled) return;
-		ws._controlFloodSignalled = true;
-		ws.send(controlFloodFrame(MAX_CONTROL_EGRESS_BYTES), false, false);
-		ws.end(CONTROL_FLOOD_CLOSE_CODE, 'control frame budget exhausted');
-	} catch {
-		wsCounters.closedWsAborts++;
-	}
-}
-
 /** Unsubscribe backlogs, throttled with decay: a client controls how many. */
 const unsubOverflowThrottle = createLogThrottle(() => performance.now());
 
@@ -256,6 +214,35 @@ function sendSubscribeDenied(ws, topic, ref, reason) {
 function sendUnsubscribeDenied(ws, topic, ref, reason) {
 	if (ref === null) return;
 	sendControl(ws, unsubscribeDeniedFrame(topic, ref, reason));
+}
+
+
+/**
+ * Is this topic one the RESUME lane must not hand to the app's hook?
+ *
+ * Deliberately NOT `isWireTopicRejected`, and the difference is one flag: this
+ * lane allows non-ASCII names whatever `allowNonAsciiTopics` says. The wire
+ * subscribe lane is stricter, but it is not the only way a connection acquires
+ * a topic - `platform.subscribe` is the documented server-side spelling and it
+ * trusts non-ASCII past that bound on purpose. Holding resume to the wire lane's
+ * charset would therefore drop a topic the app legitimately granted, and this
+ * lane's refusal is SILENT: the topic vanishes from the map the hook gap-fills
+ * from and the `resumed` ack still tells the client to go live. Being stricter
+ * here manufactures the hole the resume machinery exists to prevent, which is
+ * the same reason the unsubscribe lane is permissive.
+ *
+ * `__proto__` is refused even though the adapter's own maps are null-prototype:
+ * the hazard is the APP's, whose history lookup is commonly a plain-object
+ * allowlist, where `__proto__` reads truthy off `Object.prototype`. The
+ * subscribe path refuses it for that exact reason.
+ *
+ * @param {string} topic
+ * @returns {boolean}
+ */
+function isResumeTopicRejected(topic) {
+	if (!isValidWireTopic(topic, true)) return true;
+	if (topic === '__proto__') return true;
+	return !allow_system_topic_subscribe && isSystemTopic(topic);
 }
 
 
@@ -543,17 +530,55 @@ export const websocketHandlers = {
 					} catch {
 						return;
 					}
-					// Client-named topics are held to the wire validation the
-					// unsubscribe lane applies, and to the system-topic guard: this
-					// lane yields a topic's message HISTORY through the app's hook, so
-					// a topic the wire would refuse must not reach it. Filtered rather
-					// than refused whole - a resume names many topics at once and a
-					// client legitimately holds most of them.
+					// The session id is client input the app's hook queries a backend with,
+					// so it takes shape rules of its own rather than only a typeof test.
+					// Refused rather than filtered: there is no resume to perform without one,
+					// and forwarding a value this lane could not vouch for is the whole risk.
+					if (!isValidResumeSessionId(msg.sessionId)) {
+						sendControl(ws, INVALID_SESSION_ID_FRAME);
+						return;
+					}
+					// One resume frame names at most as many topics as one subscribe-batch
+					// carries. The gate below counts FRAMES, not topics, so without a per-frame
+					// bound one legal frame opens a backend read per topic it names - the
+					// control-frame ceiling alone leaves room for about a thousand short topics -
+					// and pipelined frames multiply that by the gate width. Refused WHOLE like an
+					// oversized batch rather than truncated to the cap: a truncated gap-fill
+					// would still end in `resumed`, and the client has no way to tell which
+					// topics were actually covered. (The gate below has its own answer to
+					// saturation, and it is NOT this one - see the comment there.)
+					const seqTopics = Object.keys(msg.lastSeenSeqs);
+					const rawEpochs =
+						msg.lastSeenEpochs &&
+						typeof msg.lastSeenEpochs === 'object' &&
+						!Array.isArray(msg.lastSeenEpochs)
+							? msg.lastSeenEpochs
+							: undefined;
+					const epochTopics = rawEpochs === undefined ? null : Object.keys(rawEpochs);
+					// The UNION of the two maps, not the larger of them. Both ride into the
+					// same hook, so what this bounds is how many DISTINCT topics one frame
+					// can put in front of it - and two disjoint maps of the cap each would
+					// name twice the cap between them while each looked compliant.
+					const namedTopics =
+						epochTopics === null
+							? seqTopics.length
+							: new Set(seqTopics.concat(epochTopics)).size;
+					if (namedTopics > MAX_BATCH_TOPICS) {
+						sendControl(ws, resumeTooLargeFrame(namedTopics));
+						return;
+					}
+					// Client-named topics are held to the always-illegal bytes, the
+					// `__proto__` guard and the system-topic guard - one predicate for both
+					// maps, because a guard written out per loop is a guard that gets fixed
+					// on one of them. See isResumeTopicRejected for why this lane is NOT
+					// held to the wire subscribe lane's charset rule.
+					//
+					// Filtered rather than refused whole: a resume names many topics at once
+					// and a client legitimately holds most of them.
 					/** @type {Record<string, number>} */
 					const resumeSeqs = Object.create(null);
-					for (const t of Object.keys(msg.lastSeenSeqs)) {
-						if (!isValidWireTopic(t, true)) continue;
-						if (!allow_system_topic_subscribe && isSystemTopic(t)) continue;
+					for (const t of seqTopics) {
+						if (isResumeTopicRejected(t)) continue;
 						// Only a watermark the server could have issued reaches the
 						// hook: the value is client input, and the hook queries a
 						// backend with it, so a crafted shape must never pass
@@ -563,24 +588,18 @@ export const websocketHandlers = {
 						if (isValidResumeSeq(v)) resumeSeqs[t] = v;
 					}
 					// The epoch map rides alongside the watermarks into the same
-					// hook, so it gets the SAME treatment - topic validation, the
-					// system-topic guard, the shared epoch rule, and a null
-					// prototype. Forwarding the raw parse handed the hook topics
+					// hook, so it gets the SAME treatment - the identical topic
+					// predicate, the shared epoch rule, and a null prototype. Forwarding the raw parse handed the hook topics
 					// the watermark map had already refused, plus whatever
 					// `__proto__` key the client put in it. Absent when the client
 					// sends no map at all - that is how the recover lane reports "no
 					// epoch known", and the hook sees one contract, not two.
 					let lastSeenEpochs;
-					if (
-						msg.lastSeenEpochs &&
-						typeof msg.lastSeenEpochs === 'object' &&
-						!Array.isArray(msg.lastSeenEpochs)
-					) {
+					if (epochTopics !== null) {
 						lastSeenEpochs = Object.create(null);
-						for (const t of Object.keys(msg.lastSeenEpochs)) {
-							if (!isValidWireTopic(t, true)) continue;
-							if (!allow_system_topic_subscribe && isSystemTopic(t)) continue;
-							const e = msg.lastSeenEpochs[t];
+						for (const t of epochTopics) {
+							if (isResumeTopicRejected(t)) continue;
+							const e = rawEpochs[t];
 							if (isValidResumeEpoch(e)) lastSeenEpochs[t] = e;
 						}
 					}
@@ -589,9 +608,23 @@ export const websocketHandlers = {
 					// not await the message handler, so a client can pipeline
 					// resume frames to open one concurrent read per frame. Bound
 					// it by the same per-connection gate counter the subscribe
-					// gates use; over the bound the frame still ACKs so the client
-					// goes live, it just does not gap-fill this round.
-					if (typeof wsModule.resume === 'function' && hasGateHeadroom(ws)) {
+					// gates use.
+					//
+					// Over the bound the frame is REFUSED, not acked. `resumed` is
+					// the only frame a resuming client keys on and it has no gap
+					// detection, so acking a frame whose hook never ran tells the
+					// client it caught up on history nobody read - a silent hole,
+					// and a worse one than the partial gap-fill the topic cap above
+					// refuses whole to avoid. The sibling recover lane answers the
+					// same saturation with RATE_LIMITED, though only when the
+					// subscribe carried a `ref` - this lane's refusals are
+					// unconditional, because a resume frame has no ref to withhold
+					// them on.
+					if (typeof wsModule.resume === 'function') {
+						if (!hasGateHeadroom(ws)) {
+							sendControl(ws, RESUME_RATE_LIMITED_FRAME);
+							return;
+						}
 						try {
 							// Awaited so per-topic replay flushes its frames before
 							// the ack tells the client to switch to live mode -
@@ -606,9 +639,19 @@ export const websocketHandlers = {
 								})
 							);
 						} catch (err) {
-							console.error('[ws] resume hook threw:', err);
+							// Same rule as saturation, for the same reason: the hook
+							// did not finish, so how much of the window it covered is
+							// unknown and `resumed` would claim coverage the app never
+							// delivered. A DIFFERENT code, because the client's move
+							// differs - retrying a hook that threw does not help, and
+							// a cold resync does.
+							reportHookError('resume', err);
+							sendControl(ws, RESUME_FAILED_FRAME);
+							return;
 						}
 					}
+					// No hook at all is not a failure: there is no history to serve,
+					// so nothing was missed and the ack is honest.
 					sendControl(ws, '{"type":"resumed"}');
 					return;
 				}

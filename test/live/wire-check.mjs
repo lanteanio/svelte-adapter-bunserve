@@ -177,9 +177,54 @@ try {
 		c.texts[replay2At]?.data?.sessionId === 'prev-session',
 		JSON.stringify(c.texts[replay2At]));
 
+	// --- the reported watermark, against an EXPLICIT seq mark ----------------
+	// Everything above publishes with { seq: true }, the local counter, which
+	// never marks a topic as explicitly stamped. A reported watermark is trusted
+	// only up to what this server HAS stamped, so on those topics every report
+	// is refused and the boundary is never reached; and because counter frames
+	// are exempt from the dedup gate, the delivered bytes are identical whether
+	// a report is honoured or thrown away. The lane is blind there by
+	// construction. This drives the explicit lane instead, where the report is
+	// accepted and the dedup floor is observable in what the client receives.
+	const SEQ_TOPIC = 'wire:seqroom';
+	const d = client('watermark');
+	await d.opened;
+	// The plan is armed BEFORE the resume window opens: on resume, the hook
+	// publishes explicit seqs 21..23 from inside the window and reports 22 as
+	// covered. 22 is a seq the server really stamped, so the report survives the
+	// ceiling; 21 and 22 must then be deduped away and only 23 delivered.
+	d.send({
+		type: 'fixture-resume-plan',
+		topic: SEQ_TOPIC,
+		report: 22,
+		publish: [21, 22, 23]
+	});
+	await until(() => d.texts.some((t) => t.event === 'resume-planned'), 'resume plan armed');
+	// A pre-window explicit publish, so the topic carries a real mark before the
+	// window opens rather than being marked only from inside it.
+	d.send({ type: 'fixture-publish-seq', topic: SEQ_TOPIC, seq: 20, data: { pre: true } });
+	await Bun.sleep(50);
+
+	d.send({ type: 'subscribe', topic: SEQ_TOPIC, ref: 9, recover: { offset: 20 } });
+	await until(() => d.texts.some((t) => t.type === 'subscribed'), 'watermark recover subscribe');
+	const inWindow = d.texts.filter((t) => t.event === 'said' && t.data?.inWindow !== undefined);
+	const seqs = inWindow.map((t) => t.data.inWindow);
+	check('a watermark the server stamped is honoured: frames at or below it are deduped',
+		!seqs.includes(21) && !seqs.includes(22),
+		JSON.stringify(seqs));
+	check('and the frame above the watermark is delivered',
+		seqs.includes(23),
+		JSON.stringify(seqs));
+	const ackAt2 = d.texts.findIndex((t) => t.type === 'subscribed');
+	const above = d.texts.findIndex((t) => t.data?.inWindow === 23);
+	check('the surviving in-window frame arrives before the subscribed ack',
+		above !== -1 && ackAt2 !== -1 && above < ackAt2,
+		JSON.stringify({ above, ackAt2 }));
+
 	a.ws.close();
 	b.ws.close();
 	c.ws.close();
+	d.ws.close();
 } catch (err) {
 	failed++;
 	failures.push('THREW: ' + (err?.message ?? String(err)));

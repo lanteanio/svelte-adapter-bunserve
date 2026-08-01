@@ -213,7 +213,7 @@ export function POST({ platform }) {
 | `requestId` | per-connection / per-request identity |
 | `now()` / `monotonic()` / `random.float()` `.u32()` `.uuid()` `.bytes(n)` | determinism seams |
 | `publishWire(topic, event, data, wire, options?)` | binary fan-out through a codec: capable clients get the `0x03` frame, everyone else the `publish()` envelope with the SAME seq; `{ seq, compress, excludeWs }` |
-| `publishWireBatch(topic, event, entries, wire, options?)` | one tick's updates as ONE batch frame per capable connection (the codec's `<event>-batch` form), per-entry envelopes and seqs for the rest; per-entry `excludeWs` |
+| `publishWireBatch(topic, event, entries, wire, options?)` | one tick's updates as ONE batch frame per capable connection (the codec's `<event>-batch` form), per-entry envelopes and seqs for the rest; per-entry `excludeWs` and `seq` |
 | `sendWire(ws, topic, event, data, wire, options?)` | single-target codec frame (seq 0), or the JSON envelope for a caps-less / degraded connection; returns the send tri-state |
 | `sendWireBatch(ws, topic, event, entries, wire, options?)` | the per-subscriber twin of `publishWireBatch`, for culled per-viewer walks |
 | `registerWireCodec(wire)` | register a codec under its capability token; idempotent, last-wins |
@@ -290,7 +290,10 @@ are different jobs rather than different sizes of the same one:
   call is suspended. That is where an app does its database round-trip, and
   distinct-topic counting cannot bound it - N concurrent gates for one topic
   cost 1 against the cap above. Exceeding it denies the subscribe with
-  `RATE_LIMITED`. It does NOT cover `platform.checkSubscribe`, which the app
+  `RATE_LIMITED`. The same counter also bounds the `resume` hook on both lanes
+  that reach it, so lowering this number starts refusing gap-fills too: a
+  standalone `resume` frame over the bound is answered `RESUME_RATE_LIMITED`,
+  and a `subscribe` carrying `recover` is denied `RATE_LIMITED` as usual. It does NOT cover `platform.checkSubscribe`, which the app
   calls from its own code: the adapter can bound the verbs it owns and answer a
   refusal in a protocol it defines, and it can do neither for a server-side
   call, the same reason the `message` hook is unbounded.
@@ -327,7 +330,13 @@ are different jobs rather than different sizes of the same one:
   because recording those would let a client grow the record by naming topics it
   never had.
 - `maxControlEgressBytes` bounds the ACK CHANNEL, in bytes per 10 s. Exceeding
-  it closes the connection with `CONTROL_FLOOD` and code 4429.
+  it closes the connection with `CONTROL_FLOOD` and code 4429. It covers every
+  frame the client's own input buys, which includes the `__replay:t`
+  `truncated` marker: a resume or recover naming many topics can be answered
+  with a marker per topic, so that lane amplifies the same way acks do. A
+  marker the budget cannot afford therefore CUTS the connection rather than
+  being dropped - a client that reconnects cold-resyncs, which is what the
+  marker says.
 
 Every one of these is PER CONNECTION, which is the honest scope and not the same
 as per client. A peer that reconnects after being cut gets a fresh budget, so
@@ -374,14 +383,33 @@ Client to server: `subscribe` (optionally carrying
 `recover: { offset, epoch? }` to gap-fill the missed tail before going live),
 `unsubscribe`, `subscribe-batch` (each accepts an optional `ref`),
 `hello` (`{"caps":[...]}` capability declaration; re-sends replace the set),
-and `resume` (`{"sessionId","lastSeenSeqs",{"lastSeenEpochs"?}}`). Server to
+and `resume` (`{"sessionId","lastSeenSeqs",{"lastSeenEpochs"?}}`).
+
+A `subscribe-batch` and a `resume` each name at most **256 topics** - the
+batch's entries, and the UNION of the resume's `lastSeenSeqs` and
+`lastSeenEpochs` (a topic in both counts once, two disjoint maps of 256 do not
+pass). One number for both lanes, so a client needs one chunking rule rather
+than two. Over it, the frame is refused WHOLE and nothing is applied.
+
+Chunk by BYTES as well: the 8192-byte control-frame ceiling below bites first
+for realistic topic names - a resume naming UUID-shaped topics overflows it at
+roughly 150 - and answers `CONTROL_FRAME_TOO_LARGE` instead. The family clients
+chunk at 200 topics and 8000 bytes, which clears both.
+
+A `resume` also carries a `sessionId`: 1 to 128 characters of printable ASCII
+with no quote or backslash. It is handed to the app's `resume` hook, which
+queries a backend with it, so a `sessionId` that is a string but breaks those
+rules is refused rather than forwarded. Printable ASCII rather than merely "no
+control byte", because the looser rule still admits DEL, the C1 block, the bidi
+overrides and U+2028 / U+2029 - which `JSON.stringify` emits raw - and because
+over printable ASCII the 128 bound is characters and bytes alike. Server to
 client:
 
 | frame | when |
 |---|---|
 | `{"type":"welcome","sessionId":"..."}` | on open |
 | `{"type":"wire-id","topic":"t","id":N}` | the numeric topic id for `0x03` frames, announced on the same socket before the first binary frame for its topic |
-| `{"type":"resumed"}` | the `resume` frame's gap-fill (if any) has flushed; switch to live |
+| `{"type":"resumed"}` | the `resume` frame's gap-fill RAN and flushed - or the app exports no `resume` hook, so there was nothing to serve; switch to live. Sent only then: every other outcome is an `error` carrying a `code`, so a client that does not receive this must not treat itself as caught up |
 | `{"topic":"__replay:t","event":"truncated","data":null}` | the gap-fill for `t` is INCOMPLETE - the buffered window overflowed its cap, or a frame was refused past the backpressure limit. Drop the stored per-topic offset and cold-resync; do not trust the partial flush |
 | binary `[0x03][schemaVersion:u8][topicId:varint][seq:varint][codec payload]` | a codec frame, for connections that declared the codec's capability in `hello` |
 | `{"type":"subscribed","topic":"t","ref":N,"epoch":E}` | a subscription took |
@@ -390,6 +418,10 @@ client:
 | `{"type":"unsubscribe-denied","topic":"t","ref":N,"reason":"..."}` | the topic failed wire validation, so the adapter will not claim it was released |
 | `{"type":"error","code":"CONTROL_FRAME_TOO_LARGE","limit":L,"size":N}` | a control frame at or above 8192 BYTES |
 | `{"type":"error","code":"BATCH_TOO_LARGE","limit":L,"size":N}` | a `subscribe-batch` carrying more than 256 entries; NONE of them were applied |
+| `{"type":"error","code":"RESUME_TOO_LARGE","limit":L,"size":N}` | a `resume` naming more than 256 topics across either of its maps; NO gap-fill ran and no `resumed` follows |
+| `{"type":"error","code":"INVALID_SESSION_ID"}` | a `resume` whose `sessionId` was a string but empty, over 128 characters, or carried a byte outside printable ASCII (or a quote or backslash); the value is never echoed back. A frame whose `sessionId` is not a string at all is not recognised as a `resume` and reaches the app's `message` hook like any other unrecognised frame |
+| `{"type":"error","code":"RESUME_RATE_LIMITED"}` | this connection already has `maxConcurrentSubscribeGates` (64) hooks in flight, so the `resume` hook never ran and NO gap-fill happened. Transient: retry |
+| `{"type":"error","code":"RESUME_FAILED"}` | the app's `resume` hook threw or rejected, so how much of the window it covered is unknown. Retrying does not help; drop the stored per-topic offsets and cold-resync |
 | `{"type":"error","code":"CONTROL_FLOOD","limit":B}` | this connection's control-frame budget is spent; the socket is then closed **4429** |
 | `{"type":"reconnect","afterMs":N,"windowMs":W}` | shutdown advice, before the drain closes the socket; `afterMs` is omitted when the advice carries no delay |
 | `{topic, event, data, seq?, j?}` | the data envelopes; `j` is the per-subscriber jitter in ms, present only when `publish` was given `jitterMs` |
@@ -397,28 +429,94 @@ client:
 Acks are sent only when the client supplied a `ref`; a `ref` over 128 BYTES is
 treated as absent. Every subscribe / unsubscribe reply names the topic it
 answers for - a denial a client cannot correlate is one it discards, which is
-why the two frames that answer for no single topic (`BATCH_TOO_LARGE`,
-`CONTROL_FLOOD`) are `error` frames carrying a `code` rather than denials
-carrying a null topic.
+why the frames that answer for no single topic (`BATCH_TOO_LARGE`,
+`RESUME_TOO_LARGE`, `INVALID_SESSION_ID`, `RESUME_RATE_LIMITED`,
+`RESUME_FAILED`, `CONTROL_FLOOD`) are `error` frames carrying a `code` rather
+than denials carrying a null topic.
+
+A `resume` is refused whole rather than truncated to the limit, which matters
+more than it does for a batch: a partly-covered gap-fill would still end in
+`resumed`, and the client has no gap detection, so it would go live believing
+it had caught up on topics the server never read.
+
+The topics a `resume` names are held to the always-illegal bytes, to
+`__proto__`, and to the system-topic guard - but NOT to the wire subscribe
+lane's `allowNonAsciiTopics` rule. The wire is not the only way a connection
+acquires a topic: `platform.subscribe` is the documented server-side spelling
+and trusts non-ASCII names past that bound on purpose, so holding a resume to
+the stricter rule would drop a topic the app legitimately granted. That refusal
+would be SILENT - the topic simply vanishes from the map the hook gap-fills
+from, and `resumed` still says go live - which is the hole this machinery
+exists to prevent. Refusing must never be stricter than granting, the same
+reason the `unsubscribe` lane is permissive.
+
+`resumed` therefore means the hook ran to completion for the topics the frame
+was allowed to name. Every other outcome is an `error` carrying a `code` -
+`RESUME_TOO_LARGE`, `INVALID_SESSION_ID`, `RESUME_RATE_LIMITED`,
+`RESUME_FAILED` - because `resumed` is the only frame a resuming client keys on
+and it has no gap detection: an ack that follows no gap-fill tells the client it
+caught up on history nobody read. A client that pipelines many frames at
+reconnect WILL meet `RESUME_RATE_LIMITED`, so handle it rather than waiting for
+an ack that is not coming.
+
+Two limits on that guarantee, both deliberate. Topics the frame named but the
+lane refused (an always-illegal byte, `__proto__`, a system topic where
+`allowSystemTopicSubscribe` is off) are dropped from the map silently and are
+not reported per topic. And a hook that itself calls `platform.send` is
+responsible for its own send results: the adapter cannot see that a frame the
+hook pushed was refused past the backpressure limit, so a resume hook that
+ignores the tri-state can still lose frames under a full socket.
+
+On the `subscribe` + `recover` lane the answer is the marker rather than an
+error, because that lane already has the replay channel open and answers per
+topic: a hook that throws there emits
+`{"topic":"__replay:t","event":"truncated","data":null}` BEFORE the `subscribed`
+ack, so the ack never implies a gap-fill that did not happen. That is the same
+signal the lane already sends for an overflowed window or a refused gap-fill
+frame, and the same one the family clients already act on.
 
 The `resume` hook's RETURN VALUE is the dedup boundary for the gap-fill, so it
 is part of the contract rather than an ignored result. Return the highest seq
 you actually delivered per topic (`{ [topic]: seq }`, or a bare number for a
 single-topic recover).
 
-Report nothing and the boundary falls back to the topic's high-water mark as it
-stood when the window opened. That re-delivers most of the window, but it is
-conservative rather than lossless: a frame arriving inside the window carrying
-an OLDER explicit seq than that mark - a reordered cluster seq - is still
-deduped away. Reporting what you actually covered is what makes the boundary
-exact.
+Report nothing and the boundary falls back to the highest EXPLICIT seq this
+server has stamped for the topic, as it stood when the window opened. That
+re-delivers most of the window, but it is conservative rather than lossless: a
+frame arriving inside the window carrying an OLDER explicit seq than that mark -
+a reordered cluster seq - is still deduped away. Reporting what you actually
+covered is what makes the boundary exact.
+
+A topic this server has stamped no explicit seq for has no mark at all, which is
+not the same as a mark of 0: it dedups nothing, and the whole held window
+re-delivers.
+
+An explicit `{ seq: <number> }` must be a NON-NEGATIVE INTEGER. There is no
+upper bound - the frame varint carries any magnitude exactly, so snowflake ids
+and log sequence numbers past 2^53 are fine - but a negative seq parses back off
+the wire as a different number, and a fractional one is truncated on the binary
+frame while the JSON envelope prints it in full, so in both cases a capable and
+a JSON-only client would read different seqs for the same event. A seq that
+breaks the rule is refused with a logged error and the event publishes WITHOUT a
+seq, rather than falling back to the counter: the counter is a different
+sequence space, and substituting it would put a local value into the topic's
+authoritative mark.
+
+Only explicit-seq frames are measured against the boundary at all. A
+`{ seq: true }` frame draws from this process's own per-topic counter, an
+unrelated space, so it is never deduped and always flushes - and publishing one
+does not move the mark a reported boundary is checked against. A topic published
+both ways therefore behaves the same as one published with explicit seqs only.
 
 The reported boundary is trusted only up to the highest seq this server has
 stamped for the topic. That bound exists because echoing the client's own
 offset straight back is the easiest hook to write and that value is client
 input: unbounded, it would let a client suppress precisely the frames the
 barrier is holding for it. (`test/fixture/src/ws-handler.js` echoes it on
-purpose - it is a controlled test double, not a pattern to copy.)
+purpose - it is a controlled test double, not a pattern to copy. Its
+`fixture-resume-plan` lane is the opposite double: it reports a watermark the
+server really stamped, which is the only way the live suite can reach the
+boundary at all, since an echoed offset is always refused by the bound above.)
 
 A control frame is recognized by its `{"type"` prefix, so a control frame must
 put `type` first. Whitespace is stepped over in two bounded runs of 16 - before

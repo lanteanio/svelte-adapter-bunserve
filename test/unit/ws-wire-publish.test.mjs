@@ -14,7 +14,7 @@ globalThis.WS_PATH = '/ws';
 register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { platform } = await import('../../src/runtime/handler/platform.js');
-const { WS_CAPS, WS_SUBSCRIPTIONS, capCounts, sharedTopics, setServer, topicSeqs, wsConnections } =
+const { WS_CAPS, WS_SUBSCRIPTIONS, capCounts, maxAuthoritativeSeq, sharedTopics, setServer, topicSeqs, wsConnections } =
 	await import('../../src/runtime/handler/ws-state.js');
 const { wireStatePoisoned } = await import('../../src/runtime/handler/wire-state.js');
 const { leaveSharedCohort } = await import('../../src/runtime/handler/cohort.js');
@@ -131,6 +131,90 @@ test('a mixed room: binary to the capable, the SAME-seq envelope to the rest', (
 		// Non-subscriber: nothing.
 		assert.equal(stranger.sent.length, 0);
 	});
+});
+
+test('a seq the wire cannot carry throws, and publishes nothing at all', () => {
+	// The defect this pins: an explicit seq went to both wires unchecked, and
+	// the frame varint encodes -1 and parses it back as 127 while the envelope
+	// keeps -1. A capable client and a JSON-only client on the same topic then
+	// read two different sequence numbers for one event - the exact parity the
+	// binary tier exists to guarantee - and the watermark the client stores is a
+	// number the server never meant. It fails fast now rather than corrupting
+	// the wire: publishing seq-less instead would degrade the client's resume
+	// dedup with nothing to notice it by.
+	setServer(fakeServer());
+	const capable = fakeWs({ topics: ['room'], caps: [CAP] });
+	const jsonOnly = fakeWs({ topics: ['room'] });
+	try {
+		withConnections([capable, jsonOnly], () => {
+			assert.throws(
+				() => platform.publishWire('room', 'moved', { x: 1 }, statelessCodec(), { seq: -1 }),
+				(err) => err instanceof TypeError && /integer >= 1/.test(err.message),
+				'a TypeError naming the rule'
+			);
+			assert.equal(capable.sent.length, 0, 'no binary frame went out');
+			assert.equal(jsonOnly.sent.length, 0, 'and no envelope either');
+			assert.equal(maxAuthoritativeSeq.get('room'), undefined, 'the topic was not marked');
+		});
+	} finally {
+		maxAuthoritativeSeq.clear();
+	}
+});
+
+test('0 and a fractional seq throw too, from BOTH publish lanes', () => {
+	// 0 is the binary frame's "no seq" sentinel, so a stamped 0 vanishes for
+	// binary subscribers while the envelope carries "seq":0. A fractional seq
+	// splits the wires the other way: truncated on the frame, printed in full in
+	// the envelope. Driven through publishWireBatch's PER-ENTRY seq as well,
+	// because that path stamps without reaching stampSeq and would otherwise
+	// keep its own unchecked lane.
+	setServer(fakeServer());
+	const capable = fakeWs({ topics: ['room'], caps: [CAP] });
+	const statefulCodec = { capability: CAP, schemaVersion: 2, encode: () => null, state: {} };
+	try {
+		withConnections([capable], () => {
+			assert.throws(
+				() => platform.publishWire('room', 'moved', { x: 1 }, statelessCodec(), { seq: 0 }),
+				TypeError,
+				'0 is the no-seq sentinel, not a seq'
+			);
+			assert.throws(
+				() => platform.publishWire('room', 'moved', { x: 1 }, statelessCodec(), { seq: 1.5 }),
+				TypeError
+			);
+			assert.throws(
+				() =>
+					platform.publishWireBatch(
+						'room',
+						'moved',
+						[{ data: { x: 1 }, seq: 2.5 }],
+						statefulCodec
+					),
+				TypeError,
+				'the per-entry lane takes the same check'
+			);
+			// The batch is refused WHOLE: a bad entry anywhere must not leave the
+			// earlier ones fanned out with the topic's mark already advanced.
+			assert.throws(
+				() =>
+					platform.publishWireBatch(
+						'room',
+						'moved',
+						[{ data: { x: 1 }, seq: 5 }, { data: { x: 2 }, seq: 0 }],
+						statefulCodec
+					),
+				TypeError
+			);
+			assert.equal(capable.sent.length, 0, 'nothing was sent for the half-good batch');
+			assert.equal(
+				maxAuthoritativeSeq.get('room'),
+				undefined,
+				'and the valid entry did not mark the topic on the way past'
+			);
+		});
+	} finally {
+		maxAuthoritativeSeq.clear();
+	}
 });
 
 test('excludeWs walks and skips exactly that socket', () => {

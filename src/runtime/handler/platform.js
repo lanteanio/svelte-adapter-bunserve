@@ -32,6 +32,7 @@ import { completeEnvelope } from '../utils/envelope.js';
 import { isSystemTopic, isValidWireTopic, createTopicHelperCache } from '../utils/topic.js';
 import { SEND_DROPPED } from '../utils/send-result.js';
 import { isValidResumeEpoch, isValidResumeSeq } from '../utils/resume-input.js';
+import { isValidPublishSeq } from '../utils/publish-seq.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
 import {
 	denyAllBatch,
@@ -54,6 +55,7 @@ import {
 } from './wire-state.js';
 import {
 	beginResumeCapture,
+	markResumeTruncated,
 	coveredSeqFor,
 	discardResumeCapture,
 	flushResumeTopic
@@ -67,7 +69,7 @@ import {
 	beginPendingSubscribe,
 	capCounts,
 	captureResumeFrame,
-	noteMaxSeen,
+	notePublishedSeq,
 	resumeBuffers,
 	sharedTopics,
 	getServer,
@@ -75,6 +77,7 @@ import {
 	pendingSubscribeTopics,
 	settlePendingSubscribe,
 	withGateCounted,
+	stampExplicitSeq,
 	stampSeq,
 	tombstonePendingSubscribe,
 	wsConnections,
@@ -84,6 +87,9 @@ import { allow_unauthenticated_subscribe, ws_compression_on, ws_options } from '
 
 /** Throws from the app's subscribe hook, throttled with decay. */
 const subscribeThrewThrottle = createLogThrottle(() => performance.now());
+
+/** Throws from the app's resume hook on the recover lane, throttled with decay. */
+const recoverThrewThrottle = createLogThrottle(() => performance.now());
 
 /**
  * The seq-less JSON envelope a wire member falls back to for a caps-less,
@@ -112,18 +118,20 @@ function wireJsonSend(ws, topic, event, data, compress) {
 }
 
 /**
- * Track the highest observed seq for a topic (the resume barrier's fallback
- * dedup floor), LRU-bounded in noteMaxSeen. An explicit numeric seq is
- * cluster-authoritative and may arrive reordered, so it takes the monotone-max
- * guard there; the in-memory counter is monotonic by construction.
+ * Note this publish's seq against the topic's authoritative high-water mark -
+ * the resume barrier's fallback dedup floor, and its ceiling on a watermark a
+ * resume hook reports - LRU-bounded in notePublishedSeq. Only an explicit
+ * numeric seq is a value that mark can hold: it is cluster-authoritative and
+ * may arrive reordered, so it takes the monotone guard there. A `{ seq: true }`
+ * counter seq belongs to an unrelated space and only keeps the topic recent.
  *
  * @param {string} topic
  * @param {number | null} seq
  * @param {{ seq?: boolean | number } | undefined} options
  */
-function recordMaxSeen(topic, seq, options) {
+function recordPublishedSeq(topic, seq, options) {
 	if (seq === null) return;
-	noteMaxSeen(topic, seq, isAuthoritativeSeq(options));
+	notePublishedSeq(topic, seq, isAuthoritativeSeq(options));
 }
 
 /**
@@ -137,6 +145,27 @@ function recordMaxSeen(topic, seq, options) {
  */
 function isAuthoritativeSeq(options) {
 	return !!(options && typeof options.seq === 'number');
+}
+
+/**
+ * A batch published with one explicit cluster seq for all of its entries.
+ *
+ * Once per process, like the other app-API misuse warnings here: it is a
+ * property of the calling code, so the second occurrence says nothing the first
+ * did not.
+ */
+function warnBatchExplicitSeq() {
+	if (wsCounters.batchExplicitSeqWarned) return;
+	wsCounters.batchExplicitSeqWarned = true;
+	console.error(
+		'[ws] publishWireBatch was given a batch-level { seq: <number> }; publishing without a seq.\n' +
+		'  One number cannot be one seq per entry, and stamping every entry with it is worse than\n' +
+		'  dropping it: a resuming client that received only part of the batch reports that shared\n' +
+		'  seq as its watermark, and the dedup floor then discards the WHOLE batch - including the\n' +
+		'  entries it never received.\n' +
+		'  Put the cluster seq on each entry instead: { data, seq }. Use { seq: true } for the\n' +
+		'  local counter, which already increments per entry.'
+	);
 }
 
 /**
@@ -419,7 +448,7 @@ export const platform = {
 	publish(topic, event, data, options) {
 		wsCounters.publishCount++;
 		const seq = stampSeq(options, topic);
-		recordMaxSeen(topic, seq, options);
+		recordPublishedSeq(topic, seq, options);
 		// A de-herd window is carried verbatim so each client rolls its own
 		// delay. Rolling one server-side offset instead would defer every
 		// subscriber of this frame by the SAME amount, which is the stampede
@@ -580,7 +609,7 @@ export const platform = {
 		}
 		wsCounters.publishCount++;
 		const seq = stampSeq(options, topic);
-		recordMaxSeen(topic, seq, options);
+		recordPublishedSeq(topic, seq, options);
 		const envelope = completeEnvelope(envelopePrefix(topic, event), data, seq);
 		// Binary codec frames (and this call's JSON-fallback frames) compress
 		// only when the caller opts in with `{ compress: true }` AND a
@@ -879,57 +908,115 @@ export const platform = {
 	 * stateless codec never reaches here - publishWireBatch routes it through
 	 * publishWire per entry above, keeping its binary fan-out.
 	 *
+	 * An explicit cluster seq belongs on the ENTRY (`{ data, seq }`), not on the
+	 * batch: one seq per entry is the contract above, and a single number cannot
+	 * satisfy it for N entries. A batch-level `{ seq: <number> }` is therefore
+	 * refused - see the warning below for why stamping it N times is worse than
+	 * refusing it. `{ seq: true }` is unaffected: the counter increments per
+	 * entry, which is already one seq per entry.
+	 *
 	 * @param {string} topic
 	 * @param {string} event - the PER-ENTRY event name; the codec's batch
 	 *   form is looked up as `<event>-batch` with `{ updates }` data.
-	 * @param {Array<{ data: any, excludeWs?: any }>} entries
+	 * @param {Array<{ data: any, excludeWs?: any, seq?: number }>} entries
 	 * @param {{ capability: string, schemaVersion: number, encode: Function, state?: any }} wire
-	 * @param {{ seq?: boolean, compress?: boolean }} [options]
+	 * @param {{ seq?: boolean | number, compress?: boolean }} [options]
 	 * @returns {boolean}
 	 */
 	publishWireBatch(topic, event, entries, wire, options) {
 		if (!Array.isArray(entries) || entries.length === 0) return false;
+		let opts = options;
+		if (options && typeof options.seq === 'number') {
+			warnBatchExplicitSeq();
+			// Published WITHOUT a seq rather than with the wrong one. A seq-less
+			// frame is never deduped on resume, so the resuming client re-receives
+			// these entries; stamping all N with the same number instead lets one
+			// reported watermark dedup the WHOLE batch away, losing the entries
+			// the client never got. Re-delivery is the recoverable error here.
+			opts = { ...options, seq: false };
+		}
+		// Every per-entry seq is checked BEFORE anything is stamped or sent.
+		// stampExplicitSeq throws on a seq the wire cannot carry, and a throw
+		// from inside either publish loop below would leave the earlier entries
+		// already fanned out and the topic's mark already advanced, for a batch
+		// that never went out whole. Whole-batch or nothing, like the refusals
+		// around it. The predicate matches the stamping paths exactly, so a
+		// nullish or non-numeric `seq` falls through to the counter lane here
+		// as it does there rather than being refused only in this pre-pass.
+		for (let i = 0; i < entries.length; i++) {
+			if (typeof entries[i].seq === 'number') stampExplicitSeq(entries[i].seq, topic);
+		}
 		// A stateless codec gains nothing from a batched walk (encode-once
 		// already amortizes it) - route through the per-entry path unchanged.
 		if (!wire || !wire.state) {
 			let ok = false;
 			for (let i = 0; i < entries.length; i++) {
-				const per =
-					entries[i].excludeWs !== undefined
-						? { ...(options || {}), excludeWs: entries[i].excludeWs }
-						: options;
-				ok = this.publishWire(topic, event, entries[i].data, wire, per) || ok;
+				const entry = entries[i];
+				// Allocate a per-entry options object only when the entry
+				// actually overrides something, as the exclude-only form did.
+				let per = opts;
+				if (entry.excludeWs !== undefined || typeof entry.seq === 'number') {
+					per = { ...(opts || {}) };
+					if (entry.excludeWs !== undefined) per.excludeWs = entry.excludeWs;
+					if (typeof entry.seq === 'number') per.seq = entry.seq;
+				}
+				ok = this.publishWire(topic, event, entry.data, wire, per) || ok;
 			}
 			return ok;
 		}
 		wsCounters.publishCount += entries.length;
-		const compress = ws_compression_on && !!(options && options.compress === true);
+		const compress = ws_compression_on && !!(opts && opts.compress === true);
 
 		// Per-entry seq and envelope - the exact bookkeeping N publishWire
 		// calls would have produced.
 		const envs = new Array(entries.length);
+		// The seq AS STAMPED: a number, or null for an entry carrying none.
+		// Deliberately not the wire's 0 sentinel, which the frame builder wants
+		// but the resume capture must not see: 0 is a seq the explicit lane can
+		// legitimately issue, and collapsing it into "no seq" hands the capture a
+		// null that is never deduped, so the same event is deduped through
+		// publish() and re-delivered through here. The 0 is applied at the frame
+		// sites below, where it means "no seq" on the wire and nowhere else.
 		const seqs = new Array(entries.length);
 		let anyExclude = false;
 		for (let i = 0; i < entries.length; i++) {
-			const seq = stampSeq(options, topic);
-			recordMaxSeen(topic, seq, options);
-			seqs[i] = seq == null ? 0 : seq;
-			envs[i] = completeEnvelope(envelopePrefix(topic, event), entries[i].data, seq);
-			if (entries[i].excludeWs !== undefined && entries[i].excludeWs !== null) anyExclude = true;
+			const entry = entries[i];
+			// A per-entry explicit seq is cluster-authoritative exactly as the
+			// same value would be through publishWire, and takes the same
+			// wire-representability check - this path does not reach stampSeq,
+			// so it has to ask for that itself. Anything else draws from this
+			// batch's shared options (the counter, or no seq at all).
+			const seq =
+				typeof entry.seq === 'number'
+					? stampExplicitSeq(entry.seq, topic)
+					: stampSeq(opts, topic);
+			// A refused explicit seq is seq-less, not authoritative-with-no-seq.
+			const authoritative = typeof entry.seq === 'number' && seq !== null;
+			if (authoritative) notePublishedSeq(topic, seq, true);
+			else recordPublishedSeq(topic, seq, opts);
+			seqs[i] = seq;
+			envs[i] = completeEnvelope(envelopePrefix(topic, event), entry.data, seq);
+			if (entry.excludeWs !== undefined && entry.excludeWs !== null) anyExclude = true;
 		}
 		// Resume cutover in flight: hold the per-entry JSON envelopes a
 		// caps-less resuming subscriber would receive from this batch, each
 		// skipping the socket its own entry excluded.
 		if (resumeBuffers.size > 0) {
-			const authoritative = isAuthoritativeSeq(options);
+			// Authority is per ENTRY here, not per call: an entry carrying its own
+			// explicit seq sits in the cluster space and is measured against the
+			// dedup floor, while a counter-stamped one is not. The call-level
+			// options cannot contribute authority - a numeric batch seq was
+			// refused above - so the entry is the whole answer. It is the VALID
+			// explicit seqs that are authoritative: a refused one published
+			// seq-less and belongs to no space at all.
 			for (let i = 0; i < entries.length; i++) {
 				captureResumeFrame(
 					topic,
-					seqs[i] === 0 ? null : seqs[i],
+					seqs[i],
 					envs[i],
 					compress,
 					entries[i].excludeWs,
-					authoritative
+					isValidPublishSeq(entries[i].seq)
 				);
 			}
 		}
@@ -1041,7 +1128,9 @@ export const platform = {
 						sendJson(ws, envList.slice(i));
 						break;
 					}
-					const frame = buildBinaryFrame(sv, id, seqList[i], p);
+					// 0 is the wire's "no seq" (see sendWire); the null lives only
+					// in seqs, where the resume capture can still read it.
+					const frame = buildBinaryFrame(sv, id, seqList[i] ?? 0, p);
 					let result;
 					try {
 						result = ws.send(frame, true, compress);
@@ -1067,7 +1156,7 @@ export const platform = {
 				sendJson(ws, envList);
 				continue;
 			}
-			const frame = buildBinaryFrame(sv, id, lastSeq, payload);
+			const frame = buildBinaryFrame(sv, id, lastSeq ?? 0, payload);
 			let result;
 			try {
 				result = ws.send(frame, true, compress);
@@ -1773,7 +1862,19 @@ export async function subscribeWithVerdict(ws, topic, options, verdict) {
 				})
 			);
 		} catch (err) {
-			console.error('[ws] recover-on-subscribe hook threw:', err);
+			// The hook did not finish, so how much of the window it covered is
+			// unknown - and the `subscribed` ack this lane ends with would imply a
+			// gap-fill that did not happen, which the client cannot detect. Signal
+			// the same truncation the overflow path sends: the client drops its
+			// stored offset for this topic and cold-resyncs. Throttled, because a
+			// hook that throws on client-shaped input throws on every frame and a
+			// client can loop that frame.
+			const { log: logIt, count: threwCount } = recoverThrewThrottle();
+			if (logIt) {
+				const suffix = threwCount > 1 ? ` (occurrence ${threwCount})` : '';
+				console.error(`[ws] recover-on-subscribe hook threw${suffix}:`, err);
+			}
+			if (recoverCapture) markResumeTruncated(recoverCapture, topic);
 		}
 	}
 	const stillWanted = settlePendingSubscribe(userData, topic, token);

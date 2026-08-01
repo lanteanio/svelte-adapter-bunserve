@@ -10,6 +10,7 @@
 import { ws_options } from './config.js';
 import { createByteBudget } from '../utils/egress-budget.js';
 import { createHookQueue } from '../utils/hook-queue.js';
+import { isValidPublishSeq } from '../utils/publish-seq.js';
 import { createCapCounts } from '../utils/wire.js';
 import {
 	beginPending,
@@ -100,40 +101,68 @@ export const WS_SHARED_COHORTS = Symbol('sharedCohorts');
 export const sharedTopics = new Map();
 
 /**
- * The highest sequence number observed per topic, updated at every publish
- * site. The resume barrier reads it when a buffer opens, as the conservative
- * dedup floor for a resume hook that does not report the watermark it covered.
+ * The highest EXPLICIT (cluster-authoritative) sequence number this server has
+ * stamped per topic. ONE seq space: a `{ seq: true }` publish draws from the
+ * local per-topic counter, which is an unrelated space, and never writes a
+ * value here.
+ *
+ * The resume barrier is the only consumer, and it asks this map a single
+ * question - what is the highest seq this server could have issued for the
+ * topic - both as the fallback dedup floor when a resume hook reports no
+ * watermark, and as the ceiling on a watermark a hook does report. A map
+ * holding the max of two spaces cannot answer that for a topic published both
+ * ways, which is why the counter lane stays out of it.
  *
  * LRU-bounded exactly like `topicSeqs`, and for the same reason: an app that
- * publishes `{ seq: true }` to client-named topics (`room:<uuid>`) would
+ * publishes explicit seqs to client-named topics (`room:<uuid>`) would
  * otherwise grow one entry per topic ever published, for the life of the
- * process. An evicted topic loses its floor and falls back to 0, which at
- * worst re-delivers a small already-covered window on a resume - the same
- * tolerance a non-reporting resume hook already carries, never a gap.
+ * process. An evicted topic loses its mark outright, and a resume then dedups
+ * nothing for it: every reported watermark is refused and the whole held window
+ * re-delivers, up to `MAX_RESUME_BUFFERED_FRAMES`. Duplicates on a topic that
+ * has gone quiet, never a gap.
  * @type {Map<string, number>}
  */
-export const maxSeenSeq = new Map();
+export const maxAuthoritativeSeq = new Map();
 
 /**
- * Note one observed seq as a topic's max-seen, LRU-bounded. An `authoritative`
- * (explicit numeric, cluster-stamped) seq may arrive reordered, so it takes
- * the monotone-max guard; the in-memory counter is monotonic by construction
- * and simply refreshes recency. Re-inserting on every note keeps iteration
- * order least-recently-noted first, which makes the eviction a true LRU.
+ * Note one published seq against a topic's authoritative high-water mark,
+ * LRU-bounded.
+ *
+ * An `authoritative` (explicit numeric, cluster-stamped) seq may arrive
+ * reordered, so the mark only ever moves UP.
+ *
+ * A seq no comparison can order - a NaN - is refused rather than stored. It
+ * could never raise the mark, storing one would erase a real seq, and the flush
+ * reads this map for a ceiling a NaN would make meaningless.
+ *
+ * A counter seq is not a value this mark can hold, so it refreshes recency and
+ * nothing else, and only for a topic that already has a mark: the counter lane
+ * must never be what creates an entry here. Re-inserting on every note keeps
+ * iteration order least-recently-noted first, which makes the eviction a true
+ * LRU, and keeps a topic that is busy in the counter lane from aging out of
+ * this one.
  *
  * @param {string} topic
  * @param {number} seq
  * @param {boolean} authoritative - true for an explicit numeric `seq`
  */
-export function noteMaxSeen(topic, seq, authoritative) {
-	if (typeof seq !== 'number') return;
-	const prev = maxSeenSeq.get(topic);
-	const next = authoritative && prev !== undefined && prev > seq ? prev : seq;
-	if (prev !== undefined) maxSeenSeq.delete(topic);
-	maxSeenSeq.set(topic, next);
-	if (maxSeenSeq.size > MAX_SEQ_TOPICS) {
-		const oldest = maxSeenSeq.keys().next().value;
-		if (oldest !== undefined) maxSeenSeq.delete(oldest);
+export function notePublishedSeq(topic, seq, authoritative) {
+	if (typeof seq !== 'number' || Number.isNaN(seq)) return;
+	const prev = maxAuthoritativeSeq.get(topic);
+	if (!authoritative) {
+		// Recency only. No entry to keep recent means nothing to do - creating
+		// one would put a counter value in the authoritative space.
+		if (prev === undefined) return;
+		maxAuthoritativeSeq.delete(topic);
+		maxAuthoritativeSeq.set(topic, prev);
+		return;
+	}
+	const next = prev === undefined || seq > prev ? seq : prev;
+	if (prev !== undefined) maxAuthoritativeSeq.delete(topic);
+	maxAuthoritativeSeq.set(topic, next);
+	if (maxAuthoritativeSeq.size > MAX_SEQ_TOPICS) {
+		const oldest = maxAuthoritativeSeq.keys().next().value;
+		if (oldest !== undefined) maxAuthoritativeSeq.delete(oldest);
 	}
 }
 
@@ -264,10 +293,11 @@ export const MAX_SUBSCRIPTIONS_PER_CONNECTION =
 	ws_options?.maxSubscriptionsPerConnection ?? 10_000;
 
 /**
- * Topics whose sequence counter is retained. Unbounded retention is a slow leak
- * on any app that publishes to client-named topics (`room:<uuid>`) with
- * `{ seq: true }`: one Map entry per topic ever published, for the life of the
- * process, with nothing to evict it.
+ * Topics whose per-topic seq state is retained - the cap on `topicSeqs` and on
+ * `maxAuthoritativeSeq` alike. Unbounded retention is a slow leak on any app
+ * that publishes to client-named topics (`room:<uuid>`) with a seq: one Map
+ * entry per topic ever published, for the life of the process, with nothing to
+ * evict it.
  */
 export const MAX_SEQ_TOPICS = 10_000;
 
@@ -306,7 +336,10 @@ export const wsCounters = {
 	sendToAsyncWarned: false,
 
 	/** One-shot latch for the async-adviseReconnect-filter warning. */
-	adviseAsyncWarned: false
+	adviseAsyncWarned: false,
+
+	/** One-shot latch for the batch-level explicit-seq warning. */
+	batchExplicitSeqWarned: false
 };
 
 /**
@@ -715,9 +748,40 @@ export function tombstonePendingSubscribe(ud, topic) {
 }
 
 /**
+ * Take an explicit (cluster-authoritative) seq for a publish, or throw when the
+ * value cannot go on the wire.
+ *
+ * FAIL FAST RATHER THAN CORRUPT THE WIRE. The alternatives are both worse than
+ * a throw. Publishing seq-less degrades the client's resume dedup with nothing
+ * to notice it by, and substituting the counter is worse still: it belongs to a
+ * different sequence space, so it would put a local value into the topic's
+ * authoritative mark - the cross-space clobber the resume floor is built to
+ * avoid. A bad seq is a bug in the calling app, not a runtime condition to
+ * absorb, and it is deterministic - it will surface on the first publish rather
+ * than under load.
+ *
+ * @param {number} seq
+ * @param {string} topic
+ * @returns {number}
+ * @throws {TypeError} when the seq cannot be represented on both wires
+ */
+export function stampExplicitSeq(seq, topic) {
+	if (isValidPublishSeq(seq)) return seq;
+	throw new TypeError(
+		`publish seq must be an integer >= 1, received ${String(seq)} (topic "${topic}"). ` +
+		'There is no upper bound - the frame varint carries any magnitude exactly - but 0 is ' +
+		'the binary frame\'s "no seq" sentinel so a stamped 0 vanishes for binary subscribers, ' +
+		'a negative seq parses back off the wire as a different number, and a fractional one is ' +
+		'truncated on the frame but not in the JSON envelope. The counter lane and every shipped ' +
+		'authority are 1-based; offset a 0-based source by 1.'
+	);
+}
+
+/**
  * Stamp the next sequence number for a topic, or null when this publish opted
- * out. An explicit numeric `seq` is passed through verbatim (a cluster-
- * authoritative value); `{ seq: true }` draws from the local counter.
+ * out. An explicit numeric `seq` is a cluster-authoritative value, taken as
+ * given once it is one the wire can carry; `{ seq: true }` draws from the local
+ * counter.
  *
  * @param {{ seq?: boolean | number } | undefined} options
  * @param {string} topic
@@ -725,7 +789,7 @@ export function tombstonePendingSubscribe(ud, topic) {
  */
 export function stampSeq(options, topic) {
 	if (!options || options.seq === undefined || options.seq === false) return null;
-	if (typeof options.seq === 'number') return options.seq;
+	if (typeof options.seq === 'number') return stampExplicitSeq(options.seq, topic);
 	const current = topicSeqs.get(topic);
 	const next = (current ?? 0) + 1;
 	// Re-insert on every stamp so iteration order is least-recently-stamped

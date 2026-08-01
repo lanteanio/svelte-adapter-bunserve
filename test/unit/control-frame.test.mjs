@@ -7,8 +7,12 @@ import {
 	batchTooLargeFrame,
 	controlFloodFrame,
 	controlFrameTooLargeFrame,
+	INVALID_SESSION_ID_FRAME,
+	RESUME_FAILED_FRAME,
+	RESUME_RATE_LIMITED_FRAME,
 	isConsumedControlType,
-	looksLikeControlFrame
+	looksLikeControlFrame,
+	resumeTooLargeFrame
 } from '../../src/runtime/utils/control-frame.js';
 
 test('the types the demux consumes are recognized', () => {
@@ -189,6 +193,41 @@ test('the batch limit stays under what the family clients chunk to', () => {
 	// this below 200 would start refusing ordinary reconnects.
 	assert.equal(MAX_BATCH_TOPICS, 256);
 	assert.ok(MAX_BATCH_TOPICS > 200);
+});
+
+test('the oversized-resume refusal answers for no topic, like its siblings', () => {
+	// Same property the batch refusal carries: a client keys its denial store by
+	// topic name, so a frame that answers for the WHOLE frame must not look like
+	// a per-topic denial. It reports the limit and what was actually named.
+	assert.deepEqual(JSON.parse(resumeTooLargeFrame(600)), {
+		type: 'error',
+		code: 'RESUME_TOO_LARGE',
+		limit: MAX_BATCH_TOPICS,
+		size: 600
+	});
+	assert.ok(!resumeTooLargeFrame(600).includes('"topic"'));
+	assert.ok(resumeTooLargeFrame(600).startsWith('{"type":"'));
+	// One cap for both lanes, so a client needs one chunking rule.
+	assert.ok(resumeTooLargeFrame(600).includes('"limit":256'));
+});
+
+test('the payload-free resume refusals answer for no topic and echo nothing', () => {
+	// Same contract as the builders above: an `error` carrying a `code`, which is
+	// the field a client gates on for frames that answer for no single topic.
+	for (const [name, frame] of [
+		['INVALID_SESSION_ID', INVALID_SESSION_ID_FRAME],
+		['RESUME_RATE_LIMITED', RESUME_RATE_LIMITED_FRAME],
+		['RESUME_FAILED', RESUME_FAILED_FRAME]
+	]) {
+		assert.deepEqual(JSON.parse(frame), { type: 'error', code: name }, name);
+		assert.ok(!frame.includes('"topic"'), `${name} answers for no topic`);
+		assert.ok(frame.startsWith('{"type":"'), `${name} puts type first`);
+	}
+	// Three distinct codes, because the client's move differs for each.
+	assert.equal(
+		new Set([INVALID_SESSION_ID_FRAME, RESUME_RATE_LIMITED_FRAME, RESUME_FAILED_FRAME]).size,
+		3
+	);
 });
 
 test('the control-flood cut is a throttle code, never a terminal one', () => {

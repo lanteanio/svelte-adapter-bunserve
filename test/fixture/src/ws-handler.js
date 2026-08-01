@@ -46,6 +46,22 @@ export function init({ platform }) {
 }
 
 /**
+ * Per-topic scripts for the honest-watermark lane, armed by `fixture-resume-plan`.
+ *
+ * The default hook below reports the offset the CLIENT presented, which is the
+ * natural hook shape but is useless for testing the dedup boundary: the runtime
+ * trusts a reported watermark only up to what it has actually stamped, so an
+ * echoed client offset on a topic with no explicit mark is always refused and
+ * the boundary is never exercised. A planned topic instead publishes known
+ * explicit seqs INSIDE the barrier window and reports one of them - a value the
+ * server really did stamp, so the report is accepted and the frames at or below
+ * it are deduped.
+ *
+ * @type {Map<string, { report: number, publish: number[] }>}
+ */
+const resumePlans = new Map();
+
+/**
  * Gap-fill for a recover offset or a standalone resume frame. Awaits a real
  * timer so the live suite exercises the barrier window the runtime bridges,
  * sends one identifiable replay frame per topic, and reports the offset as
@@ -57,7 +73,19 @@ export async function resume(ws, { sessionId, lastSeenSeqs, platform }) {
 	const covered = {};
 	for (const [topic, since] of Object.entries(lastSeenSeqs)) {
 		platform.send(ws, topic, 'replayed', { sessionId, since });
-		covered[topic] = typeof since === 'number' ? since : 0;
+		const plan = resumePlans.get(topic);
+		if (plan === undefined) {
+			covered[topic] = typeof since === 'number' ? since : 0;
+			continue;
+		}
+		// Published from inside the hook, so these land in the barrier window
+		// the resuming connection has open - the case the flush's dedup floor
+		// exists for. Deterministic by construction: no second connection has
+		// to race the 30 ms above.
+		for (const seq of plan.publish) {
+			platform.publish(topic, 'said', { inWindow: seq }, { seq });
+		}
+		covered[topic] = plan.report;
 	}
 	return covered;
 }
@@ -113,6 +141,19 @@ export function message(ws, { data, isBinary, msg, platform }) {
 	// A control-shaped frame the adapter did not consume arrives pre-parsed.
 	if (msg && msg.type === 'fixture-publish') {
 		platform.publish(msg.topic, 'said', msg.data, { seq: true });
+		return;
+	}
+	// The EXPLICIT (cluster) seq lane. The `{ seq: true }` drivers above draw
+	// from this process's counter, which never marks a topic as explicitly
+	// stamped - so nothing they publish can exercise the reported-watermark
+	// path at all.
+	if (msg && msg.type === 'fixture-publish-seq') {
+		platform.publish(msg.topic, 'said', msg.data, { seq: msg.seq });
+		return;
+	}
+	if (msg && msg.type === 'fixture-resume-plan') {
+		resumePlans.set(msg.topic, { report: msg.report, publish: msg.publish });
+		platform.send(ws, '__fixture', 'resume-planned', { topic: msg.topic });
 		return;
 	}
 	// Wire-tier drivers, one per platform member the wire suite asserts.

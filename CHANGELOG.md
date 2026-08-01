@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `publishWireBatch` entries may carry their own explicit cluster seq
+  (`{ data, seq }`), alongside the per-entry `excludeWs` they already had. That
+  is the only form that can honour the method's contract of one seq per entry
+  when the seqs come from a cluster rather than from the local counter, so an
+  authoritative publisher no longer has to give up batching to stamp its own
+  seqs. `{ seq: true }` is unchanged: the counter already increments per entry.
+
 - The binary wire tier: `platform.publishWire`, `platform.publishWireBatch`,
   `platform.sendWire`, `platform.sendWireBatch`, and
   `platform.registerWireCodec`. Connections that declare a codec's capability
@@ -34,8 +41,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   frame the socket refuses past its backpressure limit, signals `truncated` on
   the replay channel (`__replay:<topic>`) so the client cold-resyncs instead of
   trusting a partial flush. The standalone `{"type":"resume"}` frame drives the same hook for
-  client-named topics (held to the wire validation and system-topic guard the
-  subscribe lanes apply) and always answers `{"type":"resumed"}`.
+  client-named topics and answers `{"type":"resumed"}` once its gap-fill has
+  flushed. Its topics are held to the always-illegal bytes, to `__proto__` (an
+  app allowlist written as a plain object reads that key truthy off
+  `Object.prototype`), and to the system-topic guard - but deliberately NOT to
+  the wire subscribe lane's `allowNonAsciiTopics` rule, because
+  `platform.subscribe` grants non-ASCII names past that bound on purpose and a
+  stricter resume would silently drop a topic the app had legitimately granted.
+  The frame is bounded like a `subscribe-batch` and by the same number: at most
+  256 topics, counting the UNION of its `lastSeenSeqs` and `lastSeenEpochs` so
+  that two disjoint maps cannot name twice the cap while each looks compliant.
+  Past it the frame is refused WHOLE with
+  `{"type":"error","code":"RESUME_TOO_LARGE","limit":L,"size":N}` and no
+  `resumed`. The per-connection gate beside it counts FRAMES rather than topics,
+  so without a per-frame bound one legal frame could open a backend read per
+  topic it named; refusing whole rather than truncating is what keeps a
+  partly-covered gap-fill from ending in `resumed` on a client that has no way
+  to detect the hole. Its `sessionId` takes rules of its own - 1 to 128
+  characters of printable ASCII, no quote or backslash - since it is handed to
+  the hook, which queries a backend with it; one that breaks them is answered
+  `{"type":"error","code":"INVALID_SESSION_ID"}` with the value never echoed
+  back, rather than forwarded.
+  `resumed` is sent ONLY when the gap-fill actually ran, or when the app exports
+  no `resume` hook and there was nothing to serve. A saturated per-connection
+  gate answers `{"type":"error","code":"RESUME_RATE_LIMITED"}` and a hook that
+  threw or rejected answers `{"type":"error","code":"RESUME_FAILED"}`, both in
+  place of the ack rather than alongside it: `resumed` is the only frame a
+  resuming client keys on and it has no gap detection, so acking a frame whose
+  hook never ran told the client it had caught up on history nobody read. The
+  two codes are distinct because the client's move differs - a saturated gate is
+  transient and worth retrying, while a hook that threw wants a cold resync.
+  On the `subscribe` + `recover` lane the same failure is answered with the
+  marker instead of an error, because that lane answers per topic and already
+  has the replay channel open: a `resume` hook that throws there now emits
+  `{"topic":"__replay:t","event":"truncated","data":null}` before the
+  `subscribed` ack, so the ack no longer implies a gap-fill that did not happen.
+  It previously logged the throw and acked as though the history had been
+  served. That is the same marker the lane already sends for an overflowed
+  window or a refused gap-fill frame.
 - A live wire suite (`test/live/wire-check.mjs`) driving two raw WebSocket
   clients - one capable, one JSON-only - plus a resuming third against the
   built fixture: the announce, per-connection stateful payloads, seq parity
@@ -84,6 +127,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deferral queue was also full it did not run either.
 
 ### Fixed
+
+- An explicit `{ seq: <number> }` went onto both wires unchecked, so a negative
+  seq broke the parity the binary tier exists to guarantee: the frame varint
+  encodes `-1` and parses it back as `127`, so a capable client and a JSON-only
+  client on the same topic read different sequence numbers for the same event,
+  and the watermark the client then stored was a number the server never meant.
+  A fractional seq split the two wires the same way, being truncated on the
+  frame and printed in full in the envelope. An explicit seq must now be a
+  non-negative integer - still with no upper bound, since the varint carries any
+  magnitude exactly - and one that is not is refused with a logged error and
+  published without a seq. Not coerced to the counter lane: that is a different
+  sequence space, and substituting it would put a local counter value into the
+  topic's authoritative mark. The check covers `publishWireBatch`'s per-entry
+  seq too, which does not go through the same stamping path.
+
+- `publishWireBatch` conflated an explicit seq of 0 with no seq at all. It
+  round-tripped every stamped seq through the wire's 0 sentinel before handing
+  it to the resume capture, so an entry published with `seq: 0` was captured as
+  seq-less - and a seq-less frame is never deduped, so the same event was
+  deduped through `publish()` and re-delivered through the batch. The stamped
+  seq is now kept as stamped, and the 0 is applied only at the frame builder,
+  where it means "no seq" on the wire and nowhere else.
+
+- `publishWireBatch` given a batch-level `{ seq: <number> }` stamped every entry
+  with that one number, which cannot be the one-seq-per-entry it documents. It
+  is now refused (warned once, published without a seq) rather than honoured:
+  with all N entries sharing a seq, a client that received only part of the
+  batch reports that seq as its watermark and the resume dedup floor then
+  discards the WHOLE batch, including the entries it never received. Publishing
+  seq-less costs a re-delivery instead, which the client tolerates. Put the seq
+  on the entry to keep it. The method's JSDoc also typed `seq` as a boolean
+  while `publishWire` documented and accepted a number; both now agree.
+
+- The `__replay:t` `truncated` marker was charged to no budget. Every other
+  frame a client's own input buys goes through the per-connection control-egress
+  bound (`maxControlEgressBytes`), but the marker went to the socket directly -
+  so a lane emitting one per resumed topic was an amplifier the bound could not
+  see. It is now charged like the acks, and a marker the budget cannot afford
+  cuts the connection with `CONTROL_FLOOD` instead of being dropped: dropping it
+  silently would restore the very gap the marker exists to close, whereas a
+  client that reconnects cold-resyncs, which is what the marker asks for.
 
 - A zero-length payload sent through the socket facade on a healthy socket was
   reported as dropped: Bun returns 0 for "zero bytes accepted" even though the
@@ -148,6 +232,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it previously failed outright, which made the live lane unrunnable anywhere
   but the author's machine. `ADAPTER=uws` imports it by path, overridable with
   `UWS_ADAPTER`.
+- The resume barrier's per-topic high-water mark was written by two unrelated
+  sequence spaces. Both the local `{ seq: true }` counter and an explicit
+  cluster-stamped `{ seq: <number> }` wrote it, the monotone guard applied only
+  to explicit seqs, and only explicit seqs are ever measured against it - so on
+  a topic published both ways a counter publish overwrote the explicit mark,
+  downward included. That mark is the bound on the watermark an app's `resume`
+  hook reports. Pulled DOWN, it made an honest report look impossible: the
+  report was rejected and the gap-fill fell back to re-delivering the whole held
+  window. Pulled UP, by a counter that had run further than the cluster seqs, it
+  did the opposite - a client echoing that offset back could suppress held
+  frames the resume never covered. The mark now tracks the explicit lane alone,
+  a counter publish keeps its topic recent there and changes no value, and a seq
+  no comparison can order (`NaN`) neither erases a standing mark nor seeds a new
+  one. `{ seq: true }` publishes no longer occupy that map at all, so its
+  eviction cap bounds only topics carrying cluster-stamped seqs.
+  One behavior change to know about: on a topic published both ways, the floor
+  used when a hook reports nothing is now that explicit mark rather than
+  whichever lane published last, so an in-window frame carrying an older
+  explicit seq is deduped where it previously flushed by accident. Report the
+  watermark you covered and the boundary is exact either way.
+- A topic this server had stamped no explicit seq for was treated as having
+  covered seq 0, so the first frame of a 0-based cluster sequence space - a
+  Kafka offset, a log index - was deduped away during a resume gap-fill and
+  reached the client from nobody, with no truncation marker and nothing to make
+  the client notice. "No mark yet" and "mark of 0" are now distinct: an unmarked
+  topic dedups nothing, while a topic whose mark really is 0 still covers seq 0.
 
 ## [0.0.1] - 2026-07-30
 

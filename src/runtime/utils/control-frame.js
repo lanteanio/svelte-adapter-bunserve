@@ -18,17 +18,23 @@ export const CONTROL_FRAME_LIMIT = 8192;
 export const CONSUMED_CONTROL_TYPES = ['subscribe', 'unsubscribe', 'subscribe-batch', 'hello', 'resume'];
 
 /**
- * Entries one `subscribe-batch` may carry.
+ * Topics one control frame may name - the entries of a `subscribe-batch`, and
+ * the per-topic maps of a `resume`.
  *
- * A batch beyond this is refused WHOLE (see batchTooLargeFrame) rather than
- * partly applied. Partial application is the worse contract on both sides: the
+ * ONE number for both lanes on purpose. A client that already chunks its
+ * subscribe-batch to stay under this needs no second chunking rule for the
+ * resume it sends beside it on reconnect, and two limits to remember is how a
+ * client ends up respecting neither.
+ *
+ * A frame beyond this is refused WHOLE (see batchTooLargeFrame and
+ * resumeTooLargeFrame) rather than partly applied. Partial application is the worse contract on both sides: the
  * client has to diff what it sent against what it was told about, and the
  * server has to answer every dropped entry to tell it - which is what turned
  * one 8 KB frame into 800 KB of denials, since a frame that size holds four
  * thousand two-byte entries and each one bought a whole refusal frame.
  *
  * Refusing whole costs one frame no matter how many entries arrived, and no
- * client is left guessing: the batch either applied or it did not.
+ * client is left guessing: the frame either applied or it did not.
  *
  * Every client in the family chunks well below this - 200 topics and 8000
  * bytes, explicitly to stay under this limit and the parse ceiling - so the
@@ -202,6 +208,47 @@ export function batchTooLargeFrame(size) {
 	return '{"type":"error","code":"BATCH_TOO_LARGE","limit":' + MAX_BATCH_TOPICS +
 		',"size":' + size + '}';
 }
+
+/**
+ * The oversized-resume refusal.
+ *
+ * The same shape and the same reasoning as the batch refusal above: an `error`
+ * frame carrying a `code`, because there is no single topic it answers for.
+ *
+ * A resume is refused whole rather than truncated to the limit, and that matters
+ * more here than it does for a batch: a partly-covered gap-fill still ends in
+ * `resumed`, and the client has no gap detection, so it would go live believing
+ * it had caught up on topics the server never read. One refusal the client can
+ * act on beats a silent hole.
+ *
+ * @param {number} size - how many topics the resume frame actually named
+ * @returns {string}
+ */
+export function resumeTooLargeFrame(size) {
+	return '{"type":"error","code":"RESUME_TOO_LARGE","limit":' + MAX_BATCH_TOPICS +
+		',"size":' + size + '}';
+}
+
+/**
+ * The three resume refusals that carry no payload.
+ *
+ * Constants rather than builders because there is nothing to interpolate, and
+ * they live HERE beside the builders rather than inline at the send site so the
+ * shapes the README documents have one source. Each answers for the whole frame,
+ * so each is an `error` carrying a `code` - the field a client gates on for
+ * frames that answer for no single topic - and none of them echoes anything the
+ * client sent.
+ *
+ * The two RESUME_ ones exist because `resumed` is the only frame a resuming
+ * client keys on, and it has no gap detection: an ack that follows no gap-fill
+ * tells it that it caught up on history nobody read. They are distinct codes
+ * because the client's move differs. RATE_LIMITED is transient and retrying is
+ * the right response; FAILED means the app's hook threw, where retrying the same
+ * frame does not help and a cold resync does.
+ */
+export const INVALID_SESSION_ID_FRAME = '{"type":"error","code":"INVALID_SESSION_ID"}';
+export const RESUME_RATE_LIMITED_FRAME = '{"type":"error","code":"RESUME_RATE_LIMITED"}';
+export const RESUME_FAILED_FRAME = '{"type":"error","code":"RESUME_FAILED"}';
 
 /**
  * The control-budget-exhausted refusal.
