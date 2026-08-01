@@ -433,6 +433,75 @@ async function probeIdleTimeoutCap() {
 	}
 }
 
+async function probeHttpIdleTimeout() {
+	// The TOP-LEVEL idleTimeout, distinct from websocket.idleTimeout above. The
+	// adapter does not set it, so whatever Bun defaults to is what ships - and
+	// the question that decides whether that is safe is not the number but
+	// whether a slow RESPONSE counts as idle. A streaming SSE endpoint that
+	// emits less often than the timeout would be cut mid-stream, which is the
+	// one failure this has to rule out before the option is wired.
+	const section = 'http-idle-timeout';
+
+	// A response that writes its first chunk immediately, then goes quiet for
+	// `gapMs` before writing again. `idleTimeout: undefined` leaves Bun's own
+	// default in place, which is the configuration the adapter actually ships.
+	const serveSlowStream = (idleTimeout, gapMs) =>
+		Bun.serve({
+			hostname: HOST, port: 0,
+			...(idleTimeout === undefined ? {} : { idleTimeout }),
+			fetch() {
+				const stream = new ReadableStream({
+					async start(controller) {
+						controller.enqueue(new TextEncoder().encode('first\n'));
+						await Bun.sleep(gapMs);
+						controller.enqueue(new TextEncoder().encode('second\n'));
+						controller.close();
+					}
+				});
+				return new Response(stream, { headers: { 'content-type': 'text/event-stream' } });
+			}
+		});
+
+	const streamCase = async (label, idleTimeout, gapMs) => {
+		const server = serveSlowStream(idleTimeout, gapMs);
+		try {
+			const res = await fetch(`http://${HOST}:${server.port}/`);
+			const body = await res.text().catch((err) => `CUT: ${err.message.slice(0, 60)}`);
+			record(section, label, JSON.stringify(body));
+		} catch (err) {
+			record(section, label, `CUT: ${String(err.message).slice(0, 80)}`);
+		} finally {
+			server.stop(true);
+		}
+	};
+
+	// THE ONE THAT DECIDES THE ADAPTER'S BEHAVIOUR: no idleTimeout set at all,
+	// with an idle gap longer than Bun's documented 10s default. If this is cut,
+	// every app streaming an SSE heartbeat slower than the default loses the
+	// connection, and the adapter has to own the value rather than inherit it.
+	// Every gap here is far from its timeout on purpose. An earlier version of
+	// this probe compared a 2.2s gap against 1s and 2s timeouts and produced a
+	// non-monotonic result that reproduced three times, then reversed when
+	// unrelated code around it changed: at that margin it measures timer
+	// granularity, not a contract. Near-boundary cases do not belong in a facts
+	// report.
+	await streamCase('DEFAULT (unset), stream idle 12s', undefined, 12_000);
+	await streamCase('DEFAULT (unset), stream idle 2s', undefined, 2_000);
+	await streamCase('idleTimeout=30s, stream idle 12s', 30, 12_000);
+	await streamCase('idleTimeout=0, stream idle 12s', 0, 12_000);
+
+	// The accepted range, so a configured value cannot fail at boot.
+	for (const value of [0, 255, 256]) {
+		try {
+			const server = Bun.serve({ hostname: HOST, port: 0, idleTimeout: value, fetch: () => new Response('ok') });
+			server.stop(true);
+			record(section, `Bun.serve accepts idleTimeout=${value}`, 'accepted');
+		} catch (err) {
+			record(section, `Bun.serve accepts idleTimeout=${value}`, `THREW: ${String(err.message).slice(0, 120)}`);
+		}
+	}
+}
+
 async function probeMaxPayloadEnforcement() {
 	const section = 'max-payload';
 	const { server } = serveWs({ maxPayloadLength: 1024 });
@@ -720,6 +789,7 @@ const probes = [
 	probeClosedSocketBehavior,
 	probePrototypePatch,
 	probeIdleTimeoutCap,
+	probeHttpIdleTimeout,
 	probeMaxPayloadEnforcement,
 	probeMessageBufferLifetime,
 	probeUpgradeFlow,

@@ -6,7 +6,7 @@ import { cacheDir, clientDir, prerenderedDir, serveStatic, tryPrerendered } from
 import { handleSSR } from './handler/ssr.js';
 import { requestDone, isDraining } from './handler/lifecycle.js';
 import { response400, response500 } from './handler/http-helpers.js';
-import { is_tls, ssl_cert, ssl_key, body_size_limit, ws_options, ws_path } from './handler/config.js';
+import { is_tls, ssl_cert, ssl_key, body_size_limit, idle_timeout, ws_options, ws_path } from './handler/config.js';
 import { tryUpgrade } from './handler/upgrade.js';
 import { websocketHandlers } from './handler/ws.js';
 import { setServer } from './handler/ws-state.js';
@@ -105,6 +105,10 @@ export function start(host, port) {
 		maxRequestBodySize: Number.isFinite(body_size_limit) && body_size_limit > 0
 			? body_size_limit
 			: Number.MAX_SAFE_INTEGER,
+		// Set explicitly rather than inherited: Bun's ~10s default treats a
+		// quiet RESPONSE as idle, so it severs a slow SSE or streaming render
+		// mid-flight. See IDLE_TIMEOUT in handler/config.js.
+		idleTimeout: idle_timeout,
 		...(is_tls ? { tls: { cert: Bun.file(ssl_cert), key: Bun.file(ssl_key) } } : {}),
 		// The websocket handler set is only installed when the build found a
 		// handler module, so an app with no realtime code carries no WS surface

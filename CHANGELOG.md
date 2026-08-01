@@ -128,6 +128,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A streaming response that went quiet for more than about 10 seconds was cut
+  mid-flight. The adapter never set `Bun.serve`'s `idleTimeout`, so it inherited
+  Bun's default - and a quiet RESPONSE counts as idle, so an SSE endpoint whose
+  heartbeat was slower than that lost its connection with nothing the app could
+  catch. Measured both ways in `probe/bun-api-facts.report.md`
+  (`http-idle-timeout`): unset, a stream idle for 12s is cut while one idle for
+  2s is delivered. The adapter now sets the value itself, defaulting to 120
+  seconds, which clears ordinary heartbeat intervals while still bounding how
+  long a silent connection holds a socket. Configurable with `IDLE_TIMEOUT`
+  (seconds; `0` disables it). A value outside the 0-255 range Bun accepts is
+  refused at boot with a message naming the variable, rather than falling back
+  to a timeout nobody chose.
+
 - An explicit `{ seq: <number> }` went onto both wires unchecked, so a negative
   seq broke the parity the binary tier exists to guarantee: the frame varint
   encodes `-1` and parses it back as `127`, so a capable client and a JSON-only

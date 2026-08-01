@@ -565,6 +565,29 @@ The WebSocket handler is bundled by Rollup from project source, with SvelteKit's
 `$lib` alias resolved. There is no esbuild fallback, so the handler must be
 plain JavaScript resolvable by that plugin set.
 
+## Timeouts
+
+`IDLE_TIMEOUT` is the number of seconds a connection may go idle before Bun
+closes it. It defaults to **120**, and the adapter sets it explicitly rather
+than inheriting Bun's own default of roughly 10 seconds.
+
+That is not a preference. A quiet RESPONSE counts as idle, so Bun's default
+severs a stream that pauses for longer than it - measured, an unset timeout
+delivers a stream that pauses for 2s and cuts one that pauses for 12s
+(`probe/bun-api-facts.report.md`, `http-idle-timeout` section). An SSE endpoint
+whose heartbeat is slower than 10 seconds would therefore be disconnected
+mid-stream, with nothing the app can catch. 120 clears every ordinary heartbeat
+interval while still bounding how long a silent connection holds a socket.
+
+Set `IDLE_TIMEOUT=0` to disable it entirely (also measured), accepting that a
+connection which goes silent is then held indefinitely. Bun refuses anything
+above 255, so the adapter refuses it first, at boot, with a message naming the
+variable - a value outside the range is an error rather than a silent fallback
+to a timeout nobody chose.
+
+WebSocket connections are governed separately, by `websocket.idleTimeout` in the
+adapter options (Bun caps that one at 960).
+
 ## Development
 
 Requires [Bun](https://bun.com) installed. Current facts baseline: **Bun

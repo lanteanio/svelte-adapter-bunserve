@@ -1,5 +1,5 @@
 import { env } from '../env.js';
-import { parse_as_bytes, parse_origin } from '../utils/parse.js';
+import { parse_as_bytes, parse_idle_timeout, parse_origin } from '../utils/parse.js';
 import { createTrustedProxyMatcher } from '../utils/trusted-proxies.js';
 
 /* global WS_OPTIONS */
@@ -65,6 +65,21 @@ export const host_header = env('HOST_HEADER', '').toLowerCase();
 export const port_header = env('PORT_HEADER', '').toLowerCase();
 
 export const body_size_limit = parse_as_bytes(env('BODY_SIZE_LIMIT', '512K'));
+
+/**
+ * Seconds a connection may go idle before Bun closes it.
+ *
+ * Bun's own default is about 10 seconds, and a RESPONSE that goes quiet counts
+ * as idle: measured, an unset timeout cuts a stream that pauses for 12s while
+ * delivering one that pauses for 2s (probe/bun-api-facts.report.md,
+ * http-idle-timeout). That default is wrong for this adapter's traffic - an SSE
+ * endpoint with a heartbeat slower than 10s would be severed mid-stream with no
+ * error the app can see - so the adapter owns the value rather than inheriting
+ * it. 120s clears every ordinary heartbeat interval while still bounding how
+ * long a connection that has gone silent can hold a socket. Set 0 to disable it
+ * (also measured), at the cost of that bound.
+ */
+export const idle_timeout = parse_idle_timeout(env('IDLE_TIMEOUT', '120'));
 
 /**
  * Trusted-proxy allowlist (comma-separated IPs / CIDR ranges, IPv4 + IPv6).

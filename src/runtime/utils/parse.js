@@ -22,6 +22,32 @@ export function parse_as_bytes(value) {
 }
 
 /**
+ * Seconds a connection may sit idle before Bun closes it, for `IDLE_TIMEOUT`.
+ *
+ * Bun accepts 0-255 and THROWS above that, so the range is enforced here where
+ * the message can name the variable, rather than surfacing as a bare
+ * "Bun.serve expects idleTimeout to be 255 or less" at boot. 0 disables the
+ * timeout entirely (measured - see the http-idle-timeout section of the facts
+ * report). Throws rather than falling back to a default: an operator who typed
+ * a timeout wants that timeout, and silently serving a different one is how a
+ * streaming endpoint gets cut in production by a value nobody chose.
+ *
+ * @param {string} value
+ * @returns {number}
+ */
+export function parse_idle_timeout(value) {
+	const str = value.trim();
+	const result = Number(str);
+	if (str === '' || !Number.isInteger(result) || result < 0 || result > 255) {
+		throw new Error(
+			`IDLE_TIMEOUT must be a whole number of seconds from 0 to 255, received ${JSON.stringify(value)}. ` +
+			'0 disables the idle timeout; Bun refuses anything above 255.'
+		);
+	}
+	return result;
+}
+
+/**
  * @param {string | undefined} value
  * @returns {string | undefined}
  */
