@@ -491,16 +491,23 @@ A topic this server has stamped no explicit seq for has no mark at all, which is
 not the same as a mark of 0: it dedups nothing, and the whole held window
 re-delivers.
 
-An explicit `{ seq: <number> }` must be a NON-NEGATIVE INTEGER. There is no
+An explicit `{ seq: <number> }` must be an INTEGER OF AT LEAST 1. There is no
 upper bound - the frame varint carries any magnitude exactly, so snowflake ids
-and log sequence numbers past 2^53 are fine - but a negative seq parses back off
-the wire as a different number, and a fractional one is truncated on the binary
-frame while the JSON envelope prints it in full, so in both cases a capable and
-a JSON-only client would read different seqs for the same event. A seq that
-breaks the rule is refused with a logged error and the event publishes WITHOUT a
-seq, rather than falling back to the counter: the counter is a different
-sequence space, and substituting it would put a local value into the topic's
-authoritative mark.
+and log sequence numbers past 2^53 are fine - but each of the excluded cases
+makes the two wires disagree about one event: `0` is the binary frame's "no seq"
+sentinel, so a stamped 0 vanishes for binary subscribers while the envelope
+carries `"seq":0`; a negative seq parses back off the wire as a different number
+(`-1` arrives as `127`); and a fractional one is truncated on the frame while
+the JSON envelope prints it in full. The counter lane and every shipped
+authority are 1-based, so a 0-based external source must offset by 1.
+
+A seq that breaks the rule THROWS a `TypeError` rather than being absorbed.
+Publishing it seq-less instead would degrade the client's resume dedup with
+nothing to notice it by, and falling back to the counter would be worse still:
+the counter is a different sequence space, so substituting it puts a local value
+into the topic's authoritative mark. A batch is refused whole - every per-entry
+seq is checked before anything is stamped or sent, so a bad entry cannot leave
+the earlier ones already fanned out.
 
 Only explicit-seq frames are measured against the boundary at all. A
 `{ seq: true }` frame draws from this process's own per-topic counter, an

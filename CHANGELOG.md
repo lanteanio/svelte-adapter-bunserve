@@ -134,13 +134,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client on the same topic read different sequence numbers for the same event,
   and the watermark the client then stored was a number the server never meant.
   A fractional seq split the two wires the same way, being truncated on the
-  frame and printed in full in the envelope. An explicit seq must now be a
-  non-negative integer - still with no upper bound, since the varint carries any
-  magnitude exactly - and one that is not is refused with a logged error and
-  published without a seq. Not coerced to the counter lane: that is a different
-  sequence space, and substituting it would put a local counter value into the
-  topic's authoritative mark. The check covers `publishWireBatch`'s per-entry
-  seq too, which does not go through the same stamping path.
+  frame and printed in full in the envelope, and `0` split them a third way -
+  it is the frame's "no seq" sentinel, so a stamped 0 vanished for binary
+  subscribers while the envelope carried `"seq":0`. An explicit seq must now be
+  an integer of at least 1, still with no upper bound since the varint carries
+  any magnitude exactly, and one that is not throws a `TypeError`. Not absorbed:
+  publishing seq-less would degrade the client's resume dedup silently, and
+  coercing to the counter would put a local value into the topic's authoritative
+  mark, which is a different sequence space. The check covers
+  `publishWireBatch`'s per-entry seq too, which does not go through the same
+  stamping path, and a batch is refused whole so a bad entry cannot leave the
+  earlier ones already fanned out.
 
 - `publishWireBatch` conflated an explicit seq of 0 with no seq at all. It
   round-tripped every stamped seq through the wire's 0 sentinel before handing
