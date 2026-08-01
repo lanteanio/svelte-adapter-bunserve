@@ -602,6 +602,19 @@ frame-shape and hook-contract assertions there - it is the fast lane:
 npm test   # requires Node 22+ for the test-runner glob
 ```
 
+`test/unit/io-budget.test.mjs` is the performance gate in that lane. It counts
+OPERATIONS - encode calls, native publishes, socket writes - and never measures
+time, because a wall-clock assertion cannot gate CI: it fails on a busy runner,
+gets retried until green, and is then ignored. The gates that matter most are
+the scaling ones, of the shape "6x the input must not increase the count of X",
+which is what catches a lost encode-once or a fan-out that quietly became a
+per-connection walk. The file ends with a self-check pointing the detector at a
+case that genuinely scales, so the gates cannot pass vacuously.
+
+Lowering a budget needs no discussion. RAISING one is a design decision - it
+says the adapter now does more I/O per unit of work - so record the reason in
+the comment on that budget, in the same change that raises it.
+
 The live lane asserts the same contract end to end against a real server, which
 is what catches everything the stub cannot model: it first drives the real send
 facade over a genuinely saturated Bun socket (the send-result suite, which
