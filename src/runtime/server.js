@@ -28,6 +28,28 @@ const readinessPath = READINESS_CHECK_PATH;
 const IS_WIN32 = process.platform === 'win32';
 
 /**
+ * A liveness/readiness probe answer, with the HEAD form carrying the same
+ * status and headers as the GET and no body. Content-Length is stated rather
+ * than left to the runtime: on a body-less response there is nothing to infer
+ * it from, and a probe that reports 0 bytes for a 2-byte body is exactly the
+ * kind of small lie a HEAD request exists to avoid.
+ *
+ * @param {string} body
+ * @param {number} status
+ * @param {boolean} isHead
+ * @returns {Response}
+ */
+function probeResponse(body, status, isHead) {
+	return new Response(isHead ? null : body, {
+		status,
+		headers: {
+			'content-type': 'text/plain;charset=utf-8',
+			'content-length': String(Buffer.byteLength(body))
+		}
+	});
+}
+
+/**
  * @param {Request} req
  * @param {import('bun').Server} srv
  * @returns {Response | Promise<Response>}
@@ -37,21 +59,25 @@ function fetchHandler(req, srv) {
 	const url = new URL(req.url);
 	const pathname = url.pathname;
 
-	if (method === 'GET') {
+	// HEAD as well as GET: a probe answering GET but 404ing HEAD is worse than
+	// one that does not exist, because a load balancer configured to probe with
+	// HEAD marks every instance permanently unhealthy and the endpoint looks
+	// fine to anyone checking it by hand.
+	if (method === 'GET' || method === 'HEAD') {
 		// Health check (before the catch-all so it never hits SSR). This is a
 		// LIVENESS probe: it reports 200 whenever the process is up, INCLUDING
 		// during a graceful drain - so a k8s liveness probe never restarts an
 		// instance mid-shutdown.
 		if (healthPath && pathname === healthPath) {
-			return new Response('OK');
+			return probeResponse('OK', 200, method === 'HEAD');
 		}
 		// Readiness probe, distinct from liveness: 200 when ready and 503 once
 		// graceful shutdown has begun, so a fronting load balancer stops routing
 		// NEW traffic to a draining instance while its in-flight requests finish.
 		if (readinessPath && pathname === readinessPath) {
 			return isDraining()
-				? new Response('draining', { status: 503 })
-				: new Response('OK');
+				? probeResponse('draining', 503, method === 'HEAD')
+				: probeResponse('OK', 200, method === 'HEAD');
 		}
 	}
 

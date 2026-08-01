@@ -128,6 +128,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The liveness and readiness probes answered `GET` but 404'd `HEAD`, because
+  both were gated behind a `GET` check that let every other method fall through
+  to the SSR catch-all. A load balancer or uptime monitor configured to probe
+  with `HEAD` would mark every instance permanently unhealthy, while the
+  endpoint looked fine to anyone checking it by hand. Both now answer `HEAD`
+  with the same status and headers and no body, including a `Content-Length`
+  describing the body the `GET` would have returned.
+
 - A streaming response that went quiet for more than about 10 seconds was cut
   mid-flight. The adapter never set `Bun.serve`'s `idleTimeout`, so it inherited
   Bun's default - and a quiet RESPONSE counts as idle, so an SSE endpoint whose
