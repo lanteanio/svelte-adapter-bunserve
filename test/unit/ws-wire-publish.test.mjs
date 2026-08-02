@@ -217,6 +217,48 @@ test('0 and a fractional seq throw too, from BOTH publish lanes', () => {
 	}
 });
 
+test('a codec returning a non-Uint8Array declines, it does not hang the loop', { timeout: 5000 }, () => {
+	// safeEncode exists to keep a misbehaving codec from taking the fan-out with
+	// it, and it caught a THROW but not a wrong-type return. Untyped, the value
+	// reached buildBinaryFrame, which sizes its writer `8 + payload.length` -
+	// NaN for anything without a numeric length - and the writer's growth loop
+	// could not grow a zero-capacity buffer. The codec's bug became a hung event
+	// loop. An accidentally-async encode is the likely route: a Promise is
+	// truthy and has no length.
+	const errors = [];
+	const realError = console.error;
+	console.error = (...args) => errors.push(args.map(String).join(' '));
+	try {
+		for (const bad of [{}, 'bytes', Promise.resolve(new Uint8Array([1]))]) {
+			const srv = fakeServer();
+			setServer(srv);
+			const capable = fakeWs({ topics: ['room'], caps: [CAP] });
+			withConnections([capable], () => {
+				const ok = platform.publishWire(
+					'room',
+					'moved',
+					{ x: 1 },
+					statelessCodec({ encode: () => bad })
+				);
+				assert.equal(ok, true, 'the publish still reported delivery');
+			});
+			assert.equal(
+				capable.sent.filter((s) => s.isBinary).length,
+				0,
+				'no binary frame was built from it'
+			);
+			assert.equal(srv.published.length, 1, 'it went out as the plain JSON fan-out instead');
+			assert.ok(String(srv.published[0].payload).includes('"topic":"room"'), 'the JSON envelope');
+		}
+	} finally {
+		console.error = realError;
+	}
+	assert.equal(errors.length, 3, 'each bad return was reported');
+	assert.ok(errors[0].includes('Return a Uint8Array'), errors[0]);
+	assert.ok(errors[0].includes('object'), 'and named the type it got: ' + errors[0]);
+	assert.ok(errors[1].includes('string'), 'and named the type it got: ' + errors[1]);
+});
+
 test('a batch refused on a PAYLOAD leaves no mark, exactly as one refused on a seq', () => {
 	// The seq pre-pass makes a bad seq refuse the batch whole. The envelope
 	// build is the other throw site, it runs app code (JSON.stringify, so any

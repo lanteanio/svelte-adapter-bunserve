@@ -188,12 +188,29 @@ function throwBatchExplicitSeq(topic, seq) {
  * @returns {Uint8Array | null}
  */
 function safeEncode(wire, event, data, state) {
+	let payload;
 	try {
-		return wire.encode(event, data, state);
+		payload = wire.encode(event, data, state);
 	} catch (err) {
 		console.error('[ws] wire.encode threw for', wire.capability, event, err);
 		return null;
 	}
+	// A wrong-TYPE return is the same class of codec bug as a throw and takes
+	// the same answer. Unchecked it reaches buildBinaryFrame, which sizes the
+	// frame writer as `8 + payload.length`: for anything without a numeric
+	// length that is NaN, the writer gets a zero-capacity buffer, and the
+	// growth loop cannot grow it - the codec's bug becomes a hung event loop
+	// instead of one degraded connection. An accidentally-async `encode` is the
+	// likely route, since a Promise is truthy and has no length. Buffer passes,
+	// being a Uint8Array subclass.
+	if (payload != null && !(payload instanceof Uint8Array)) {
+		console.error(
+			'[ws] wire.encode returned a', typeof payload, 'for', wire.capability, event,
+			'- serving the JSON envelope instead. Return a Uint8Array, or null to decline.'
+		);
+		return null;
+	}
+	return payload;
 }
 
 /**

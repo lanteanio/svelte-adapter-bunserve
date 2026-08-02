@@ -47,6 +47,44 @@ test('f32, f64 and length-prefixed strings round-trip', () => {
 	assert.equal(r.done, true);
 });
 
+// HONEST LIMIT OF THIS TEST: the defect it pins is a synchronous infinite
+// loop, and nothing in-process can bound one - node:test's timeout cannot
+// interrupt a spinning event loop, so reintroducing the loop would wedge the
+// run rather than fail it. What this asserts is that the capacity math is
+// correct from a zero or NaN start; the defence against the hang is that
+// `_ensure` no longer contains a loop that can fail to make progress.
+test('a zero-capacity writer grows instead of spinning', () => {
+	// Reachable from buildBinaryFrame, which sizes the writer `8 + payload.length`:
+	// a payload with no numeric length makes that NaN, and ArrayBuffer floors NaN
+	// to 0. Doubling from 0 stays at 0 forever. A growth primitive must not be one
+	// bad caller away from an unbreakable loop, so this is pinned on the writer
+	// itself rather than only on the caller that used to reach it.
+	for (const initial of [0, NaN]) {
+		const w = new ByteWriter(initial);
+		w.u8(1);
+		w.varint(300);
+		w.f64(Math.PI);
+		w.str('grown');
+		const r = new ByteReader(w.take());
+		assert.equal(r.u8(), 1, `initial=${String(initial)}`);
+		assert.equal(r.varint(), 300);
+		assert.equal(r.f64(), Math.PI);
+		assert.equal(r.str(), 'grown');
+		assert.equal(r.done, true);
+	}
+});
+
+test('growth still reaches a capacity larger than one doubling', { timeout: 5000 }, () => {
+	// The zero fix replaced a doubling LOOP with a single max(), so the case the
+	// loop existed for - a write far bigger than twice the buffer - is pinned.
+	const w = new ByteWriter(4);
+	const big = 'x'.repeat(5000);
+	w.str(big);
+	const r = new ByteReader(w.take());
+	assert.equal(r.str(), big);
+	assert.equal(r.done, true);
+});
+
 test('reads past the end throw RangeError rather than returning garbage', () => {
 	const r = new ByteReader(new Uint8Array([0x80]));
 	assert.throws(() => r.varint(), RangeError);

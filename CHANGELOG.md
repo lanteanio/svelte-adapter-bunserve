@@ -229,6 +229,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lane is N independent `publishWire` calls by construction and still counts
   each as it delivers it.
 
+- A wire codec returning something other than a `Uint8Array` hung the event loop
+  instead of declining. `safeEncode` caught a throwing `encode` and served the
+  JSON envelope, but never checked the TYPE of what came back, so a truthy
+  non-`Uint8Array` reached the frame builder - most plausibly a Promise from an
+  accidentally `async` encode, which is truthy and has no length. The builder
+  sizes its writer `8 + payload.length`, that is `NaN`, `new ArrayBuffer(NaN)`
+  is zero bytes, and the writer grew by doubling: `0 * 2` never reaches the
+  requested size, so it spun forever. One connection's codec bug took the whole
+  process down, with no error and no frame. A wrong-type return is now a decline
+  - logged, and served as the JSON envelope like any other - and the writer's
+  growth is `max(double, needed)`, which cannot fail to make progress from any
+  starting capacity including zero.
+
 - The `__replay:t` `truncated` marker was charged to no budget. Every other
   frame a client's own input buys goes through the per-connection control-egress
   bound (`maxControlEgressBytes`), but the marker went to the socket directly -
