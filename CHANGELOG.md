@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Adapter options are validated on a two-tier policy. An unknown top-level key
+  is warned about at build time and names the option it probably meant
+  (`precomress` suggests `precompress`, and a case-only difference always
+  matches); it is never fatal, so an app pinned to an older adapter than its
+  config was written for still builds. A known option carrying a value the
+  adapter cannot honour throws at once, saying what the option accepts - and
+  nothing is coerced, so `precompress: 'no'` is refused rather than read as
+  truthy. `healthCheckPath` is now held to the same rule `readinessCheckPath`
+  already was: without a leading slash it could never match a request, so the
+  liveness probe would have 404'd forever while looking configured.
+
 - `publishWireBatch` entries may carry their own explicit cluster seq
   (`{ data, seq }`), alongside the per-entry `excludeWs` they already had. That
   is the only form that can honour the method's contract of one seq per entry

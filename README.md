@@ -253,6 +253,19 @@ which frame asked for it.
 
 ### Options
 
+Options are checked on a two-tier policy, because the person most likely to
+mistype one is the person who gets no help from an editor. An unknown top-level
+key is **warned** about at build time, naming the option it probably meant - it
+is not fatal, so an app pinned to an older adapter than its config was written
+for still builds. A known option with a value the adapter cannot honour
+**throws** immediately, saying what the option accepts.
+
+The distinction is deliberate: an unrecognised key is a version question, while
+an unusable value never becomes correct by waiting. Note that no coercion
+happens either - `precompress: 'no'` is refused rather than read as truthy,
+which is the shape of typo that otherwise turns an option ON when its author
+plainly meant OFF.
+
 ```js
 adapter: bunserve({
 	websocketPath: '/ws',                 // default

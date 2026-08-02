@@ -6,6 +6,7 @@ import { nodeResolve } from '@rollup/plugin-node-resolve';
 import commonjs from '@rollup/plugin-commonjs';
 import json from '@rollup/plugin-json';
 import { normalizeStaticHeaders } from './build-config.js';
+import { assertScalarOptions, unknownOptionWarnings } from './adapter-options.js';
 import { normalizeWsOptions } from './runtime/utils/ws-options.js';
 
 const runtimeDir = fileURLToPath(new URL('./runtime', import.meta.url).href);
@@ -17,6 +18,13 @@ const DEFAULT_STATIC_CACHE_MAX_FILE_SIZE = 4 * 1024 * 1024;
 
 /** @type {import('./index.js').default} */
 export default function (opts = {}) {
+	// Unusable VALUES fail here, before any option is read: an option the
+	// adapter cannot honour is not a forward-compatibility question, and the
+	// factory is the closest point to the config that set it. Unknown KEYS are
+	// only warned about, and that happens in adapt() where builder.log exists -
+	// see below.
+	assertScalarOptions(opts);
+
 	const {
 		out = 'build',
 		precompress = true,
@@ -86,6 +94,12 @@ export default function (opts = {}) {
 		name: 'adapter-bunserve',
 
 		async adapt(builder) {
+			// Unknown top-level keys: warned, never fatal, so an app pinning an
+			// older adapter than its config was written for still builds. Emitted
+			// here rather than at factory time because this is where the builder's
+			// logger exists, and a warning nobody sees is not a warning.
+			for (const warning of unknownOptionWarnings(opts)) builder.log.warn(warning);
+
 			const tmp = builder.getBuildDirectory('adapter-bunserve');
 
 			builder.rimraf(out);
