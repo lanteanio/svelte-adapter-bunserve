@@ -188,13 +188,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `publishWireBatch` given a batch-level `{ seq: <number> }` stamped every entry
   with that one number, which cannot be the one-seq-per-entry it documents. It
-  is now refused (warned once, published without a seq) rather than honoured:
-  with all N entries sharing a seq, a client that received only part of the
-  batch reports that seq as its watermark and the resume dedup floor then
-  discards the WHOLE batch, including the entries it never received. Publishing
-  seq-less costs a re-delivery instead, which the client tolerates. Put the seq
-  on the entry to keep it. The method's JSDoc also typed `seq` as a boolean
-  while `publishWire` documented and accepted a number; both now agree.
+  now throws a `TypeError` - the same answer an entry seq the wire cannot carry
+  gets, so one class of seq misuse has one failure mode whether it was written
+  on the call or on an entry. Neither way of absorbing it was safe: with all N
+  entries sharing a seq, a client that received only part of the batch reports
+  that seq as its watermark and the resume dedup floor then discards the WHOLE
+  batch, including the entries it never received; publishing the batch seq-less
+  instead traded that for a resume dedup silently degraded to nothing. Put the
+  seq on each entry to keep it (`{ data, seq }`), or use `{ seq: true }` for the
+  local counter, which already increments per entry. The call is refused before
+  the empty-batch no-op, so a tick that happened to have no entries cannot hide
+  the misuse until load produces one. Note the asymmetry this settles: a number
+  is a valid `seq` for `publish` and `publishWire`, and is not one for
+  `publishWireBatch`, whose `options.seq` is now typed and documented as the
+  counter opt-in alone. Raised from a hook, the `TypeError` is reported through
+  the usual hook-error path and abandons that tick, where the old behaviour
+  published it seq-less.
 
 - The `__replay:t` `truncated` marker was charged to no budget. Every other
   frame a client's own input buys goes through the per-connection control-egress

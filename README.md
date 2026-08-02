@@ -522,6 +522,16 @@ into the topic's authoritative mark. A batch is refused whole - every per-entry
 seq is checked before anything is stamped or sent, so a bad entry cannot leave
 the earlier ones already fanned out.
 
+A batch-level `{ seq: <number> }` on `publishWireBatch` throws for the same
+reason. One number cannot be the one-seq-per-entry the method publishes, and
+stamping all N entries with it is precisely what lets a partial delivery dedup
+the whole batch away: the client reports that shared seq as its watermark and
+the floor discards every entry at or below it, including the ones it never
+received. Put the cluster seq on each entry (`{ data, seq }`), or use
+`{ seq: true }` for the local counter, which already increments per entry. The
+call is refused even when the batch is empty, because the seq is a property of
+the call rather than of that tick's data.
+
 Only explicit-seq frames are measured against the boundary at all. A
 `{ seq: true }` frame draws from this process's own per-topic counter, an
 unrelated space, so it is never deduped and always flushes - and publishing one

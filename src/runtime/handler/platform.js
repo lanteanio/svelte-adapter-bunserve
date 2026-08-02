@@ -32,7 +32,6 @@ import { completeEnvelope } from '../utils/envelope.js';
 import { isSystemTopic, isValidWireTopic, createTopicHelperCache } from '../utils/topic.js';
 import { SEND_DROPPED } from '../utils/send-result.js';
 import { isValidResumeEpoch, isValidResumeSeq } from '../utils/resume-input.js';
-import { isValidPublishSeq } from '../utils/publish-seq.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
 import {
 	denyAllBatch,
@@ -150,21 +149,28 @@ function isAuthoritativeSeq(options) {
 /**
  * A batch published with one explicit cluster seq for all of its entries.
  *
- * Once per process, like the other app-API misuse warnings here: it is a
- * property of the calling code, so the second occurrence says nothing the first
- * did not.
+ * FAIL FAST RATHER THAN CORRUPT THE WIRE, the same judgement stampExplicitSeq
+ * makes about a seq the wire cannot carry - and for the same reason, so that
+ * one class of seq misuse does not fail two different ways depending on
+ * whether it was written on the call or on an entry. Both ways of absorbing it
+ * lose data silently: stamping all N entries with the one number lets a client
+ * that received only part of the batch report that shared seq as its
+ * watermark, and the dedup floor then discards the WHOLE batch including the
+ * entries it never received; publishing seq-less instead degrades that
+ * client's resume dedup with nothing to notice it by. A bad seq is a bug in
+ * the calling app, not a runtime condition to absorb.
+ *
+ * @param {string} topic
+ * @param {number} seq
+ * @returns {never}
+ * @throws {TypeError} always
  */
-function warnBatchExplicitSeq() {
-	if (wsCounters.batchExplicitSeqWarned) return;
-	wsCounters.batchExplicitSeqWarned = true;
-	console.error(
-		'[ws] publishWireBatch was given a batch-level { seq: <number> }; publishing without a seq.\n' +
-		'  One number cannot be one seq per entry, and stamping every entry with it is worse than\n' +
-		'  dropping it: a resuming client that received only part of the batch reports that shared\n' +
-		'  seq as its watermark, and the dedup floor then discards the WHOLE batch - including the\n' +
-		'  entries it never received.\n' +
-		'  Put the cluster seq on each entry instead: { data, seq }. Use { seq: true } for the\n' +
-		'  local counter, which already increments per entry.'
+function throwBatchExplicitSeq(topic, seq) {
+	throw new TypeError(
+		`publishWireBatch was given a batch-level { seq: ${String(seq)} } (topic "${topic}"): one ` +
+		'number cannot be the one-seq-per-entry this method publishes. Put the cluster seq on ' +
+		'each entry instead - { data, seq }, each an integer >= 1 - or use { seq: true } for the ' +
+		'local counter, which already increments per entry.'
 	);
 }
 
@@ -910,31 +916,32 @@ export const platform = {
 	 *
 	 * An explicit cluster seq belongs on the ENTRY (`{ data, seq }`), not on the
 	 * batch: one seq per entry is the contract above, and a single number cannot
-	 * satisfy it for N entries. A batch-level `{ seq: <number> }` is therefore
-	 * refused - see the warning below for why stamping it N times is worse than
-	 * refusing it. `{ seq: true }` is unaffected: the counter increments per
-	 * entry, which is already one seq per entry.
+	 * satisfy it for N entries. A batch-level `{ seq: <number> }` therefore
+	 * THROWS, exactly as a per-entry seq the wire cannot carry does - see
+	 * throwBatchExplicitSeq for why absorbing it either way loses data silently.
+	 * `{ seq: true }` is unaffected: the counter increments per entry, which is
+	 * already one seq per entry.
 	 *
 	 * @param {string} topic
 	 * @param {string} event - the PER-ENTRY event name; the codec's batch
 	 *   form is looked up as `<event>-batch` with `{ updates }` data.
 	 * @param {Array<{ data: any, excludeWs?: any, seq?: number }>} entries
 	 * @param {{ capability: string, schemaVersion: number, encode: Function, state?: any }} wire
-	 * @param {{ seq?: boolean | number, compress?: boolean }} [options]
+	 * @param {{ seq?: boolean, compress?: boolean }} [options] - `seq` is the
+	 *   counter opt-in only; a number here is the refused batch-level form.
 	 * @returns {boolean}
+	 * @throws {TypeError} on a batch-level explicit seq, or an entry seq the
+	 *   wire cannot carry
 	 */
 	publishWireBatch(topic, event, entries, wire, options) {
+		// Checked BEFORE the empty-batch no-op below. A batch-level seq is a
+		// property of the CALL, not of this tick's data, so whether it is
+		// refused must not depend on how many entries happened to be ready -
+		// otherwise the misuse hides on exactly the ticks that publish nothing
+		// and surfaces later under load, which is what fail-fast exists to
+		// prevent.
+		if (options && typeof options.seq === 'number') throwBatchExplicitSeq(topic, options.seq);
 		if (!Array.isArray(entries) || entries.length === 0) return false;
-		let opts = options;
-		if (options && typeof options.seq === 'number') {
-			warnBatchExplicitSeq();
-			// Published WITHOUT a seq rather than with the wrong one. A seq-less
-			// frame is never deduped on resume, so the resuming client re-receives
-			// these entries; stamping all N with the same number instead lets one
-			// reported watermark dedup the WHOLE batch away, losing the entries
-			// the client never got. Re-delivery is the recoverable error here.
-			opts = { ...options, seq: false };
-		}
 		// Every per-entry seq is checked BEFORE anything is stamped or sent.
 		// stampExplicitSeq throws on a seq the wire cannot carry, and a throw
 		// from inside either publish loop below would leave the earlier entries
@@ -954,9 +961,9 @@ export const platform = {
 				const entry = entries[i];
 				// Allocate a per-entry options object only when the entry
 				// actually overrides something, as the exclude-only form did.
-				let per = opts;
+				let per = options;
 				if (entry.excludeWs !== undefined || typeof entry.seq === 'number') {
-					per = { ...(opts || {}) };
+					per = { ...(options || {}) };
 					if (entry.excludeWs !== undefined) per.excludeWs = entry.excludeWs;
 					if (typeof entry.seq === 'number') per.seq = entry.seq;
 				}
@@ -965,7 +972,7 @@ export const platform = {
 			return ok;
 		}
 		wsCounters.publishCount += entries.length;
-		const compress = ws_compression_on && !!(opts && opts.compress === true);
+		const compress = ws_compression_on && !!(options && options.compress === true);
 
 		// Per-entry seq and envelope - the exact bookkeeping N publishWire
 		// calls would have produced.
@@ -989,11 +996,14 @@ export const platform = {
 			const seq =
 				typeof entry.seq === 'number'
 					? stampExplicitSeq(entry.seq, topic)
-					: stampSeq(opts, topic);
-			// A refused explicit seq is seq-less, not authoritative-with-no-seq.
-			const authoritative = typeof entry.seq === 'number' && seq !== null;
+					: stampSeq(options, topic);
+			// An explicit entry seq is authoritative by construction: the
+			// pre-pass above already accepted it, and stampExplicitSeq answers
+			// with the seq or throws - there is no refused-but-published case
+			// left to tell apart.
+			const authoritative = typeof entry.seq === 'number';
 			if (authoritative) notePublishedSeq(topic, seq, true);
-			else recordPublishedSeq(topic, seq, opts);
+			else recordPublishedSeq(topic, seq, options);
 			seqs[i] = seq;
 			envs[i] = completeEnvelope(envelopePrefix(topic, event), entry.data, seq);
 			if (entry.excludeWs !== undefined && entry.excludeWs !== null) anyExclude = true;
@@ -1006,9 +1016,10 @@ export const platform = {
 			// explicit seq sits in the cluster space and is measured against the
 			// dedup floor, while a counter-stamped one is not. The call-level
 			// options cannot contribute authority - a numeric batch seq was
-			// refused above - so the entry is the whole answer. It is the VALID
-			// explicit seqs that are authoritative: a refused one published
-			// seq-less and belongs to no space at all.
+			// refused above - so the entry is the whole answer. Carrying one at
+			// all is the whole test: an entry seq that survived to here is an
+			// integer >= 1, because the pre-pass and stampExplicitSeq both throw
+			// on anything else. Same predicate as the stamping loop, on purpose.
 			for (let i = 0; i < entries.length; i++) {
 				captureResumeFrame(
 					topic,
@@ -1016,7 +1027,7 @@ export const platform = {
 					envs[i],
 					compress,
 					entries[i].excludeWs,
-					isValidPublishSeq(entries[i].seq)
+					typeof entries[i].seq === 'number'
 				);
 			}
 		}

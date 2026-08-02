@@ -29,8 +29,7 @@ const {
 	notePublishedSeq,
 	resumeBuffers,
 	setServer,
-	topicSeqs,
-	wsCounters
+	topicSeqs
 } = await import('../../src/runtime/handler/ws-state.js');
 const {
 	beginResumeCapture,
@@ -362,38 +361,48 @@ test('publishWireBatch stamps each entry its own explicit seq', () => {
 	maxAuthoritativeSeq.clear();
 });
 
-test('a batch-level explicit seq is refused, warned once, and published seq-less', () => {
-	// One number cannot be one seq per entry. Stamping all N with it is the
-	// dangerous answer: a client holding only part of the batch reports that
-	// shared seq and the floor then discards the WHOLE batch, including the
-	// entries it never received. Refusing costs a re-delivery instead.
+test('a batch-level explicit seq throws: one number cannot be one seq per entry', () => {
+	// Both ways of absorbing it lose data with nothing for the caller to notice
+	// it by. Stamping all N entries with the one number is the sharper of the
+	// two: a client holding only part of the batch reports that shared seq as
+	// its watermark and the floor then discards the WHOLE batch, including the
+	// entries it never received. Publishing seq-less instead only trades that
+	// for a silently degraded dedup. So this fails the way a per-entry seq the
+	// wire cannot carry already does - one class of misuse, one failure mode.
 	setServer({ publish: () => 0, subscriberCount: () => 0 });
-	wsCounters.batchExplicitSeqWarned = false;
-	const errors = [];
-	const realError = console.error;
-	console.error = (...args) => errors.push(args.join(' '));
-	try {
-		const ws = collectingWs();
-		const cap = beginResumeCapture(['room'], ws);
-		const entries = [{ data: { x: 1 } }, { data: { x: 2 } }];
-		platform.publishWireBatch('room', 'moved', entries, statefulCodec(), { seq: 1234 });
-		// Published a second time: the warning is a property of the calling
-		// code, so it must not repeat per publish.
-		platform.publishWireBatch('room', 'moved', entries, statefulCodec(), { seq: 1234 });
-		assert.equal(
-			maxAuthoritativeSeq.get('room'),
-			undefined,
-			'the topic mark was not poisoned with the batch seq'
-		);
-		flushResumeTopic(cap, 'room', 1234);
-		assert.equal(ws.sent.length, 4, 'every entry flushed: a seq-less frame is never deduped');
-		assert.ok(!ws.sent[0].includes('"seq"'), 'and the envelopes carry no seq');
-	} finally {
-		console.error = realError;
-		wsCounters.batchExplicitSeqWarned = false;
-	}
-	assert.equal(errors.length, 1, 'warned exactly once across both publishes');
-	assert.ok(errors[0].includes('{ data, seq }'), 'and named the per-entry form');
+	const ws = collectingWs();
+	const cap = beginResumeCapture(['room'], ws);
+	const entries = [{ data: { x: 1 } }, { data: { x: 2 } }];
+	assert.throws(
+		() => platform.publishWireBatch('room', 'moved', entries, statefulCodec(), { seq: 1234 }),
+		(err) => err instanceof TypeError && err.message.includes('{ data, seq }'),
+		'threw a TypeError naming the per-entry form'
+	);
+	assert.equal(
+		maxAuthoritativeSeq.get('room'),
+		undefined,
+		'the topic mark was not poisoned with the batch seq'
+	);
+	flushResumeTopic(cap, 'room', 1234);
+	assert.deepEqual(ws.sent, [], 'and not one entry was published on the way out');
+	maxAuthoritativeSeq.clear();
+});
+
+test('a batch-level explicit seq is refused on an empty batch too', () => {
+	// The seq is a property of the CALL, not of this tick's data. Behind the
+	// empty-batch no-op, the check would let the misuse hide on exactly the
+	// ticks that publish nothing and surface later under load - which is the
+	// failure fail-fast exists to prevent.
+	setServer({ publish: () => 0, subscriberCount: () => 0 });
+	assert.throws(
+		() => platform.publishWireBatch('room', 'moved', [], statefulCodec(), { seq: 7 }),
+		TypeError
+	);
+	assert.equal(
+		platform.publishWireBatch('room', 'moved', [], statefulCodec(), { seq: true }),
+		false,
+		'while { seq: true } on an empty batch is still the no-op'
+	);
 	maxAuthoritativeSeq.clear();
 });
 

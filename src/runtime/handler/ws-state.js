@@ -336,10 +336,7 @@ export const wsCounters = {
 	sendToAsyncWarned: false,
 
 	/** One-shot latch for the async-adviseReconnect-filter warning. */
-	adviseAsyncWarned: false,
-
-	/** One-shot latch for the batch-level explicit-seq warning. */
-	batchExplicitSeqWarned: false
+	adviseAsyncWarned: false
 };
 
 /**
