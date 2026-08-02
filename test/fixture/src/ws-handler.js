@@ -53,9 +53,15 @@ export function init({ platform }) {
  * trusts a reported watermark only up to what it has actually stamped, so an
  * echoed client offset on a topic with no explicit mark is always refused and
  * the boundary is never exercised. A planned topic instead publishes known
- * explicit seqs INSIDE the barrier window and reports one of them - a value the
- * server really did stamp, so the report is accepted and the frames at or below
- * it are deduped.
+ * explicit seqs INSIDE the barrier window, DELIVERS the ones at or below
+ * `report` to the resuming socket itself, and reports `report` as covered.
+ *
+ * The delivery is what makes the report TRUE, and it is not a formality: the
+ * hook's contract is the highest seq it actually delivered, and the flush drops
+ * everything at or below what it returns. A plan that published 21, 22 and 23
+ * into the topic and reported 22 without sending anything would leave the
+ * client short of 21 and 22 for good - a seq the server stamped is not a seq
+ * the client received.
  *
  * @type {Map<string, { report: number, publish: number[] }>}
  */
@@ -84,6 +90,15 @@ export async function resume(ws, { sessionId, lastSeenSeqs, platform }) {
 		// to race the 30 ms above.
 		for (const seq of plan.publish) {
 			platform.publish(topic, 'said', { inWindow: seq }, { seq });
+		}
+		// Now DELIVER everything the report is about to claim. Derived from
+		// `report` rather than listed separately on the plan so the fixture
+		// cannot arm a watermark it did not honour: the frames the flush will
+		// drop are exactly the frames sent here.
+		for (const seq of plan.publish) {
+			if (seq <= plan.report) {
+				platform.send(ws, topic, 'said', { inWindow: seq, viaHook: true });
+			}
 		}
 		covered[topic] = plan.report;
 	}

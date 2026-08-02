@@ -190,9 +190,12 @@ try {
 	const d = client('watermark');
 	await d.opened;
 	// The plan is armed BEFORE the resume window opens: on resume, the hook
-	// publishes explicit seqs 21..23 from inside the window and reports 22 as
-	// covered. 22 is a seq the server really stamped, so the report survives the
-	// ceiling; 21 and 22 must then be deduped away and only 23 delivered.
+	// publishes explicit seqs 21..23 from inside the window, DELIVERS 21 and 22
+	// to this socket itself, and reports 22 as covered. 22 is then a seq the
+	// server both stamped and sent, so the report survives the ceiling AND is
+	// true; the flush owes the client exactly 23. Delivering them is what makes
+	// the report honest - reporting a merely-stamped 22 would have the flush
+	// drop 21 and 22 as already-held while this client never received them.
 	d.send({
 		type: 'fixture-resume-plan',
 		topic: SEQ_TOPIC,
@@ -200,26 +203,55 @@ try {
 		publish: [21, 22, 23]
 	});
 	await until(() => d.texts.some((t) => t.event === 'resume-planned'), 'resume plan armed');
-	// A pre-window explicit publish, so the topic carries a real mark before the
-	// window opens rather than being marked only from inside it.
+	// A pre-window explicit publish, so the topic is already marked when the
+	// window opens rather than being marked only from inside it. It does not
+	// decide this lane's outcome - the in-window publishes raise the mark to 23
+	// on their own, so the ceiling is 23 either way - it keeps the scenario a
+	// resume of an established topic. The ceiling-against-a-pre-window-mark
+	// interaction itself is pinned in the unit lane.
 	d.send({ type: 'fixture-publish-seq', topic: SEQ_TOPIC, seq: 20, data: { pre: true } });
 	await Bun.sleep(50);
 
 	d.send({ type: 'subscribe', topic: SEQ_TOPIC, ref: 9, recover: { offset: 20 } });
 	await until(() => d.texts.some((t) => t.type === 'subscribed'), 'watermark recover subscribe');
 	const inWindow = d.texts.filter((t) => t.event === 'said' && t.data?.inWindow !== undefined);
-	const seqs = inWindow.map((t) => t.data.inWindow);
-	check('a watermark the server stamped is honoured: frames at or below it are deduped',
-		!seqs.includes(21) && !seqs.includes(22),
-		JSON.stringify(seqs));
-	check('and the frame above the watermark is delivered',
-		seqs.includes(23),
-		JSON.stringify(seqs));
+	const viaHook = inWindow.filter((t) => t.data.viaHook === true).map((t) => t.data.inWindow);
+	const viaFlush = inWindow.filter((t) => t.data.viaHook !== true).map((t) => t.data.inWindow);
+	check('the hook delivers the frames its reported watermark claims',
+		viaHook.includes(21) && viaHook.includes(22),
+		JSON.stringify(viaHook));
+	check('a watermark the server stamped is honoured: the flush re-sends nothing at or below it',
+		!viaFlush.includes(21) && !viaFlush.includes(22),
+		JSON.stringify(viaFlush));
+	check('and the frame above the watermark is delivered by the flush',
+		viaFlush.includes(23),
+		JSON.stringify(viaFlush));
+	// The point of the dedup is to drop RE-delivery, never data. With an honest
+	// report the client ends the resume holding all three seqs, each exactly
+	// once - the assertion the previous shape of this lane could not make.
+	// Counted per SEQ rather than per frame, deliberately: 21 and 22 reach the
+	// client as the hook's own replay frames, which are a different envelope
+	// from the one published into the topic.
+	check('every seq in the window is accounted for exactly once, by replay or by flush',
+		[21, 22, 23].every((s) =>
+			viaHook.filter((v) => v === s).length + viaFlush.filter((v) => v === s).length === 1),
+		JSON.stringify({ viaHook, viaFlush }));
+	// The flushed envelope must still carry its wire seq: that field is what a
+	// real client records as its next watermark, and every check above reads the
+	// fixture's own payload marker instead, which a dropped seq would not touch.
+	const flushed23 = d.texts.find((t) => t.data?.inWindow === 23 && t.data?.viaHook !== true);
+	check('and the flushed frame carries the wire seq the client resumes from',
+		flushed23?.seq === 23,
+		JSON.stringify(flushed23));
 	const ackAt2 = d.texts.findIndex((t) => t.type === 'subscribed');
-	const above = d.texts.findIndex((t) => t.data?.inWindow === 23);
+	const above = d.texts.findIndex((t) => t.data?.inWindow === 23 && t.data?.viaHook !== true);
+	const lastHookAt = d.texts.findLastIndex((t) => t.data?.viaHook === true);
 	check('the surviving in-window frame arrives before the subscribed ack',
 		above !== -1 && ackAt2 !== -1 && above < ackAt2,
 		JSON.stringify({ above, ackAt2 }));
+	check('and after the hook replay it follows, so the client sees 21, 22, 23 in order',
+		lastHookAt !== -1 && lastHookAt < above,
+		JSON.stringify({ lastHookAt, above }));
 
 	a.ws.close();
 	b.ws.close();
