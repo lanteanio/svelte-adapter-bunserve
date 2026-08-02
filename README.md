@@ -268,9 +268,10 @@ plainly meant OFF.
 
 ```js
 adapter: bunserve({
-	websocketPath: '/ws',                 // default
-	websocketHandler: 'src/ws-handler.js',// default
 	websocket: {
+		path: '/ws',                        // default
+		handler: 'src/ws-handler.js',       // default
+		compressCredentialedResponses: false,
 		maxPayloadLength: 1024 * 1024,      // default 1 MB
 		idleTimeout: 120,                   // seconds; Bun REFUSES anything above 960
 		maxBackpressure: 1024 * 1024,

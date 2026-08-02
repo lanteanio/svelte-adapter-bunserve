@@ -25,11 +25,8 @@ export const KNOWN_ADAPTER_OPTIONS = [
 	'healthCheckPath',
 	'readinessCheckPath',
 	'staticCacheMaxFileSize',
-	'compressCredentialedResponses',
 	'staticHeaders',
-	'websocket',
-	'websocketPath',
-	'websocketHandler'
+	'websocket'
 ];
 
 /**
@@ -120,7 +117,7 @@ export function unknownOptionWarnings(opts) {
 export function assertScalarOptions(opts) {
 	if (!opts || typeof opts !== 'object') return;
 
-	for (const key of ['precompress', 'compressCredentialedResponses']) {
+	for (const key of ['precompress']) {
 		if (key in opts && typeof opts[key] !== 'boolean') {
 			throw new Error(
 				`adapter option \`${key}\` must be true or false - got ${JSON.stringify(opts[key])}. ` +
@@ -130,7 +127,7 @@ export function assertScalarOptions(opts) {
 		}
 	}
 
-	for (const key of ['out', 'envPrefix', 'websocketHandler']) {
+	for (const key of ['out', 'envPrefix']) {
 		if (key in opts && typeof opts[key] !== 'string') {
 			throw new Error(
 				`adapter option \`${key}\` must be a string - got ${JSON.stringify(opts[key])}.`

@@ -7,6 +7,7 @@ import {
 	suggestOption,
 	unknownOptionWarnings
 } from '../../src/adapter-options.js';
+import { normalizeWsOptions } from '../../src/runtime/utils/ws-options.js';
 
 // The two-tier option policy. The whole point is the config-file user who gets
 // no type checking: a key they misspelled is destructured away and the default
@@ -64,20 +65,36 @@ test('a non-boolean for a boolean option THROWS, and says why coercion is refuse
 		() => assertScalarOptions({ precompress: 'no' }),
 		/`precompress` must be true or false/
 	);
-	assert.throws(
-		() => assertScalarOptions({ compressCredentialedResponses: 1 }),
-		/must be true or false/
-	);
 	assert.doesNotThrow(() => assertScalarOptions({ precompress: false }));
 });
 
 test('a non-string for a string option throws', () => {
 	assert.throws(() => assertScalarOptions({ out: 42 }), /`out` must be a string/);
 	assert.throws(() => assertScalarOptions({ envPrefix: null }), /`envPrefix` must be a string/);
+});
+
+test('the websocket-nested options are validated where they now live', () => {
+	// `handler`, `path` and `compressCredentialedResponses` moved from the top
+	// level into `websocket` to match svelte-adapter-uws, which is the only
+	// position that makes a config portable between the two adapters. Their
+	// validation moved with them, so it is asserted against the block they are
+	// actually read from rather than the one they used to be read from.
 	assert.throws(
-		() => assertScalarOptions({ websocketHandler: [] }),
-		/`websocketHandler` must be a string/
+		() => normalizeWsOptions({ handler: [] }),
+		/`websocket.handler` must be a path/
 	);
+	assert.throws(
+		() => normalizeWsOptions({ path: 'ws' }),
+		/`websocket.path` must be an absolute path/
+	);
+	assert.throws(
+		() => normalizeWsOptions({ compressCredentialedResponses: 1 }),
+		/`websocket.compressCredentialedResponses` must be a boolean/
+	);
+	const { options } = normalizeWsOptions({ path: '/socket', handler: 'src/ws.js' });
+	assert.equal(options.path, '/socket');
+	assert.equal(options.handler, 'src/ws.js');
+	assert.equal(options.compressCredentialedResponses, false, 'and the default is off');
 });
 
 test('healthCheckPath is held to the rule readinessCheckPath already states', () => {

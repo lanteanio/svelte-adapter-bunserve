@@ -88,22 +88,9 @@ const PLATFORM_EXTRAS = {
  */
 const ADAPTER_OPTION_GAPS = {};
 
-/**
- * Top-level adapter options this adapter accepts that uws does not declare.
- *
- * The last three are the sharpest finding in this file: uws nests them under
- * `websocket` (`websocket.handler`, `websocket.path`,
- * `websocket.compressCredentialedResponses`) while this adapter takes them at
- * the top level. A svelte.config.js written for one adapter therefore does NOT
- * configure the other - the options are silently accepted as unknown keys and
- * the behaviour they were meant to set never takes effect. See the dedicated
- * test below.
- */
+/** Top-level adapter options this adapter accepts that uws does not declare. */
 const ADAPTER_OPTION_EXTRAS = {
-	staticCacheMaxFileSize: 'drift: no equivalent in the pinned uws release',
-	websocketHandler: 'shape drift: uws nests this as websocket.handler',
-	websocketPath: 'shape drift: uws nests this as websocket.path',
-	compressCredentialedResponses: 'shape drift: uws nests this under websocket'
+	staticCacheMaxFileSize: 'drift: no equivalent in the pinned uws release'
 };
 
 /** `websocket.*` keys uws declares and this adapter does not accept. */
@@ -128,10 +115,7 @@ const WS_OPTION_GAPS = {
 	protection: 'pressure/protection observability',
 	primaryInit: 'multi-worker clustering',
 	workers: 'multi-worker clustering',
-	unsafeSameOriginWithoutHostPin: 'origin pinning escape hatch',
-	handler: 'shape drift: this adapter takes it top-level as websocketHandler',
-	path: 'shape drift: this adapter takes it top-level as websocketPath',
-	compressCredentialedResponses: 'shape drift: this adapter takes it top-level'
+	unsafeSameOriginWithoutHostPin: 'origin pinning escape hatch'
 };
 
 /** `websocket.*` keys this adapter accepts that uws does not declare. */
@@ -228,24 +212,24 @@ test('websocket options match the uws contract, or the difference is recorded', 
 	);
 });
 
-test('the options that are top-level here and nested in uws are pinned as config breaks', () => {
-	// Named separately from the lists above because this is the one class of
+test('the options uws nests under `websocket` are nested here too, not top-level', () => {
+	// Kept as its own test after the fact, because this is the one class of
 	// difference that silently MISCONFIGURES a migrating app rather than merely
-	// missing a feature. Moving a config between the adapters leaves these keys
-	// in a position the other adapter treats as unknown: warned about at build
-	// time at best, and the behaviour they were meant to set never applies.
-	const nestedInUws = ['handler', 'path', 'compressCredentialedResponses'];
-	for (const key of nestedInUws) {
+	// missing a feature: a key in the wrong position is accepted as unknown,
+	// warned about at build time at best, and the behaviour it was meant to set
+	// never applies. The lists above would catch a regression, but not say why
+	// it matters.
+	for (const key of ['handler', 'path', 'compressCredentialedResponses']) {
+		assert.ok(surface.webSocketOptions.includes(key), `uws nests ${key} under websocket`);
+		assert.ok(KNOWN_WS_OPTION_KEYS.has(key), `and so does this adapter (websocket.${key})`);
+	}
+	// The superseded top-level spellings must be GONE, not merely deprecated:
+	// accepting both would let a config be valid here and silently inert in uws,
+	// which is the failure this move exists to remove.
+	for (const key of ['websocketHandler', 'websocketPath', 'compressCredentialedResponses']) {
 		assert.ok(
-			surface.webSocketOptions.includes(key),
-			`uws still nests ${key} under websocket`
+			!KNOWN_ADAPTER_OPTIONS.includes(key),
+			`\`${key}\` is no longer a top-level option; uws has never had one`
 		);
 	}
-	assert.ok(KNOWN_ADAPTER_OPTIONS.includes('websocketHandler'));
-	assert.ok(KNOWN_ADAPTER_OPTIONS.includes('websocketPath'));
-	assert.ok(KNOWN_ADAPTER_OPTIONS.includes('compressCredentialedResponses'));
-	assert.ok(
-		!KNOWN_WS_OPTION_KEYS.has('handler') && !KNOWN_WS_OPTION_KEYS.has('path'),
-		'and this adapter does NOT also accept them nested, so the two spellings cannot both work'
-	);
 });

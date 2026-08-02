@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING** `websocketPath`, `websocketHandler` and
+  `compressCredentialedResponses` moved from the top level into the `websocket`
+  block, as `websocket.path`, `websocket.handler` and
+  `websocket.compressCredentialedResponses`. That is where svelte-adapter-uws
+  declares them, and the two adapters are meant to be drop-in replacements for
+  each other - so a config carried between them has to mean the same thing in
+  both. It did not: each adapter read a key the other never sets, accepted the
+  one it was given as an unknown top-level key, and applied its own default
+  instead. The endpoint quietly moved to `/ws`, or the handler quietly resolved
+  to `src/ws-handler.js`, with a build-time warning as the only signal. The old
+  spellings are gone rather than deprecated, because accepting both is what
+  makes a config valid here and silently inert there.
+
+- Whether the realtime endpoint is served at all is now decided by the
+  `websocket` keys an app actually sets, not by the block being present. Naming
+  only `handler` or `path` says WHERE the endpoint would be, not that one is
+  wanted, so an app pointing `handler` at a file it does not have is opting out
+  - which is how a build with no realtime tier is expressed.
+
 ### Added
 
 - Adapter options are validated on a two-tier policy. An unknown top-level key

@@ -60,7 +60,18 @@ const DEFAULTS = {
 	maxControlEgressBytes: 4 * 1024 * 1024,
 	// When no `subscribe` hook is exported, every topic is readable by every
 	// client. That has to be opted into rather than arrived at by omission.
-	allowUnauthenticatedSubscribe: false
+	allowUnauthenticatedSubscribe: false,
+	// Build-time rather than transport tuning, and nested HERE rather than at the
+	// top level because that is where svelte-adapter-uws declares them. The two
+	// adapters are drop-in replacements for each other, so a `websocket` block
+	// has to mean the same thing in both: spelling these `websocketHandler` and
+	// `websocketPath` at the top level made a carried-over config silently not
+	// apply, since the other adapter reads the key it does not find and warns
+	// about the one it does.
+	handler: 'src/ws-handler.js',
+	path: '/ws',
+	// Also uws-nested: whether a Vary-on-credentials response may be compressed.
+	compressCredentialedResponses: false
 };
 
 /** Every `websocket.*` key this adapter consumes. */
@@ -161,6 +172,30 @@ export function normalizeWsOptions(input) {
 	}
 	if (raw.allowUnauthenticatedSubscribe !== undefined) {
 		options.allowUnauthenticatedSubscribe = requireBoolean(raw.allowUnauthenticatedSubscribe, 'allowUnauthenticatedSubscribe');
+	}
+	if (raw.compressCredentialedResponses !== undefined) {
+		options.compressCredentialedResponses = requireBoolean(
+			raw.compressCredentialedResponses,
+			'compressCredentialedResponses'
+		);
+	}
+	if (raw.handler !== undefined) {
+		if (typeof raw.handler !== 'string' || raw.handler.length === 0) {
+			throw new Error(
+				'adapter option `websocket.handler` must be a path to the module exporting your ' +
+				`WebSocket hooks (e.g. 'src/ws-handler.js') - got ${JSON.stringify(raw.handler)}.`
+			);
+		}
+		options.handler = raw.handler;
+	}
+	if (raw.path !== undefined) {
+		if (typeof raw.path !== 'string' || raw.path[0] !== '/') {
+			throw new Error(
+				"adapter option `websocket.path` must be an absolute path string starting with '/' " +
+				`(e.g. '/ws') - got ${JSON.stringify(raw.path)}.`
+			);
+		}
+		options.path = raw.path;
 	}
 	if (raw.maxSubscriptionsPerConnection !== undefined) {
 		options.maxSubscriptionsPerConnection = requirePositiveInt(

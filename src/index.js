@@ -32,27 +32,32 @@ export default function (opts = {}) {
 		healthCheckPath = '/healthz',
 		readinessCheckPath = '/readyz',
 		staticCacheMaxFileSize = DEFAULT_STATIC_CACHE_MAX_FILE_SIZE,
-		compressCredentialedResponses = false,
-		websocket,
-		websocketPath = '/ws',
-		websocketHandler = 'src/ws-handler.js'
+		websocket
 	} = opts;
 
-	// Transport tuning for the WebSocket endpoint. Validated at factory time so
-	// a value Bun would refuse (an idleTimeout above its 960s ceiling, say)
-	// fails the build with an adapter-shaped message instead of crashing
-	// Bun.serve on boot.
+	// Transport tuning for the WebSocket endpoint, plus the endpoint's own path
+	// and handler module. Validated at factory time so a value Bun would refuse
+	// (an idleTimeout above its 960s ceiling, say) fails the build with an
+	// adapter-shaped message instead of crashing Bun.serve on boot.
+	//
+	// `path`, `handler` and `compressCredentialedResponses` live INSIDE this
+	// block because svelte-adapter-uws declares them there, and a config has to
+	// mean the same thing in both adapters to be portable between them.
 	const wsResult = normalizeWsOptions(websocket);
+	const websocketPath = wsResult.options.path;
+	const websocketHandler = wsResult.options.handler;
+	const compressCredentialedResponses = wsResult.options.compressCredentialedResponses;
 
-	if (typeof websocketPath !== 'string' || websocketPath[0] !== '/') {
-		throw new Error(
-			"adapter option `websocketPath` must be an absolute path string starting with '/' " +
-			`(e.g. '/ws') - got ${JSON.stringify(websocketPath)}.`
-		);
-	}
+	// Whether the app asked for a realtime endpoint AT ALL, as opposed to just
+	// saying where one would live. `handler` and `path` are addresses, not
+	// intent - see the WS_OPTIONS decision below.
+	const wsTransportConfigured =
+		websocket !== undefined &&
+		Object.keys(websocket).some((key) => key !== 'handler' && key !== 'path');
+
 	if (websocketPath === healthCheckPath || websocketPath === readinessCheckPath) {
 		throw new Error(
-			`adapter option \`websocketPath\` ('${websocketPath}') collides with a probe route. ` +
+			`adapter option \`websocket.path\` ('${websocketPath}') collides with a probe route. ` +
 			'The probe routes are matched first, so the WebSocket endpoint would never be reached.'
 		);
 	}
@@ -159,7 +164,7 @@ export default function (opts = {}) {
 					`[adapter-bunserve] no WebSocket handler at ${wsHandlerPath}, but \`websocket\` ` +
 					'options are configured. The endpoint will be served with no app hooks, so every ' +
 					'subscribe is denied SUBSCRIBE_NOT_CONFIGURED. Check the path (it resolves against ' +
-					'the current working directory) or pass `websocketHandler` explicitly.'
+					'the current working directory) or pass `websocket.handler` explicitly.'
 				);
 			}
 			if (hasWsHandler) {
@@ -315,7 +320,15 @@ export default function (opts = {}) {
 					// no upgrade lane, no websocket option set on Bun.serve, no
 					// per-connection bookkeeping. An app with no handler and no
 					// explicit `websocket` config pays nothing for realtime.
-					WS_OPTIONS: hasWsHandler || websocket !== undefined
+					//
+					// Measured on the KEYS, not on `websocket !== undefined`.
+					// Since `handler` and `path` moved into this block to match
+					// svelte-adapter-uws, naming only those is how an app says
+					// WHERE the endpoint would be - not that it wants one. An app
+					// pointing `handler` at a file it does not have is opting OUT,
+					// and reading that as opting in served the endpoint with no
+					// hooks, denying every subscribe.
+					WS_OPTIONS: hasWsHandler || wsTransportConfigured
 						? JSON.stringify(wsResult.options)
 						: 'null'
 				}

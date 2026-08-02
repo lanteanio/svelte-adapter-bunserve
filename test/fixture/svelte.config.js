@@ -19,11 +19,11 @@ const noWs = process.env.NO_WS === '1' || process.env.NO_WS === 'true';
 
 let adapter;
 if (which === 'bunserve' && noWs) {
-	// The no-handler regression build for test/live/no-ws-check.mjs: no
-	// websocket options, and websocketHandler pointed at a file the fixture
-	// does not have. That is the same no-handler state as an app that never
-	// opted into the realtime tier, without touching src/ws-handler.js.
-	adapter = bunserve({ out: 'build-no-ws', websocketHandler: 'src/no-ws-handler.js' });
+	// The no-handler regression build for test/live/no-ws-check.mjs:
+	// `websocket.handler` points at a file the fixture does not have. That is
+	// the same no-handler state as an app that never opted into the realtime
+	// tier, without touching src/ws-handler.js.
+	adapter = bunserve({ out: 'build-no-ws', websocket: { handler: 'src/no-ws-handler.js' } });
 } else if (which === 'bunserve') {
 	// A deliberately small subscription cap so the live smoke tests can prove the
 	// bound actually holds. At the 10,000 default a cap regression is invisible:
