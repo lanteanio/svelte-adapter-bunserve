@@ -462,12 +462,13 @@ export const platform = {
 			? options.jitterMs
 			: null;
 		const envelope = completeEnvelope(envelopePrefix(topic, event), data, seq, jitterMs);
-		// Counted only once the frame exists. This call has two throw sites -
-		// stampSeq, on an explicit seq the wire cannot carry, and completeEnvelope,
-		// on a payload JSON cannot represent - and a publish refused at either
-		// never reached a socket. `publishCount` is documented as "publishes since
-		// boot", so counting above would drift it upward on the app's own bug, in
-		// the one case where nothing was delivered to notice it by.
+		// Everything that can still refuse this publish is resolved above the
+		// count: stampSeq on a seq the wire cannot carry, completeEnvelope on a
+		// payload JSON cannot represent, and getServer when the platform is used
+		// before Bun.serve() started. `publishCount` is documented as "publishes
+		// since boot", so counting any earlier drifts it upward on the app's own
+		// bug, in the one case where nothing was delivered to notice it by.
+		const server = getServer();
 		wsCounters.publishCount++;
 		const compress = ws_compression_on && (!options || options.compress !== false);
 		// A connection still gap-filling this topic (resume cutover in
@@ -477,7 +478,7 @@ export const platform = {
 		if (resumeBuffers.size > 0) {
 			captureResumeFrame(topic, seq, envelope, compress, null, isAuthoritativeSeq(options));
 		}
-		const result = getServer().publish(topic, envelope, compress);
+		const result = server.publish(topic, envelope, compress);
 		// Bun returns the byte count on delivery and 0 when the topic has no
 		// subscribers (probed).
 		return typeof result === 'number' && result > 0;
@@ -622,7 +623,8 @@ export const platform = {
 		const seq = stampSeq(options, topic);
 		recordPublishedSeq(topic, seq, options);
 		const envelope = completeEnvelope(envelopePrefix(topic, event), data, seq);
-		// Past both throw sites before counting, as in publish() above.
+		// Past all three refusal points before counting, as in publish() above.
+		const server = getServer();
 		wsCounters.publishCount++;
 		// Binary codec frames (and this call's JSON-fallback frames) compress
 		// only when the caller opts in with `{ compress: true }` AND a
@@ -647,7 +649,7 @@ export const platform = {
 
 		// JSON fast path: no live connection wants binary for this codec.
 		if (excludeWs === null && !capCounts.has(wire.capability)) {
-			const result = getServer().publish(topic, envelope, compress);
+			const result = server.publish(topic, envelope, compress);
 			return typeof result === 'number' && result > 0;
 		}
 
@@ -773,7 +775,7 @@ export const platform = {
 		const payload = safeEncode(wire, event, data);
 		if (payload == null) {
 			if (excludeWs === null) {
-				const result = getServer().publish(topic, envelope, compress);
+				const result = server.publish(topic, envelope, compress);
 				return typeof result === 'number' && result > 0;
 			}
 			// Declined frame with sender exclusion: the same JSON envelope the
@@ -839,7 +841,6 @@ export const platform = {
 			// announce succeeded); otherwise this shared topic currently has
 			// only JSON subscribers and skips the binary fan-out entirely.
 			const id = getSharedWireId(topic);
-			const server = getServer();
 			let binBytes = 0;
 			if (id !== undefined) {
 				binBytes = server.publish(bin, buildBinaryFrame(wire.schemaVersion, id, seqOnWire, payload), compress);
@@ -962,6 +963,14 @@ export const platform = {
 		}
 		// A stateless codec gains nothing from a batched walk (encode-once
 		// already amortizes it) - route through the per-entry path unchanged.
+		//
+		// This lane is N independent publishes, so "whole batch or nothing"
+		// covers the SEQ only: the pre-pass above ran for every entry, but a
+		// payload that fails to serialise partway through leaves the earlier
+		// entries already fanned out and counted. Making it atomic would mean
+		// serialising every entry up front and then again per publish, which is
+		// the cost this reroute exists to avoid. The stateful lane below builds
+		// all its envelopes first and so IS whole for both.
 		if (!wire || !wire.state) {
 			let ok = false;
 			for (let i = 0; i < entries.length; i++) {
@@ -991,6 +1000,11 @@ export const platform = {
 		// publish() and re-delivered through here. The 0 is applied at the frame
 		// sites below, where it means "no seq" on the wire and nowhere else.
 		const seqs = new Array(entries.length);
+		// Authority per entry, decided in the stamping pass and reused below
+		// rather than re-derived from entries[]. completeEnvelope runs app code
+		// (a toJSON on the payload), so a second read of entry.seq after that
+		// point is not guaranteed to see the value that was actually stamped.
+		const authoritative = new Array(entries.length);
 		let anyExclude = false;
 		for (let i = 0; i < entries.length; i++) {
 			const entry = entries[i];
@@ -1007,17 +1021,24 @@ export const platform = {
 			// pre-pass above already accepted it, and stampExplicitSeq answers
 			// with the seq or throws - there is no refused-but-published case
 			// left to tell apart.
-			const authoritative = typeof entry.seq === 'number';
-			if (authoritative) notePublishedSeq(topic, seq, true);
-			else recordPublishedSeq(topic, seq, options);
+			authoritative[i] = typeof entry.seq === 'number';
 			seqs[i] = seq;
 			envs[i] = completeEnvelope(envelopePrefix(topic, event), entry.data, seq);
 			if (entry.excludeWs !== undefined && entry.excludeWs !== null) anyExclude = true;
 		}
-		// Counted whole, after the last throw site, for the reason the batch is
-		// refused whole: completeEnvelope throws on a payload JSON cannot carry,
-		// and counting per entry above would leave N counted for a batch that
-		// never went out - or worse, a partial count for one that threw midway.
+		// The topic's mark and the publish count both move only once EVERY entry
+		// has stamped AND serialized. completeEnvelope runs app code and throws
+		// on a payload JSON cannot carry, so doing either inside the loop above
+		// left a batch that put nothing on any wire with its authoritative mark
+		// already advanced for the entries it got through - and that mark is the
+		// resume dedup floor, so a later window would discard the republished
+		// frames as already-seen. Whole batch or nothing, the rule the per-entry
+		// seq pre-pass already enforces.
+		const server = getServer();
+		for (let i = 0; i < entries.length; i++) {
+			if (authoritative[i]) notePublishedSeq(topic, seqs[i], true);
+			else recordPublishedSeq(topic, seqs[i], options);
+		}
 		wsCounters.publishCount += entries.length;
 		// Resume cutover in flight: hold the per-entry JSON envelopes a
 		// caps-less resuming subscriber would receive from this batch, each
@@ -1027,10 +1048,9 @@ export const platform = {
 			// explicit seq sits in the cluster space and is measured against the
 			// dedup floor, while a counter-stamped one is not. The call-level
 			// options cannot contribute authority - a numeric batch seq was
-			// refused above - so the entry is the whole answer. Carrying one at
-			// all is the whole test: an entry seq that survived to here is an
-			// integer >= 1, because the pre-pass and stampExplicitSeq both throw
-			// on anything else. Same predicate as the stamping loop, on purpose.
+			// refused above - so the entry is the whole answer, as decided in the
+			// stamping pass and carried in `authoritative` rather than read off
+			// the app's entries a second time.
 			for (let i = 0; i < entries.length; i++) {
 				captureResumeFrame(
 					topic,
@@ -1038,7 +1058,7 @@ export const platform = {
 					envs[i],
 					compress,
 					entries[i].excludeWs,
-					typeof entries[i].seq === 'number'
+					authoritative[i]
 				);
 			}
 		}
@@ -1067,7 +1087,6 @@ export const platform = {
 		// no entry excludes a socket - N native fan-outs, byte-identical to N
 		// publishWire calls.
 		if (!anyExclude && !capCounts.has(wire.capability)) {
-			const server = getServer();
 			let anyBytes = false;
 			for (let i = 0; i < entries.length; i++) {
 				const r = server.publish(topic, envs[i], compress);

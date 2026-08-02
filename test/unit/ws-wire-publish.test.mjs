@@ -217,6 +217,47 @@ test('0 and a fractional seq throw too, from BOTH publish lanes', () => {
 	}
 });
 
+test('a batch refused on a PAYLOAD leaves no mark, exactly as one refused on a seq', () => {
+	// The seq pre-pass makes a bad seq refuse the batch whole. The envelope
+	// build is the other throw site, it runs app code (JSON.stringify, so any
+	// toJSON), and it happens per entry - so marking the topic inside that loop
+	// left the entries BEFORE the throw marked for a batch that put nothing on
+	// any wire. That mark is the resume dedup floor: republish the same seqs
+	// after fixing the payload and the next window discards them as already
+	// seen. Silent data loss, which is worse than the counter drift beside it.
+	setServer(fakeServer());
+	const statefulCodec = { capability: CAP, schemaVersion: 2, encode: () => null, state: {} };
+	const capable = fakeWs({ topics: ['room'], caps: [CAP] });
+	try {
+		const before = platform.publishCount;
+		withConnections([capable], () => {
+			assert.throws(
+				() =>
+					platform.publishWireBatch(
+						'room',
+						'moved',
+						// Entry 0 is perfectly good and stamps first; entry 1 throws
+						// on the way into its envelope. One entry alone cannot catch
+						// this - the mark has to be observed for an EARLIER entry.
+						[{ data: { x: 1 }, seq: 40 }, { data: { n: 1n }, seq: 41 }],
+						statefulCodec
+					),
+				TypeError
+			);
+		});
+		assert.equal(
+			maxAuthoritativeSeq.get('room'),
+			undefined,
+			'the entry that stamped before the throw did not mark the topic'
+		);
+		assert.equal(platform.publishCount, before, 'and the batch counted nothing');
+		assert.equal(capable.sent.length, 0, 'and sent nothing');
+	} finally {
+		maxAuthoritativeSeq.clear();
+		topicSeqs.clear();
+	}
+});
+
 test('a refused publish is not counted in publishCount, on any lane', () => {
 	// `publishCount` is documented as "topic publishes since boot". Counting
 	// before the call can still throw makes a publish that put nothing on any

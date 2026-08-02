@@ -205,15 +205,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the usual hook-error path and abandons that tick, where the old behaviour
   published it seq-less.
 
+- `publishWireBatch` advanced the topic's authoritative mark for entries it had
+  already stamped when a LATER entry threw. The per-entry seq pre-pass makes a
+  bad seq refuse the batch whole, but the envelope build is a second throw site
+  - it runs `JSON.stringify`, so any payload the app cannot serialise, including
+  a `toJSON` of its own - and the marking sat inside that loop. A batch that put
+  nothing on any wire could therefore leave the mark raised, and that mark is
+  the resume dedup floor: republishing the same seqs after fixing the payload
+  had the next gap-fill window discard them as already-seen. The mark now moves
+  in a second pass, after every entry has stamped and serialised, so the batch
+  is refused whole for either kind of bad input.
+
 - Every publish member counted publishes it went on to refuse. `publish` and
   `publishWire` incremented `publishCount` before stamping the seq, and all
   three - `publishWireBatch` included - counted before building the envelope. So
   a seq the wire cannot carry, or a payload JSON cannot represent, threw the call
   out after it had already advanced a documented metric: "publishes since boot"
   drifted upward on the app's own bug, in the one case where nothing reached a
-  socket to notice it by. The count now happens past both throw sites, and the
-  batch counts whole rather than per entry, so one that threw midway cannot
-  leave a partial tally behind either.
+  socket to notice it by. The count now sits past every point that can still
+  refuse the call - the seq stamp, the envelope build, and the server lookup
+  that throws when the platform is used before `Bun.serve()` is listening. A
+  batch on the stateful lane counts whole after its envelope loop; the stateless
+  lane is N independent `publishWire` calls by construction and still counts
+  each as it delivers it.
 
 - The `__replay:t` `truncated` marker was charged to no budget. Every other
   frame a client's own input buys goes through the per-connection control-egress
