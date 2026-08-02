@@ -242,13 +242,17 @@ test('a codec returning a non-Uint8Array declines, it does not hang the loop', {
 				);
 				assert.equal(ok, true, 'the publish still reported delivery');
 			});
-			assert.equal(
-				capable.sent.filter((s) => s.isBinary).length,
-				0,
-				'no binary frame was built from it'
-			);
 			assert.equal(srv.published.length, 1, 'it went out as the plain JSON fan-out instead');
-			assert.ok(String(srv.published[0].payload).includes('"topic":"room"'), 'the JSON envelope');
+			// The type IS the assertion: a binary frame would be a Uint8Array
+			// here. Checking the connection's own sends would prove nothing -
+			// the declined path returns before any per-connection walk, so that
+			// list is empty either way.
+			assert.equal(
+				typeof srv.published[0].payload,
+				'string',
+				'the fan-out carried the JSON envelope, not a frame built from the bad value'
+			);
+			assert.ok(srv.published[0].payload.includes('"topic":"room"'), srv.published[0].payload);
 		}
 	} finally {
 		console.error = realError;
@@ -259,16 +263,60 @@ test('a codec returning a non-Uint8Array declines, it does not hang the loop', {
 	assert.ok(errors[1].includes('string'), 'and named the type it got: ' + errors[1]);
 });
 
-test('a batch refused on a PAYLOAD leaves no mark, exactly as one refused on a seq', () => {
-	// The seq pre-pass makes a bad seq refuse the batch whole. The envelope
-	// build is the other throw site, it runs app code (JSON.stringify, so any
-	// toJSON), and it happens per entry - so marking the topic inside that loop
-	// left the entries BEFORE the throw marked for a batch that put nothing on
-	// any wire. That mark is the resume dedup floor: republish the same seqs
-	// after fixing the payload and the next window discards them as already
-	// seen. Silent data loss, which is worse than the counter drift beside it.
+const statefulCodec = () => ({ capability: CAP, schemaVersion: 2, encode: () => null, state: {} });
+
+test('a publish refused on a PAYLOAD leaves no mark, on every atomic lane', () => {
+	// The seq check refuses before anything is stamped. The envelope build is
+	// the OTHER throw site - it runs JSON.stringify, so any payload the app
+	// cannot serialise, including a toJSON of its own - and every lane used to
+	// raise the topic's authoritative mark before reaching it.
+	//
+	// That mark is the resume dedup floor. Raised for a frame that never went
+	// out, the next gap-fill window discards the republished frame as
+	// already-seen: a silent gap, and strictly worse than the publishCount
+	// drift sitting next to it.
+	//
+	// The two-entry batch is not redundant with the single publishes. It pins
+	// the WHOLE-batch guarantee: an entry that serialised successfully, before a
+	// later one threw, must also leave no mark behind.
+	const lanes = {
+		publish: () => platform.publish('room', 'said', { n: 1n }, { seq: 40 }),
+		publishWire: () =>
+			platform.publishWire('room', 'moved', { n: 1n }, statelessCodec(), { seq: 40 }),
+		'publishWireBatch (stateful)': () =>
+			platform.publishWireBatch(
+				'room',
+				'moved',
+				[{ data: { x: 1 }, seq: 40 }, { data: { n: 1n }, seq: 41 }],
+				statefulCodec()
+			)
+	};
+	for (const [lane, run] of Object.entries(lanes)) {
+		setServer(fakeServer());
+		const capable = fakeWs({ topics: ['room'], caps: [CAP] });
+		try {
+			const before = platform.publishCount;
+			withConnections([capable], () => {
+				assert.throws(run, TypeError, lane);
+			});
+			assert.equal(maxAuthoritativeSeq.get('room'), undefined, lane + ': marked nothing');
+			assert.equal(platform.publishCount, before, lane + ': counted nothing');
+			assert.equal(capable.sent.length, 0, lane + ': sent nothing');
+		} finally {
+			maxAuthoritativeSeq.clear();
+			topicSeqs.clear();
+		}
+	}
+});
+
+test('the stateless batch reroute keeps what already went out, and marks no more', () => {
+	// This lane is N independent publishWire calls, so it is NOT atomic and the
+	// contract is deliberately different: entry 0 really was delivered, so its
+	// mark and its count must STAND. What must not happen is the failing entry
+	// marking a seq that never reached a socket. Pinned explicitly so the
+	// asymmetry with the stateful lane above is a decision on the record rather
+	// than something a later reader has to infer from a passing suite.
 	setServer(fakeServer());
-	const statefulCodec = { capability: CAP, schemaVersion: 2, encode: () => null, state: {} };
 	const capable = fakeWs({ topics: ['room'], caps: [CAP] });
 	try {
 		const before = platform.publishCount;
@@ -278,22 +326,15 @@ test('a batch refused on a PAYLOAD leaves no mark, exactly as one refused on a s
 					platform.publishWireBatch(
 						'room',
 						'moved',
-						// Entry 0 is perfectly good and stamps first; entry 1 throws
-						// on the way into its envelope. One entry alone cannot catch
-						// this - the mark has to be observed for an EARLIER entry.
 						[{ data: { x: 1 }, seq: 40 }, { data: { n: 1n }, seq: 41 }],
-						statefulCodec
+						statelessCodec()
 					),
 				TypeError
 			);
 		});
-		assert.equal(
-			maxAuthoritativeSeq.get('room'),
-			undefined,
-			'the entry that stamped before the throw did not mark the topic'
-		);
-		assert.equal(platform.publishCount, before, 'and the batch counted nothing');
-		assert.equal(capable.sent.length, 0, 'and sent nothing');
+		assert.equal(maxAuthoritativeSeq.get('room'), 40, 'the entry that DID publish kept its mark');
+		assert.equal(platform.publishCount, before + 1, 'and its count');
+		assert.notEqual(maxAuthoritativeSeq.get('room'), 41, 'the entry that threw marked nothing');
 	} finally {
 		maxAuthoritativeSeq.clear();
 		topicSeqs.clear();

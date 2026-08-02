@@ -91,6 +91,15 @@ const subscribeThrewThrottle = createLogThrottle(() => performance.now());
 const recoverThrewThrottle = createLogThrottle(() => performance.now());
 
 /**
+ * A codec that threw, or handed back something that is not bytes. Throttled
+ * with decay for the same reason the hook throttles are: safeEncode runs inside
+ * the PER-CONNECTION walk, so one broken codec on a busy topic is one stderr
+ * write per connection per publish - an event-loop stall and a filled disk from
+ * a bug that is already degrading that capability to JSON.
+ */
+const encodeFailedThrottle = createLogThrottle(() => performance.now());
+
+/**
  * The seq-less JSON envelope a wire member falls back to for a caps-less,
  * poisoned, or codec-declined frame: byte-identical to what `send()` produces
  * (`envelopePrefix + JSON.stringify(data ?? null) + '}'`), so a degraded
@@ -178,8 +187,9 @@ function throwBatchExplicitSeq(topic, seq) {
  * Encode one wire frame, treating a throwing codec as a decline rather than
  * letting it abort a fan-out walk partway - some subscribers already have the
  * frame, and the seq is stamped and resume-captured, so a mid-walk escape
- * leaves the topic inconsistent. A throw is logged (throttled by the caller's
- * context) and the connection takes the JSON envelope like any other decline.
+ * leaves the topic inconsistent. A failure is logged - throttled with decay,
+ * because this runs inside the per-connection walk - and the connection takes
+ * the JSON envelope like any other decline.
  *
  * @param {{ encode: Function }} wire
  * @param {string} event
@@ -192,7 +202,8 @@ function safeEncode(wire, event, data, state) {
 	try {
 		payload = wire.encode(event, data, state);
 	} catch (err) {
-		console.error('[ws] wire.encode threw for', wire.capability, event, err);
+		const { log, count } = encodeFailedThrottle();
+		if (log) console.error(`[ws] wire.encode threw for ${wire.capability} ${event} (x${count})`, err);
 		return null;
 	}
 	// A wrong-TYPE return is the same class of codec bug as a throw and takes
@@ -204,10 +215,13 @@ function safeEncode(wire, event, data, state) {
 	// likely route, since a Promise is truthy and has no length. Buffer passes,
 	// being a Uint8Array subclass.
 	if (payload != null && !(payload instanceof Uint8Array)) {
-		console.error(
-			'[ws] wire.encode returned a', typeof payload, 'for', wire.capability, event,
-			'- serving the JSON envelope instead. Return a Uint8Array, or null to decline.'
-		);
+		const { log, count } = encodeFailedThrottle();
+		if (log) {
+			console.error(
+				`[ws] wire.encode returned a ${typeof payload} for ${wire.capability} ${event} (x${count})` +
+				' - serving the JSON envelope instead. Return a Uint8Array, or null to decline.'
+			);
+		}
 		return null;
 	}
 	return payload;
@@ -470,7 +484,6 @@ export const platform = {
 	 */
 	publish(topic, event, data, options) {
 		const seq = stampSeq(options, topic);
-		recordPublishedSeq(topic, seq, options);
 		// A de-herd window is carried verbatim so each client rolls its own
 		// delay. Rolling one server-side offset instead would defer every
 		// subscriber of this frame by the SAME amount, which is the stampede
@@ -479,13 +492,19 @@ export const platform = {
 			? options.jitterMs
 			: null;
 		const envelope = completeEnvelope(envelopePrefix(topic, event), data, seq, jitterMs);
-		// Everything that can still refuse this publish is resolved above the
-		// count: stampSeq on a seq the wire cannot carry, completeEnvelope on a
+		// Everything that can still refuse this publish is resolved above this
+		// line: stampSeq on a seq the wire cannot carry, completeEnvelope on a
 		// payload JSON cannot represent, and getServer when the platform is used
-		// before Bun.serve() started. `publishCount` is documented as "publishes
-		// since boot", so counting any earlier drifts it upward on the app's own
-		// bug, in the one case where nothing was delivered to notice it by.
+		// before Bun.serve() started. Only then is anything recorded.
+		//
+		// The MARK is the load-bearing half. It is the resume dedup floor, so
+		// raising it for a frame that never went out makes the next gap-fill
+		// window discard the republished frame as already-seen - a silent gap.
+		// The count is the visible half: `publishCount` is documented as
+		// "publishes since boot" and drifts upward on the app's own bug in the
+		// one case where nothing was delivered to notice it by.
 		const server = getServer();
+		recordPublishedSeq(topic, seq, options);
 		wsCounters.publishCount++;
 		const compress = ws_compression_on && (!options || options.compress !== false);
 		// A connection still gap-filling this topic (resume cutover in
@@ -638,10 +657,11 @@ export const platform = {
 			return this.publish(topic, event, data, options);
 		}
 		const seq = stampSeq(options, topic);
-		recordPublishedSeq(topic, seq, options);
 		const envelope = completeEnvelope(envelopePrefix(topic, event), data, seq);
-		// Past all three refusal points before counting, as in publish() above.
+		// Past all three refusal points before the mark or the count moves, as
+		// in publish() above and for the same reasons.
 		const server = getServer();
+		recordPublishedSeq(topic, seq, options);
 		wsCounters.publishCount++;
 		// Binary codec frames (and this call's JSON-fallback frames) compress
 		// only when the caller opts in with `{ compress: true }` AND a

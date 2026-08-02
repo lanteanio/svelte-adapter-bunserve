@@ -74,15 +74,30 @@ test('a zero-capacity writer grows instead of spinning', () => {
 	}
 });
 
-test('growth still reaches a capacity larger than one doubling', { timeout: 5000 }, () => {
-	// The zero fix replaced a doubling LOOP with a single max(), so the case the
-	// loop existed for - a write far bigger than twice the buffer - is pinned.
+test('growth still reaches a capacity larger than one doubling', () => {
+	// A write far bigger than twice the buffer has to be satisfied in one go.
 	const w = new ByteWriter(4);
 	const big = 'x'.repeat(5000);
 	w.str(big);
 	const r = new ByteReader(w.take());
 	assert.equal(r.str(), big);
 	assert.equal(r.done, true);
+});
+
+test('growth leaves slack, so a big write does not make the next write realloc', () => {
+	// A PERFORMANCE invariant, pinned as a count rather than a timing because
+	// timings here are pure noise. The zero fix was first written as
+	// max(double, want), which satisfies the write exactly and leaves capacity
+	// == len - so every following write reallocated and copied the whole
+	// buffer. Measured at one extra realloc and up to twice the wall clock on a
+	// big-write pattern. Doubling keeps the slack that makes growth amortised,
+	// and this is the assertion that says so.
+	const w = new ByteWriter(64);
+	w.bytes(new Uint8Array(5000));
+	const capacity = w._buf.length;
+	assert.ok(capacity > w.len, `capacity ${capacity} must exceed len ${w.len}`);
+	w.u8(1);
+	assert.equal(w._buf.length, capacity, 'the following write reused the buffer');
 });
 
 test('reads past the end throw RangeError rather than returning garbage', () => {

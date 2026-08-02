@@ -49,13 +49,19 @@ export class ByteWriter {
 	_ensure(need) {
 		const want = this.len + need;
 		if (want <= this._buf.length) return;
-		// Amortised doubling, but never FROM zero and never short of `want`. The
-		// old form doubled in a loop, which cannot leave 0 - so a writer built
-		// with a zero (or NaN, which ArrayBuffer floors to 0) capacity spun here
-		// forever instead of growing, hanging the event loop rather than
-		// throwing. A growth primitive must not be one bad caller away from
-		// that, whatever the caller did wrong.
-		const cap = Math.max(this._buf.length * 2, want);
+		// Doubling, seeded to 1 when the buffer is empty. The seed is the whole
+		// fix: a writer built with a zero capacity - or NaN, which ArrayBuffer
+		// floors to 0 - left `cap` at 0, and doubling 0 never reaches `want`, so
+		// this spun forever and hung the event loop instead of growing. A growth
+		// primitive must not be one bad caller away from that.
+		//
+		// Deliberately still a LOOP rather than max(double, want): allocating
+		// exactly `want` leaves no slack, so the next write of any size
+		// reallocates and copies the whole buffer again. Measured at one extra
+		// realloc and up to twice the wall-clock on a big-write pattern, which
+		// is why the cheaper-looking form is not here.
+		let cap = this._buf.length * 2 || 1;
+		while (cap < want) cap *= 2;
 		const ab = new ArrayBuffer(cap);
 		const buf = new Uint8Array(ab);
 		buf.set(this._buf.subarray(0, this.len));

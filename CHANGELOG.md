@@ -205,16 +205,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the usual hook-error path and abandons that tick, where the old behaviour
   published it seq-less.
 
-- `publishWireBatch` advanced the topic's authoritative mark for entries it had
-  already stamped when a LATER entry threw. The per-entry seq pre-pass makes a
-  bad seq refuse the batch whole, but the envelope build is a second throw site
-  - it runs `JSON.stringify`, so any payload the app cannot serialise, including
-  a `toJSON` of its own - and the marking sat inside that loop. A batch that put
-  nothing on any wire could therefore leave the mark raised, and that mark is
-  the resume dedup floor: republishing the same seqs after fixing the payload
-  had the next gap-fill window discard them as already-seen. The mark now moves
-  in a second pass, after every entry has stamped and serialised, so the batch
-  is refused whole for either kind of bad input.
+- Every publish member advanced the topic's authoritative mark for a frame it
+  then failed to build. The seq check refuses before anything is stamped, but
+  the envelope build is a second throw site - it runs `JSON.stringify`, so any
+  payload the app cannot serialise, including a `toJSON` of its own - and the
+  mark was raised before reaching it. `publishWireBatch` did it per entry, so a
+  batch that put nothing on any wire left the mark raised for every entry it had
+  got through. That mark is the resume dedup floor: republishing the same seqs
+  after fixing the payload had the next gap-fill window discard them as
+  already-seen, which is a silent gap of exactly the kind the resume barrier
+  exists to prevent. The mark now moves only once the frame exists and the
+  server is there to take it, and the batch marks in a second pass after every
+  entry has serialised, so it is refused whole for either kind of bad input.
+  The stateless batch lane is N independent publishes by construction and keeps
+  the contract that follows from that: an entry already delivered keeps its mark
+  and its count, and only the failing entry marks nothing.
 
 - Every publish member counted publishes it went on to refuse. `publish` and
   `publishWire` incremented `publishCount` before stamping the seq, and all
