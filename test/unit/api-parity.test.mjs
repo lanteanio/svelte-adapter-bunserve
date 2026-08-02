@@ -65,10 +65,7 @@ const PLATFORM_GAPS = {
 	onPublishRate: 'pressure/protection observability',
 	pressure: 'pressure/protection observability',
 	protection: 'pressure/protection observability',
-	introspect: 'diagnostics',
-	diagnostic: 'diagnostics',
-	trace: 'tracing',
-	traceContext: 'tracing'
+	introspect: 'diagnostics'
 };
 
 /**
@@ -82,11 +79,14 @@ const PLATFORM_EXTRAS = {
 	droppedReleaseRecords: 'drift: no uws equivalent'
 };
 
-/** Top-level adapter options uws declares and this adapter does not accept. */
-const ADAPTER_OPTION_GAPS = {
-	staticCacheControl: 'per-rule static cache-control',
-	tracing: 'tracing configuration'
-};
+/**
+ * Top-level adapter options uws declares and this adapter does not accept.
+ *
+ * Empty against the pinned release: every top-level option uws ships is
+ * accepted here. Kept as a list rather than deleted so the next uws release
+ * that adds one fails this file instead of passing unnoticed.
+ */
+const ADAPTER_OPTION_GAPS = {};
 
 /**
  * Top-level adapter options this adapter accepts that uws does not declare.
@@ -100,7 +100,7 @@ const ADAPTER_OPTION_GAPS = {
  * test below.
  */
 const ADAPTER_OPTION_EXTRAS = {
-	staticCacheMaxFileSize: 'drift: uws spells its static caching control staticCacheControl',
+	staticCacheMaxFileSize: 'drift: no equivalent in the pinned uws release',
 	websocketHandler: 'shape drift: uws nests this as websocket.handler',
 	websocketPath: 'shape drift: uws nests this as websocket.path',
 	compressCredentialedResponses: 'shape drift: uws nests this under websocket'
@@ -115,7 +115,6 @@ const WS_OPTION_GAPS = {
 	authPathRateLimitWindow: 'auth endpoint',
 	authPathRequireOrigin: 'auth endpoint',
 	authorizeWireSubscribe: 'wire-subscribe authorization',
-	messageAdmission: 'admission control',
 	upgradeAdmission: 'admission control',
 	upgradeRateLimit: 'admission control',
 	upgradeRateLimitWindow: 'admission control',

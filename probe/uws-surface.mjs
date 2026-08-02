@@ -14,11 +14,43 @@
 // consumer, and it distinguishes public API from whatever the implementation
 // happens to expose.
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { writeFileSync, existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Read a file out of the uws repo AT A COMMIT, never from its working tree.
+ *
+ * The working tree of a repo under active development is not a contract - a
+ * half-finished API in someone's editor would end up recorded here as though it
+ * had shipped, and the parity test would then hold this adapter to it. Reading
+ * through `git show` pins the manifest to a state that actually exists in
+ * history, and the resolved sha goes into the manifest so the provenance is
+ * reviewable.
+ *
+ * @param {string} repo
+ * @param {string} ref
+ * @param {string} path
+ * @returns {string}
+ */
+function showAtRef(repo, ref, path) {
+	try {
+		return execFileSync('git', ['show', `${ref}:${path}`], {
+			cwd: repo,
+			encoding: 'utf8',
+			maxBuffer: 64 * 1024 * 1024
+		});
+	} catch (err) {
+		throw new Error(
+			`could not read ${path} at ${ref} from ${repo}.\n` +
+			'Pass a ref that exists (UWS_REF=<sha|tag|branch>); the default is HEAD.\n' +
+			String(err.message ?? err)
+		);
+	}
+}
 
 /**
  * Locate the uws checkout. Explicit env var wins; otherwise the sibling
@@ -128,12 +160,18 @@ export function interfaceMembers(source, name) {
 }
 
 const uwsRoot = findUws();
-const dts = readFileSync(join(uwsRoot, 'src', 'index.d.ts'), 'utf8');
-const pkg = JSON.parse(readFileSync(join(uwsRoot, 'package.json'), 'utf8'));
+const ref = process.env.UWS_REF || 'HEAD';
+const commit = execFileSync('git', ['rev-parse', ref], { cwd: uwsRoot, encoding: 'utf8' }).trim();
+const dts = showAtRef(uwsRoot, commit, 'src/index.d.ts');
+const pkg = JSON.parse(showAtRef(uwsRoot, commit, 'package.json'));
 
 const surface = {
-	// Recorded so a stale manifest is visible at a glance in review.
+	// Provenance, so a stale or mis-sourced manifest is visible in review. The
+	// commit matters as much as the version: it is what makes this reproducible
+	// while the uws working tree is mid-change.
 	uwsVersion: pkg.version,
+	uwsRef: ref,
+	uwsCommit: commit,
 	platform: interfaceMembers(dts, 'Platform'),
 	adapterOptions: interfaceMembers(dts, 'AdapterOptions'),
 	webSocketOptions: interfaceMembers(dts, 'WebSocketOptions'),

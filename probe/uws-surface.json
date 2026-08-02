@@ -1,5 +1,7 @@
 {
-	"uwsVersion": "0.6.0-next.91",
+	"uwsVersion": "0.6.0-next.90",
+	"uwsRef": "HEAD",
+	"uwsCommit": "7b9ba000056b7cb198cd83605355302ecec3853c",
 	"platform": [
 		"adviseReconnect",
 		"authorizeWireSubscribe",
@@ -8,7 +10,6 @@
 		"checkSubscribe",
 		"closedWsAborts",
 		"connections",
-		"diagnostic",
 		"forEachSubscriber",
 		"grantPublish",
 		"hlc",
@@ -43,8 +44,6 @@
 		"subscribers",
 		"topic",
 		"topicEpoch",
-		"trace",
-		"traceContext",
 		"unsubscribe"
 	],
 	"adapterOptions": [
@@ -53,9 +52,7 @@
 		"out",
 		"precompress",
 		"readinessCheckPath",
-		"staticCacheControl",
 		"staticHeaders",
-		"tracing",
 		"websocket"
 	],
 	"webSocketOptions": [
@@ -77,7 +74,6 @@
 		"idleTimeout",
 		"maxBackpressure",
 		"maxPayloadLength",
-		"messageAdmission",
 		"metrics",
 		"path",
 		"postureExport",
@@ -97,8 +93,6 @@
 	"exports": [
 		".",
 		"./client",
-		"./connection",
-		"./observability",
 		"./plugins/channels",
 		"./plugins/channels/client",
 		"./plugins/crdt",
