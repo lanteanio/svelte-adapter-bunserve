@@ -394,10 +394,12 @@ test('a batch-level explicit seq is refused on an empty batch too', () => {
 	// ticks that publish nothing and surface later under load - which is the
 	// failure fail-fast exists to prevent.
 	setServer({ publish: () => 0, subscriberCount: () => 0 });
+	const before = platform.publishCount;
 	assert.throws(
 		() => platform.publishWireBatch('room', 'moved', [], statefulCodec(), { seq: 7 }),
 		TypeError
 	);
+	assert.equal(platform.publishCount, before, 'and counted nothing on the way out');
 	assert.equal(
 		platform.publishWireBatch('room', 'moved', [], statefulCodec(), { seq: true }),
 		false,

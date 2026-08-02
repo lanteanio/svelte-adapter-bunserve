@@ -205,6 +205,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the usual hook-error path and abandons that tick, where the old behaviour
   published it seq-less.
 
+- Every publish member counted publishes it went on to refuse. `publish` and
+  `publishWire` incremented `publishCount` before stamping the seq, and all
+  three - `publishWireBatch` included - counted before building the envelope. So
+  a seq the wire cannot carry, or a payload JSON cannot represent, threw the call
+  out after it had already advanced a documented metric: "publishes since boot"
+  drifted upward on the app's own bug, in the one case where nothing reached a
+  socket to notice it by. The count now happens past both throw sites, and the
+  batch counts whole rather than per entry, so one that threw midway cannot
+  leave a partial tally behind either.
+
 - The `__replay:t` `truncated` marker was charged to no budget. Every other
   frame a client's own input buys goes through the per-connection control-egress
   bound (`maxControlEgressBytes`), but the marker went to the socket directly -

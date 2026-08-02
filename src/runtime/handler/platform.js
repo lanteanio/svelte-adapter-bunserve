@@ -452,7 +452,6 @@ export const platform = {
 	 * @returns {boolean} whether any local subscriber received it
 	 */
 	publish(topic, event, data, options) {
-		wsCounters.publishCount++;
 		const seq = stampSeq(options, topic);
 		recordPublishedSeq(topic, seq, options);
 		// A de-herd window is carried verbatim so each client rolls its own
@@ -463,6 +462,13 @@ export const platform = {
 			? options.jitterMs
 			: null;
 		const envelope = completeEnvelope(envelopePrefix(topic, event), data, seq, jitterMs);
+		// Counted only once the frame exists. This call has two throw sites -
+		// stampSeq, on an explicit seq the wire cannot carry, and completeEnvelope,
+		// on a payload JSON cannot represent - and a publish refused at either
+		// never reached a socket. `publishCount` is documented as "publishes since
+		// boot", so counting above would drift it upward on the app's own bug, in
+		// the one case where nothing was delivered to notice it by.
+		wsCounters.publishCount++;
 		const compress = ws_compression_on && (!options || options.compress !== false);
 		// A connection still gap-filling this topic (resume cutover in
 		// flight) is not yet subscribed to live, so hold the envelope it
@@ -613,10 +619,11 @@ export const platform = {
 		if (!wire || typeof wire.capability !== 'string') {
 			return this.publish(topic, event, data, options);
 		}
-		wsCounters.publishCount++;
 		const seq = stampSeq(options, topic);
 		recordPublishedSeq(topic, seq, options);
 		const envelope = completeEnvelope(envelopePrefix(topic, event), data, seq);
+		// Past both throw sites before counting, as in publish() above.
+		wsCounters.publishCount++;
 		// Binary codec frames (and this call's JSON-fallback frames) compress
 		// only when the caller opts in with `{ compress: true }` AND a
 		// compressor is configured. One decision governs the whole call so a
@@ -971,7 +978,6 @@ export const platform = {
 			}
 			return ok;
 		}
-		wsCounters.publishCount += entries.length;
 		const compress = ws_compression_on && !!(options && options.compress === true);
 
 		// Per-entry seq and envelope - the exact bookkeeping N publishWire
@@ -1008,6 +1014,11 @@ export const platform = {
 			envs[i] = completeEnvelope(envelopePrefix(topic, event), entry.data, seq);
 			if (entry.excludeWs !== undefined && entry.excludeWs !== null) anyExclude = true;
 		}
+		// Counted whole, after the last throw site, for the reason the batch is
+		// refused whole: completeEnvelope throws on a payload JSON cannot carry,
+		// and counting per entry above would leave N counted for a batch that
+		// never went out - or worse, a partial count for one that threw midway.
+		wsCounters.publishCount += entries.length;
 		// Resume cutover in flight: hold the per-entry JSON envelopes a
 		// caps-less resuming subscriber would receive from this batch, each
 		// skipping the socket its own entry excluded.
