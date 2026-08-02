@@ -219,7 +219,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entry has serialised, so it is refused whole for either kind of bad input.
   The stateless batch lane is N independent publishes by construction and keeps
   the contract that follows from that: an entry already delivered keeps its mark
-  and its count, and only the failing entry marks nothing.
+  and its count, and only the failing entry marks nothing. The `{ seq: true }`
+  counter is the one thing not rewound - it is a separate space that is never
+  deduped and never marks the topic, so a refused publish costs that topic a gap
+  in its counter numbering and nothing else, and rewinding it would be unsafe
+  anyway because a `toJSON` can publish re-entrantly and take the next value.
 
 - Every publish member counted publishes it went on to refuse. `publish` and
   `publishWire` incremented `publishCount` before stamping the seq, and all

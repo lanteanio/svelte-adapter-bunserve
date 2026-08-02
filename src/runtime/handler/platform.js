@@ -1071,6 +1071,15 @@ export const platform = {
 		// resume dedup floor, so a later window would discard the republished
 		// frames as already-seen. Whole batch or nothing, the rule the per-entry
 		// seq pre-pass already enforces.
+		//
+		// ONE thing is not rolled back, deliberately: the `{ seq: true }` counter
+		// advanced in the loop above for every entry it stamped. It cannot be
+		// undone safely - completeEnvelope runs JSON.stringify, so a toJSON can
+		// publish re-entrantly and take the next value, and a rollback would then
+		// hand two frames the same seq. And it costs nothing: the counter is a
+		// separate space that is never deduped and never marks the topic, so a
+		// refused batch leaves a gap in that topic's counter numbering and
+		// nothing else. No contract anywhere calls that lane contiguous.
 		const server = getServer();
 		for (let i = 0; i < entries.length; i++) {
 			if (authoritative[i]) notePublishedSeq(topic, seqs[i], true);

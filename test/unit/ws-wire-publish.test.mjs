@@ -309,6 +309,35 @@ test('a publish refused on a PAYLOAD leaves no mark, on every atomic lane', () =
 	}
 });
 
+test('a refused publish leaves the { seq: true } counter advanced, on purpose', () => {
+	// The one piece of state a refusal does NOT rewind, pinned so it reads as a
+	// decision rather than as the next thing a review finds.
+	//
+	// It cannot be rewound safely: completeEnvelope runs JSON.stringify, so a
+	// toJSON can publish re-entrantly and take the next counter value, and a
+	// rollback would then hand two frames the same seq - which is worse than a
+	// gap by exactly the margin that makes seqs useful. And it costs nothing:
+	// the counter is a separate space, never deduped and never marking the
+	// topic, so the only consequence is a gap in that topic's counter numbering.
+	// Nothing in the README or the wire contract calls that lane contiguous.
+	setServer(fakeServer());
+	try {
+		platform.publish('room', 'said', { x: 1 }, { seq: true });
+		assert.equal(topicSeqs.get('room'), 1);
+		assert.throws(() => platform.publish('room', 'said', { n: 1n }, { seq: true }), TypeError);
+		platform.publish('room', 'said', { x: 3 }, { seq: true });
+		assert.equal(topicSeqs.get('room'), 3, 'the refused publish consumed its counter value');
+		assert.equal(
+			maxAuthoritativeSeq.get('room'),
+			undefined,
+			'and marked nothing, which is why the gap is harmless'
+		);
+	} finally {
+		topicSeqs.clear();
+		maxAuthoritativeSeq.clear();
+	}
+});
+
 test('the stateless batch reroute keeps what already went out, and marks no more', () => {
 	// This lane is N independent publishWire calls, so it is NOT atomic and the
 	// contract is deliberately different: entry 0 really was delivered, so its
