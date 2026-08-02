@@ -47,8 +47,8 @@ test('a watermark the server itself issued round-trips, however large or fractio
 	// requires an integer). The asymmetry is deliberate: this rule governs what
 	// a client may be holding - from an older build, or another node in a
 	// cluster - and tightening it to match would drop those topics and
-	// manufacture the gap above. Refusing on publish costs a warning; refusing
-	// here costs a client its history.
+	// manufacture the gap above. Refusing on publish THROWS, at the app that
+	// chose the value; refusing here would cost a client its history.
 	assert.equal(isValidResumeSeq(2.5), true, 'an app cursor need not be an integer');
 });
 

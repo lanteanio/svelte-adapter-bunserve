@@ -31,13 +31,16 @@
  * Kafka offsets and log sequence numbers run past 2^53 as a matter of course.
  * A watermark this server itself put on the wire has to round-trip.
  *
- * The publish side is STRICTER than this (utils/publish-seq.js requires a
- * non-negative integer), and the gap is deliberate rather than an inconsistency
- * to close. This rule governs what a client may be HOLDING - from an older
- * build, or from another node in a cluster - so tightening it to match would
- * drop those topics from the gap-fill map and manufacture the silent gap the
- * barrier exists to prevent. Refusing on the publish side costs a warning;
- * refusing here costs a client its history.
+ * The publish side is STRICTER than this (utils/publish-seq.js requires an
+ * integer of AT LEAST 1, since 0 is the binary frame's "no seq" sentinel), and
+ * the gap is deliberate rather than an inconsistency to close. This rule
+ * governs what a client may be HOLDING - from an older build, or from another
+ * node in a cluster - so tightening it to match would drop those topics from
+ * the gap-fill map and manufacture the silent gap the barrier exists to
+ * prevent. Note that 0 is precisely such a value: never emitted, but "seen
+ * nothing yet" is a real thing for a client to be holding. Refusing on the
+ * publish side throws, at the app that chose the value; refusing here would
+ * cost a client its history.
  *
  * Magnitude is the app's business, and the wire carries it exactly - the frame
  * varint round-trips 2^53 and beyond. The place an absurd value does damage is

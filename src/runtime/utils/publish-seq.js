@@ -39,8 +39,11 @@
  * Note the contrast with `isValidResumeSeq`, which accepts a fractional
  * watermark. That is not an oversight there: refusing a watermark drops its
  * topic from the gap-fill map, so an over-strict inbound rule manufactures the
- * silent gap the resume barrier exists to prevent. Refusing here costs a
- * warning and a seq-less publish instead, which is why this side can be exact.
+ * silent gap the resume barrier exists to prevent. Refusing here THROWS
+ * instead, which is why this side can be exact: a publish carries a value the
+ * calling app chose, so it can be told the value is wrong, and publishing it
+ * seq-less would degrade that client's resume dedup with nothing to notice it
+ * by. A watermark arriving from a client is not the app's to be told about.
  *
  * @param {unknown} v
  * @returns {v is number}
