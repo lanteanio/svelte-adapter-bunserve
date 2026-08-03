@@ -591,6 +591,24 @@ The WebSocket handler is bundled by Rollup from project source, with SvelteKit's
 `$lib` alias resolved. There is no esbuild fallback, so the handler must be
 plain JavaScript resolvable by that plugin set.
 
+## Versions at boot
+
+The first thing a built server logs is its resolved identity:
+
+```
+svelte-adapter-bunserve 0.0.1 (protocol rev 1, svelte-realtime 0.4.2, svelte-adapter-uws-extensions not installed)
+```
+
+Everything on that line is read at runtime, never inlined at build time: the
+adapter's own version and the protocol revision come from the exact
+`package.json` and `protocol.schema.json` the build copied into
+`build/meta/`, and each sibling version is what `import.meta.resolve` actually
+finds next to the app - what is deployed, not what was declared. When two
+surfaces disagree at runtime, compare these versions first: partial upgrades
+and registry cooldowns are the usual real-world cause. The schema itself ships
+in the package as `protocol.schema.json` (the family contract's vendored copy,
+held byte-identical to svelte-adapter-uws's by the parity gate).
+
 ## Timeouts
 
 `IDLE_TIMEOUT` is the number of seconds a connection may go idle before Bun
@@ -651,8 +669,11 @@ frame-shape and hook-contract assertions there - it is the fast lane:
 npm test   # requires Node 22+ for the test-runner glob
 ```
 
-`test/unit/io-budget.test.mjs` is the performance gate in that lane. It counts
-OPERATIONS - encode calls, native publishes, socket writes - and never measures
+`test/unit/io-budget.test.mjs` is the performance gate in that lane, and
+`test/unit/http-io-budget.test.mjs` is its HTTP twin: per-response operation
+counts for the static lane (Headers and Response constructions, `Bun.file`
+opens, pathname decodes), pinned exactly and under 6x load. Both count
+OPERATIONS - encode calls, native publishes, socket writes - and never measure
 time, because a wall-clock assertion cannot gate CI: it fails on a busy runner,
 gets retried until green, and is then ignored. The gates that matter most are
 the scaling ones, of the shape "6x the input must not increase the count of X",

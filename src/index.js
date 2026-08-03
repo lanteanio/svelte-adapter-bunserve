@@ -334,6 +334,21 @@ export default function (opts = {}) {
 				}
 			});
 
+			// The exact metadata that produced this server, for the boot
+			// banner and diagnostics: the runtime reads its version and the
+			// protocol revision from these FILES at runtime, never from
+			// constants inlined at build time, so what it reports is what is
+			// deployed - including after someone hand-patches a build.
+			builder.mkdirp(`${out}/meta`);
+			writeFileSync(
+				`${out}/meta/package.json`,
+				readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)))
+			);
+			writeFileSync(
+				`${out}/meta/protocol.schema.json`,
+				readFileSync(fileURLToPath(new URL('../protocol.schema.json', import.meta.url)))
+			);
+
 			if (builder.hasServerInstrumentationFile?.()) {
 				builder.instrument?.({
 					entrypoint: `${out}/index.js`,

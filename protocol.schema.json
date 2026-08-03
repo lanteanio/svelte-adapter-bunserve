@@ -1,0 +1,261 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:lantean-protocol:revision-1",
+  "title": "The Lantean protocol, revision 1",
+  "description": "JSON Schema for every CORE-OWNED control frame and the data-event envelope of the Lantean protocol (PROTOCOL.md). Additional properties are permitted everywhere: the protocol is forward-compatible and a peer ignores fields it does not recognize (PROTOCOL.md section 10). The same rule holds at the frame level: an unrecognized application control frame passes through to the application handler, and higher layers define their own frames that way (svelte-realtime ships its companion schema as svelte-realtime/protocol.schema.json). A validator for mixed ecosystem traffic accepts a frame when it matches the core schema OR a composed layer schema. A core frame is one of the definitions in $defs; correlate control frames by their `type` const.",
+  "oneOf": [
+    { "$ref": "#/$defs/welcome" },
+    { "$ref": "#/$defs/hello" },
+    { "$ref": "#/$defs/lease-ok" },
+    { "$ref": "#/$defs/subscribe" },
+    { "$ref": "#/$defs/subscribe-batch" },
+    { "$ref": "#/$defs/unsubscribe" },
+    { "$ref": "#/$defs/subscribed" },
+    { "$ref": "#/$defs/subscribe-denied" },
+    { "$ref": "#/$defs/batch" },
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/reply" },
+    { "$ref": "#/$defs/wire-id" },
+    { "$ref": "#/$defs/resume" },
+    { "$ref": "#/$defs/resumed" },
+    { "$ref": "#/$defs/lease" },
+    { "$ref": "#/$defs/request-n" },
+    { "$ref": "#/$defs/error" },
+    { "$ref": "#/$defs/ingress-ok" },
+    { "$ref": "#/$defs/ingress-bind" },
+    { "$ref": "#/$defs/ingress-bound" },
+    { "$ref": "#/$defs/reconnect" },
+    { "$ref": "#/$defs/game" },
+    { "$ref": "#/$defs/game-denied" },
+    { "$ref": "#/$defs/data-event" }
+  ],
+  "$defs": {
+    "ref": {
+      "description": "Client-allocated correlation id: a number or a string.",
+      "type": ["integer", "string"]
+    },
+    "recover-one": {
+      "type": "object",
+      "properties": {
+        "offset": { "type": "integer" },
+        "epoch": { "type": "integer" }
+      },
+      "required": ["offset"]
+    },
+    "welcome": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "welcome" },
+        "sessionId": { "type": "string" }
+      },
+      "required": ["type", "sessionId"]
+    },
+    "reconnect": {
+      "description": "Server -> client drain advisory: the node is draining/restarting and asks the client to reconnect on a jittered schedule in [afterMs, afterMs+windowMs), so a fleet does not stampede the replacement. Additive and unknown-type-safe (an old client ignores it).",
+      "type": "object",
+      "properties": {
+        "type": { "const": "reconnect" },
+        "windowMs": { "type": "integer", "exclusiveMinimum": 0 },
+        "afterMs": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["type", "windowMs"]
+    },
+    "hello": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "hello" },
+        "caps": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["type", "caps"]
+    },
+    "lease-ok": {
+      "type": "object",
+      "properties": { "type": { "const": "lease-ok" } },
+      "required": ["type"]
+    },
+    "subscribe": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "subscribe" },
+        "topic": { "type": "string" },
+        "ref": { "$ref": "#/$defs/ref" },
+        "recover": { "$ref": "#/$defs/recover-one" }
+      },
+      "required": ["type", "topic"]
+    },
+    "subscribe-batch": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "subscribe-batch" },
+        "topics": { "type": "array", "items": { "type": "string" } },
+        "ref": { "$ref": "#/$defs/ref" },
+        "recover": { "type": "object" }
+      },
+      "required": ["type", "topics"]
+    },
+    "unsubscribe": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "unsubscribe" },
+        "topic": { "type": "string" }
+      },
+      "required": ["type", "topic"]
+    },
+    "subscribed": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "subscribed" },
+        "topic": { "type": "string" },
+        "ref": { "$ref": "#/$defs/ref" },
+        "epoch": { "type": "integer" }
+      },
+      "required": ["type", "topic", "ref", "epoch"]
+    },
+    "subscribe-denied": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "subscribe-denied" },
+        "topic": { "type": "string" },
+        "ref": { "$ref": "#/$defs/ref" },
+        "reason": { "type": "string" }
+      },
+      "required": ["type", "topic", "ref", "reason"]
+    },
+    "batch": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "batch" },
+        "events": { "type": "array", "items": { "$ref": "#/$defs/data-event" } }
+      },
+      "required": ["type", "events"]
+    },
+    "request": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "request" },
+        "ref": { "$ref": "#/$defs/ref" },
+        "event": { "type": "string" },
+        "data": {}
+      },
+      "required": ["type", "ref", "event"]
+    },
+    "reply": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "reply" },
+        "ref": { "$ref": "#/$defs/ref" },
+        "data": {},
+        "error": { "type": "string" }
+      },
+      "required": ["type", "ref"]
+    },
+    "wire-id": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "wire-id" },
+        "topic": { "type": "string" },
+        "id": { "type": "integer" }
+      },
+      "required": ["type", "topic", "id"]
+    },
+    "resume": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "resume" },
+        "sessionId": { "type": "string" },
+        "lastSeenSeqs": { "type": "object" },
+        "lastSeenEpochs": { "type": "object" }
+      },
+      "required": ["type", "sessionId", "lastSeenSeqs"]
+    },
+    "resumed": {
+      "type": "object",
+      "properties": { "type": { "const": "resumed" } },
+      "required": ["type"]
+    },
+    "lease": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "lease" },
+        "count": { "type": "integer" },
+        "ttlMs": { "type": "integer" }
+      },
+      "required": ["type", "count", "ttlMs"]
+    },
+    "request-n": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "request-n" },
+        "n": { "type": "integer" }
+      },
+      "required": ["type", "n"]
+    },
+    "error": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "error" },
+        "code": { "type": "string" },
+        "limit": { "type": "integer" },
+        "size": { "type": "integer" }
+      },
+      "required": ["type", "code"]
+    },
+    "ingress-ok": {
+      "type": "object",
+      "properties": { "type": { "const": "ingress-ok" } },
+      "required": ["type"]
+    },
+    "ingress-bind": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "ingress-bind" },
+        "id": { "type": "integer" },
+        "kind": { "type": "string" },
+        "target": {}
+      },
+      "required": ["type", "id", "kind", "target"]
+    },
+    "ingress-bound": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "ingress-bound" },
+        "id": { "type": "integer" }
+      },
+      "required": ["type", "id"]
+    },
+    "game": {
+      "description": "Client -> server client-driven relay publish (the `game` lane, PROTOCOL.md section 3.10). Carries NO topic: the server derives it from the connection's publish grant. `event` is a string; `data` is any JSON value; `id` is an optional client-chosen input id echoed on the fan-out.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "game" },
+        "event": { "type": "string" },
+        "data": {},
+        "id": { "$ref": "#/$defs/ref" }
+      },
+      "required": ["type", "event"]
+    },
+    "game-denied": {
+      "description": "Server -> the sender of a rejected `game` frame (PROTOCOL.md section 3.10). `FORBIDDEN`: no publish grant. `INVALID`: granted but a malformed frame (non-string event). `id` is echoed when the rejected frame carried one.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "game-denied" },
+        "reason": { "enum": ["FORBIDDEN", "INVALID"] },
+        "id": { "$ref": "#/$defs/ref" }
+      },
+      "required": ["type", "reason"]
+    },
+    "data-event": {
+      "description": "The published-event carrier. No `type` field: identified by `topic` + `event`. `id` appears only on the fan-out of a `game`-lane frame (section 3.10), echoing the sender's input id.",
+      "type": "object",
+      "properties": {
+        "topic": { "type": "string" },
+        "event": { "type": "string" },
+        "data": {},
+        "seq": { "type": "integer" },
+        "j": { "type": "number" },
+        "id": { "$ref": "#/$defs/ref" }
+      },
+      "required": ["topic", "event"]
+    }
+  }
+}

@@ -15,6 +15,7 @@
 // happens to expose.
 
 import { writeFileSync, existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -164,6 +165,7 @@ const ref = process.env.UWS_REF || 'HEAD';
 const commit = execFileSync('git', ['rev-parse', ref], { cwd: uwsRoot, encoding: 'utf8' }).trim();
 const dts = showAtRef(uwsRoot, commit, 'src/index.d.ts');
 const pkg = JSON.parse(showAtRef(uwsRoot, commit, 'package.json'));
+const schema = showAtRef(uwsRoot, commit, 'protocol.schema.json');
 
 const surface = {
 	// Provenance, so a stale or mis-sourced manifest is visible in review. The
@@ -172,6 +174,12 @@ const surface = {
 	uwsVersion: pkg.version,
 	uwsRef: ref,
 	uwsCommit: commit,
+	// The family protocol schema, recorded as a hash: this repo VENDORS a
+	// byte-identical copy at its root (uws is the schema's home; the copy is
+	// what ships to consumers and what the runtime reads its protocol
+	// revision from), and the parity test compares the committed copy against
+	// this hash so the two cannot drift apart silently.
+	protocolSchemaSha256: createHash('sha256').update(schema, 'utf8').digest('hex'),
 	platform: interfaceMembers(dts, 'Platform'),
 	adapterOptions: interfaceMembers(dts, 'AdapterOptions'),
 	webSocketOptions: interfaceMembers(dts, 'WebSocketOptions'),

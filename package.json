@@ -20,6 +20,7 @@
 	},
 	"files": [
 		"src",
+		"protocol.schema.json",
 		"LICENSE",
 		"README.md",
 		"CHANGELOG.md"

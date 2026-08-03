@@ -233,3 +233,22 @@ test('the options uws nests under `websocket` are nested here too, not top-level
 		);
 	}
 });
+
+test('the vendored protocol schema is byte-identical to the uws copy at the pin', async () => {
+	// uws is the schema's home; this repo ships a vendored copy so consumers
+	// (and the runtime's own version banner, which parses the protocol
+	// revision from it) do not need uws installed. A copy is only safe under
+	// a gate: the manifest records the sha256 of the schema at the pinned
+	// commit, and this hashes the committed copy against it, so the two
+	// cannot drift apart silently. Regenerate with `npm run probe:uws`
+	// (UWS_REF=<sha>) and re-vendor when uws revs the protocol.
+	const { createHash } = await import('node:crypto');
+	const vendored = readFileSync(new URL('../../protocol.schema.json', import.meta.url));
+	const hash = createHash('sha256').update(vendored).digest('hex');
+	assert.equal(
+		hash,
+		surface.protocolSchemaSha256,
+		'protocol.schema.json no longer matches the uws copy at the manifest pin - ' +
+		're-vendor it from the pinned commit (or regenerate the manifest if the pin moved)'
+	);
+});

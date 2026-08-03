@@ -30,6 +30,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A boot-time version banner. The first line a built server logs is its
+  resolved identity - own version, protocol revision, and the version of each
+  family sibling as `import.meta.resolve` actually finds it (or "not
+  installed") - all read at runtime from files, never from constants inlined
+  at build time: the build copies the exact `package.json` and
+  `protocol.schema.json` that produced the server into `build/meta/`. Mixed
+  sibling versions are the usual cause when two surfaces disagree, and the
+  banner puts the answer at the top of every boot log. The protocol schema now
+  ships in the package as `protocol.schema.json`, a vendored byte-identical
+  copy of svelte-adapter-uws's, held to it by a hash the parity manifest
+  records at its pinned commit.
+
+- Deterministic I/O budgets for the HTTP static lane
+  (`test/unit/http-io-budget.test.mjs`), counting operations per response the
+  way the fan-out budgets already do: one Headers and one Response per served
+  asset, zero disk opens from the memory lane on any representation, exactly
+  one `Bun.file` per disk-lane GET and none per HEAD, a 304 with no header
+  build, one pathname decode however often the same encoded path repeats -
+  each pinned exactly and under 6x load, so a lost cache or a new per-request
+  disk touch fails a count, not a timing.
+
 - A publishing-hygiene gate: `npm run check:publish` runs publint and
   arethetypeswrong (esm-only profile) against the packed package, and CI runs
   it on every push. It validates the export map and file list as a consumer's

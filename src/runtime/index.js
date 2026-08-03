@@ -1,6 +1,7 @@
 import process from 'node:process';
 import { env } from './env.js';
 import { start } from './server.js';
+import { formatVersionBanner, versionInfo } from './version-info.js';
 import { drain, markDraining } from './handler/lifecycle.js';
 import { drainWebSockets } from './handler/ws-drain.js';
 import { beginDraining } from './handler/ws-state.js';
@@ -48,6 +49,11 @@ if (env('CLUSTER_WORKERS', undefined) !== undefined) {
 		'For multi-node deployments use the transport-agnostic extensions bus (Redis/Valkey).'
 	);
 }
+
+// The version banner, before the listen line: when two surfaces disagree at
+// runtime, mixed sibling versions are the usual cause, and this puts the
+// resolved answer at the top of every boot log.
+console.log(formatVersionBanner(versionInfo()));
 
 const bunServer = start(host, port);
 

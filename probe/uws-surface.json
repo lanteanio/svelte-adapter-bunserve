@@ -1,7 +1,8 @@
 {
 	"uwsVersion": "0.6.0-next.90",
-	"uwsRef": "HEAD",
+	"uwsRef": "7b9ba00",
 	"uwsCommit": "7b9ba000056b7cb198cd83605355302ecec3853c",
+	"protocolSchemaSha256": "41fcfc48a166974d9cc2bb62332aa5e3f8918229d541ce3c6d2f18a93084ab75",
 	"platform": [
 		"adviseReconnect",
 		"authorizeWireSubscribe",
