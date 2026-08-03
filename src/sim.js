@@ -83,10 +83,13 @@ export { resetProcessEpoch };
  * runtime is one-server-per-process by design, so the sim - forty seeds in one
  * process - owns the reset explicitly. A miss in anything fingerprint-visible
  * shows up as a determinism failure in replay. The self-gate only polices
- * what it can see, though: stderr-lane state (warn-once latches, log
- * throttles) is deliberately not reset, so which seed first triggers a given
- * warning depends on swarm order - accepted, because resetting it would mean
- * harness-only exports sprayed across the production modules.
+ * what it can see, though: MODULE-PRIVATE stderr state across the handler
+ * graph (warn-once latches, log throttles) is not reset, so which seed first
+ * triggers a given warning - and how a throttle window carries over the
+ * clock rewind to the next run's start epoch - depends on swarm order.
+ * Accepted, because resetting those would mean harness-only exports sprayed
+ * across the production modules; the two warn latches that already ride the
+ * exported wsCounters are reset below with the rest of it.
  */
 function resetSimState() {
 	wsConnections.clear();
@@ -215,7 +218,7 @@ async function defaultScenario(api, opts) {
 
 /**
  * Run one simulation. Single-process only - the cluster path joins when the
- * multi-process slice lands, per the recorded scope.
+ * multi-process backend does.
  *
  * @param {{
  *   seed?: string,

@@ -73,7 +73,14 @@ const SKIP_SEGMENTS = new Set([
 ]);
 // These two are skipped everywhere, src/ included - never first-party source.
 const ALWAYS_SKIP_DIRS = new Set(['node_modules', '.git']);
-const SKIP_SUFFIX = ['.test.js', '.spec.js', '.config.js', '.config.mjs', '.d.ts'];
+// Suffix skips apply OUTSIDE src/ only, like the segment skips and for the
+// same reason: a test or config file placed under src/ is enforced as source
+// rather than silently leaving the ratchet. One entry per scanned extension.
+const SKIP_SUFFIX = [
+	'.test.js', '.test.mjs', '.test.cjs',
+	'.spec.js', '.spec.mjs', '.spec.cjs',
+	'.config.js', '.config.mjs', '.config.cjs'
+];
 const SCAN_EXT = ['.js', '.mjs', '.cjs'];
 
 function isUnderSrc(rel) {
@@ -106,8 +113,8 @@ const PATTERNS = [
 
 function shouldSkipPath(rel) {
 	if (ALLOW_FILES.has(basename(rel))) return true;
-	if (SKIP_SUFFIX.some((suf) => rel.endsWith(suf))) return true;
 	if (isUnderSrc(rel)) return false;
+	if (SKIP_SUFFIX.some((suf) => rel.endsWith(suf))) return true;
 	return rel.split('/').some((s) => SKIP_SEGMENTS.has(s));
 }
 
