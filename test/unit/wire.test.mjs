@@ -44,6 +44,10 @@ test('varint refuses non-integers instead of spinning or writing garbage', () =>
 	// parses back off the wire as a different number (-1 reads back as 127).
 	// Every legitimate caller passes a validated seq, an internal id or a
 	// real length, so anything else is refused at the primitive itself.
+	// HONEST LIMIT (same as the growth test below): if the guard is removed,
+	// the Infinity case WEDGES this run at the suite timeout rather than
+	// failing it - loud, but slow. Nothing in-process can bound a synchronous
+	// infinite loop.
 	for (const bad of [Infinity, -Infinity, NaN, -1, 1.5]) {
 		const w = new ByteWriter();
 		assert.throws(() => w.varint(bad), RangeError, `varint(${String(bad)})`);
