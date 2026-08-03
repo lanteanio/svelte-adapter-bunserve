@@ -217,6 +217,238 @@ test('0 and a fractional seq throw too, from BOTH publish lanes', () => {
 	}
 });
 
+test('a toJSON mutating a later entry cannot change what the batch publishes', () => {
+	// The preflight accepted [21, 22]; the publish loops then run app code
+	// (completeEnvelope's JSON.stringify calls any toJSON), which holds live
+	// references to the caller's entries. Re-reading entry.seq after that
+	// point stamps a value the preflight never saw - and on the stateless
+	// reroute, where entry 0 has already fanned out, the re-read value throws
+	// MID-batch, breaking the whole-batch-or-nothing rule the preflight
+	// exists to enforce. The seqs published must be the seqs validated, on
+	// both lanes.
+	const statefulCodec = { capability: CAP, schemaVersion: 2, encode: () => null, state: {} };
+	try {
+		for (const wire of [statelessCodec(), statefulCodec]) {
+			const srv = fakeServer();
+			setServer(srv);
+			const entries = [
+				{ data: { toJSON: () => { entries[1].seq = 0; return { x: 1 }; } }, seq: 21 },
+				{ data: { x: 2 }, seq: 22 }
+			];
+			const ok = platform.publishWireBatch('room', 'moved', entries, wire);
+			assert.equal(ok, true, 'the batch went out whole');
+			assert.equal(entries[1].seq, 0, 'the mutation really ran');
+			assert.equal(srv.published.length, 2, 'both entries were published');
+			assert.deepEqual(
+				srv.published.map((p) => JSON.parse(p.payload).seq),
+				[21, 22],
+				'each entry carries the seq the preflight accepted'
+			);
+			assert.equal(maxAuthoritativeSeq.get('room'), 22, 'the mark followed the stamped seqs');
+			maxAuthoritativeSeq.clear();
+		}
+	} finally {
+		maxAuthoritativeSeq.clear();
+		topicSeqs.clear();
+	}
+});
+
+test("a toJSON writing into the caller's options cannot hand later entries a seq", () => {
+	// The batch-level numeric-seq refusal runs once, up front. A toJSON that
+	// writes a number into the SAME options object afterwards would hand
+	// every later entry an explicit seq no preflight saw - the refused
+	// batch-level form, readmitted through the back door and marking the
+	// topic on the way.
+	const statefulCodec = { capability: CAP, schemaVersion: 2, encode: () => null, state: {} };
+	try {
+		for (const wire of [statelessCodec(), statefulCodec]) {
+			const srv = fakeServer();
+			setServer(srv);
+			const options = { compress: false };
+			const entries = [
+				{ data: { toJSON: () => { options.seq = 7; return { x: 1 }; } } },
+				{ data: { x: 2 } }
+			];
+			const ok = platform.publishWireBatch('room', 'moved', entries, wire, options);
+			assert.equal(ok, true);
+			assert.equal(options.seq, 7, 'the mutation really ran');
+			assert.equal(srv.published.length, 2);
+			for (const p of srv.published) {
+				assert.equal(JSON.parse(p.payload).seq, undefined, 'no entry drew the injected seq');
+			}
+			assert.equal(maxAuthoritativeSeq.get('room'), undefined, 'and the topic was never marked');
+			maxAuthoritativeSeq.clear();
+		}
+	} finally {
+		maxAuthoritativeSeq.clear();
+		topicSeqs.clear();
+	}
+});
+
+test('a toJSON growing or shrinking the batch cannot change its membership', () => {
+	// entries.push from inside a payload's toJSON would otherwise feed the
+	// publish loops an entry whose seq was never preflighted: an invalid one
+	// throws mid-batch with the earlier entries already delivered (stateless
+	// reroute) or refuses a batch the preflight accepted whole (stateful
+	// lane). entries.pop is the other direction: a hole where an accepted
+	// entry stood, and dereferencing it throws mid-batch the same way. The
+	// membership published is the membership handed in.
+	const statefulCodec = { capability: CAP, schemaVersion: 2, encode: () => null, state: {} };
+	try {
+		for (const wire of [statelessCodec(), statefulCodec]) {
+			const srv = fakeServer();
+			setServer(srv);
+			const entries = [
+				{
+					data: { toJSON: () => { entries.push({ data: { x: 3 }, seq: 0 }); return { x: 1 }; } },
+					seq: 21
+				},
+				{ data: { x: 2 }, seq: 22 }
+			];
+			const ok = platform.publishWireBatch('room', 'moved', entries, wire);
+			assert.equal(ok, true, 'the accepted batch went out whole');
+			assert.equal(entries.length, 3, 'the mutation really ran');
+			assert.equal(srv.published.length, 2, 'the appended entry was not published');
+			maxAuthoritativeSeq.clear();
+
+			const srv2 = fakeServer();
+			setServer(srv2);
+			const shrinking = [
+				{
+					data: { toJSON: () => { shrinking.pop(); return { x: 1 }; } },
+					seq: 31
+				},
+				{ data: { x: 2 }, seq: 32 },
+				{ data: { x: 3 }, seq: 33 }
+			];
+			const ok2 = platform.publishWireBatch('room', 'moved', shrinking, wire);
+			assert.equal(ok2, true, 'the accepted batch went out whole');
+			assert.equal(shrinking.length, 2, 'the mutation really ran');
+			assert.deepEqual(
+				srv2.published.map((p) => JSON.parse(p.payload).seq),
+				[31, 32, 33],
+				'every accepted entry was still published'
+			);
+			maxAuthoritativeSeq.clear();
+		}
+	} finally {
+		maxAuthoritativeSeq.clear();
+		topicSeqs.clear();
+	}
+});
+
+test('a toJSON flipping excludeWs cannot change who a batch excludes', () => {
+	// Exclusion is a delivery contract, not payload: the socket a caller
+	// excluded at call time must stay excluded on every path (fan-out choice,
+	// per-socket walk, resume capture), and one a caller did NOT exclude must
+	// be delivered to. Re-reading the live entry lets a toJSON answer those
+	// questions differently at different points in one call.
+	try {
+		// Stateless reroute: entry 0's toJSON excludes the only subscriber
+		// from entry 1. Captured, entry 1 still fans out natively.
+		const srv = fakeServer();
+		setServer(srv);
+		const jsonOnly = fakeWs({ topics: ['room'] });
+		withConnections([jsonOnly], () => {
+			const entries = [
+				{ data: { toJSON: () => { entries[1].excludeWs = jsonOnly; return { x: 1 }; } } },
+				{ data: { x: 2 } }
+			];
+			const ok = platform.publishWireBatch('room', 'moved', entries, statelessCodec());
+			assert.equal(ok, true);
+			assert.equal(entries[1].excludeWs, jsonOnly, 'the mutation really ran');
+			assert.equal(srv.published.length, 2, 'both entries kept the native fan-out');
+		});
+
+		// Stateful lane: entry 0 excludes a socket at call time, and its own
+		// toJSON then CLEARS that exclusion. Captured, the walk still
+		// withholds entry 0 from the excluded socket.
+		const srv2 = fakeServer();
+		setServer(srv2);
+		const excluded = fakeWs({ topics: ['room'] });
+		const statefulCodec = { capability: CAP, schemaVersion: 2, encode: () => null, state: {} };
+		withConnections([excluded], () => {
+			const entries = [
+				{
+					data: { toJSON: () => { entries[0].excludeWs = undefined; return { x: 1 }; } },
+					excludeWs: excluded
+				},
+				{ data: { x: 2 } }
+			];
+			const ok = platform.publishWireBatch('room', 'moved', entries, statefulCodec);
+			assert.equal(ok, true);
+			assert.equal(entries[0].excludeWs, undefined, 'the mutation really ran');
+			assert.equal(excluded.sent.length, 1, 'the excluded socket received only entry 1');
+			assert.ok(excluded.sent[0].payload.includes('"x":2'), excluded.sent[0].payload);
+			assert.equal(srv2.published.length, 0, 'an excluding batch never takes the fast path');
+		});
+	} finally {
+		maxAuthoritativeSeq.clear();
+		topicSeqs.clear();
+	}
+});
+
+test('an options accessor cannot answer the seq refusal and the stamp differently', () => {
+	// The batch-level numeric-seq refusal and the value the counter lane later
+	// stamps from must be ONE read. With two reads, a getter can answer the
+	// refusal with `true` and the stamp with a number - the refused
+	// batch-level form back in through the side door, stamping every entry
+	// with one shared seq and marking the topic for a value no check accepted.
+	const statefulCodec = { capability: CAP, schemaVersion: 2, encode: () => null, state: {} };
+	try {
+		for (const wire of [statelessCodec(), statefulCodec]) {
+			const srv = fakeServer();
+			setServer(srv);
+			let reads = 0;
+			const options = { get seq() { return reads++ === 0 ? true : 7; } };
+			const entries = [{ data: { x: 1 } }, { data: { x: 2 } }];
+			const ok = platform.publishWireBatch('room', 'moved', entries, wire, options);
+			assert.equal(ok, true);
+			assert.ok(reads >= 1, 'the accessor really was consulted');
+			assert.deepEqual(
+				srv.published.map((p) => JSON.parse(p.payload).seq),
+				[1, 2],
+				'the one captured read (true) drew the counter, never the 7'
+			);
+			assert.equal(maxAuthoritativeSeq.get('room'), undefined, 'the topic was never marked');
+			maxAuthoritativeSeq.clear();
+			topicSeqs.clear();
+		}
+	} finally {
+		maxAuthoritativeSeq.clear();
+		topicSeqs.clear();
+	}
+});
+
+test('a toJSON swapping a later entry\'s payload reference publishes the reference handed in', () => {
+	// The record pins the data REFERENCE at the top of the call; only the
+	// object's contents stay live. Re-reading entry.data lets entry 0's
+	// toJSON hand entry 1 a different object - and on the walk lanes the
+	// binary encode reads data later than the JSON envelope did, so the two
+	// wires could carry different payloads under one seq.
+	const statefulCodec = { capability: CAP, schemaVersion: 2, encode: () => null, state: {} };
+	try {
+		for (const wire of [statelessCodec(), statefulCodec]) {
+			const srv = fakeServer();
+			setServer(srv);
+			const entries = [
+				{ data: { toJSON: () => { entries[1].data = { x: 99 }; return { x: 1 }; } } },
+				{ data: { x: 2 } }
+			];
+			const ok = platform.publishWireBatch('room', 'moved', entries, wire);
+			assert.equal(ok, true);
+			assert.deepEqual(entries[1].data, { x: 99 }, 'the mutation really ran');
+			assert.ok(
+				srv.published[1].payload.includes('"x":2'),
+				'entry 1 published the object it was handed: ' + srv.published[1].payload
+			);
+		}
+	} finally {
+		maxAuthoritativeSeq.clear();
+		topicSeqs.clear();
+	}
+});
+
 test('a codec returning a non-Uint8Array declines, it does not hang the loop', { timeout: 5000 }, () => {
 	// safeEncode exists to keep a misbehaving codec from taking the fan-out with
 	// it, and it caught a THROW but not a wrong-type return. Untyped, the value

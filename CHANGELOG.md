@@ -199,6 +199,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stamping path, and a batch is refused whole so a bad entry cannot leave the
   earlier ones already fanned out.
 
+- `publishWireBatch` validated every per-entry seq up front but then read the
+  caller's entries and options again while publishing, and by that point app
+  code has already run: serialising a payload calls its `toJSON`, which holds
+  live references to both. A `toJSON` that changed a later entry's `seq` had
+  that unvalidated value stamped on the stateful lane, or thrown on mid-batch
+  by the per-entry reroute with the earlier entries already fanned out and the
+  topic already marked - the exact partial failure the up-front check exists
+  to prevent. Writing a number into the shared options object smuggled the
+  refused batch-level seq form back in for every later entry; flipping an
+  entry's `excludeWs` made delivery, the fast-path choice and the resume
+  capture disagree about who was excluded; swapping a `data` reference put
+  different payloads on the two wires under one seq; and growing or shrinking
+  the entries array changed which entries went out at all. The call now reads
+  its inputs once, at the top: `options` is copied (own enumerable
+  properties, one read) before anything can observe it, and each entry is
+  normalised into a private record - data reference, exclusion target,
+  validated seq - that both publish lanes work from, so what the batch
+  publishes is what the call was handed, whatever a payload's serialisation
+  code mutates in between. Payload contents are the one deliberately live
+  part: the record pins the reference, and the object behind it stays the
+  app's own, as on every publish lane.
+
 - `publishWireBatch` conflated an explicit seq of 0 with no seq at all. It
   round-tripped every stamped seq through the wire's 0 sentinel before handing
   it to the resume capture, so an entry published with `seq: 0` was captured as

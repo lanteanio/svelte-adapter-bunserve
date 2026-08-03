@@ -967,6 +967,14 @@ export const platform = {
 	 * `{ seq: true }` is unaffected: the counter increments per entry, which is
 	 * already one seq per entry.
 	 *
+	 * The batch is read ONCE, at the top of the call: `entries` and `options`
+	 * are captured (own enumerable properties) into private records, so
+	 * mutating the caller's array, entry objects or options object after the
+	 * call starts - from a payload's toJSON, say - does not change what the
+	 * batch publishes. The payload reference is captured too; its CONTENTS
+	 * stay live, serialising whenever the lane serialises, as on every
+	 * publish lane.
+	 *
 	 * @param {string} topic
 	 * @param {string} event - the PER-ENTRY event name; the codec's batch
 	 *   form is looked up as `<event>-batch` with `{ updates }` data.
@@ -979,6 +987,16 @@ export const platform = {
 	 *   wire cannot carry
 	 */
 	publishWireBatch(topic, event, entries, wire, options) {
+		// The call-level options are captured FIRST: one shallow copy, own
+		// enumerable properties, read once, taken before any other app-
+		// observable read. Everything below runs app code sooner or later
+		// (completeEnvelope's JSON.stringify calls any toJSON, and the entries
+		// walk can trap through a Proxy), and app code holds live references
+		// to the caller's objects - an options.seq that answers the refusal
+		// below with one value and a later read with another would smuggle the
+		// refused batch-level seq form in for every counter-lane entry. The
+		// value refused and the value used are one read.
+		if (options) options = { ...options };
 		// Checked BEFORE the empty-batch no-op below. A batch-level seq is a
 		// property of the CALL, not of this tick's data, so whether it is
 		// refused must not depend on how many entries happened to be ready -
@@ -987,38 +1005,70 @@ export const platform = {
 		// prevent.
 		if (options && typeof options.seq === 'number') throwBatchExplicitSeq(topic, options.seq);
 		if (!Array.isArray(entries) || entries.length === 0) return false;
-		// Every per-entry seq is checked BEFORE anything is stamped or sent.
-		// stampExplicitSeq throws on a seq the wire cannot carry, and a throw
-		// from inside either publish loop below would leave the earlier entries
-		// already fanned out and the topic's mark already advanced, for a batch
-		// that never went out whole. Whole-batch or nothing, like the refusals
-		// around it. The predicate matches the stamping paths exactly, so a
-		// nullish or non-numeric `seq` falls through to the counter lane here
-		// as it does there rather than being refused only in this pre-pass.
-		for (let i = 0; i < entries.length; i++) {
-			if (typeof entries[i].seq === 'number') stampExplicitSeq(entries[i].seq, topic);
+		// Every per-entry seq is checked AND CAPTURED before anything is
+		// stamped or sent. stampExplicitSeq throws on a seq the wire cannot
+		// carry, and a throw from inside either publish loop below would leave
+		// the earlier entries already fanned out and the topic's mark already
+		// advanced, for a batch that never went out whole. Whole-batch or
+		// nothing, like the refusals around it. The predicate matches the
+		// stamping paths exactly, so a nullish or non-numeric `seq` falls
+		// through to the counter lane as it does there rather than being
+		// refused only here.
+		//
+		// Captured rather than merely checked: the batch is normalised into
+		// PRIVATE RECORDS - data reference, exclusion target, validated seq -
+		// and every read below is against these records, never the caller's
+		// array or entry objects again. A toJSON rewriting a later entry's
+		// seq would otherwise have it stamped unchecked on the stateful lane,
+		// or thrown on mid-batch by the per-entry reroute with earlier
+		// entries already delivered; one flipping excludeWs would make
+		// delivery, the fast-path choice and the resume capture disagree
+		// about who was excluded; one swapping a data reference would put
+		// different payloads on the two wires under one seq; and one growing
+		// or shrinking the array would publish a membership no pre-pass ever
+		// saw. What this batch publishes is what this call was handed.
+		// (Payload INTERNALS stay the app's own objects, as on every publish
+		// lane - the record pins the reference, not the contents.)
+		const n = entries.length;
+		{
+			const records = new Array(n);
+			for (let i = 0; i < n; i++) {
+				const e = entries[i];
+				records[i] = {
+					data: e.data,
+					excludeWs: e.excludeWs,
+					seq: typeof e.seq === 'number' ? stampExplicitSeq(e.seq, topic) : undefined
+				};
+			}
+			entries = records;
 		}
 		// A stateless codec gains nothing from a batched walk (encode-once
 		// already amortizes it) - route through the per-entry path unchanged.
 		//
 		// This lane is N independent publishes, so "whole batch or nothing"
-		// covers the SEQ only: the pre-pass above ran for every entry, but a
-		// payload that fails to serialise partway through leaves the earlier
-		// entries already fanned out and counted. Making it atomic would mean
-		// serialising every entry up front and then again per publish, which is
-		// the cost this reroute exists to avoid. The stateful lane below builds
-		// all its envelopes first and so IS whole for both.
+		// covers the SEQ only: every seq below comes from the pre-pass
+		// snapshot, already accepted, so no publish in this loop can throw on
+		// one - but a payload that fails to serialise partway through leaves
+		// the earlier entries already fanned out and counted. Making it atomic
+		// would mean serialising every entry up front and then again per
+		// publish, which is the cost this reroute exists to avoid. The
+		// stateful lane below builds all its envelopes first and so IS whole
+		// for both.
 		if (!wire || !wire.state) {
 			let ok = false;
-			for (let i = 0; i < entries.length; i++) {
+			for (let i = 0; i < n; i++) {
+				// The private record from the pre-pass, not the caller's entry:
+				// by the second iteration, app toJSON code has already run
+				// inside the first entry's publish, and the caller's objects
+				// can no longer be trusted to say what this call was handed.
 				const entry = entries[i];
 				// Allocate a per-entry options object only when the entry
 				// actually overrides something, as the exclude-only form did.
 				let per = options;
-				if (entry.excludeWs !== undefined || typeof entry.seq === 'number') {
+				if (entry.excludeWs !== undefined || entry.seq !== undefined) {
 					per = { ...(options || {}) };
 					if (entry.excludeWs !== undefined) per.excludeWs = entry.excludeWs;
-					if (typeof entry.seq === 'number') per.seq = entry.seq;
+					if (entry.seq !== undefined) per.seq = entry.seq;
 				}
 				ok = this.publishWire(topic, event, entry.data, wire, per) || ok;
 			}
@@ -1028,7 +1078,7 @@ export const platform = {
 
 		// Per-entry seq and envelope - the exact bookkeeping N publishWire
 		// calls would have produced.
-		const envs = new Array(entries.length);
+		const envs = new Array(n);
 		// The seq AS STAMPED: a number, or null for an entry carrying none.
 		// Deliberately not the wire's 0 sentinel, which the frame builder wants
 		// but the resume capture must not see: 0 is a seq the explicit lane can
@@ -1036,29 +1086,26 @@ export const platform = {
 		// null that is never deduped, so the same event is deduped through
 		// publish() and re-delivered through here. The 0 is applied at the frame
 		// sites below, where it means "no seq" on the wire and nowhere else.
-		const seqs = new Array(entries.length);
-		// Authority per entry, decided in the stamping pass and reused below
-		// rather than re-derived from entries[]. completeEnvelope runs app code
-		// (a toJSON on the payload), so a second read of entry.seq after that
-		// point is not guaranteed to see the value that was actually stamped.
-		const authoritative = new Array(entries.length);
+		const seqs = new Array(n);
+		// Authority per entry, decided in the pre-pass and reused below. The
+		// records are private, so nothing an app toJSON does between here and
+		// delivery can change what they say.
+		const authoritative = new Array(n);
 		let anyExclude = false;
-		for (let i = 0; i < entries.length; i++) {
+		for (let i = 0; i < n; i++) {
 			const entry = entries[i];
 			// A per-entry explicit seq is cluster-authoritative exactly as the
-			// same value would be through publishWire, and takes the same
-			// wire-representability check - this path does not reach stampSeq,
-			// so it has to ask for that itself. Anything else draws from this
-			// batch's shared options (the counter, or no seq at all).
-			const seq =
-				typeof entry.seq === 'number'
-					? stampExplicitSeq(entry.seq, topic)
-					: stampSeq(options, topic);
+			// same value would be through publishWire, and already took the
+			// same wire-representability check in the pre-pass, whose record
+			// is stamped verbatim here. Anything else draws from this batch's
+			// shared options (the counter, or no seq at all).
+			const seq = entry.seq !== undefined ? entry.seq : stampSeq(options, topic);
 			// An explicit entry seq is authoritative by construction: the
-			// pre-pass above already accepted it, and stampExplicitSeq answers
-			// with the seq or throws - there is no refused-but-published case
-			// left to tell apart.
-			authoritative[i] = typeof entry.seq === 'number';
+			// pre-pass accepted it or threw - there is no refused-but-published
+			// case left to tell apart, and no way for a toJSON run by an
+			// earlier iteration's completeEnvelope to swap in a value the
+			// pre-pass never saw.
+			authoritative[i] = entry.seq !== undefined;
 			seqs[i] = seq;
 			envs[i] = completeEnvelope(envelopePrefix(topic, event), entry.data, seq);
 			if (entry.excludeWs !== undefined && entry.excludeWs !== null) anyExclude = true;
@@ -1081,11 +1128,11 @@ export const platform = {
 		// refused batch leaves a gap in that topic's counter numbering and
 		// nothing else. No contract anywhere calls that lane contiguous.
 		const server = getServer();
-		for (let i = 0; i < entries.length; i++) {
+		for (let i = 0; i < n; i++) {
 			if (authoritative[i]) notePublishedSeq(topic, seqs[i], true);
 			else recordPublishedSeq(topic, seqs[i], options);
 		}
-		wsCounters.publishCount += entries.length;
+		wsCounters.publishCount += n;
 		// Resume cutover in flight: hold the per-entry JSON envelopes a
 		// caps-less resuming subscriber would receive from this batch, each
 		// skipping the socket its own entry excluded.
@@ -1097,7 +1144,7 @@ export const platform = {
 			// refused above - so the entry is the whole answer, as decided in the
 			// stamping pass and carried in `authoritative` rather than read off
 			// the app's entries a second time.
-			for (let i = 0; i < entries.length; i++) {
+			for (let i = 0; i < n; i++) {
 				captureResumeFrame(
 					topic,
 					seqs[i],
@@ -1134,7 +1181,7 @@ export const platform = {
 		// publishWire calls.
 		if (!anyExclude && !capCounts.has(wire.capability)) {
 			let anyBytes = false;
-			for (let i = 0; i < entries.length; i++) {
+			for (let i = 0; i < n; i++) {
 				const r = server.publish(topic, envs[i], compress);
 				if (typeof r === 'number' && r > 0) anyBytes = true;
 			}
@@ -1160,12 +1207,12 @@ export const platform = {
 			let list = entries;
 			let envList = envs;
 			let seqList = seqs;
-			let lastSeq = seqs[entries.length - 1];
+			let lastSeq = seqs[n - 1];
 			if (anyExclude) {
 				list = [];
 				envList = [];
 				seqList = [];
-				for (let i = 0; i < entries.length; i++) {
+				for (let i = 0; i < n; i++) {
 					if (entries[i].excludeWs === ws) continue;
 					list.push(entries[i]);
 					envList.push(envs[i]);
