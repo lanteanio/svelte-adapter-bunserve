@@ -381,8 +381,12 @@ export function processEpoch() {
  * installs its seeded env and re-draws, so every run's epoch is a function of
  * the seed rather than of module-load randomness.
  */
-export function resetProcessEpoch() {
-	PROCESS_EPOCH = drawProcessEpoch();
+export function resetProcessEpoch(next) {
+	// A harness may LATCH a specific generation (the simulator uses the virtual
+	// epoch, matching the sibling adapter's sim semantics and keeping the
+	// seeded rng stream free of this draw); argless, it redraws through the
+	// seam exactly as module load did.
+	PROCESS_EPOCH = typeof next === 'number' ? (next >>> 0) : drawProcessEpoch();
 }
 
 /**

@@ -715,6 +715,19 @@ plain clone installs):
 npm run test:live   # builds test/fixture twice and runs the suites in test/live/
 ```
 
+The deterministic simulation drives the REAL handler dispatch - the same
+modules a built server runs - over an in-memory Bun.serve double, a virtual
+clock, and a seeded fault engine (`src/sim.js`; every clock, RNG and timer
+read in the runtime goes through `src/runtime/runtime.js`, enforced by
+`npm run check:determinism`). A seed reproduces its interleaving bit-for-bit,
+and the committed golden corpus (`test/dst-goldens/`, verified in CI by
+`npm run sim:golden`) pins forty seeds' structural fingerprints - which are
+fingerprint-identical to svelte-adapter-uws's own committed corpus at the
+parity pin, checked locally with
+`npm run sim:golden -- --against ../svelte-adapter-uws/test/dst-goldens/adapter-single.golden.json`.
+Identical golden traces are the positioning guard: the tier line stays a
+performance statement, never a capability statement.
+
 The publishing surface has its own gate, run in CI on every push:
 
 ```sh

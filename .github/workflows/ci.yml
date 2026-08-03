@@ -17,6 +17,52 @@ jobs:
           node-version: '22'
       - name: Run the unit suite
         run: npm test
+      # The determinism ratchet: every clock/rng/timer read under src/ goes
+      # through the runtime seam, or this fails naming the raw call site.
+      - name: Determinism seam scan
+        run: npm run check:determinism
+
+  sim-golden:
+    name: DST golden gate (Node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # Re-runs the committed corpus seeds under the corpus config and fails
+      # on any fingerprint drift. The corpus entries are fingerprint-identical
+      # to svelte-adapter-uws's adapter-single corpus at the parity pin
+      # (verified locally via `npm run sim:golden -- --against <uws corpus>`,
+      # the same local-ritual shape as probe:uws); this job holds THIS repo to
+      # that blessed baseline on every push.
+      - name: Verify the golden corpus
+        run: npm run sim:golden
+
+  bun-matrix:
+    name: Bun API facts (pinned Bun)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        bun-version: ['1.3.14']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ matrix.bun-version }}
+      # The probe RECORDS observed Bun behavior; this job holds a Bun upgrade
+      # to two hard rules: the probe itself must complete, and no probe may
+      # record a FAILED observation. The committed report's diff review stays
+      # a human ritual after deliberate upgrades (the report embeds platform
+      # and timing lines, so a cross-platform byte-diff would only flake).
+      - name: Run the API probe
+        run: |
+          bun probe/bun-api-facts.mjs
+          if grep -q "FAILED" probe/bun-api-facts.report.md; then
+            echo "probe recorded FAILED observations:"
+            grep -n "FAILED" probe/bun-api-facts.report.md
+            exit 1
+          fi
 
   publish-hygiene:
     name: Publishing hygiene (publint + attw)

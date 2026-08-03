@@ -329,6 +329,10 @@ export function createCapCounts() {
 		has(cap) {
 			return (counts.get(cap) || 0) > 0;
 		},
+		/** Drop every count (simulation/test harness reset between runs). */
+		clear() {
+			counts.clear();
+		},
 		adjust(prev, next) {
 			if (prev) {
 				for (const c of prev) {

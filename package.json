@@ -31,6 +31,7 @@
 		"test:live": "bun test/live/run.mjs",
 		"check:publish": "publint && attw --pack . --profile esm-only",
 		"check:determinism": "node scripts/check-determinism.js",
+		"sim:golden": "node scripts/sim-golden.js",
 		"probe:uws": "node probe/uws-surface.mjs"
 	},
 	"dependencies": {

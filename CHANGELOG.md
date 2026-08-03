@@ -30,6 +30,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A deterministic simulation harness and golden gate. `src/sim.js` drives the
+  REAL handler dispatch - the exact modules a built server runs, loaded
+  through a resolution hook - over an in-memory Bun.serve double, a virtual
+  clock and a seeded fault engine: a seed plus a commit reproduces an
+  interleaving bit-for-bit, and `replaySim` self-gates that determinism on
+  every corpus bless. The committed golden corpus
+  (`test/dst-goldens/adapter-single.golden.json`, forty seeds, verified in CI
+  by `npm run sim:golden`) is fingerprint-identical to svelte-adapter-uws's
+  own committed corpus at the parity pin - all forty seeds, the seven
+  fault-injected interleavings included - so the two adapters are held to one
+  observable behavior by one oracle. Where the sibling's sim drives a testing
+  mirror of its dispatch, this one drives the production modules themselves.
+  CI also gains the pinned-Bun probe job (a Bun upgrade that breaks an
+  observed behavior fails loudly) and the determinism seam scan.
+
 - An injectable runtime seam (`src/runtime/runtime.js`): every clock, RNG and
   timer read in the served runtime goes through named helpers over one
   swappable environment - identical in shape to svelte-adapter-uws's seam -
