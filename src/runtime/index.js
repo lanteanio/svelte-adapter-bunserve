@@ -1,5 +1,6 @@
 import process from 'node:process';
 import { env } from './env.js';
+import { setTimer, wallEpoch } from './runtime.js';
 import { start } from './server.js';
 import { formatVersionBanner, versionInfo } from './version-info.js';
 import { drain, markDraining } from './handler/lifecycle.js';
@@ -80,7 +81,7 @@ async function graceful_shutdown(reason) {
 	markDraining();
 	if (shutdown_delay > 0) {
 		console.log(`Waiting ${shutdown_delay}ms for load balancer drain...`);
-		await new Promise((resolve) => setTimeout(resolve, shutdown_delay));
+		await new Promise((resolve) => setTimer(resolve, shutdown_delay));
 	}
 
 	// Step 1b: Drain WebSockets EXPLICITLY, before the graceful stop.
@@ -108,7 +109,7 @@ async function graceful_shutdown(reason) {
 	// WebSocket drain ran at all, so every client got the 1006 the drain exists
 	// to prevent.
 	const budget_ms = shutdown_timeout * 1000;
-	const deadline = Date.now() + budget_ms;
+	const deadline = wallEpoch() + budget_ms;
 	// The WebSocket drain is INSIDE the budget. Outside it, the real worst case
 	// is SHUTDOWN_DELAY_MS + 30s + the drain's own 2s settle window - over the
 	// 30s terminationGracePeriodSeconds this deadline exists to fit inside, so
@@ -129,7 +130,7 @@ async function graceful_shutdown(reason) {
 	const untilDeadline = (work, at) =>
 		Promise.race([
 			work,
-			new Promise((resolve) => setTimeout(resolve, Math.max(0, at - Date.now())))
+			new Promise((resolve) => setTimer(resolve, Math.max(0, at - wallEpoch())))
 		]);
 
 	await untilDeadline(runWsLifecycleHook('shutdown'), pre_drain_deadline);

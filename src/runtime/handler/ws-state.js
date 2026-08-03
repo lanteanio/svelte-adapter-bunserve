@@ -9,6 +9,7 @@
 
 import { ws_options } from './config.js';
 import { createByteBudget } from '../utils/egress-budget.js';
+import { processMonotonicNow, randomBytes as randomOctets } from '../runtime.js';
 import { createHookQueue } from '../utils/hook-queue.js';
 import { isValidPublishSeq } from '../utils/publish-seq.js';
 import { createCapCounts } from '../utils/wire.js';
@@ -361,11 +362,27 @@ export const topicSeqs = new Map();
 // unauthenticated client the exact millisecond the process started, which is
 // free uptime and deploy-timing intelligence and a stable fingerprint for
 // correlating instances behind a load balancer.
-const PROCESS_EPOCH = crypto.getRandomValues(new Uint32Array(1))[0];
+// Drawn through the runtime seam so a deterministic simulation controls it;
+// the default env draws from node:crypto exactly as before.
+function drawProcessEpoch() {
+	const b = randomOctets(4);
+	return ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
+}
+
+let PROCESS_EPOCH = drawProcessEpoch();
 
 /** @returns {number} */
 export function processEpoch() {
 	return PROCESS_EPOCH;
+}
+
+/**
+ * Re-latch the seq-space generation (simulation/test harness only): a sim
+ * installs its seeded env and re-draws, so every run's epoch is a function of
+ * the seed rather than of module-load randomness.
+ */
+export function resetProcessEpoch() {
+	PROCESS_EPOCH = drawProcessEpoch();
 }
 
 /**
@@ -678,7 +695,7 @@ export function chargeControlEgress(ws, bytes) {
 	let budget = ud[WS_CONTROL_BUDGET];
 	if (budget === undefined) {
 		budget = createByteBudget(MAX_CONTROL_EGRESS_BYTES, CONTROL_EGRESS_WINDOW_MS, () =>
-			performance.now()
+			processMonotonicNow()
 		);
 		ud[WS_CONTROL_BUDGET] = budget;
 	}

@@ -17,6 +17,7 @@
 import { platform } from './platform.js';
 import { beginDraining, pendingCloseHooks, wsConnections } from './ws-state.js';
 import { ws_options } from './config.js';
+import { setTimer, wallEpoch } from '../runtime.js';
 
 /** How long to wait for connections to actually go before giving up on them. */
 const CLOSE_SETTLE_TIMEOUT_MS = 2000;
@@ -87,12 +88,12 @@ export async function drainWebSockets(windowMs) {
 	// close hook that awaits (`await redis.srem(...)`): it returns to callHook
 	// at its first await and was being killed a few milliseconds later by
 	// process.exit. Those promises are tracked for exactly this.
-	const deadline = Date.now() + CLOSE_SETTLE_TIMEOUT_MS;
+	const deadline = wallEpoch() + CLOSE_SETTLE_TIMEOUT_MS;
 	while (
 		(wsConnections.size > 0 || pendingCloseHooks.size > 0) &&
-		Date.now() < deadline
+		wallEpoch() < deadline
 	) {
-		await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+		await new Promise((resolve) => setTimer(resolve, POLL_INTERVAL_MS));
 	}
 	if (wsConnections.size > 0) {
 		console.warn(

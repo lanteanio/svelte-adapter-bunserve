@@ -11,16 +11,17 @@ import { tryUpgrade } from './handler/upgrade.js';
 import { websocketHandlers } from './handler/ws.js';
 import { setServer } from './handler/ws-state.js';
 import { toBunWebsocketOptions } from './utils/ws-options.js';
+import { processMonotonicNow } from './runtime.js';
 
 /* global HEALTH_CHECK_PATH */
 /* global READINESS_CHECK_PATH */
 /* global STATIC_HEADERS */
 
-const _t_boot = performance.now();
+const _t_boot = processMonotonicNow();
 
 cacheDir(path.join(clientDir, base), base, true, STATIC_HEADERS);
 cacheDir(path.join(prerenderedDir, base), base, false, STATIC_HEADERS);
-console.log(`Static files indexed in ${(performance.now() - _t_boot).toFixed(1)}ms (${staticCache.size} entries)`);
+console.log(`Static files indexed in ${(processMonotonicNow() - _t_boot).toFixed(1)}ms (${staticCache.size} entries)`);
 
 const healthPath = HEALTH_CHECK_PATH;
 const readinessPath = READINESS_CHECK_PATH;
@@ -150,7 +151,7 @@ export function start(host, port) {
 	// (server.publish) and the native membership count (server.subscriberCount).
 	setServer(bunServer);
 	console.log(
-		`Listening on ${is_tls ? 'https' : 'http'}://${host}:${bunServer.port} (ready in ${(performance.now() - _t_boot).toFixed(0)}ms)`
+		`Listening on ${is_tls ? 'https' : 'http'}://${host}:${bunServer.port} (ready in ${(processMonotonicNow() - _t_boot).toFixed(0)}ms)`
 	);
 	if (ws_options) console.log(`WebSocket endpoint registered at ${ws_path}`);
 	return bunServer;

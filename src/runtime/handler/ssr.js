@@ -1,6 +1,7 @@
 import { brotliCompressSync, gzipSync, constants as zlibConstants } from 'node:zlib';
 import { server } from '../_init.js';
 import { resolveRequestId } from '../utils/request-id.js';
+import { clearTimer, randomUuid, setTimer } from '../runtime.js';
 import { response413, response500 } from './http-helpers.js';
 import { origin, address_header, xff_depth, body_size_limit, get_origin, trusted_proxies, warnUntrustedClaim, ws_options } from './config.js';
 import { isDedupBufferable } from './ssr-dedup.js';
@@ -62,7 +63,7 @@ async function collectImmediate(body) {
 	/** @type {ReturnType<typeof setTimeout>} */
 	let timer;
 	const deadline = new Promise((resolve) => {
-		timer = setTimeout(() => resolve(STILL_STREAMING), 0);
+		timer = setTimer(() => resolve(STILL_STREAMING), 0);
 	});
 
 	try {
@@ -89,7 +90,7 @@ async function collectImmediate(body) {
 			}
 		}
 	} finally {
-		clearTimeout(timer);
+		clearTimer(timer);
 	}
 }
 
@@ -247,7 +248,7 @@ export async function handleSSR(request, direct) {
 		// `platform.publish(...)` to connected clients - one object per
 		// request, with every method still resolving to the shared singleton.
 		// Without it, the request identity alone.
-		const requestId = resolveRequestId(request.headers.get('x-request-id')) || crypto.randomUUID();
+		const requestId = resolveRequestId(request.headers.get('x-request-id')) || randomUuid();
 		const platform = ws_options
 			? Object.assign(Object.create(realtimePlatform), { requestId })
 			: { requestId };

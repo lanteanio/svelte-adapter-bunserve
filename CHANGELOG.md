@@ -30,6 +30,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- An injectable runtime seam (`src/runtime/runtime.js`): every clock, RNG and
+  timer read in the served runtime goes through named helpers over one
+  swappable environment - identical in shape to svelte-adapter-uws's seam -
+  so a seeded harness can replay behavior exactly without patching globals.
+  In production the helpers bind straight to the native primitives
+  (monomorphic, measured at parity on the publish hot paths). The process
+  epoch is now drawn through the seam and re-latchable by a harness; entropy
+  and semantics are unchanged. `npm run check:determinism` scans the source
+  for raw primitive calls and fails on any under `src/`, so the seam cannot
+  silently regress.
+
 - A boot-time version banner. The first line a built server logs is its
   resolved identity - own version, protocol revision, and the version of each
   family sibling as `import.meta.resolve` actually finds it (or "not

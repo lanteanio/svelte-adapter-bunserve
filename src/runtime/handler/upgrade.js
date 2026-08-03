@@ -21,14 +21,15 @@ import { wsModule } from '../ws-handler-bridge.js';
 import { isUpgradeOriginAllowed } from '../utils/ws-origin.js';
 import { resolveRequestId } from '../utils/request-id.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
+import { processMonotonicNow, randomUuid } from '../runtime.js';
 import { WS_REQUEST_ID_KEY, isDraining } from './ws-state.js';
 import { get_origin, origin, ws_options, ws_path } from './config.js';
 
 /** Upgrade-hook throws, throttled with decay. */
-const upgradeThrewThrottle = createLogThrottle(() => performance.now());
+const upgradeThrewThrottle = createLogThrottle(() => processMonotonicNow());
 
 /** Refused handshake headers, throttled with decay. */
-const badHeaderThrottle = createLogThrottle(() => performance.now());
+const badHeaderThrottle = createLogThrottle(() => processMonotonicNow());
 
 /**
  * RFC 7230 token characters, which is what a header NAME may contain.
@@ -87,7 +88,7 @@ const RESERVED_HEADERS = new Set([
 ]);
 
 /** Origin refusals, throttled with decay. */
-const originRefusedThrottle = createLogThrottle(() => performance.now());
+const originRefusedThrottle = createLogThrottle(() => processMonotonicNow());
 
 let warnedDerivedSelfOrigin = false;
 /**
@@ -261,7 +262,7 @@ async function runUpgrade(req, srv) {
 
 	/** @type {Record<string, any>} */
 	const data = {};
-	const requestId = resolveRequestId(req.headers.get('x-request-id')) ?? crypto.randomUUID();
+	const requestId = resolveRequestId(req.headers.get('x-request-id')) ?? randomUuid();
 
 	/** @type {Record<string, string> | undefined} */
 	let responseHeaders;

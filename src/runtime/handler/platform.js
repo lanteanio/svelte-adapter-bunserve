@@ -33,6 +33,7 @@ import { isSystemTopic, isValidWireTopic, createTopicHelperCache } from '../util
 import { SEND_DROPPED } from '../utils/send-result.js';
 import { isValidResumeEpoch, isValidResumeSeq } from '../utils/resume-input.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
+import { processMonotonicNow, randomBytes as randomOctets, randomFloat, randomU32, randomUuid, wallEpoch } from '../runtime.js';
 import {
 	denyAllBatch,
 	isReadableVerdict,
@@ -86,10 +87,10 @@ import {
 import { allow_unauthenticated_subscribe, ws_compression_on, ws_options } from './config.js';
 
 /** Throws from the app's subscribe hook, throttled with decay. */
-const subscribeThrewThrottle = createLogThrottle(() => performance.now());
+const subscribeThrewThrottle = createLogThrottle(() => processMonotonicNow());
 
 /** Throws from the app's resume hook on the recover lane, throttled with decay. */
-const recoverThrewThrottle = createLogThrottle(() => performance.now());
+const recoverThrewThrottle = createLogThrottle(() => processMonotonicNow());
 
 /**
  * A codec that threw, or handed back something that is not bytes. Throttled
@@ -98,7 +99,7 @@ const recoverThrewThrottle = createLogThrottle(() => performance.now());
  * write per connection per publish - an event-loop stall and a filled disk from
  * a bug that is already degrading that capability to JSON.
  */
-const encodeFailedThrottle = createLogThrottle(() => performance.now());
+const encodeFailedThrottle = createLogThrottle(() => processMonotonicNow());
 
 /**
  * The seq-less JSON envelope a wire member falls back to for a caps-less,
@@ -280,7 +281,7 @@ function normalizeSubscribeVerdict(verdict, topic, hookName) {
 }
 
 /** Throws from the app's subscribeBatch hook, throttled with decay. */
-const batchThrewThrottle = createLogThrottle(() => performance.now());
+const batchThrewThrottle = createLogThrottle(() => processMonotonicNow());
 
 /**
  * Run the app's `subscribeBatch` gate over a set of topics, in ONE call, and
@@ -1909,15 +1910,16 @@ export const platform = {
 
 	/**
 	 * Determinism seams. App and plugin code reads wall clock, monotonic time,
-	 * and randomness through the platform so a deterministic simulation can
-	 * substitute all three in one place instead of patching globals.
+	 * and randomness through the platform; the platform reads them through the
+	 * runtime seam (../runtime.js), which is the ONE place a deterministic
+	 * simulation substitutes all three - no globals are ever patched.
 	 */
 	now() {
-		return Date.now();
+		return wallEpoch();
 	},
 
 	monotonic() {
-		return performance.now();
+		return processMonotonicNow();
 	},
 
 	/**
@@ -1929,11 +1931,11 @@ export const platform = {
 	 * present-but-wrong member is worse than an absent one.
 	 */
 	random: {
-		float: () => Math.random(),
-		u32: () => Math.floor(Math.random() * 0x1_0000_0000) >>> 0,
-		uuid: () => crypto.randomUUID(),
+		float: () => randomFloat(),
+		u32: () => randomU32(),
+		uuid: () => randomUuid(),
 		/** @param {number} n */
-		bytes: (n) => crypto.getRandomValues(new Uint8Array(n))
+		bytes: (n) => new Uint8Array(randomOctets(n))
 	}
 };
 

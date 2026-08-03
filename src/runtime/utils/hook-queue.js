@@ -33,6 +33,8 @@
  * @param {number} options.maxQueued - tasks allowed to wait
  * @returns {HookQueue}
  */
+import { microtask } from '../runtime.js';
+
 export function createHookQueue({ concurrency, maxQueued }) {
 	let running = 0;
 	/** @type {Array<() => unknown>} */
@@ -57,7 +59,7 @@ export function createHookQueue({ concurrency, maxQueued }) {
 			// it, and must not strand the slot. The caller has already wrapped the
 			// hook for logging; here it is only a slot to release.
 			running--;
-			queueMicrotask(pump);
+			microtask(pump);
 			return;
 		}
 		Promise.resolve(settled)

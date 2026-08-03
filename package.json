@@ -30,6 +30,7 @@
 		"test": "node --test \"test/unit/*.test.mjs\"",
 		"test:live": "bun test/live/run.mjs",
 		"check:publish": "publint && attw --pack . --profile esm-only",
+		"check:determinism": "node scripts/check-determinism.js",
 		"probe:uws": "node probe/uws-surface.mjs"
 	},
 	"dependencies": {

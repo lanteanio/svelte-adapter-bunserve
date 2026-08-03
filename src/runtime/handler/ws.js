@@ -65,6 +65,7 @@ import {
 	unsubscribedFrame
 } from '../utils/ack-frame.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
+import { processMonotonicNow, randomUuid } from '../runtime.js';
 import {
 	isValidResumeEpoch,
 	isValidResumeSeq,
@@ -121,7 +122,7 @@ function reportHookError(name, err) {
 	// frame, and a client can loop that frame. See utils/log-throttle.js.
 	let throttle = hookErrorThrottles.get(name);
 	if (!throttle) {
-		throttle = createLogThrottle(() => performance.now());
+		throttle = createLogThrottle(() => processMonotonicNow());
 		hookErrorThrottles.set(name, throttle);
 	}
 	const { log, count } = throttle();
@@ -161,7 +162,7 @@ function callHook(name, fn) {
 }
 
 /** Unsubscribe backlogs, throttled with decay: a client controls how many. */
-const unsubOverflowThrottle = createLogThrottle(() => performance.now());
+const unsubOverflowThrottle = createLogThrottle(() => processMonotonicNow());
 
 /**
  * A connection whose unsubscribe hooks backed up past the queue.
@@ -369,14 +370,14 @@ export const websocketHandlers = {
 		userData[WS_PLATFORM] = wsPlatform;
 		delete userData[WS_REQUEST_ID_KEY];
 
-		const sessionId = crypto.randomUUID();
+		const sessionId = randomUuid();
 		userData[WS_SESSION_ID] = sessionId;
 
 		// Per-connection traffic stats exist only to feed a close hook, so an
 		// app without one does not carry the counters.
 		if (closeHookRegistered) {
 			userData[WS_STATS] = {
-				openedAt: performance.now(),
+				openedAt: processMonotonicNow(),
 				messagesIn: 0,
 				messagesOut: 0,
 				bytesIn: 0,
@@ -975,7 +976,7 @@ export const websocketHandlers = {
 				platform: closePlatform,
 				subscriptions: teardownTopics,
 				id: userData[WS_SESSION_ID],
-				duration: performance.now() - stats.openedAt,
+				duration: processMonotonicNow() - stats.openedAt,
 				messagesIn: stats.messagesIn,
 				messagesOut: stats.messagesOut,
 				bytesIn: stats.bytesIn,

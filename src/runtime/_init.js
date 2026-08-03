@@ -15,11 +15,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Server } from 'SERVER';
 import { manifest, base } from 'MANIFEST';
+import { processMonotonicNow } from './runtime.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const asset_dir = `${__dirname}/client${base}`;
 
-const _t_init = performance.now();
+const _t_init = processMonotonicNow();
 
 /** @type {import('@sveltejs/kit').Server} */
 export const server = new Server(manifest);
@@ -29,4 +30,4 @@ await server.init({
 	read: (file) => Bun.file(`${asset_dir}/${file}`).stream()
 });
 
-console.log(`SvelteKit server initialized in ${(performance.now() - _t_init).toFixed(1)}ms`);
+console.log(`SvelteKit server initialized in ${(processMonotonicNow() - _t_init).toFixed(1)}ms`);
