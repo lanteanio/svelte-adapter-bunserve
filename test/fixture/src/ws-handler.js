@@ -188,6 +188,34 @@ export function message(ws, { data, isBinary, msg, platform }) {
 		platform.publishWire(msg.topic, 'tick', msg.data, snapWire, { seq: true });
 		return;
 	}
+	if (msg && msg.type === 'fixture-pressure') {
+		// The pressure surface as an app actually reads it: the live snapshot
+		// plus the posture. Reported over the wire so the live lane can prove
+		// the sampler runs in a real Bun process, which no unit test can.
+		const p = platform.pressure;
+		// The raw heap reading beside the snapshot: this runtime's
+		// heapUsed/heapTotal is what the memory signal is computed from, and
+		// the live suite pins how it actually behaves here.
+		const mem = process.memoryUsage();
+		platform.send(ws, '__fixture', 'pressure', {
+			heapRatio: mem.heapTotal > 0 ? mem.heapUsed / mem.heapTotal : 0,
+			protection: platform.protection,
+			active: p.active,
+			reason: p.reason,
+			value: p.value,
+			publishRate: p.publishRate,
+			subscriberRatio: p.subscriberRatio,
+			memoryMB: p.memoryMB,
+			maxBufferedBytes: p.maxBufferedBytes,
+			backpressuredConnections: p.backpressuredConnections,
+			topPublishers: p.topPublishers,
+			psiNull: p.psi === null,
+			cpuThrottleNull: p.cpuThrottle === null,
+			hasOnPressure: typeof platform.onPressure === 'function',
+			hasOnPublishRate: typeof platform.onPublishRate === 'function'
+		});
+		return;
+	}
 	if (msg && msg.type === 'fixture-stats') {
 		platform.send(ws, '__fixture', 'stats', {
 			connections: platform.connections,

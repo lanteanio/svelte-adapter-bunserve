@@ -221,6 +221,22 @@ export function POST({ platform }) {
 | `protection` | `'normal' \| 'elevated' \| 'siege'`; `'normal'` today (the posture machine's option is not yet accepted here) |
 | `onPressure(cb)` | fires on `reason` TRANSITIONS with the live snapshot; throwing callbacks are contained; returns unsubscribe |
 | `onPublishRate(cb)` | per-topic runaway-publisher reports `[{ topic, messagesPerSec, bytesPerSec }]` once per window; registering replaces the default throttled console warning; returns unsubscribe |
+
+**The memory signal is off by default here, and that is the one pressure
+default that differs from svelte-adapter-uws.** `heapUsed / heapTotal` only
+measures saturation on an engine that over-allocates its heap. Bun does not:
+a freshly booted, completely idle server measures **0.90 to 0.94**, so the
+family's `memoryHeapUsedRatio: 0.85` would fire on a healthy process and
+never clear - `platform.pressure.active` would be `true` for the life of
+every app, and `onPressure` would announce `MEMORY` once after boot and never
+recover. The same reading is kept out of the flow-control window sizing for
+the same reason: fed to a knee calibrated for an over-allocating heap, an
+idle server would hand out roughly a sixteenth of the intended window. Both
+are pinned by `test/live/pressure-check.mjs` against a real server, so if the
+engine's accounting ever changes the divergence is revisited rather than kept
+out of habit. Opt back into the sibling's exact behavior with
+`websocket: { pressure: { memoryHeapUsedRatio: 0.85 } }`. Every other
+threshold, and the rest of the surface, is the family's.
 | `topic(name)` | scoped publisher: `platform.topic('chat').created(data)` |
 | `requestId` | per-connection / per-request identity |
 | `now()` / `monotonic()` / `random.float()` `.u32()` `.uuid()` `.bytes(n)` | determinism seams |
@@ -303,7 +319,9 @@ adapter: bunserve({
 		// Pressure-sampler thresholds; each signal accepts `false` to
 		// disable it. The sampler always runs - this only tunes it.
 		pressure: {
-			memoryHeapUsedRatio: 0.85,
+			// OFF here, and the one default that deliberately differs from
+			// svelte-adapter-uws (which ships 0.85). See below.
+			memoryHeapUsedRatio: false,
 			publishRatePerSec: 10_000,
 			subscriberRatio: 50,
 			sampleIntervalMs: 1000,           // clamped to >= 100
@@ -430,8 +448,8 @@ and `resume` (`{"sessionId","lastSeenSeqs",{"lastSeenEpochs"?}}`).
 A `hello` whose caps include `lease` arms flow control on that connection,
 FIRST hello only: the server answers `{"type":"lease-ok"}` plus a
 `{"type":"lease","count","ttlMs"}` window grant, and re-grants on each
-`request-n`. Windows shrink as the worker's heap and subscriber load tighten
-and always floor, so an opted-in client keeps making forward progress; the
+`request-n`. Windows narrow as per-connection subscriber load rises and
+always floor, so an opted-in client keeps making forward progress; the
 server never gates its own sends on the window - pacing is the client's job,
 which is what makes a non-opting old client's behavior byte-identical to
 before.
@@ -736,9 +754,11 @@ native fan-out a real publish also pays - the same bookkeeping the sibling
 performs on its own publish lanes. The flow-control
 engagement proof is its own bench, not an estimate: a slow consumer opting
 into the `lease` capability against the real built server sees exactly one
-`lease-ok`, a sized window per grant (windows visibly shrink when the
-worker's heap tightens), one `request-n` per low-water window, and its whole
-paced backlog delivered (2000 sends through 30 windows in the recorded run).
+`lease-ok`, a full 256-permit window per grant on an unloaded server, one
+`request-n` per low-water window, and its whole paced backlog delivered
+(2000 sends through 8 windows in the recorded run). That bench is also what
+caught the engine's idle heap ratio collapsing those windows to a sixteenth
+of the base before `grantSizeFor` stopped feeding it into the sizing math.
 
 The unit suite covers the pure decision modules (range parsing, content
 negotiation, path canonicalization, proxy trust, header validation) and runs

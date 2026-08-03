@@ -140,3 +140,78 @@ test('allowedOrigins never reaches Bun (it is an adapter-level upgrade decision)
 	const { options } = normalizeWsOptions({ allowedOrigins: ['https://a.example'] });
 	assert.equal('allowedOrigins' in toBunWebsocketOptions(options), false);
 });
+
+test('websocket.pressure: false and null build, because the sibling accepts both', () => {
+	// The family spells a disabled section `false`, and a svelte.config.js that
+	// builds against svelte-adapter-uws has to build here - refusing the
+	// sibling's own documented spelling at BUILD time is the config-portability
+	// break this adapter exists to avoid.
+	for (const value of [false, null]) {
+		const { options, warnings } = normalizeWsOptions({ pressure: value });
+		assert.equal(options.pressure, undefined, `pressure: ${value} resolves to sampler defaults`);
+		assert.deepEqual(warnings, [], 'and says nothing, because it is a supported spelling');
+	}
+});
+
+test('pressure thresholds pass through, and false disables one signal', () => {
+	const { options, warnings } = normalizeWsOptions({
+		pressure: { publishRatePerSec: 500, memoryHeapUsedRatio: false, sampleIntervalMs: 250 }
+	});
+	assert.deepEqual(options.pressure, {
+		publishRatePerSec: 500, memoryHeapUsedRatio: false, sampleIntervalMs: 250
+	});
+	assert.deepEqual(warnings, []);
+});
+
+test('a pressure block of the wrong TYPE throws, naming the shape it wanted', () => {
+	assert.throws(() => normalizeWsOptions({ pressure: 'loud' }), /websocket\.pressure.*object of thresholds/s);
+	assert.throws(() => normalizeWsOptions({ pressure: [1, 2] }), /websocket\.pressure.*object of thresholds/s);
+	assert.throws(
+		() => normalizeWsOptions({ pressure: { publishRatePerSec: 'lots' } }),
+		/websocket\.pressure\.publishRatePerSec.*number or false/s
+	);
+	assert.throws(
+		() => normalizeWsOptions({ pressure: { publishRatePerSec: NaN } }),
+		/websocket\.pressure\.publishRatePerSec/
+	);
+	assert.throws(
+		() => normalizeWsOptions({ pressure: { sampleIntervalMs: 'often' } }),
+		/websocket\.pressure\.sampleIntervalMs.*milliseconds/s
+	);
+});
+
+test('an out-of-range pressure number is accepted with a warning, never a build failure', () => {
+	// Accepted because the sibling accepts it; warned because `>= 0` fires on
+	// every sample, which reads as a permanently broken server.
+	const zero = normalizeWsOptions({ pressure: { publishRatePerSec: 0 } });
+	assert.equal(zero.options.pressure.publishRatePerSec, 0);
+	assert.equal(zero.warnings.length, 1);
+	assert.match(zero.warnings[0], /fires on every sample/);
+	assert.match(zero.warnings[0], /Use `false` to disable it/);
+
+	const low = normalizeWsOptions({ pressure: { sampleIntervalMs: 5 } });
+	assert.equal(low.warnings.length, 1);
+	assert.match(low.warnings[0], /clamps anything under 100ms/);
+
+	const high = normalizeWsOptions({ pressure: { sampleIntervalMs: 3e9 } });
+	assert.equal(high.warnings.length, 1);
+	assert.match(high.warnings[0], /silently becomes 1ms/);
+});
+
+test('a typo inside the pressure block warns instead of tuning nothing in silence', () => {
+	// The whole failure this catches: a misspelled threshold leaves the DEFAULT
+	// in place, so the operator's tuning did nothing and no other signal says so.
+	const { options, warnings } = normalizeWsOptions({
+		pressure: { publishRatePerSecond: 5000, publishRatePerSec: 900 }
+	});
+	assert.equal(options.pressure.publishRatePerSec, 900, 'the good key still applies');
+	assert.equal('publishRatePerSecond' in options.pressure, false, 'the typo is dropped');
+	assert.equal(warnings.length, 1);
+	assert.match(warnings[0], /websocket\.pressure\.publishRatePerSecond/);
+	assert.match(warnings[0], /still in effect/);
+});
+
+test('pressure never reaches Bun.serve (it is an adapter-level sampler knob)', () => {
+	const { options } = normalizeWsOptions({ pressure: { publishRatePerSec: 100 } });
+	assert.equal('pressure' in toBunWebsocketOptions(options), false);
+});

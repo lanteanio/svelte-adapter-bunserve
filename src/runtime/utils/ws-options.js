@@ -120,42 +120,110 @@ const PRESSURE_SIGNAL_KEYS = [
 ];
 
 /**
- * Type-check the `websocket.pressure` block. Values are validated here at
- * build time (the sibling merges silently - a typo'd threshold there samples
- * with NaN forever); the sampler merges the validated object over its own
- * defaults at boot, so unknown keys pass through exactly as they do there.
+ * The floor the sampler clamps `sampleIntervalMs` to, and the ceiling past
+ * which a timer delay stops meaning what it says: above 2^31-1 ms both
+ * runtimes silently fall back to a 1 ms interval, which would turn a config
+ * asking for a RARE sample into a ~1 kHz one, each tick paying a memory read,
+ * a kernel-file read and a bounded connection walk.
+ */
+export const PRESSURE_INTERVAL_MIN_MS = 100;
+export const PRESSURE_INTERVAL_MAX_MS = 2 ** 31 - 1;
+
+/**
+ * Validate the `websocket.pressure` block, warning rather than refusing
+ * wherever the sibling adapter accepts a value: a `svelte.config.js` that
+ * builds against svelte-adapter-uws has to build here, so `false` (the
+ * family's spelling for "this whole section is off"), `null`, and
+ * out-of-range numbers are all accepted and reported, never thrown on. Wrong
+ * TYPES still throw, which is this adapter's documented two-tier policy and
+ * matches what the sibling's own types declare.
+ *
+ * Unknown nested keys are warned about, because a typo'd threshold leaves the
+ * DEFAULT silently in place - the operator's tuning did nothing and there is
+ * no other signal. The sibling walks its nested sections for the same reason.
  *
  * @param {unknown} value
- * @returns {Record<string, unknown>}
+ * @param {string[]} warnings - build-time warnings, appended in place
+ * @returns {Record<string, unknown> | undefined} thresholds, or undefined for the defaults
  */
-function requirePressureThresholds(value) {
-	if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+function requirePressureThresholds(value, warnings) {
+	// `false`/`null` mean "leave the sampler alone": the family spells a
+	// disabled section that way, and the sampler is not optional here (it is
+	// what platform.pressure reads), so both resolve to plain defaults.
+	if (value === false || value === null) return undefined;
+	if (typeof value !== 'object' || Array.isArray(value)) {
 		throw new Error(
-			'adapter option `websocket.pressure` must be an object of thresholds, e.g. ' +
-			"{ publishRatePerSec: 5000, sampleIntervalMs: 1000 }, got " + JSON.stringify(value) + '.'
+			'adapter option `websocket.pressure` must be an object of thresholds (or `false`), e.g. ' +
+			'{ publishRatePerSec: 5000, sampleIntervalMs: 1000 }, got ' + JSON.stringify(value) + '.'
 		);
 	}
 	const raw = /** @type {Record<string, unknown>} */ (value);
-	for (const key of PRESSURE_SIGNAL_KEYS) {
+	/** @type {Record<string, unknown>} */
+	const out = {};
+
+	for (const key of Object.keys(raw)) {
 		const v = raw[key];
-		if (v === undefined || v === false) continue;
-		if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) {
+		if (key === 'sampleIntervalMs') continue; // handled below
+		if (!PRESSURE_SIGNAL_KEYS.includes(key)) {
+			warnings.push(
+				`unknown adapter option \`websocket.pressure.${key}\` is ignored, so the default for ` +
+				'the threshold you meant to set is still in effect. Known thresholds: ' +
+				PRESSURE_SIGNAL_KEYS.join(', ') + ', sampleIntervalMs.'
+			);
+			continue;
+		}
+		if (v === undefined || v === false) {
+			out[key] = v;
+			continue;
+		}
+		if (typeof v !== 'number' || !Number.isFinite(v)) {
 			throw new Error(
-				`adapter option \`websocket.pressure.${key}\` must be a positive number or false ` +
+				`adapter option \`websocket.pressure.${key}\` must be a number or false ` +
 				`(false disables the signal), got ${JSON.stringify(v)}.`
 			);
 		}
-	}
-	if (raw.sampleIntervalMs !== undefined) {
-		const v = raw.sampleIntervalMs;
-		if (typeof v !== 'number' || !Number.isFinite(v) || v < 100) {
-			throw new Error(
-				'adapter option `websocket.pressure.sampleIntervalMs` must be a number of at least 100 ' +
-				`milliseconds, got ${JSON.stringify(v)}.`
+		if (v <= 0) {
+			// Accepted for portability, but a zero or negative threshold is
+			// matched with `sample >= threshold`, so the signal fires on every
+			// single sample - permanent pressure, which reads as a broken
+			// server rather than as the "off" the author probably meant.
+			warnings.push(
+				`adapter option \`websocket.pressure.${key}\` is ${JSON.stringify(v)}, so that signal ` +
+				'fires on every sample (thresholds are compared with >=). Use `false` to disable it.'
 			);
 		}
+		out[key] = v;
 	}
-	return raw;
+
+	if (raw.sampleIntervalMs !== undefined) {
+		const v = raw.sampleIntervalMs;
+		if (typeof v !== 'number' || !Number.isFinite(v)) {
+			throw new Error(
+				'adapter option `websocket.pressure.sampleIntervalMs` must be a number of milliseconds, ' +
+				`got ${JSON.stringify(v)}.`
+			);
+		}
+		if (v < PRESSURE_INTERVAL_MIN_MS) {
+			warnings.push(
+				`\`websocket.pressure.sampleIntervalMs\` is ${v}ms; the sampler clamps anything under ` +
+				`${PRESSURE_INTERVAL_MIN_MS}ms back to the 1000ms default rather than spin.`
+			);
+			out.sampleIntervalMs = v;
+		} else if (v > PRESSURE_INTERVAL_MAX_MS) {
+			// Left to the sampler's own clamp so the runtime is safe however
+			// the value arrives, but warned here because a build-time warning
+			// is the only place the author sees it.
+			warnings.push(
+				`\`websocket.pressure.sampleIntervalMs\` is ${v}ms, past the ${PRESSURE_INTERVAL_MAX_MS}ms ` +
+				'timer ceiling; it is capped there, because a larger delay silently becomes 1ms.'
+			);
+			out.sampleIntervalMs = v;
+		} else {
+			out.sampleIntervalMs = v;
+		}
+	}
+
+	return out;
 }
 
 /**
@@ -227,7 +295,7 @@ export function normalizeWsOptions(input) {
 		options.allowUnauthenticatedSubscribe = requireBoolean(raw.allowUnauthenticatedSubscribe, 'allowUnauthenticatedSubscribe');
 	}
 	if (raw.pressure !== undefined) {
-		options.pressure = requirePressureThresholds(raw.pressure);
+		options.pressure = requirePressureThresholds(raw.pressure, warnings);
 	}
 	if (raw.compressCredentialedResponses !== undefined) {
 		options.compressCredentialedResponses = requireBoolean(

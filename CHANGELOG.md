@@ -45,6 +45,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the new `websocket.pressure` block, validated at build time; every signal
   can be disabled with `false`.
 
+  One default differs from svelte-adapter-uws deliberately:
+  `memoryHeapUsedRatio` ships **disabled** rather than at 0.85, because
+  `heapUsed / heapTotal` is not a saturation measure on this engine - an idle
+  server measures 0.90 to 0.94, so the family threshold would report `MEMORY`
+  pressure on a healthy process for the life of the app. The same reading is
+  kept out of the lease window sizing, where it would otherwise collapse an
+  unloaded server's window to about a sixteenth of the base. Both are pinned
+  against a real server by the live suite, and
+  `websocket: { pressure: { memoryHeapUsedRatio: 0.85 } }` restores the
+  sibling's exact behavior.
+
 - A deterministic simulation harness and golden gate. `src/sim.js` drives the
   REAL handler dispatch - the exact modules a built server runs, loaded
   through a resolution hook - over an in-memory Bun.serve double, a virtual

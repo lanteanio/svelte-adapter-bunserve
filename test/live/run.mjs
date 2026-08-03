@@ -65,6 +65,7 @@ if (built) {
 	await run('cap-check', [process.execPath, suite('cap-check.mjs')]);
 	await run('origin-check', [process.execPath, suite('origin-check.mjs')]);
 	await run('wire-check', [process.execPath, suite('wire-check.mjs')]);
+	await run('pressure-check', [process.execPath, suite('pressure-check.mjs')]);
 	await run('head-check', [process.execPath, suite('head-check.mjs')]);
 	// Skips itself on Windows, where the signal never reaches the handler.
 	await run('shutdown-check', [process.execPath, suite('shutdown-check.mjs')]);

@@ -13,6 +13,26 @@ function framesOf(result, i) {
 	return (result.clientFrames[i] || []).filter((f) => f !== null);
 }
 
+/**
+ * Every assertion about frames that did NOT arrive needs this first: a throw
+ * inside the demux is collected into `schedulerUncaught` and the run returns
+ * normally, so "no lease frames" would otherwise pass for a lane that
+ * exploded on its first statement.
+ */
+function assertRanClean(result) {
+	assert.deepEqual(result.schedulerUncaught, [], 'the dispatch threw nothing');
+	assert.equal(result.invariantViolations.length, 0);
+}
+
+/**
+ * The positive control for the absence tests: prove this connection's frames
+ * reach the real demux at all, by subscribing and seeing the ack come back.
+ */
+function assertDemuxAlive(frames) {
+	assert.equal(frames.some((f) => f.type === 'subscribed' && f.topic === 'probe'), true,
+		'the connection reached the demux and was answered');
+}
+
 test('a hello advertising `lease` arms flow control: one lease-ok, a sized grant, re-grant on request-n', async () => {
 	const result = await runSim({
 		clients: 0,
@@ -31,16 +51,32 @@ test('a hello advertising `lease` arms flow control: one lease-ok, a sized grant
 			await api.advance();
 		}
 	});
-	assert.equal(result.invariantViolations.length, 0);
+	assertRanClean(result);
 	const frames = framesOf(result, 0);
 	const leaseOks = frames.filter((f) => f.type === 'lease-ok');
 	const grants = frames.filter((f) => f.type === 'lease');
 	assert.equal(leaseOks.length, 1, 'first hello only - the re-sent hello repeated nothing');
 	assert.equal(grants.length, 2, 'one grant on arm, one on replenish');
+
+	// ORDER is contract, not incidental: a client keys on lease-ok before it
+	// trusts its first window, so the ack must precede the grant. Comparing
+	// positions in the delivered sequence is what a set-of-types check misses.
+	const types = frames.map((f) => f.type).filter((t) => t === 'lease-ok' || t === 'lease');
+	assert.deepEqual(types, ['lease-ok', 'lease', 'lease'],
+		'the ack arrives first, then each window in the order it was granted');
+
 	for (const g of grants) {
+		// A range only - deliberately. The window is sized from the LIVE heap
+		// (grantSizeFor reads process.memoryUsage() off the seam, matching the
+		// sibling), so an exact expectation computed here could disagree with
+		// the one computed inside the run whenever the heap crosses a knee
+		// between the two reads. The exact wiring - subscriptions divided by
+		// connections, heap headroom, no constant return - is pinned in
+		// pressure-sampler.test.mjs, where the two reads are microseconds
+		// apart and the load factor dominates any heap noise.
 		assert.ok(Number.isInteger(g.count) && g.count >= 8 && g.count <= 256,
-			'window sized between the floor and the base: ' + g.count);
-		assert.equal(g.ttlMs, 10000);
+			'window between the floor and the base: ' + g.count);
+		assert.equal(g.ttlMs, 10000, 'the ttl is fixed and exact');
 	}
 });
 
@@ -52,10 +88,13 @@ test('a request-n from a connection that never opted in is a silent no-op', asyn
 			await api.advance();
 			c.send({ type: 'request-n', n: 256 });
 			await api.advance();
+			c.subscribe('probe');
+			await api.advance();
 		}
 	});
-	assert.equal(result.invariantViolations.length, 0);
+	assertRanClean(result);
 	const frames = framesOf(result, 0);
+	assertDemuxAlive(frames);
 	assert.equal(frames.filter((f) => f.type === 'lease' || f.type === 'lease-ok').length, 0,
 		'no window was armed, so nothing was granted');
 });
@@ -68,8 +107,13 @@ test('a hello without the lease capability arms nothing', async () => {
 			await api.advance();
 			c.send({ type: 'hello', caps: ['batch'] });
 			await api.advance();
+			c.subscribe('probe');
+			await api.advance();
 		}
 	});
+	assertRanClean(result);
 	const frames = framesOf(result, 0);
-	assert.equal(frames.filter((f) => f.type === 'lease' || f.type === 'lease-ok').length, 0);
+	assertDemuxAlive(frames);
+	assert.equal(frames.filter((f) => f.type === 'lease' || f.type === 'lease-ok').length, 0,
+		'the hello was understood, but no lease capability means no window');
 });

@@ -296,7 +296,12 @@ test('os-pressure: psi and cpu.stat parse, deltas baseline at zero, failed probe
 
 test('resolvePressureThresholds: defaults, override merge, interval clamp', () => {
 	const d = resolvePressureThresholds(undefined);
-	assert.equal(d.memoryHeapUsedRatio, 0.85);
+	// Disabled by default on this engine (see pressure-metrics.js): an idle
+	// server measures 0.9+, so the family's 0.85 would fire on a healthy
+	// process. Opting back in is one option key.
+	assert.equal(d.memoryHeapUsedRatio, false);
+	assert.equal(resolvePressureThresholds({ memoryHeapUsedRatio: 0.85 }).memoryHeapUsedRatio, 0.85,
+		'the sibling threshold is one option away');
 	assert.equal(d.publishRatePerSec, 10000);
 	assert.equal(d.subscriberRatio, 50);
 	assert.equal(d.sampleIntervalMs, 1000);
@@ -319,4 +324,158 @@ test('lease control frames: exact wire shapes, demux-consumed type', () => {
 	assert.equal(DEFAULT_GRANT.requestCount, 256);
 	assert.equal(DEFAULT_GRANT.ttlMs, 10000);
 	assert.equal(MAX_QUEUED_REQUESTS, 256);
+});
+
+test('every kernel signal folds through its OWN threshold, not a neighbours', () => {
+	// Four near-identical blocks: the highest-probability copy-paste site in
+	// the fold. Each is driven alone, at a value that is unambiguous against
+	// the OTHER thresholds, so a crossed pairing changes the result.
+	assert.equal(samplePressureValue({ ...idle, psiCpuSome10: 30 }, T, 0), 30 / 60);
+	assert.equal(samplePressureValue({ ...idle, psiMemoryFull10: 3 }, T, 0), 3 / 15);
+	assert.equal(samplePressureValue({ ...idle, psiIoFull10: 20 }, T, 0), 20 / 50);
+	assert.equal(samplePressureValue({ ...idle, cpuThrottledRatio: 0.05 }, T, 0), 0.05 / 0.25);
+	// Disabling one kernel signal must not silence the others.
+	assert.equal(
+		samplePressureValue({ ...idle, psiIoFull10: 20 }, { ...T, psiCpuSome: false }, 0),
+		20 / 50
+	);
+	// An absent field never fires, however low the threshold.
+	assert.equal(samplePressureValue(idle, { ...T, psiIoFull: 0.0001 }, 0), 0.1 / 0.85);
+});
+
+test('each PSI axis can raise the reason on its own', () => {
+	// The PSI arm is a three-way disjunction; only one disjunct was covered by
+	// the precedence corpus, so a crossed comparison in either of the others
+	// would never have shown up.
+	const quiet = { ...T, memoryHeapUsedRatio: false, cpuThrottledRatio: false };
+	assert.equal(computePressureReason({ ...idle, psiCpuSome10: 60 }, quiet), 'PSI');
+	assert.equal(computePressureReason({ ...idle, psiMemoryFull10: 15 }, quiet), 'PSI');
+	assert.equal(computePressureReason({ ...idle, psiIoFull10: 50 }, quiet), 'PSI');
+	// Just under each threshold stays quiet - pinning the comparison direction.
+	assert.equal(computePressureReason({ ...idle, psiCpuSome10: 59.9 }, quiet), 'NONE');
+	assert.equal(computePressureReason({ ...idle, psiMemoryFull10: 14.9 }, quiet), 'NONE');
+	assert.equal(computePressureReason({ ...idle, psiIoFull10: 49.9 }, quiet), 'NONE');
+});
+
+test('leaseGrantSize engages exactly at its documented knees', () => {
+	// The knees ARE the tuning contract; every earlier case sat far from them,
+	// so moving 0.7 to 0.6 or 25 to 30 would have passed.
+	assert.equal(leaseGrantSize({ heapRatio: 0.7, subscriberRatio: 0 }), 256,
+		'at 0.7 the heap knee is not yet engaged');
+	assert.ok(leaseGrantSize({ heapRatio: 0.701, subscriberRatio: 0 }) < 256,
+		'just past it, the window narrows');
+	assert.equal(leaseGrantSize({ heapRatio: 0, subscriberRatio: 25 }), 256,
+		'at 25 the subscriber knee is not yet engaged');
+	assert.ok(leaseGrantSize({ heapRatio: 0, subscriberRatio: 25.1 }) < 256,
+		'just past it, the window narrows');
+});
+
+test('createLeaseState.grant honours explicit arguments, and requestN ignores the clock', () => {
+	let t = 0;
+	const gate = createLeaseState({ requestCount: 4, ttlMs: 1000, now: () => t });
+	gate.grant(9, 50);
+	assert.equal(gate.granted(), 9, 'an explicit count wins over the configured one');
+	assert.equal(gate.expiresAt(), 50, 'and so does an explicit ttl');
+	gate.grant();
+	assert.equal(gate.granted(), 4, 'argless falls back to the configured window');
+	assert.equal(gate.expiresAt(), 1000);
+
+	// requestN drains on permits alone: a zero-ttl re-grant is dead the instant
+	// it is created, yet still releases queued work. Pinned because it differs
+	// from tryAcquire, which does check the clock.
+	gate.grant(0, 0);
+	assert.equal(gate.enqueue('x'), true);
+	assert.deepEqual(gate.requestN(1, 0), ['x'], 'the queued item drains despite the dead window');
+	assert.equal(gate.live(), false);
+	assert.equal(gate.tryAcquire(), false, 'while tryAcquire refuses on the same state');
+});
+
+test('createPosture reports its reject rate with decay, and announces transitions once', () => {
+	const seen = [];
+	const posture = createPosture({
+		admission: { maxConcurrent: 10 },
+		onTransition: (from, to) => { seen.push(from + '->' + to); }
+	});
+	assert.equal(posture.rejectedPerSecond, 0);
+	posture.recordCapacityReject();
+	posture.recordCapacityReject();
+	assert.equal(posture.rejectedPerSecond, 2, 'fresh rejects are visible before any tick');
+	posture.tick({ active: false });
+	assert.equal(posture.rejectedPerSecond, 2, 'folded into the rolling rate');
+	posture.tick({ active: false });
+	assert.equal(posture.rejectedPerSecond, 1, 'and decays by half on a quiet tick');
+
+	// A 429 storm must never move the rate the escalation reads.
+	for (let i = 0; i < 50; i++) posture.recordRateLimitReject();
+	assert.equal(posture.rejectedPerSecond, 1, 'rate-limit rejects are accounted separately');
+
+	assert.deepEqual(seen, [], 'no transition yet');
+	for (let i = 0; i < 5; i++) posture.tick({ active: true });
+	assert.deepEqual(seen, ['normal->elevated'], 'the observer is told once, in order');
+});
+
+test('a throwing transition observer cannot wedge the posture machine', () => {
+	const posture = createPosture({
+		admission: { maxConcurrent: 10 },
+		onTransition: () => { throw new Error('observer boom'); }
+	});
+	for (let i = 0; i < 5; i++) posture.tick({ active: true });
+	assert.equal(posture.level, 'elevated', 'the level still advanced');
+	for (let i = 0; i < 10; i++) posture.tick({ active: false });
+	assert.equal(posture.level, 'normal', 'and still relaxes afterwards');
+});
+
+test('os-pressure: a LATER read failure is transient, only a failed startup probe disables', () => {
+	let fail = false;
+	const psi = 'some avg10=1.0 avg60=0 avg300=0 total=0\nfull avg10=2.0 avg60=0 avg300=0 total=0\n';
+	const sampler = createOsPressureSampler({
+		readFile: (p) => {
+			if (fail) throw new Error('EIO');
+			if (p.startsWith('/proc/pressure/')) return psi;
+			throw new Error('ENOENT');
+		}
+	});
+	assert.equal(sampler.sample(1000).psi.cpuSome10, 1.0, 'the startup probe succeeded');
+	fail = true;
+	assert.equal(sampler.sample(1000).psi, null, 'a transient failure reports nothing for that sample');
+	fail = false;
+	assert.equal(sampler.sample(1000).psi.cpuSome10, 1.0, 'and the source stays armed for the next one');
+});
+
+test('os-pressure: the cgroup v1 layout is found by falling through the path list', () => {
+	const seen = [];
+	const sampler = createOsPressureSampler({
+		readFile: (p) => {
+			seen.push(p);
+			if (p.startsWith('/proc/pressure/')) throw new Error('ENOENT');
+			// Only the v1 layout answers, and only in nanoseconds.
+			if (p.includes('cpuacct')) {
+				return 'nr_periods 10\nnr_throttled 4\nthrottled_time 2000000\n';
+			}
+			throw new Error('ENOENT');
+		}
+	});
+	const first = sampler.sample(1000);
+	assert.deepEqual(first.cpuThrottle, { throttledRatio: 0, nrThrottledDelta: 0 }, 'baseline sample');
+	assert.ok(seen.some((p) => p.includes('cpuacct')), 'the v1 path was reached by falling through');
+	const second = sampler.sample(1000);
+	assert.equal(second.cpuThrottle.nrThrottledDelta, 0, 'no new throttling between identical reads');
+});
+
+test('os-pressure: the throttle delta counts periods as well as time', () => {
+	let nr = 1;
+	let usec = 0;
+	const sampler = createOsPressureSampler({
+		readFile: (p) => {
+			if (p.startsWith('/proc/pressure/')) throw new Error('ENOENT');
+			if (p === '/sys/fs/cgroup/cpu.stat') return 'nr_throttled ' + nr + '\nthrottled_usec ' + usec + '\n';
+			throw new Error('ENOENT');
+		}
+	});
+	sampler.sample(1000);
+	nr = 4;
+	usec = 250000;
+	const s = sampler.sample(1000);
+	assert.equal(s.cpuThrottle.nrThrottledDelta, 3, 'three new throttled periods');
+	assert.equal(s.cpuThrottle.throttledRatio, 0.25, 'a quarter of the window suspended');
 });

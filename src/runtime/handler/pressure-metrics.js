@@ -12,6 +12,7 @@ import { foldConnectionBackpressure, BACKPRESSURE_SAMPLE_CAP, BACKPRESSURE_SAMPL
 import { DEFAULT_GRANT, leaseGrantSize, samplePressureValue } from '../utils/lease.js';
 import { now, setIntervalTimer, clearIntervalTimer } from '../runtime.js';
 import { createOsPressureSampler } from '../utils/os-pressure.js';
+import { PRESSURE_INTERVAL_MAX_MS, PRESSURE_INTERVAL_MIN_MS } from '../utils/ws-options.js';
 import {
 	lastPublishWarnAt,
 	pressureListeners,
@@ -46,7 +47,24 @@ let pressureTimer = null;
  * per-deployment via the `pressure` field on the WebSocket options.
  */
 const DEFAULT_PRESSURE_THRESHOLDS = {
-	memoryHeapUsedRatio: 0.85,
+	// OFF BY DEFAULT ON THIS RUNTIME, and the one place this adapter's
+	// defaults deliberately differ from the sibling's (which ships 0.85).
+	//
+	// heapUsed/heapTotal is a saturation measure only where the engine
+	// over-allocates its heap. It does not here: a freshly booted, idle
+	// server measured 0.90 to 0.94 (test/live/pressure-check.mjs pins that
+	// it stays high), because this engine keeps heapTotal fitted close to
+	// heapUsed. Against the family's 0.85 the signal therefore fires on an
+	// idle process and never clears - `platform.pressure.active` would be
+	// true for the life of every zero-config app, `onPressure` would announce
+	// MEMORY once after boot and never recover, and a posture machine reading
+	// it could never relax. A signal that is always on carries no
+	// information and actively misleads, so it is off until the family
+	// settles on a memory reading that means the same thing on both engines.
+	//
+	// Set `websocket: { pressure: { memoryHeapUsedRatio: 0.85 } }` to opt
+	// back into the sibling's exact threshold.
+	memoryHeapUsedRatio: false,
 	publishRatePerSec: 10000,
 	subscriberRatio: 50,
 	sampleIntervalMs: 1000,
@@ -269,11 +287,17 @@ function samplePressure(thresholds) {
  * @returns {{ count: number, ttlMs: number }}
  */
 export function grantSizeFor() {
-	const mem = process.memoryUsage();
-	const heapRatio = mem.heapTotal > 0 ? mem.heapUsed / mem.heapTotal : 0;
 	const conns = wsConnections.size || 1;
 	const subRatio = wsCounters.totalSubscriptions / conns;
-	const count = leaseGrantSize({ heapRatio, subscriberRatio: subRatio });
+	// No heap term, for the same measured reason the memory THRESHOLD is off
+	// by default above: leaseGrantSize narrows the window once the ratio
+	// passes 0.7, a knee calibrated against an over-allocating heap. This
+	// engine reports 0.90 to 0.94 on an IDLE server, so feeding it that
+	// number collapses every window to roughly a sixteenth of the base
+	// (~15 permits instead of 256) on a server under no load at all - the
+	// opposite of the "healthy worker hands out the full window" contract.
+	// Subscriber load is engine-independent and still narrows the window.
+	const count = leaseGrantSize({ heapRatio: 0, subscriberRatio: subRatio });
 	return { count, ttlMs: DEFAULT_GRANT.ttlMs };
 }
 
@@ -287,8 +311,12 @@ export function grantSizeFor() {
  */
 export function resolvePressureThresholds(opts) {
 	const merged = { ...DEFAULT_PRESSURE_THRESHOLDS, ...(opts || {}) };
-	if (typeof merged.sampleIntervalMs !== 'number' || merged.sampleIntervalMs < 100) {
+	if (typeof merged.sampleIntervalMs !== 'number' || merged.sampleIntervalMs < PRESSURE_INTERVAL_MIN_MS) {
 		merged.sampleIntervalMs = DEFAULT_PRESSURE_THRESHOLDS.sampleIntervalMs;
+	} else if (merged.sampleIntervalMs > PRESSURE_INTERVAL_MAX_MS) {
+		// Past this a timer delay silently becomes 1ms on both runtimes, so a
+		// config asking for a rare sample would get a ~1 kHz one. Cap instead.
+		merged.sampleIntervalMs = PRESSURE_INTERVAL_MAX_MS;
 	}
 	return merged;
 }
