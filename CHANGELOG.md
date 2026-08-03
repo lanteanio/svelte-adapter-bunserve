@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A publishing-hygiene gate: `npm run check:publish` runs publint and
+  arethetypeswrong (esm-only profile) against the packed package, and CI runs
+  it on every push. It validates the export map and file list as a consumer's
+  package manager would resolve them, which no amount of local testing covers.
+
 - Adapter options are validated on a two-tier policy. An unknown top-level key
   is warned about at build time and names the option it probably meant
   (`precomress` suggests `precompress`, and a case-only difference always

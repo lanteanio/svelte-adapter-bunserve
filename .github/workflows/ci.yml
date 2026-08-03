@@ -18,6 +18,24 @@ jobs:
       - name: Run the unit suite
         run: npm test
 
+  publish-hygiene:
+    name: Publishing hygiene (publint + attw)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      # Lints the PACKED package, not the checkout: publint validates the
+      # export map and file list against what `npm pack` would ship, and attw
+      # checks that every export subpath actually resolves for an ESM consumer.
+      # These are the failure modes that never surface locally - they break
+      # only in a consumer's node_modules, as a confusing downstream report.
+      - name: Lint the publishable package
+        run: npm run check:publish
+
   live:
     name: Live wire contract (Bun on Linux)
     runs-on: ubuntu-latest

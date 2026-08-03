@@ -681,6 +681,17 @@ plain clone installs):
 npm run test:live   # builds test/fixture twice and runs the suites in test/live/
 ```
 
+The publishing surface has its own gate, run in CI on every push:
+
+```sh
+npm run check:publish   # publint + attw against the packed package
+```
+
+It lints what `npm pack` would actually ship - the export map, the file list,
+and whether each export subpath resolves for an ESM consumer. These are the
+failure modes that pass every local test and break only inside a consumer's
+node_modules.
+
 ## License
 
 [MIT](LICENSE)

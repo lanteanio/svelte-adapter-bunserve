@@ -28,6 +28,7 @@
 		"probe": "bun probe/bun-api-facts.mjs",
 		"test": "node --test \"test/unit/*.test.mjs\"",
 		"test:live": "bun test/live/run.mjs",
+		"check:publish": "publint && attw --pack . --profile esm-only",
 		"probe:uws": "node probe/uws-surface.mjs"
 	},
 	"dependencies": {
@@ -51,5 +52,9 @@
 		"bun.serve",
 		"websocket",
 		"realtime"
-	]
+	],
+	"devDependencies": {
+		"@arethetypeswrong/cli": "^0.18.5",
+		"publint": "^0.3.22"
+	}
 }
