@@ -495,6 +495,44 @@ test('a codec returning a non-Uint8Array declines, it does not hang the loop', {
 	assert.ok(errors[1].includes('string'), 'and named the type it got: ' + errors[1]);
 });
 
+test('a persistently broken codec produces a BOUNDED diagnostic, not one line per publish', () => {
+	// safeEncode runs inside the fan-out, so an unthrottled failure log is one
+	// synchronous stderr write per publish - on a busy topic that trades the
+	// codec's bug for an event-loop stall, which is the same class of failure
+	// the wrong-type guard itself exists to prevent. The log goes through the
+	// decaying throttle: every one of the first nine, then powers of ten, so
+	// ten thousand failures may produce at most fourteen lines from ANY
+	// starting point in the schedule. The exact count depends on what earlier
+	// tests consumed from the shared throttle; the BOUND does not, and the
+	// bound is the contract.
+	const errors = [];
+	const realError = console.error;
+	console.error = (...args) => errors.push(args.map(String).join(' '));
+	const N = 10_000;
+	try {
+		setServer(fakeServer());
+		const capable = fakeWs({ topics: ['room'], caps: [CAP] });
+		withConnections([capable], () => {
+			const wire = statelessCodec({ encode: () => ({}) });
+			for (let i = 0; i < N; i++) {
+				platform.publishWire('room', 'moved', { x: i }, wire);
+			}
+		});
+	} finally {
+		console.error = realError;
+	}
+	assert.ok(errors.length >= 1, 'the failure is still reported at all');
+	assert.ok(
+		errors.length <= 14,
+		`${N} failures produced ${errors.length} log lines - the throttle is not wired`
+	);
+	assert.match(
+		errors[errors.length - 1],
+		/x\d+/,
+		'the last line carries the occurrence count, so an operator sees it is ongoing'
+	);
+});
+
 const statefulCodec = () => ({ capability: CAP, schemaVersion: 2, encode: () => null, state: {} });
 
 test('a publish refused on a PAYLOAD leaves no mark, on every atomic lane', () => {
