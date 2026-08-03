@@ -53,6 +53,20 @@ test('a faulted run reproduces itself bit-for-bit', async () => {
 	assert.equal(replay.reproduced, true, 'the fault interleaving is a function of the seed');
 });
 
+test('runs are order-independent: a seed rerun after other seeds is unchanged', async () => {
+	// replaySim reruns a seed IMMEDIATELY, so state that leaks between runs
+	// in the same order would reproduce and slip past that gate. This pins
+	// the stronger property: interleave other seeds, and the rerun still
+	// fingerprints identically - which is what proves resetSimState resets
+	// everything the fingerprint can see.
+	const F = { drop: 0.25, duplicate: 0.15, reorder: 0.5, maxJitterMs: 30 };
+	const first = fingerprintOf(await runSim({ seed: '2', faults: F }));
+	await runSim({ seed: '11', faults: F });
+	await runSim({ seed: '1' });
+	const again = fingerprintOf(await runSim({ seed: '2', faults: F }));
+	assert.equal(again, first, 'cross-seed module state leaked into the rerun');
+});
+
 test('the committed corpus declares the family swarm config', () => {
 	// The fingerprints are only comparable to the sibling adapter's corpus
 	// under the SAME knobs; pin them so a config edit cannot silently
