@@ -114,6 +114,7 @@ const PATTERNS = [
 	['process.nextTick', /\bprocess\s*\.\s*nextTick\s*\(/],
 	// The served runtime targets Bun, so Bun's own clock/timer spellings are
 	// part of the raw surface, not an exotic case.
+	['Bun.sleepSync', /\bBun\s*\.\s*sleepSync\s*\(/],
 	['Bun.sleep', /\bBun\s*\.\s*sleep\s*\(/],
 	['Bun.nanoseconds', /\bBun\s*\.\s*nanoseconds\s*\(/]
 ];
