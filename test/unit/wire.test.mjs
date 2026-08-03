@@ -17,16 +17,37 @@ import {
 
 const SLOT = Symbol('topicIds');
 
-test('varint round-trips values across the 2^31 and 2^32 boundaries', () => {
+test('varint round-trips values across the 2^31 and 2^32 boundaries, with no upper bound', () => {
 	// A long-lived per-topic seq exceeds 32 bits; bit-shift arithmetic would
-	// silently wrap it. The shared wire-id space STARTS at 2^32.
-	const values = [0, 1, 127, 128, 300, 0x7fffffff, 0x80000000, 0xffffffff, SHARED_WIRE_ID_BASE, 2 ** 43 + 12345];
+	// silently wrap it. The shared wire-id space STARTS at 2^32. And the
+	// explicit-seq lane deliberately has NO magnitude ceiling - snowflake ids
+	// and log offsets live past 2^53 - so the biggest integer-valued doubles
+	// are pinned too, not just the 32-bit boundaries.
+	const values = [
+		0, 1, 127, 128, 300, 0x7fffffff, 0x80000000, 0xffffffff,
+		SHARED_WIRE_ID_BASE, 2 ** 43 + 12345,
+		Number.MAX_SAFE_INTEGER, 2 ** 53, 1e308
+	];
 	for (const v of values) {
 		const w = new ByteWriter();
 		w.varint(v);
 		const r = new ByteReader(w.take());
 		assert.equal(r.varint(), v, `value ${v}`);
 		assert.equal(r.done, true);
+	}
+});
+
+test('varint refuses non-integers instead of spinning or writing garbage', () => {
+	// Infinity would never exit the encode loop - the same
+	// loop-that-cannot-exit class as the zero-capacity growth trap below -
+	// NaN would write garbage bytes, and a negative or fractional value
+	// parses back off the wire as a different number (-1 reads back as 127).
+	// Every legitimate caller passes a validated seq, an internal id or a
+	// real length, so anything else is refused at the primitive itself.
+	for (const bad of [Infinity, -Infinity, NaN, -1, 1.5]) {
+		const w = new ByteWriter();
+		assert.throws(() => w.varint(bad), RangeError, `varint(${String(bad)})`);
+		assert.equal(w.len, 0, `varint(${String(bad)}) wrote nothing`);
 	}
 });
 
@@ -86,12 +107,12 @@ test('growth still reaches a capacity larger than one doubling', () => {
 
 test('growth leaves slack, so a big write does not make the next write realloc', () => {
 	// A PERFORMANCE invariant, pinned as a count rather than a timing because
-	// timings here are pure noise. The zero fix was first written as
-	// max(double, want), which satisfies the write exactly and leaves capacity
-	// == len - so every following write reallocated and copied the whole
-	// buffer. Measured at one extra realloc and up to twice the wall clock on a
-	// big-write pattern. Doubling keeps the slack that makes growth amortised,
-	// and this is the assertion that says so.
+	// timings here are pure noise. An exact-fit growth policy - max(double,
+	// want) - satisfies the write but leaves capacity == len, so every
+	// following write reallocates and copies the whole buffer: measured at
+	// one extra realloc and up to twice the wall clock on a big-write
+	// pattern. Doubling keeps the slack that makes growth amortised, and this
+	// is the assertion that says so.
 	const w = new ByteWriter(64);
 	w.bytes(new Uint8Array(5000));
 	const capacity = w._buf.length;

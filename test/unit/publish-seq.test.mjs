@@ -24,9 +24,10 @@ test('0 is refused: the binary frame reserves it as the "no seq" sentinel', () =
 });
 
 test('no upper bound: the frame varint carries any magnitude exactly', () => {
-	// Measured against buildBinaryFrame -> parseBinaryFrame. A ceiling here
-	// would refuse cursors the wire handles perfectly well, and apps relay
-	// event-store cursors through this lane as a matter of course.
+	// The carrier itself is pinned in wire.test.mjs, which round-trips these
+	// same magnitudes through the varint the frame's seq rides on. A ceiling
+	// here would refuse cursors the wire handles perfectly well, and apps
+	// relay event-store cursors through this lane as a matter of course.
 	assert.equal(isValidPublishSeq(2 ** 31), true);
 	assert.equal(isValidPublishSeq(2 ** 32), true);
 	assert.equal(isValidPublishSeq(Number.MAX_SAFE_INTEGER), true);

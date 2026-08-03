@@ -76,8 +76,23 @@ export class ByteWriter {
 		this._buf[this.len++] = n & 0xff;
 	}
 
-	/** Write an unsigned LEB128 varint. @param {number} value - non-negative, < 2^53 */
+	/**
+	 * Write an unsigned LEB128 varint. Any non-negative integer a double can
+	 * hold exactly round-trips - there is no 2^53 ceiling; the encode below
+	 * uses Math, not 32-bit shifts, so 2^53 and 1e308 both carry.
+	 *
+	 * @param {number} value - a non-negative integer. Anything else throws:
+	 *   Infinity would spin the loop below forever (the same
+	 *   loop-that-cannot-exit class the growth seed above closes), NaN would
+	 *   encode as garbage, and a negative or fractional value parses back off
+	 *   the wire as a different number. Every shipped caller passes validated
+	 *   seqs, internal ids or real lengths, so this refusal is a guard against
+	 *   the NEXT caller, priced at one predictable branch.
+	 */
 	varint(value) {
+		if (!Number.isInteger(value) || value < 0) {
+			throw new RangeError(`varint requires a non-negative integer, got ${String(value)}`);
+		}
 		// Math (not >>>) so values above 2^31 stay correct - `seq` can exceed
 		// 32 bits on a long-lived high-throughput topic.
 		while (value > 0x7f) {
