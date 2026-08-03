@@ -12,11 +12,11 @@
  * Known evasion holes, accepted for a dependency-free line scanner (closing
  * them means an import-graph-aware lint): an aliased import
  * (`import { randomBytes as rb }`) escapes the name patterns; a reference
- * that is not called on the same line (`const f = Date.now`) escapes the
- * trailing-paren match; and ALLOW_FILES matches by basename, so ANY file
- * named runtime.js is exempt wherever it lives. The scan is a ratchet
- * against honest drift, not a sandbox against adversarial code - review
- * still owns intent.
+ * that is not called on the same line (`const f = Date.now`, or a call split
+ * across lines) escapes the trailing-paren match; and ALLOW_FILES matches by
+ * basename, so ANY file named runtime.js is exempt wherever it lives. The
+ * scan is a ratchet against honest drift, not a sandbox against adversarial
+ * code - review still owns intent.
  *
  * Modes:
  *   - default: WARN. Prints a per-file summary of raw call sites and exits 0, so
@@ -62,13 +62,23 @@ function isEnforced(rel) {
 	return rel.startsWith('src/') && !ENFORCE_EXCEPT.has(rel);
 }
 
-// Path segments that are never framework runtime source.
+// Path segments that are never framework runtime source. Applied OUTSIDE the
+// enforced src/ subtree only: under src/, a directory named like one of these
+// (a future src/test/ or src/build/) would otherwise silently leave the scan,
+// which is exactly the regression the structural ratchet exists to prevent.
 const SKIP_SEGMENTS = new Set([
 	'node_modules', 'test', 'tests', '__tests__', 'bench', 'benchmarks', 'scripts', 'probe',
 	'fixture', 'fixtures', '.svelte-kit', 'dist', 'build', 'coverage', 'examples',
 	'example', 'docs', '.git'
 ]);
+// These two are skipped everywhere, src/ included - never first-party source.
+const ALWAYS_SKIP_DIRS = new Set(['node_modules', '.git']);
 const SKIP_SUFFIX = ['.test.js', '.spec.js', '.config.js', '.config.mjs', '.d.ts'];
+const SCAN_EXT = ['.js', '.mjs', '.cjs'];
+
+function isUnderSrc(rel) {
+	return rel === 'src' || rel.startsWith('src/');
+}
 
 // Ordered most-specific-first so a dotted form wins over the bare form on the
 // same line (we report one primitive per line).
@@ -89,15 +99,16 @@ const PATTERNS = [
 	['setImmediate', /\bsetImmediate\s*\(/],
 	['clearTimeout', /\bclearTimeout\s*\(/],
 	['clearInterval', /\bclearInterval\s*\(/],
-	['queueMicrotask', /\bqueueMicrotask\s*\(/]
+	['queueMicrotask', /\bqueueMicrotask\s*\(/],
+	['process.hrtime', /\bprocess\s*\.\s*hrtime\b/],
+	['process.nextTick', /\bprocess\s*\.\s*nextTick\s*\(/]
 ];
 
 function shouldSkipPath(rel) {
-	const segs = rel.split(/[\\/]/);
-	if (segs.some((s) => SKIP_SEGMENTS.has(s))) return true;
-	if (SKIP_SUFFIX.some((suf) => rel.endsWith(suf))) return true;
 	if (ALLOW_FILES.has(basename(rel))) return true;
-	return false;
+	if (SKIP_SUFFIX.some((suf) => rel.endsWith(suf))) return true;
+	if (isUnderSrc(rel)) return false;
+	return rel.split('/').some((s) => SKIP_SEGMENTS.has(s));
 }
 
 function walk(dir, out) {
@@ -105,16 +116,17 @@ function walk(dir, out) {
 		const abs = join(dir, entry);
 		let st;
 		try { st = statSync(abs); } catch { continue; }
-		const rel = relative(root, abs);
+		// Normalize to forward slashes so the ENFORCED set (and the printed
+		// report) read the same on Windows and POSIX. ENFORCED entries are
+		// written with forward slashes; a raw backslash path would silently
+		// skip enforcement on Windows.
+		const rel = relative(root, abs).split('\\').join('/');
 		if (st.isDirectory()) {
-			if (SKIP_SEGMENTS.has(entry)) continue;
+			if (ALWAYS_SKIP_DIRS.has(entry)) continue;
+			if (!isUnderSrc(rel) && SKIP_SEGMENTS.has(entry)) continue;
 			walk(abs, out);
-		} else if ((abs.endsWith('.js') || abs.endsWith('.mjs')) && !shouldSkipPath(rel)) {
-			// Normalize to forward slashes so the ENFORCED set (and the printed
-			// report) read the same on Windows and POSIX. ENFORCED entries are
-			// written with forward slashes; a raw backslash path would silently
-			// skip enforcement on Windows.
-			out.push(rel.split('\\').join('/'));
+		} else if (SCAN_EXT.some((e) => abs.endsWith(e)) && !shouldSkipPath(rel)) {
+			out.push(rel);
 		}
 	}
 }
@@ -127,7 +139,7 @@ function scanFile(rel) {
 		const line = lines[i];
 		const trimmed = line.trimStart();
 		if (trimmed.startsWith('//') || trimmed.startsWith('*')) continue; // comment line
-		if (line.includes('determinism-allow:')) continue; // explicit opt-out
+		if (/\/\/\s*determinism-allow:/.test(line)) continue; // explicit opt-out
 		for (const [name, re] of PATTERNS) {
 			if (re.test(line)) {
 				findings.push({ rel, line: i + 1, primitive: name, snippet: trimmed.slice(0, 80) });

@@ -14,6 +14,15 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 /**
+ * The one fixed origin the whole sim agrees on: sim.js pins process.env.ORIGIN
+ * to this before config.js loads, and every simulated client's Host/Origin
+ * headers and request url derive from it. One constant, because the two sides
+ * drifting apart would turn every upgrade cross-origin and refuse it.
+ */
+export const SIM_ORIGIN = 'http://sim.invalid';
+const SIM_HOST = new URL(SIM_ORIGIN).host;
+
+/**
  * Build the in-memory Bun app double. The returned object carries the server
  * double (`_server`, handed to setServer and to tryUpgrade), the live
  * connection set the invariant snapshot reads, and the sim-only `connect()`
@@ -228,11 +237,11 @@ export function createInMemoryApp(opts) {
 		const headers = {
 			upgrade: 'websocket',
 			connection: 'Upgrade',
-			host: 'sim.invalid',
-			origin: 'http://sim.invalid',
+			host: SIM_HOST,
+			origin: SIM_ORIGIN,
 			...(connectOpts.headers || {})
 		};
-		const url = 'http://sim.invalid' + wsPath + (connectOpts.query ? '?' + connectOpts.query : '');
+		const url = SIM_ORIGIN + wsPath + (connectOpts.query ? '?' + connectOpts.query : '');
 		const req = new Request(url, { headers });
 		pendingUpgrades.set(req, {
 			clientSide,

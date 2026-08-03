@@ -19,7 +19,7 @@ import { normalizeWsOptions } from './runtime/utils/ws-options.js';
 import {
 	createScheduler, createSeededRng, createFaultEngine, DEFAULT_SEED, FIXED_EPOCH
 } from './runtime/sim-core.js';
-import { createInMemoryApp } from './runtime/sim-inmemory.js';
+import { createInMemoryApp, SIM_ORIGIN } from './runtime/sim-inmemory.js';
 import { setRuntimeEnv, resetRuntimeEnv } from './runtime/runtime.js';
 import { checkSubscriptionBookkeeping } from './runtime/invariants.js';
 import { createConsistencyAuditor } from './runtime/auditor.js';
@@ -44,10 +44,11 @@ globalThis.WS_OPTIONS ??= normalizeWsOptions({ allowUnauthenticatedSubscribe: tr
 // A resolvable, fixed server origin: config.js reads ORIGIN once at import,
 // the same-origin default compares upgrades against it, and the sim's clients
 // send the matching Origin header exactly as a browser or the family client
-// would. Assigned UNCONDITIONALLY, unlike the globals above: an ambient
-// ORIGIN in the shell would win a `??=`, turn every sim upgrade cross-origin,
-// and drift the corpus for reasons outside the run.
-process.env.ORIGIN = 'http://sim.invalid';
+// would (SIM_ORIGIN is the same constant the client double derives its
+// Host/Origin headers from). Assigned UNCONDITIONALLY, unlike the globals
+// above: an ambient ORIGIN in the shell would win a `??=`, turn every sim
+// upgrade cross-origin, and drift the corpus for reasons outside the run.
+process.env.ORIGIN = SIM_ORIGIN;
 
 register('./runtime/sim-loader.mjs', import.meta.url);
 
@@ -76,11 +77,16 @@ const { _resetSharedWireIds } = await import('./runtime/utils/shared-wire-id.js'
 export { resetProcessEpoch };
 
 /**
- * Reset every piece of module-level runtime state a previous run could have
- * left behind. The production runtime is one-server-per-process by design, so
- * the sim - forty seeds in one process - owns the reset explicitly. Anything
- * missing here shows up as cross-seed contamination, which the replay
- * self-gate turns into a determinism failure rather than a silent drift.
+ * Reset the module-level runtime state a previous run could have left behind -
+ * everything the structural fingerprint, the invariant auditor, the
+ * steady-state oracles or the replay self-gate can observe. The production
+ * runtime is one-server-per-process by design, so the sim - forty seeds in one
+ * process - owns the reset explicitly. A miss in anything fingerprint-visible
+ * shows up as a determinism failure in replay. The self-gate only polices
+ * what it can see, though: stderr-lane state (warn-once latches, log
+ * throttles) is deliberately not reset, so which seed first triggers a given
+ * warning depends on swarm order - accepted, because resetting it would mean
+ * harness-only exports sprayed across the production modules.
  */
 function resetSimState() {
 	wsConnections.clear();
