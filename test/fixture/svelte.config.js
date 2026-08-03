@@ -28,7 +28,18 @@ if (which === 'bunserve' && noWs) {
 	// A deliberately small subscription cap so the live smoke tests can prove the
 	// bound actually holds. At the 10,000 default a cap regression is invisible:
 	// no test would ever reach it.
-	adapter = bunserve({ out: 'build', websocket: { maxSubscriptionsPerConnection: 20 } });
+	adapter = bunserve({
+		out: 'build',
+		websocket: {
+			maxSubscriptionsPerConnection: 20,
+			// A NON-DEFAULT pressure block, so the live suite proves the whole
+			// round trip - normalize, serialize into the build, read back at
+			// boot, resolve into the sampler - and not just its two ends. The
+			// faster interval also lets that suite watch several real samples
+			// without sleeping for seconds.
+			pressure: { sampleIntervalMs: 200 }
+		}
+	});
 } else if (which === 'node') {
 	const node = (await import('@sveltejs/adapter-node')).default;
 	adapter = node({ out: 'build-node' });

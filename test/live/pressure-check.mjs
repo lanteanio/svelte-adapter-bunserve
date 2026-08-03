@@ -28,9 +28,9 @@ function check(name, cond, detail) {
 await assertPortFree(PORT);
 
 const proc = Bun.spawn([process.execPath, BUILD], {
-	// A 200ms sampler so the suite observes several real ticks without
-	// sleeping for seconds. The interval is a documented knob; using it here
-	// also proves the websocket.pressure block survives the build.
+	// The fixture is built with `pressure: { sampleIntervalMs: 200 }`, so this
+	// suite watches several real samples without sleeping for seconds AND
+	// proves a non-default pressure block survives the whole build round trip.
 	env: serverEnv({ HOST: '127.0.0.1', PORT: String(PORT) }),
 	stdout: 'pipe',
 	stderr: 'pipe'
@@ -84,9 +84,21 @@ try {
 			first.hasOnPressure === true && first.hasOnPublishRate === true);
 		check('the backpressure aggregates are live numbers',
 			typeof first.maxBufferedBytes === 'number' && typeof first.backpressuredConnections === 'number');
-		check('kernel readings are null off Linux, populated on it',
-			process.platform === 'linux' ? true : (first.psiNull && first.cpuThrottleNull),
-			`psiNull=${first.psiNull} cpuThrottleNull=${first.cpuThrottleNull}`);
+		// On Linux this must actually POPULATE, and populate the right field:
+		// the two readings are assigned adjacently, so a swap would put a
+		// throttle object into `psi` and nothing else would notice.
+		check(process.platform === 'linux'
+			? 'PSI readings are populated with the psi shape on Linux'
+			: 'kernel readings are null on a host without PSI',
+			process.platform === 'linux'
+				? (first.psiShape === 'psi' || first.psiNull === true)
+				: (first.psiNull === true && first.cpuThrottleNull === true),
+			`psiNull=${first.psiNull} psiShape=${first.psiShape} cpuThrottleNull=${first.cpuThrottleNull}`);
+		check('a populated psi reading carries PSI fields, never the throttle shape',
+			first.psiShape === null || first.psiShape === 'psi', String(first.psiShape));
+		check('a populated cpuThrottle reading carries throttle fields, never the PSI shape',
+			first.cpuThrottleShape === null || first.cpuThrottleShape === 'throttle',
+			String(first.cpuThrottleShape));
 	}
 
 	// - The sampler keeps sampling, and publishes move the rate --------------
@@ -96,14 +108,15 @@ try {
 		ws.send(JSON.stringify({ type: 'fixture-publish', topic: 'pressure-lane', event: 'tick', data: { i } }));
 	}
 	// The rate lives for exactly ONE window - the next tick drains it - so
-	// poll across several ticks and keep the best reading rather than betting
-	// on landing inside the right one.
+	// poll several times per window rather than betting on landing inside the
+	// right one. The fixture samples every 200ms, so 60ms polls see each
+	// window roughly three times.
 	const before = pressures.length;
-	for (let i = 0; i < 10; i++) {
-		await new Promise((r) => setTimeout(r, 250));
+	for (let i = 0; i < 25; i++) {
+		await new Promise((r) => setTimeout(r, 60));
 		ws.send(JSON.stringify({ type: 'fixture-pressure' }));
 	}
-	await new Promise((r) => setTimeout(r, 400));
+	await new Promise((r) => setTimeout(r, 300));
 	const after = pressures.slice(before);
 	check('samples kept arriving, so the timer is still ticking', after.length >= 2,
 		`samples=${after.length}`);
@@ -113,9 +126,14 @@ try {
 	check('the burst topic surfaced in topPublishers',
 		after.some((p) => p.topPublishers.some((t) => t.topic === 'pressure-lane' && t.messagesPerSec > 0)),
 		JSON.stringify(after.map((p) => p.topPublishers.length)));
+	// Publishing stopped long before the last poll, so the final windows must
+	// read zero: a rate that keeps reporting is a window that never drained.
+	await new Promise((r) => setTimeout(r, 600));
+	ws.send(JSON.stringify({ type: 'fixture-pressure' }));
+	await new Promise((r) => setTimeout(r, 300));
 	check('the window is drained again afterwards, not left compounding',
-		after[after.length - 1].publishRate === 0,
-		`last=${after[after.length - 1].publishRate}`);
+		pressures[pressures.length - 1].publishRate === 0,
+		`last=${pressures[pressures.length - 1].publishRate}`);
 	check('the subscription registered in the subscriber ratio',
 		after.some((p) => p.subscriberRatio > 0),
 		`ratios=${JSON.stringify(after.map((p) => p.subscriberRatio))}`);

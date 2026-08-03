@@ -211,6 +211,14 @@ export function message(ws, { data, isBinary, msg, platform }) {
 			topPublishers: p.topPublishers,
 			psiNull: p.psi === null,
 			cpuThrottleNull: p.cpuThrottle === null,
+			// WHICH shape landed in each slot, so the live suite can catch the
+			// two readings being assigned to each other's field.
+			psiShape: p.psi === null
+				? null
+				: ('cpuSome10' in p.psi ? 'psi' : 'throttle'),
+			cpuThrottleShape: p.cpuThrottle === null
+				? null
+				: ('throttledRatio' in p.cpuThrottle ? 'throttle' : 'psi'),
 			hasOnPressure: typeof platform.onPressure === 'function',
 			hasOnPublishRate: typeof platform.onPublishRate === 'function'
 		});

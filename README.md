@@ -222,21 +222,6 @@ export function POST({ platform }) {
 | `onPressure(cb)` | fires on `reason` TRANSITIONS with the live snapshot; throwing callbacks are contained; returns unsubscribe |
 | `onPublishRate(cb)` | per-topic runaway-publisher reports `[{ topic, messagesPerSec, bytesPerSec }]` once per window; registering replaces the default throttled console warning; returns unsubscribe |
 
-**The memory signal is off by default here, and that is the one pressure
-default that differs from svelte-adapter-uws.** `heapUsed / heapTotal` only
-measures saturation on an engine that over-allocates its heap. Bun does not:
-a freshly booted, completely idle server measures **0.90 to 0.94**, so the
-family's `memoryHeapUsedRatio: 0.85` would fire on a healthy process and
-never clear - `platform.pressure.active` would be `true` for the life of
-every app, and `onPressure` would announce `MEMORY` once after boot and never
-recover. The same reading is kept out of the flow-control window sizing for
-the same reason: fed to a knee calibrated for an over-allocating heap, an
-idle server would hand out roughly a sixteenth of the intended window. Both
-are pinned by `test/live/pressure-check.mjs` against a real server, so if the
-engine's accounting ever changes the divergence is revisited rather than kept
-out of habit. Opt back into the sibling's exact behavior with
-`websocket: { pressure: { memoryHeapUsedRatio: 0.85 } }`. Every other
-threshold, and the rest of the surface, is the family's.
 | `topic(name)` | scoped publisher: `platform.topic('chat').created(data)` |
 | `requestId` | per-connection / per-request identity |
 | `now()` / `monotonic()` / `random.float()` `.u32()` `.uuid()` `.bytes(n)` | determinism seams |
@@ -245,6 +230,34 @@ threshold, and the rest of the surface, is the family's.
 | `sendWire(ws, topic, event, data, wire, options?)` | single-target codec frame (seq 0), or the JSON envelope for a caps-less / degraded connection; returns the send tri-state |
 | `sendWireBatch(ws, topic, event, entries, wire, options?)` | the per-subscriber twin of `publishWireBatch`, for culled per-viewer walks |
 | `registerWireCodec(wire)` | register a codec under its capability token; idempotent, last-wins |
+
+**The memory signal is off by default here, and that is the one pressure
+default that differs from svelte-adapter-uws.** `heapUsed / heapTotal` only
+measures saturation on an engine that over-allocates its heap. Bun does not:
+a freshly booted, completely idle server measures 0.90 to 0.94 (the live
+suite pins that it stays above 0.85), so the family's
+`memoryHeapUsedRatio: 0.85` would fire on a healthy process and never clear -
+`platform.pressure.active` would be `true` for the life of every app, and
+`onPressure` would announce `MEMORY` once after boot and never recover. The
+same reading is kept out of the flow-control window sizing for the same
+reason: fed to a knee calibrated for an over-allocating heap, an idle server
+would hand out roughly a sixteenth of the intended window. Both are pinned by
+`test/live/pressure-check.mjs` against a real server, so if the engine's
+accounting ever changes the divergence is revisited rather than kept out of
+habit.
+
+**What that costs you, stated plainly:** with the heap signal off, this
+adapter ships no memory pressure signal at all on a host without PSI - every
+non-Linux host, and Linux without PSI compiled in. A worker genuinely
+approaching OOM there reports `reason: 'NONE'` and `active: false`, so
+`onPressure` is not a memory alert on those hosts. On Linux, `psiMemoryFull`
+(default 15) is live and is the better memory signal anyway: it measures
+kernel-observed stall time, which fires meaningfully earlier than an
+OOM-adjacent heap ratio. Elsewhere, either opt back into the sibling's exact
+threshold with `websocket: { pressure: { memoryHeapUsedRatio: 0.85 } }` -
+accepting that it reads as permanently active - or watch RSS outside the
+process until the family settles a runtime-independent memory signal. Every
+other threshold, and the rest of the surface, is the family's.
 
 `platform.subscribe` refuses the adapter's own `__`-prefixed namespace by
 default, because the documented advice is to route server-initiated subscribes
@@ -324,7 +337,7 @@ adapter: bunserve({
 			memoryHeapUsedRatio: false,
 			publishRatePerSec: 10_000,
 			subscriberRatio: 50,
-			sampleIntervalMs: 1000,           // clamped to >= 100
+			sampleIntervalMs: 1000,           // under 100 resets to 1000; capped at 2^31-1
 			topicPublishRatePerSec: 5000,
 			topicPublishBytesPerSec: 10 * 1024 * 1024,
 			psiCpuSome: 60,                   // kernel signals; inert off-Linux

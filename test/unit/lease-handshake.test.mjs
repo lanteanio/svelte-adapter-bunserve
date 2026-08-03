@@ -66,16 +66,13 @@ test('a hello advertising `lease` arms flow control: one lease-ok, a sized grant
 		'the ack arrives first, then each window in the order it was granted');
 
 	for (const g of grants) {
-		// A range only - deliberately. The window is sized from the LIVE heap
-		// (grantSizeFor reads process.memoryUsage() off the seam, matching the
-		// sibling), so an exact expectation computed here could disagree with
-		// the one computed inside the run whenever the heap crosses a knee
-		// between the two reads. The exact wiring - subscriptions divided by
-		// connections, heap headroom, no constant return - is pinned in
-		// pressure-sampler.test.mjs, where the two reads are microseconds
-		// apart and the load factor dominates any heap noise.
-		assert.ok(Number.isInteger(g.count) && g.count >= 8 && g.count <= 256,
-			'window between the floor and the base: ' + g.count);
+		// EXACT, and deterministically so: one connection with no
+		// subscriptions is nowhere near the fan-out knee, and the sizing takes
+		// no heap term on this engine, so a healthy server owes the full base
+		// window. A range check here would pass for a constant return, a
+		// swapped argument, or a forgotten division - and would have passed
+		// while an idle server was really granting 27.
+		assert.equal(g.count, 256, 'an unloaded server grants the full base window');
 		assert.equal(g.ttlMs, 10000, 'the ttl is fixed and exact');
 	}
 });

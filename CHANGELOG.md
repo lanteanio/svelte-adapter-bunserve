@@ -39,8 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `platform.onPublishRate` (per-topic runaway-publisher reports; the
   default is a throttled console warning). A client advertising the `lease`
   capability in its `hello` is answered with `lease-ok` plus a `lease`
-  window grant, and `request-n` re-grants a window sized from live heap and
-  subscriber load - windows shrink as the worker tightens and always floor,
+  window grant, and `request-n` re-grants a window sized from per-connection
+  subscriber load - windows narrow as fan-out rises and always floor,
   so an opted-in client keeps making progress. Thresholds are tunable via
   the new `websocket.pressure` block, validated at build time; every signal
   can be disabled with `false`.
@@ -54,7 +54,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unloaded server's window to about a sixteenth of the base. Both are pinned
   against a real server by the live suite, and
   `websocket: { pressure: { memoryHeapUsedRatio: 0.85 } }` restores the
-  sibling's exact behavior.
+  sibling's exact behavior. The cost, stated plainly: on a host without PSI
+  (every non-Linux host) this adapter now ships no memory pressure signal at
+  all, so `onPressure` is not a memory alert there. On Linux `psiMemoryFull`
+  is live and is the better signal anyway - kernel stall time fires earlier
+  than an OOM-adjacent heap ratio.
 
 - A deterministic simulation harness and golden gate. `src/sim.js` drives the
   REAL handler dispatch - the exact modules a built server runs, loaded

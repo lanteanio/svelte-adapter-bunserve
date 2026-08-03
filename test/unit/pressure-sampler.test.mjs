@@ -259,8 +259,9 @@ test('starting twice replaces the timer rather than stacking samplers', () => {
 });
 
 test('grantSizeFor wires the LIVE readings into the sizing math', () => {
-	// The window must be a function of heap headroom AND per-connection
-	// subscriber load. Computing the expectation from the same inputs the
+	// The window must be a function of per-connection subscriber load - and of
+	// nothing else on this engine, whose idle heap ratio would otherwise
+	// collapse it. Computing the expectation from the same inputs the
 	// implementation reads makes this exact rather than a range check: a
 	// forgotten division, swapped arguments, or a constant return all fail.
 	const before = wsConnections.size;
@@ -294,10 +295,12 @@ test('grantSizeFor wires the LIVE readings into the sizing math', () => {
 		const idle = grantSizeFor();
 		assert.equal(Number.isInteger(idle.count), true);
 		assert.equal(idle.count, 256, 'the divisor floors at 1 rather than producing NaN or Infinity');
+		// Checked here, not in the `finally`: an assertion during unwinding
+		// would replace the real failure's diagnostic with its own.
+		assert.equal(before, 0, 'this test started from an empty connection set');
 	} finally {
 		wsConnections.clear();
 		wsCounters.totalSubscriptions = 0;
-		assert.equal(before, 0);
 	}
 });
 

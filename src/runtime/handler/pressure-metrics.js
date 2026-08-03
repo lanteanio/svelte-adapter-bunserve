@@ -35,6 +35,10 @@ const osPressure = createOsPressureSampler();
  * correctness impact - while an unbounded-cardinality publisher cannot grow
  * the map without limit.
  */
+// Matches the sibling's bound. Deliberately far past any real topic
+// cardinality, which also means no test drives the eviction below it - the
+// bound is a backstop against an unbounded-cardinality publisher, not a path
+// the suite can reach without building a million-entry map.
 const PUBLISH_WARN_DEDUP_MAX = 1_000_000;
 
 /** @type {ReturnType<typeof setIntervalTimer> | null} */
@@ -274,15 +278,11 @@ function samplePressure(thresholds) {
 }
 
 /**
- * Size the next send-gate window for an opted-in connection. Derived from the
- * same inputs that drive pressure: heap headroom and subscriber load narrow
- * the window so a tightening worker hands out smaller windows. Zero-config
- * defaults; never user exposed. Always floors to a window large enough that a
- * connection makes forward progress.
- *
- * Reads process.memoryUsage() live rather than the cached sample - a real
- * syscall per replenish, deliberately matching the sibling so the window a
- * replenish gets reflects the heap at replenish time, not up to a second ago.
+ * Size the next send-gate window for an opted-in connection: per-connection
+ * subscriber load narrows the window, so a worker carrying heavy fan-out
+ * hands out smaller ones. Zero-config; never user exposed. Always floors to a
+ * window large enough that a connection makes forward progress, and costs no
+ * syscall - the reading it needs is bookkeeping this process already keeps.
  *
  * @returns {{ count: number, ttlMs: number }}
  */
