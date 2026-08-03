@@ -60,11 +60,16 @@ const {
 	WS_SUBSCRIPTIONS,
 	capCounts,
 	envelopePrefixCache,
+	lastPublishWarnAt,
 	maxAuthoritativeSeq,
 	pendingCloseHooks,
+	pressureListeners,
+	pressureSnapshot,
+	publishRateListeners,
 	resetDraining,
 	resetProcessEpoch,
 	resumeBuffers,
+	topicPublishStats,
 	setServer,
 	sharedTopics,
 	topicSeqs,
@@ -109,6 +114,36 @@ function resetSimState() {
 	wsCounters.totalSubscriptions = 0;
 	wsCounters.sendToAsyncWarned = false;
 	wsCounters.adviseAsyncWarned = false;
+	// The pressure lane. The sampler itself never runs under the sim (nothing
+	// starts it), but the publish lanes bump the window counters and per-topic
+	// stats on every publish, and a scenario can register listeners or read
+	// the snapshot - all cross-seed state without this.
+	wsCounters.publishCountWindow = 0;
+	wsCounters.lastPublishCount = 0;
+	wsCounters.lastConnections = 0;
+	wsCounters.lastHeapUsedRatio = 0;
+	wsCounters.lastResidentBytes = 0;
+	wsCounters.lastBasePressureReason = 'NONE';
+	wsCounters.lastSampleWallMs = 0;
+	wsCounters.leaseSaturationPeak = 0;
+	wsCounters.activePosture = null;
+	wsCounters.metricsSampleHook = null;
+	wsCounters.postureExportHook = null;
+	topicPublishStats.clear();
+	lastPublishWarnAt.clear();
+	pressureListeners.clear();
+	publishRateListeners.clear();
+	pressureSnapshot.active = false;
+	pressureSnapshot.value = 0;
+	pressureSnapshot.subscriberRatio = 0;
+	pressureSnapshot.publishRate = 0;
+	pressureSnapshot.memoryMB = 0;
+	pressureSnapshot.reason = 'NONE';
+	pressureSnapshot.maxBufferedBytes = 0;
+	pressureSnapshot.backpressuredConnections = 0;
+	pressureSnapshot.psi = null;
+	pressureSnapshot.cpuThrottle = null;
+	pressureSnapshot.topPublishers = [];
 }
 
 /**

@@ -3,9 +3,8 @@
  * code. This is the JSON realtime surface: topic fan-out, per-connection send,
  * brokered subscribe/unsubscribe, and the observability getters.
  *
- * What is deliberately NOT here yet: the pressure/protection surface
- * (onPressure/onPublishRate and flow-control) and the deferred JSON-tier
- * members sendCoalesced, topicEpoch, batch, publishBatched, request, and
+ * What is deliberately NOT here yet: the deferred JSON-tier members
+ * sendCoalesced, topicEpoch, batch, publishBatched, request, and
  * requestTopic. Those are their own slices. They are omitted
  * rather than stubbed - a zero stub reports
  * "supported" to a caller and then silently does nothing, which is worse than
@@ -15,11 +14,12 @@
  * svelte-adapter-uws-extensions guards some of these (requestTopic,
  * authorizeWireSubscribe, the wire members) and binds four of them
  * unconditionally: sendCoalesced and request (src/redis/pubsub.js:285-286),
- * onPressure and onPublishRate (:362-363). So `bus.wrap(platform)` - the first
- * line of that package's documented usage - throws a TypeError against this
- * platform today. Omission is still the right choice; the consumer's missing
- * guards are the bug, and they are tracked on that repo. But nothing here
- * should claim multi-node fan-out works until they land.
+ * onPressure and onPublishRate (:362-363). The latter two exist here now
+ * (real sampling, not stubs), so `bus.wrap(platform)` - the first line of
+ * that package's documented usage - still throws a TypeError against this
+ * platform, on sendCoalesced/request. Omission is still the right choice; the
+ * consumer's missing guards are the bug, and they are tracked on that repo.
+ * But nothing here should claim multi-node fan-out works until they land.
  *
  * Every method that touches a socket goes through the facade
  * (handler/ws-facade.js), so a closed socket throws here rather than silently
@@ -75,16 +75,39 @@ import {
 	getServer,
 	hasGateHeadroom,
 	pendingSubscribeTopics,
+	pressureListeners,
+	pressureSnapshot,
+	publishRateListeners,
 	settlePendingSubscribe,
 	withGateCounted,
 	stampExplicitSeq,
 	stampSeq,
 	stampSeqValue,
 	tombstonePendingSubscribe,
+	topicPublishStats,
 	wsConnections,
 	wsCounters
 } from './ws-state.js';
 import { allow_unauthenticated_subscribe, ws_compression_on, ws_options } from './config.js';
+
+/**
+ * Record one publish against the per-topic window stats the pressure sampler
+ * drains: message count and envelope bytes per topic since the last sample.
+ * Called beside every `publishCountWindow` bump so `publishRate` and
+ * `topPublishers` are computed over the same window from the same events.
+ *
+ * @param {string} topic
+ * @param {number} bytes - the JSON envelope's string length
+ */
+function bumpTopicPublish(topic, bytes) {
+	let s = topicPublishStats.get(topic);
+	if (s === undefined) {
+		s = { m: 0, b: 0 };
+		topicPublishStats.set(topic, s);
+	}
+	s.m++;
+	s.b += bytes;
+}
 
 /** Throws from the app's subscribe hook, throttled with decay. */
 const subscribeThrewThrottle = createLogThrottle(() => processMonotonicNow());
@@ -517,6 +540,8 @@ export const platform = {
 		const server = getServer();
 		if (seq !== null) notePublishedSeq(topic, seq, authoritative);
 		wsCounters.publishCount++;
+		wsCounters.publishCountWindow++;
+		bumpTopicPublish(topic, envelope.length);
 		const compress = ws_compression_on && compressOpt !== false;
 		// A connection still gap-filling this topic (resume cutover in
 		// flight) is not yet subscribed to live, so hold the envelope it
@@ -685,6 +710,8 @@ export const platform = {
 		const server = getServer();
 		if (seq !== null) notePublishedSeq(topic, seq, authoritative);
 		wsCounters.publishCount++;
+		wsCounters.publishCountWindow++;
+		bumpTopicPublish(topic, envelope.length);
 		// Binary codec frames (and this call's JSON-fallback frames) compress
 		// only when the caller opts in with `{ compress: true }` AND a
 		// compressor is configured. One decision governs the whole call so a
@@ -1169,6 +1196,8 @@ export const platform = {
 			else if (seqs[i] !== null) notePublishedSeq(topic, seqs[i], false);
 		}
 		wsCounters.publishCount += n;
+		wsCounters.publishCountWindow += n;
+		for (let i = 0; i < n; i++) bumpTopicPublish(topic, envs[i].length);
 		// Resume cutover in flight: hold the per-entry JSON envelopes a
 		// caps-less resuming subscriber would receive from this batch, each
 		// skipping the socket its own entry excluded.
@@ -1890,6 +1919,60 @@ export const platform = {
 	 */
 	get droppedReleaseRecords() {
 		return wsCounters.droppedReleaseRecords;
+	},
+
+	/**
+	 * The live pressure snapshot: what the 1 Hz sampler last measured. This is
+	 * the LIVE singleton, mutated in place each sample and never copied - a
+	 * held reference always reads the latest sample, and `onPressure`
+	 * callbacks receive the same object. Fields: `active`, `value` (0..1
+	 * worst-of saturation), `reason` ('NONE' | 'PUBLISH_RATE' | 'SUBSCRIBERS'
+	 * | 'MEMORY' | 'CPU_QUOTA' | 'PSI' | 'CAPACITY'), `subscriberRatio`,
+	 * `publishRate`, `memoryMB` (rss), `maxBufferedBytes`,
+	 * `backpressuredConnections`, `psi` / `cpuThrottle` (kernel readings,
+	 * null off-Linux), `topPublishers`.
+	 */
+	get pressure() {
+		return pressureSnapshot;
+	},
+
+	/**
+	 * The protection posture level: 'normal' | 'elevated' | 'siege'. Reads
+	 * 'normal' when no posture machine is configured - the zero-config
+	 * posture, and the only one this adapter currently runs (the
+	 * `websocket.protection` option is a recorded parity gap).
+	 */
+	get protection() {
+		return wsCounters.activePosture !== null ? wsCounters.activePosture.level : 'normal';
+	},
+
+	/**
+	 * Subscribe to pressure-reason transitions. The callback fires at most
+	 * once per sample, only when `reason` CHANGED, with the live snapshot
+	 * (the same object `platform.pressure` returns). A throwing callback is
+	 * contained and logged; the remaining callbacks still run.
+	 *
+	 * @param {(snapshot: any) => void} cb
+	 * @returns {() => void} unsubscribe
+	 */
+	onPressure(cb) {
+		pressureListeners.add(cb);
+		return () => pressureListeners.delete(cb);
+	},
+
+	/**
+	 * Subscribe to per-topic runaway-publisher reports. The callback fires
+	 * once per sample window that had over-threshold topics, with
+	 * `[{ topic, messagesPerSec, bytesPerSec }]`. Registering at least one
+	 * callback replaces the default throttled console warning - the app owns
+	 * the surface at that point.
+	 *
+	 * @param {(over: Array<{ topic: string, messagesPerSec: number, bytesPerSec: number }>) => void} cb
+	 * @returns {() => void} unsubscribe
+	 */
+	onPublishRate(cb) {
+		publishRateListeners.add(cb);
+		return () => publishRateListeners.delete(cb);
 	},
 
 	/**

@@ -10,6 +10,7 @@ import { is_tls, ssl_cert, ssl_key, body_size_limit, idle_timeout, ws_options, w
 import { tryUpgrade } from './handler/upgrade.js';
 import { websocketHandlers } from './handler/ws.js';
 import { setServer } from './handler/ws-state.js';
+import { startPressureSampling } from './handler/pressure-metrics.js';
 import { toBunWebsocketOptions } from './utils/ws-options.js';
 import { processMonotonicNow } from './runtime.js';
 
@@ -150,6 +151,11 @@ export function start(host, port) {
 	// The platform reaches the server through this for topic fan-out
 	// (server.publish) and the native membership count (server.subscriberCount).
 	setServer(bunServer);
+	// Start the 1 Hz pressure sampler whenever the WS surface exists - the
+	// zero-config path always samples, exactly like the sibling adapter, so
+	// platform.pressure is live without any option set. The timer is unref'd
+	// and costs one bounded walk per second.
+	if (ws_options) startPressureSampling(ws_options.pressure);
 	console.log(
 		`Listening on ${is_tls ? 'https' : 'http'}://${host}:${bunServer.port} (ready in ${(processMonotonicNow() - _t_boot).toFixed(0)}ms)`
 	);

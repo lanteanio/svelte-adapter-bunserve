@@ -15,7 +15,7 @@
 export const CONTROL_FRAME_LIMIT = 8192;
 
 /** The control types the demux consumes itself. */
-export const CONSUMED_CONTROL_TYPES = ['subscribe', 'unsubscribe', 'subscribe-batch', 'hello', 'resume'];
+export const CONSUMED_CONTROL_TYPES = ['subscribe', 'unsubscribe', 'subscribe-batch', 'hello', 'resume', 'request-n'];
 
 /**
  * Topics one control frame may name - the entries of a `subscribe-batch`, and
@@ -262,4 +262,28 @@ export const RESUME_FAILED_FRAME = '{"type":"error","code":"RESUME_FAILED"}';
  */
 export function controlFloodFrame(limit) {
 	return '{"type":"error","code":"CONTROL_FLOOD","limit":' + limit + '}';
+}
+
+// - Send-gate control frames -----------------------------------------------
+// JSON control frames carrying no data body, JSON transport only. Routed
+// through the existing JSON-control demux (byte[3] === 'y') on both ends; no
+// new demux branch. ASCII-safe numeric serialization.
+
+/**
+ * Build the server-to-client window-grant control frame.
+ * @param {number} count
+ * @param {number} ttlMs
+ * @returns {string}
+ */
+export function leaseGrantFrame(count, ttlMs) {
+	return '{"type":"lease","count":' + (count | 0) + ',"ttlMs":' + (ttlMs | 0) + '}';
+}
+
+/**
+ * Build the client-to-server window-replenish control frame.
+ * @param {number} n
+ * @returns {string}
+ */
+export function requestNFrame(n) {
+	return '{"type":"request-n","n":' + (n | 0) + '}';
 }

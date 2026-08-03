@@ -30,6 +30,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The pressure/protection observability surface and LEASE/REQUEST_N flow
+  control, matching svelte-adapter-uws: `platform.pressure` (the live 1 Hz
+  snapshot - saturation value, reason, publish rate, subscriber ratio,
+  backpressure aggregates, kernel PSI/CPU-quota readings where the host has
+  them), `platform.protection`, `platform.onPressure` (reason transitions)
+  and `platform.onPublishRate` (per-topic runaway-publisher reports; the
+  default is a throttled console warning). A client advertising the `lease`
+  capability in its `hello` is answered with `lease-ok` plus a `lease`
+  window grant, and `request-n` re-grants a window sized from live heap and
+  subscriber load - windows shrink as the worker tightens and always floor,
+  so an opted-in client keeps making progress. Thresholds are tunable via
+  the new `websocket.pressure` block, validated at build time; every signal
+  can be disabled with `false`.
+
 - A deterministic simulation harness and golden gate. `src/sim.js` drives the
   REAL handler dispatch - the exact modules a built server runs, loaded
   through a resolution hook - over an in-memory Bun.serve double, a virtual

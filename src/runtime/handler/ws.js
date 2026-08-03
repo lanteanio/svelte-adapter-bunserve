@@ -81,13 +81,17 @@ import {
 	batchTooLargeFrame,
 	controlFrameTooLargeFrame,
 	isConsumedControlType,
+	leaseGrantFrame,
 	looksLikeControlFrame,
 	resumeTooLargeFrame
 } from '../utils/control-frame.js';
+import { createLeaseState } from '../utils/lease.js';
+import { grantSizeFor } from './pressure-metrics.js';
 import { detachWireStates } from './wire-state.js';
 import { releaseSharedWireId } from '../utils/shared-wire-id.js';
 import {
 	WS_CAPS,
+	WS_LEASE,
 	WS_PENDING_SUBSCRIBES,
 	WS_SHARED_COHORTS,
 	WS_PLATFORM,
@@ -487,6 +491,47 @@ export const websocketHandlers = {
 					// per-capability counts are diffed, not blindly incremented.
 					capCounts.adjust(helloUd[WS_CAPS], caps);
 					helloUd[WS_CAPS] = caps;
+					// First-hello lease arm: a client advertising `lease` opts
+					// into flow control. Grant-and-observe, the family
+					// semantics: the server never gates its own sends on the
+					// window - pacing is enforced client-side - it only sizes
+					// windows from its posture and observes saturation on
+					// replenish. FIRST hello only: a re-sent hello (a lazy
+					// plugin re-advertising caps) must not reset the window or
+					// repeat the ack.
+					if (caps.has('lease') && !helloUd[WS_LEASE]) {
+						const g = grantSizeFor();
+						const gate = createLeaseState({ requestCount: g.count, ttlMs: g.ttlMs });
+						gate.grant();
+						helloUd[WS_LEASE] = { gate, saturation: gate.pressureValue() };
+						sendControl(ws, '{"type":"lease-ok"}');
+						sendControl(ws, leaseGrantFrame(g.count, g.ttlMs));
+					}
+					return;
+				}
+
+				if (msg.type === 'request-n') {
+					// Window replenish. The client's `n` is advisory and
+					// deliberately ignored - the server sizes every window from
+					// its own posture, so a client cannot ask its way past a
+					// tightening worker. No armed window (a request-n from a
+					// client that never opted in) is a silent no-op.
+					let leaseUd;
+					try {
+						leaseUd = ws.getUserData();
+					} catch {
+						return;
+					}
+					const slot = leaseUd[WS_LEASE];
+					if (slot) {
+						const g = grantSizeFor();
+						slot.gate.requestN(g.count, g.ttlMs);
+						sendControl(ws, leaseGrantFrame(g.count, g.ttlMs));
+						slot.saturation = slot.gate.pressureValue();
+						if (slot.saturation > wsCounters.leaseSaturationPeak) {
+							wsCounters.leaseSaturationPeak = slot.saturation;
+						}
+					}
 					return;
 				}
 
@@ -1006,6 +1051,10 @@ export const websocketHandlers = {
 			// forever after the last capable client left.
 			capCounts.adjust(userData[WS_CAPS], null);
 			userData[WS_CAPS] = undefined;
+			// Drop the send-gate window with the socket; its saturation
+			// contribution (if any) decays out of the sampler's peak on the
+			// next tick.
+			if (userData[WS_LEASE]) userData[WS_LEASE] = undefined;
 			// Dispose per-connection wire-codec state (dictionaries, delta
 			// baselines) exactly once, via each codec's own onDetach.
 			detachWireStates(ws, userData);

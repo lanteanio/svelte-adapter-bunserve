@@ -65,6 +65,14 @@ export const WS_STATS = Symbol('stats');
 export const WS_CAPS = Symbol('caps');
 
 /**
+ * The connection's send-gate window, present only after a `hello` carrying the
+ * `lease` capability armed flow control (first hello only - a re-sent hello
+ * never resets the window). Shape: `{ gate, saturation }` where `gate` is a
+ * createLeaseState machine and `saturation` its last observed 0..1 reading.
+ */
+export const WS_LEASE = Symbol('lease');
+
+/**
  * Live per-capability connection counts across the instance, maintained by the
  * `hello` handler and released on close. The binary publish fast path asks
  * this ONE question - "does any connected client want binary for this codec?" -
@@ -347,7 +355,67 @@ export const wsCounters = {
 	sendToAsyncWarned: false,
 
 	/** One-shot latch for the async-adviseReconnect-filter warning. */
-	adviseAsyncWarned: false
+	adviseAsyncWarned: false,
+
+	/**
+	 * Publishes since the last pressure sample - the windowed companion to the
+	 * monotonic `publishCount`, drained and zeroed by each sampler tick to
+	 * produce `publishRate`. Bumped on every publish lane alongside the
+	 * monotonic counter.
+	 */
+	publishCountWindow: 0,
+
+	/** The window drained by the previous sampler tick (introspection). */
+	lastPublishCount: 0,
+
+	/** Connection count at the previous sampler tick. */
+	lastConnections: 0,
+
+	/** heapUsed/heapTotal at the previous sampler tick. */
+	lastHeapUsedRatio: 0,
+
+	/** process RSS bytes at the previous sampler tick. */
+	lastResidentBytes: 0,
+
+	/**
+	 * The UNLAYERED pressure reason of the previous sample - what the raw
+	 * thresholds said before any capacity posture was folded in. The posture
+	 * machine ticks on this one, never the layered reason, so its own effect
+	 * cannot feed back and prevent relaxation.
+	 * @type {'NONE' | 'PUBLISH_RATE' | 'SUBSCRIBERS' | 'MEMORY' | 'CPU_QUOTA' | 'PSI'}
+	 */
+	lastBasePressureReason: 'NONE',
+
+	/**
+	 * Wall-clock ms of the previous sampler tick. A stalled (unref'd) sampler
+	 * is observable here: the snapshot goes stale and this stops advancing.
+	 */
+	lastSampleWallMs: 0,
+
+	/**
+	 * Worst per-connection send-gate saturation observed since the last
+	 * sample; written on `request-n`, folded into the snapshot value by the
+	 * sampler, then decayed by half each tick.
+	 */
+	leaseSaturationPeak: 0,
+
+	/**
+	 * The protection posture machine, or null when `websocket.protection` is
+	 * unset ('normal') - the zero-config posture. The sampler null-checks it;
+	 * `platform.protection` reads 'normal' through the null.
+	 * @type {{ level: string, tick: (s: { active: boolean }) => void } | null}
+	 */
+	activePosture: null,
+
+	/**
+	 * Null seams for the metrics registry and posture-export features (both
+	 * recorded parity gaps). The sampler calls them null-checked at the end of
+	 * every tick so the features can attach without touching the sampler.
+	 * @type {(() => void) | null}
+	 */
+	metricsSampleHook: null,
+	/** @type {(() => void) | null} */
+	postureExportHook: null
 };
 
 /**
@@ -355,6 +423,55 @@ export const wsCounters = {
  * @type {Map<string, number>}
  */
 export const topicSeqs = new Map();
+
+/**
+ * Per-topic publish counts and envelope bytes since the last pressure sample:
+ * `topic -> { m, b }`. Bumped on every publish lane beside the window
+ * counter, drained into `topPublishers` and cleared by each sampler tick, so
+ * it never grows past one window's topic cardinality.
+ * @type {Map<string, { m: number, b: number }>}
+ */
+export const topicPublishStats = new Map();
+
+/**
+ * The live pressure snapshot `platform.pressure` returns and `onPressure`
+ * callbacks receive. Mutated IN PLACE by the sampler - deliberately a
+ * singleton, never copied, so a held reference always reads the latest
+ * sample. Consumers relying on the live reference are part of the contract.
+ */
+export const pressureSnapshot = {
+	active: false,
+	value: 0,
+	subscriberRatio: 0,
+	publishRate: 0,
+	memoryMB: 0,
+	reason: 'NONE',
+	maxBufferedBytes: 0,
+	backpressuredConnections: 0,
+	psi: null,
+	cpuThrottle: null,
+	topPublishers: []
+};
+
+/**
+ * `onPressure` subscribers, fired (each contained) on reason transitions.
+ * @type {Set<(snapshot: typeof pressureSnapshot) => void>}
+ */
+export const pressureListeners = new Set();
+
+/**
+ * `onPublishRate` subscribers. A non-empty set replaces the default throttled
+ * runaway-publisher console warning.
+ * @type {Set<(over: Array<{ topic: string, messagesPerSec: number, bytesPerSec: number }>) => void>}
+ */
+export const publishRateListeners = new Set();
+
+/**
+ * Last runaway-publisher warn time per topic, for the default (listener-less)
+ * throttled warning. Bounded with FIFO eviction by the sampler.
+ * @type {Map<string, number>}
+ */
+export const lastPublishWarnAt = new Map();
 
 /**
  * The generation of this process's seq space, stamped once at boot and carried

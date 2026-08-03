@@ -61,10 +61,6 @@ const PLATFORM_GAPS = {
 	topicEpoch: 'resume epoch introspection',
 	metrics: 'metrics registry',
 	metricsSnapshot: 'metrics registry',
-	onPressure: 'pressure/protection observability',
-	onPublishRate: 'pressure/protection observability',
-	pressure: 'pressure/protection observability',
-	protection: 'pressure/protection observability',
 	introspect: 'diagnostics'
 };
 
@@ -111,7 +107,6 @@ const WS_OPTION_GAPS = {
 	stateHashIntervalMs: 'background audits',
 	metrics: 'pressure/protection observability',
 	postureExport: 'pressure/protection observability',
-	pressure: 'pressure/protection observability',
 	protection: 'pressure/protection observability',
 	primaryInit: 'multi-worker clustering',
 	workers: 'multi-worker clustering',

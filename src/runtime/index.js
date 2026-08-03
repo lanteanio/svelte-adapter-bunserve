@@ -5,7 +5,8 @@ import { start } from './server.js';
 import { formatVersionBanner, versionInfo } from './version-info.js';
 import { drain, markDraining } from './handler/lifecycle.js';
 import { drainWebSockets } from './handler/ws-drain.js';
-import { beginDraining } from './handler/ws-state.js';
+import { beginDraining, wsCounters } from './handler/ws-state.js';
+import { stopPressureSampling } from './handler/pressure-metrics.js';
 import { runWsLifecycleHook } from './handler/ws-lifecycle.js';
 
 const host = env('HOST', '0.0.0.0');
@@ -149,6 +150,15 @@ async function graceful_shutdown(reason) {
 	// rejection rather than let it surface as an unhandled rejection during
 	// an otherwise clean exit.
 	bunServer.stop()?.catch?.(() => {});
+
+	// Stop the pressure sampler once the listener is closed - it kept
+	// sampling through the drain above (the drain IS load worth measuring),
+	// and stopping before the export hooks are cleared means a late tick can
+	// never call a torn-down consumer.
+	stopPressureSampling();
+	wsCounters.metricsSampleHook = null;
+	wsCounters.postureExportHook = null;
+
 	await untilDeadline(drain(), deadline);
 
 	// Emit after drain so handlers can safely close DB pools etc.

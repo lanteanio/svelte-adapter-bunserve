@@ -61,6 +61,10 @@ const DEFAULTS = {
 	// When no `subscribe` hook is exported, every topic is readable by every
 	// client. That has to be opted into rather than arrived at by omission.
 	allowUnauthenticatedSubscribe: false,
+	// Pressure-sampler thresholds (see handler/pressure-metrics.js for the
+	// defaults and each signal's meaning). undefined means "sampler defaults";
+	// the sampler always runs when the WS surface exists, so this only TUNES.
+	pressure: undefined,
 	// Build-time rather than transport tuning, and nested HERE rather than at the
 	// top level because that is where svelte-adapter-uws declares them. The two
 	// adapters are drop-in replacements for each other, so a `websocket` block
@@ -103,6 +107,55 @@ function requireBoolean(value, key) {
 		);
 	}
 	return value;
+}
+
+/**
+ * The pressure-threshold keys that accept a number or `false` (false disables
+ * that signal). `sampleIntervalMs` is number-only and validated separately.
+ */
+const PRESSURE_SIGNAL_KEYS = [
+	'memoryHeapUsedRatio', 'publishRatePerSec', 'subscriberRatio',
+	'topicPublishRatePerSec', 'topicPublishBytesPerSec',
+	'psiCpuSome', 'psiMemoryFull', 'psiIoFull', 'cpuThrottledRatio'
+];
+
+/**
+ * Type-check the `websocket.pressure` block. Values are validated here at
+ * build time (the sibling merges silently - a typo'd threshold there samples
+ * with NaN forever); the sampler merges the validated object over its own
+ * defaults at boot, so unknown keys pass through exactly as they do there.
+ *
+ * @param {unknown} value
+ * @returns {Record<string, unknown>}
+ */
+function requirePressureThresholds(value) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+		throw new Error(
+			'adapter option `websocket.pressure` must be an object of thresholds, e.g. ' +
+			"{ publishRatePerSec: 5000, sampleIntervalMs: 1000 }, got " + JSON.stringify(value) + '.'
+		);
+	}
+	const raw = /** @type {Record<string, unknown>} */ (value);
+	for (const key of PRESSURE_SIGNAL_KEYS) {
+		const v = raw[key];
+		if (v === undefined || v === false) continue;
+		if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) {
+			throw new Error(
+				`adapter option \`websocket.pressure.${key}\` must be a positive number or false ` +
+				`(false disables the signal), got ${JSON.stringify(v)}.`
+			);
+		}
+	}
+	if (raw.sampleIntervalMs !== undefined) {
+		const v = raw.sampleIntervalMs;
+		if (typeof v !== 'number' || !Number.isFinite(v) || v < 100) {
+			throw new Error(
+				'adapter option `websocket.pressure.sampleIntervalMs` must be a number of at least 100 ' +
+				`milliseconds, got ${JSON.stringify(v)}.`
+			);
+		}
+	}
+	return raw;
 }
 
 /**
@@ -172,6 +225,9 @@ export function normalizeWsOptions(input) {
 	}
 	if (raw.allowUnauthenticatedSubscribe !== undefined) {
 		options.allowUnauthenticatedSubscribe = requireBoolean(raw.allowUnauthenticatedSubscribe, 'allowUnauthenticatedSubscribe');
+	}
+	if (raw.pressure !== undefined) {
+		options.pressure = requirePressureThresholds(raw.pressure);
 	}
 	if (raw.compressCredentialedResponses !== undefined) {
 		options.compressCredentialedResponses = requireBoolean(
