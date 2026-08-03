@@ -13,6 +13,9 @@ const ITERS = 2_000_000;
 const TOPICS = 32; // realistic live-topic cardinality inside one sample window
 
 const topicPublishStats = new Map();
+// Keep byte-identical with bumpTopicPublish in src/runtime/handler/platform.js
+// (module-private there, so it cannot be imported): if the shipped bump gains
+// work, this copy must gain it too or the micro measures a stale shape.
 function bumpTopicPublish(topic, count, size) {
 	let s = topicPublishStats.get(topic);
 	if (s === undefined) {

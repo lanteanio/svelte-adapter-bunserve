@@ -68,7 +68,9 @@ export const WS_CAPS = Symbol('caps');
  * The connection's send-gate window, present only after a `hello` carrying the
  * `lease` capability armed flow control (first hello only - a re-sent hello
  * never resets the window). Shape: `{ gate, saturation }` where `gate` is a
- * createLeaseState machine and `saturation` its last observed 0..1 reading.
+ * createLeaseState machine and `saturation` its last observed 0..1 reading -
+ * which today always reads 0, because the observation happens after the
+ * re-grant (see the request-n lane in handler/ws.js).
  */
 export const WS_LEASE = Symbol('lease');
 
