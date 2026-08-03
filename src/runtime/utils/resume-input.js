@@ -98,8 +98,9 @@ export function isValidResumeSessionId(v) {
 /**
  * An epoch the server could actually have issued: a non-negative integer.
  *
- * `processEpoch()` is a random uint32 (`crypto.getRandomValues`), so the domain
- * is the non-negative integers. Unlike a watermark there is no app-supplied
+ * `processEpoch()` is a random uint32 (drawn through the runtime seam, from
+ * node:crypto in the default env), so the domain is the non-negative
+ * integers. Unlike a watermark there is no app-supplied
  * lane widening it - an epoch is only ever minted by the server and echoed
  * back - so integrality is safe to require here in a way it is not above. No
  * ceiling: an app running its own cluster-wide epoch scheme may number past

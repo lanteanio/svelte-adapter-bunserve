@@ -11,6 +11,15 @@ import { normalizeWsOptions } from './runtime/utils/ws-options.js';
 
 const runtimeDir = fileURLToPath(new URL('./runtime', import.meta.url).href);
 
+// The simulation lane rides src/runtime in the package but never in a built
+// app: it is reached by path from scripts/ and test/, and nothing the
+// production server imports resolves any of these. Copying them into every
+// build output would be dead weight, so the copy filters them out.
+const SIM_LANE_FILES = new Set([
+	'sim-core.js', 'sim-inmemory.js', 'sim-hooks.js', 'sim-loader.mjs',
+	'invariants.js', 'auditor.js', 'steadystate.js'
+]);
+
 // Files larger than this stay out of the in-memory static cache and are
 // served from disk via Bun.file (kernel sendfile). See the runtime's
 // static-assets module; overridable via the `staticCacheMaxFileSize` option.
@@ -302,6 +311,7 @@ export default function (opts = {}) {
 			}
 
 			builder.copy(runtimeDir, out, {
+				filter: (file) => !SIM_LANE_FILES.has(path.basename(file)),
 				replace: {
 					MANIFEST: './server/manifest.js',
 					SERVER: './server/index.js',

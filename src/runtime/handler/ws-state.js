@@ -387,9 +387,9 @@ export function processEpoch() {
 }
 
 /**
- * Re-latch the seq-space generation (simulation/test harness only): a sim
- * installs its seeded env and re-draws, so every run's epoch is a function of
- * the seed rather than of module-load randomness.
+ * Re-latch the seq-space generation (simulation/test harness only): the sim
+ * pins a fixed virtual epoch per run, and a test may redraw so the value
+ * stops depending on module-load randomness.
  */
 export function resetProcessEpoch(next) {
 	// A harness may LATCH a specific generation; argless, it redraws through

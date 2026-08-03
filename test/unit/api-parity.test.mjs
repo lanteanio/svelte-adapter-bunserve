@@ -118,6 +118,49 @@ const WS_OPTION_GAPS = {
 	unsafeSameOriginWithoutHostPin: 'origin pinning escape hatch'
 };
 
+/**
+ * Export subpaths uws declares and this adapter does not. A single-entry
+ * adapter today: the browser client and the plugin families ship from uws's
+ * own package, and the sim stays internal, reached by path from scripts/ and
+ * test/ rather than exported.
+ */
+const EXPORT_GAPS = {
+	'./client': 'browser client',
+	'./plugins/channels': 'plugin: channels',
+	'./plugins/channels/client': 'plugin: channels',
+	'./plugins/crdt': 'plugin: crdt',
+	'./plugins/crdt/channel': 'plugin: crdt',
+	'./plugins/crdt/client': 'plugin: crdt',
+	'./plugins/crdt/replica': 'plugin: crdt',
+	'./plugins/cursor': 'plugin: cursor',
+	'./plugins/cursor/client': 'plugin: cursor',
+	'./plugins/dedup': 'plugin: dedup',
+	'./plugins/groups': 'plugin: groups',
+	'./plugins/groups/client': 'plugin: groups',
+	'./plugins/lock': 'plugin: lock',
+	'./plugins/middleware': 'plugin: middleware',
+	'./plugins/presence': 'plugin: presence',
+	'./plugins/presence/client': 'plugin: presence',
+	'./plugins/queue': 'plugin: queue',
+	'./plugins/ratelimit': 'plugin: ratelimit',
+	'./plugins/replay': 'plugin: replay',
+	'./plugins/replay/client': 'plugin: replay',
+	'./plugins/session': 'plugin: session',
+	'./plugins/smooth': 'plugin: smooth',
+	'./plugins/smooth/client': 'plugin: smooth',
+	'./plugins/smooth/random': 'plugin: smooth',
+	'./plugins/throttle': 'plugin: throttle',
+	'./plugins/webhooks': 'plugin: webhooks',
+	'./safe-url': 'safe-url helper',
+	'./sim': 'sim is internal here, reached by path, not exported',
+	'./testing': 'testing server double',
+	'./upgrade-response': 'upgrade-response helper',
+	'./vite': 'vite dev plugin'
+};
+
+/** Export subpaths this adapter declares that uws does not. */
+const EXPORT_EXTRAS = {};
+
 /** `websocket.*` keys this adapter accepts that uws does not declare. */
 const WS_OPTION_EXTRAS = {
 	allowUnauthenticatedSubscribe: 'drift: uws gates this differently',
@@ -210,6 +253,13 @@ test('websocket options match the uws contract, or the difference is recorded', 
 		WS_OPTION_GAPS,
 		WS_OPTION_EXTRAS
 	);
+});
+
+test('export subpaths match the uws contract, or the difference is recorded', () => {
+	const pkg = JSON.parse(
+		readFileSync(new URL('../../package.json', import.meta.url), 'utf8')
+	);
+	assertParity('export subpath', Object.keys(pkg.exports), surface.exports, EXPORT_GAPS, EXPORT_EXTRAS);
 });
 
 test('the options uws nests under `websocket` are nested here too, not top-level', () => {

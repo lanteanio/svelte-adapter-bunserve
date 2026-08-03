@@ -74,5 +74,9 @@ test('the committed corpus declares the family swarm config', () => {
 	assert.equal(corpus.swarm.faultMode, 'random');
 	assert.equal(corpus.swarm.faultProbability, 0.25);
 	assert.deepEqual(corpus.swarm.faultProfile, { drop: 0.25, duplicate: 0.15, reorder: 0.5, maxJitterMs: 30 });
+	// The base run config must stay empty: verify() replays the corpus under
+	// the corpus's own recorded swarm block, so an unnoticed base would let
+	// the corpus verify against itself under a config nobody reviewed.
+	assert.deepEqual(corpus.swarm.base, {});
 	assert.equal(corpus.entries.length, 40);
 });

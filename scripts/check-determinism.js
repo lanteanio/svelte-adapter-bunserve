@@ -13,10 +13,13 @@
  * them means an import-graph-aware lint): an aliased import
  * (`import { randomBytes as rb }`) escapes the name patterns; a reference
  * that is not called on the same line (`const f = Date.now`, or a call split
- * across lines) escapes the trailing-paren match; and ALLOW_FILES matches by
- * basename, so ANY file named runtime.js is exempt wherever it lives. The
- * scan is a ratchet against honest drift, not a sandbox against adversarial
- * code - review still owns intent.
+ * across lines) escapes the trailing-paren match; ALLOW_FILES matches by
+ * basename, so ANY file named runtime.js or client-runtime.js is exempt
+ * wherever it lives; lines that LOOK like comments are skipped textually, so
+ * a multi-line template-literal line starting with `//` or `*` is invisible;
+ * and the determinism-allow marker is honored anywhere on a line, string
+ * content included. The scan is a ratchet against honest drift, not a
+ * sandbox against adversarial code - review still owns intent.
  *
  * Modes:
  *   - default: WARN. Prints a per-file summary of raw call sites and exits 0, so
@@ -91,7 +94,7 @@ function isUnderSrc(rel) {
 // same line (we report one primitive per line).
 const PATTERNS = [
 	['Date.now', /\bDate\s*\.\s*now\s*\(/],
-	['new Date', /\bnew\s+Date\s*\(/],
+	['new Date', /\bnew\s+Date\b/],
 	['performance.now', /\bperformance\s*\.\s*now\s*\(/],
 	['Math.random', /\bMath\s*\.\s*random\s*\(/],
 	['crypto.randomUUID', /\bcrypto\s*\.\s*randomUUID\s*\(/],
@@ -108,7 +111,11 @@ const PATTERNS = [
 	['clearInterval', /\bclearInterval\s*\(/],
 	['queueMicrotask', /\bqueueMicrotask\s*\(/],
 	['process.hrtime', /\bprocess\s*\.\s*hrtime\b/],
-	['process.nextTick', /\bprocess\s*\.\s*nextTick\s*\(/]
+	['process.nextTick', /\bprocess\s*\.\s*nextTick\s*\(/],
+	// The served runtime targets Bun, so Bun's own clock/timer spellings are
+	// part of the raw surface, not an exotic case.
+	['Bun.sleep', /\bBun\s*\.\s*sleep\s*\(/],
+	['Bun.nanoseconds', /\bBun\s*\.\s*nanoseconds\s*\(/]
 ];
 
 function shouldSkipPath(rel) {
