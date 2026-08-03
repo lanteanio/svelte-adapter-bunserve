@@ -395,7 +395,10 @@ export const wsCounters = {
 	/**
 	 * Worst per-connection send-gate saturation observed since the last
 	 * sample; written on `request-n`, folded into the snapshot value by the
-	 * sampler, then decayed by half each tick.
+	 * sampler, then decayed by half each tick. The write site reads a freshly
+	 * re-granted window (the sibling's order, kept for parity), which is 0
+	 * for a server that never consumes permits - so the fold is armed but
+	 * cannot lift the value today. See the request-n lane in handler/ws.js.
 	 */
 	leaseSaturationPeak: 0,
 

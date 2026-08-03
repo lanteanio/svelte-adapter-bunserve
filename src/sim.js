@@ -78,6 +78,7 @@ const {
 } = await import('./runtime/handler/ws-state.js');
 const { _resetWireCodecRegistry } = await import('./runtime/handler/codec-registry.js');
 const { _resetSharedWireIds } = await import('./runtime/utils/shared-wire-id.js');
+const { stopPressureSampling } = await import('./runtime/handler/pressure-metrics.js');
 
 export { resetProcessEpoch };
 
@@ -106,6 +107,10 @@ function resetSimState() {
 	pendingCloseHooks.clear();
 	capCounts.clear();
 	resetDraining();
+	// Nothing in the sim graph starts the sampler today, but a scenario or a
+	// test in this process MAY - and a live interval crossing seeds would be
+	// exactly the contamination this reset exists to prevent.
+	stopPressureSampling();
 	_resetWireCodecRegistry();
 	_resetSharedWireIds();
 	wsCounters.closedWsAborts = 0;

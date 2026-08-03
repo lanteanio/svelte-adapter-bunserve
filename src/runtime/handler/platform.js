@@ -91,22 +91,28 @@ import {
 import { allow_unauthenticated_subscribe, ws_compression_on, ws_options } from './config.js';
 
 /**
- * Record one publish against the per-topic window stats the pressure sampler
- * drains: message count and envelope bytes per topic since the last sample.
+ * Record publishes against the per-topic window stats the pressure sampler
+ * drains: message count and envelope size per topic since the last sample.
  * Called beside every `publishCountWindow` bump so `publishRate` and
  * `topPublishers` are computed over the same window from the same events.
  *
+ * `size` is the envelope's STRING length - UTF-16 code units, the same
+ * measure the sibling records - so the bytes-per-second threshold undercounts
+ * non-ASCII payloads by up to 3x. Consistent on both adapters; a true byte
+ * count would pay an encode on the publish fast path.
+ *
  * @param {string} topic
- * @param {number} bytes - the JSON envelope's string length
+ * @param {number} count - publishes recorded by this call
+ * @param {number} size - summed envelope string length across them
  */
-function bumpTopicPublish(topic, bytes) {
+function bumpTopicPublish(topic, count, size) {
 	let s = topicPublishStats.get(topic);
 	if (s === undefined) {
 		s = { m: 0, b: 0 };
 		topicPublishStats.set(topic, s);
 	}
-	s.m++;
-	s.b += bytes;
+	s.m += count;
+	s.b += size;
 }
 
 /** Throws from the app's subscribe hook, throttled with decay. */
@@ -541,7 +547,7 @@ export const platform = {
 		if (seq !== null) notePublishedSeq(topic, seq, authoritative);
 		wsCounters.publishCount++;
 		wsCounters.publishCountWindow++;
-		bumpTopicPublish(topic, envelope.length);
+		bumpTopicPublish(topic, 1, envelope.length);
 		const compress = ws_compression_on && compressOpt !== false;
 		// A connection still gap-filling this topic (resume cutover in
 		// flight) is not yet subscribed to live, so hold the envelope it
@@ -711,7 +717,7 @@ export const platform = {
 		if (seq !== null) notePublishedSeq(topic, seq, authoritative);
 		wsCounters.publishCount++;
 		wsCounters.publishCountWindow++;
-		bumpTopicPublish(topic, envelope.length);
+		bumpTopicPublish(topic, 1, envelope.length);
 		// Binary codec frames (and this call's JSON-fallback frames) compress
 		// only when the caller opts in with `{ compress: true }` AND a
 		// compressor is configured. One decision governs the whole call so a
@@ -1197,7 +1203,12 @@ export const platform = {
 		}
 		wsCounters.publishCount += n;
 		wsCounters.publishCountWindow += n;
-		for (let i = 0; i < n; i++) bumpTopicPublish(topic, envs[i].length);
+		// One topic, one Map lookup: sum the sizes first, record once.
+		{
+			let batchEnvelopeSize = 0;
+			for (let i = 0; i < n; i++) batchEnvelopeSize += envs[i].length;
+			bumpTopicPublish(topic, n, batchEnvelopeSize);
+		}
 		// Resume cutover in flight: hold the per-entry JSON envelopes a
 		// caps-less resuming subscriber would receive from this batch, each
 		// skipping the socket its own entry excluded.

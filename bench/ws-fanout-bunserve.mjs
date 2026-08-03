@@ -1,9 +1,12 @@
 // WebSocket fan-out benchmark server: the Bun.serve side of the family's
 // ws-fanout A/B (the sibling's bench suite carries the uWS side with the
 // identical message semantics: control-prefix subscribe parsing, JSON
-// envelope wrapping, publish fan-out, user-message rebroadcast). This one
-// imports the adapter's REAL pure utils for the demux and the envelope, so
-// the measured path is the shipped byte-work, not a re-spelling of it.
+// envelope wrapping, publish fan-out, user-message rebroadcast). The demux
+// and envelope byte-work are the shipped modules, imported; the rest is a
+// transport FLOOR - no gate, no facade, no counters - exactly like the
+// sibling's bench server, so the pair measures transport against transport.
+// The adapter's own per-publish bookkeeping cost is measured separately by
+// bench/publish-bump-micro.mjs.
 //
 // Run under Bun:  bun bench/ws-fanout-bunserve.mjs
 // Then drive it:  bun bench/ws-fanout-client.mjs [clients] [duration_s]

@@ -51,8 +51,12 @@ async function run() {
 	for (const sender of senders) {
 		intervals.push(setInterval(() => {
 			for (let i = 0; i < MSGS_PER_TICK; i++) {
-				if (sender.readyState === 1) sender.send(PAYLOAD);
-				totalSent++;
+				// Count only what actually went out: a dropped sender must
+				// deflate the send rate, not fake a worse fan-out ratio.
+				if (sender.readyState === 1) {
+					sender.send(PAYLOAD);
+					totalSent++;
+				}
 			}
 		}, TICK_MS));
 	}

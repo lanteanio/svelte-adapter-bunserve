@@ -81,26 +81,32 @@ Prototype phase. The build order:
    return poisons the capability for that connection; returning `null`
    declines cleanly and keeps binary available), and resume gap-fill with a
    live-frame barrier across the cutover.
-   Known-open on the realtime tier: the pressure/protection surface is not
-   implemented - those members are ABSENT from the platform rather than
-   stubbed, so nothing reports success while doing nothing. The deferred
-   JSON-tier members are likewise absent: `request` and `requestTopic`
-   (server-initiated request/reply), the coalescing and batching send variants
-   (`sendCoalesced`, `batch`, `publishBatched`), and `topicEpoch`.
-5. Backpressure/flow-control parity, then the conformance gate against the
-   family's deterministic simulation goldens.
+   Known-open on the realtime tier: the deferred JSON-tier members are
+   absent rather than stubbed, so nothing reports success while doing
+   nothing: `request` and `requestTopic` (server-initiated request/reply),
+   the coalescing and batching send variants (`sendCoalesced`, `batch`,
+   `publishBatched`), and `topicEpoch`. The protection POSTURE machine's
+   option is likewise not accepted yet - `platform.protection` reads
+   `'normal'` - while the pressure sampling, observability members and
+   LEASE/REQUEST_N flow control are live (step 5, done).
+5. Backpressure/flow-control parity (done: the pressure sampler,
+   `platform.pressure`/`onPressure`/`onPublishRate`, and the lease window
+   lane), and the conformance gate against the family's deterministic
+   simulation goldens (done: `npm run sim:golden`, fingerprint-identical to
+   the sibling's corpus at the pin).
 
 Single-process at launch; a multi-process mode is planned.
 
 **Multi-node fan-out does not work yet.**
 [svelte-adapter-uws-extensions](https://github.com/lanteanio/svelte-adapter-uws-extensions)
 (Redis/Valkey) is transport-agnostic and is the intended path, but its
-`bus.wrap(platform)` binds four members this adapter does not implement yet
-(`sendCoalesced`, `request`, `onPressure`, `onPublishRate`) without
-feature-detecting them, so it throws a `TypeError` at startup against this
-adapter. It needs either those members (steps 4 and 5 above) or the same
-guards it already applies to its other optional members. Until one of those
-lands, treat this adapter as single-node.
+`bus.wrap(platform)` binds four members without feature-detecting them:
+`onPressure` and `onPublishRate` (now live here) plus `sendCoalesced` and
+`request`, which this adapter does not implement yet - so it still throws a
+`TypeError` at startup against this adapter, on those two. It needs either
+those members (step 4 above) or the same guards it already applies to its
+other optional members. Until one of those lands, treat this adapter as
+single-node.
 
 ## WebSockets
 
@@ -721,7 +727,13 @@ figures are the point, absolute ones will differ elsewhere):
 
 At 50 subscribers both sides deliver the senders' full output at a perfect
 fan-out ratio - the client, not either server, is the bottleneck - so the
-honest reading is parity-class throughput, not a ranking. The flow-control
+honest reading is parity-class throughput, not a ranking. The fan-out pair
+measures transport against transport (both bench servers are floors without
+the adapters' gates and counters); the adapter's own per-publish pressure
+bookkeeping is measured separately by `bench/publish-bump-micro.mjs`:
+6.5 ns/publish on the recorded run, beside a 49 ns envelope build and the
+native fan-out a real publish also pays - the same bookkeeping the sibling
+performs on its own publish lanes. The flow-control
 engagement proof is its own bench, not an estimate: a slow consumer opting
 into the `lease` capability against the real built server sees exactly one
 `lease-ok`, a sized window per grant (windows visibly shrink when the

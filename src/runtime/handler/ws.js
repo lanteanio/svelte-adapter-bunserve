@@ -527,6 +527,14 @@ export const websocketHandlers = {
 						const g = grantSizeFor();
 						slot.gate.requestN(g.count, g.ttlMs);
 						sendControl(ws, leaseGrantFrame(g.count, g.ttlMs));
+						// Read AFTER the re-grant - the sibling's exact order,
+						// kept for parity. A grant-and-observe server never
+						// consumes permits, so a freshly re-granted window
+						// reads 0 and the peak fold below cannot fire today;
+						// the meaningful reading would be the OLD window's,
+						// taken before requestN. That reordering changes the
+						// snapshot fold on both adapters, so it lands in the
+						// sibling first and this site follows.
 						slot.saturation = slot.gate.pressureValue();
 						if (slot.saturation > wsCounters.leaseSaturationPeak) {
 							wsCounters.leaseSaturationPeak = slot.saturation;
