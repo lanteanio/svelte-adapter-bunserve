@@ -14,6 +14,11 @@ import path from 'node:path';
 // that adds a per-request disk touch, an extra header build, or a lost cache
 // shows up as a changed COUNT under 6x load, deterministically.
 //
+// NOT covered, honestly: per-response socket writes. Bun.serve owns the
+// transmit path - the adapter hands it a Response and never touches the
+// socket - so there is no seam to count writes through. The countable seams
+// above are everything the adapter's own code contributes per response.
+//
 // Lowering a budget needs no discussion. RAISING one is a design decision -
 // it says a response now costs more I/O - so record the reason in the comment
 // on that budget, in the same change that raises it.
@@ -97,7 +102,10 @@ test('a cached asset costs one Headers and one Response, and 6x costs exactly 6x
 	// headers: 1 is the single entryHeaders build from the tuples baked at
 	// index time - the "single Headers construction" the static lane's
 	// design comments promise. The Response constructor contributes zero
-	// global Headers constructions (measured; pinned by this exact count).
+	// global Headers constructions - a property of undici's INTERNAL Headers
+	// class, not of this codebase, so a Node upgrade could shift that term
+	// of the count. If this gate ever fails with headers off by a constant
+	// per Response across every test here, suspect undici first.
 	const one = cost(() => serveStatic(small, NO_HEADERS));
 	assert.deepEqual(one, { response: 1, headers: 1, bunFile: 0, decode: 0 });
 	const six = cost(() => {

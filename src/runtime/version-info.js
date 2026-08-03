@@ -109,14 +109,20 @@ function siblingVersion(specifier, packageName) {
  * }}
  */
 export function versionInfo() {
-	let name = 'svelte-adapter-bunserve';
+	const name = 'svelte-adapter-bunserve';
 	let version = null;
 	const pkgText = readMeta('package.json');
 	if (pkgText) {
 		try {
 			const pkg = JSON.parse(pkgText);
-			if (typeof pkg.name === 'string') name = pkg.name;
-			if (typeof pkg.version === 'string') version = pkg.version;
+			// Identity-checked, like the sibling walk below: with meta/
+			// pruned from a build, the fallback path can land on a WORKSPACE
+			// manifest above the output directory, and a banner that
+			// confidently misidentifies is worse than one that says unknown.
+			// The schema read below carries its own identity check - the
+			// revision parse answers null for anything that is not the
+			// family schema.
+			if (pkg.name === name && typeof pkg.version === 'string') version = pkg.version;
 		} catch {
 			// A corrupt manifest downgrades the banner, never the boot.
 		}
