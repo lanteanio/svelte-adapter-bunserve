@@ -211,6 +211,10 @@ export function POST({ platform }) {
 | `totalSubscriptions` / `publishCount` | instance-wide subscription total, and publishes since boot |
 | `maxPayloadLength` / `bufferedAmount(ws)` / `closedWsAborts` | limits and backpressure telemetry |
 | `droppedReleaseRecords` | instance-wide; non-zero means an `unsubscribe` hook failed often enough that some releases are no longer covered by the close-hook fallback |
+| `pressure` | the LIVE 1 Hz sample (mutated in place, never copied): `{ active, value, reason, subscriberRatio, publishRate, memoryMB, maxBufferedBytes, backpressuredConnections, psi, cpuThrottle, topPublishers }`; `reason` precedence is MEMORY > CAPACITY > CPU_QUOTA > PSI > PUBLISH_RATE > SUBSCRIBERS > NONE; kernel readings are `null` off-Linux |
+| `protection` | `'normal' \| 'elevated' \| 'siege'`; `'normal'` today (the posture machine's option is not yet accepted here) |
+| `onPressure(cb)` | fires on `reason` TRANSITIONS with the live snapshot; throwing callbacks are contained; returns unsubscribe |
+| `onPublishRate(cb)` | per-topic runaway-publisher reports `[{ topic, messagesPerSec, bytesPerSec }]` once per window; registering replaces the default throttled console warning; returns unsubscribe |
 | `topic(name)` | scoped publisher: `platform.topic('chat').created(data)` |
 | `requestId` | per-connection / per-request identity |
 | `now()` / `monotonic()` / `random.float()` `.u32()` `.uuid()` `.bytes(n)` | determinism seams |
@@ -289,7 +293,21 @@ adapter: bunserve({
 		maxConcurrentSubscribeGates: 64,
 		maxConcurrentUnsubscribeHooks: 64,
 		maxQueuedUnsubscribeHooks: 1024,
-		maxControlEgressBytes: 4 * 1024 * 1024
+		maxControlEgressBytes: 4 * 1024 * 1024,
+		// Pressure-sampler thresholds; each signal accepts `false` to
+		// disable it. The sampler always runs - this only tunes it.
+		pressure: {
+			memoryHeapUsedRatio: 0.85,
+			publishRatePerSec: 10_000,
+			subscriberRatio: 50,
+			sampleIntervalMs: 1000,           // clamped to >= 100
+			topicPublishRatePerSec: 5000,
+			topicPublishBytesPerSec: 10 * 1024 * 1024,
+			psiCpuSome: 60,                   // kernel signals; inert off-Linux
+			psiMemoryFull: 15,
+			psiIoFull: 50,
+			cpuThrottledRatio: 0.25
+		}
 	}
 })
 ```
@@ -399,7 +417,18 @@ Client to server: `subscribe` (optionally carrying
 `recover: { offset, epoch? }` to gap-fill the missed tail before going live),
 `unsubscribe`, `subscribe-batch` (each accepts an optional `ref`),
 `hello` (`{"caps":[...]}` capability declaration; re-sends replace the set),
+`request-n` (flow-control window replenish; the carried `n` is advisory - the
+server sizes every window from its own posture),
 and `resume` (`{"sessionId","lastSeenSeqs",{"lastSeenEpochs"?}}`).
+
+A `hello` whose caps include `lease` arms flow control on that connection,
+FIRST hello only: the server answers `{"type":"lease-ok"}` plus a
+`{"type":"lease","count","ttlMs"}` window grant, and re-grants on each
+`request-n`. Windows shrink as the worker's heap and subscriber load tighten
+and always floor, so an opted-in client keeps making forward progress; the
+server never gates its own sends on the window - pacing is the client's job,
+which is what makes a non-opting old client's behavior byte-identical to
+before.
 
 A `subscribe-batch` and a `resume` each name at most **256 topics** - the
 batch's entries, and the UNION of the resume's `lastSeenSeqs` and
@@ -667,6 +696,37 @@ npm run build          # ADAPTER=uws / ADAPTER=node for the A/B variants
 bun build/index.js     # serve the bunserve build
 node ../../bench/http-bench.mjs http://127.0.0.1:3000/ 32 8
 ```
+
+The WebSocket tier line ("Bun, natively" vs uws's "maximum performance") is a
+performance statement, never a capability statement, and the numbers behind it
+come from three benches, run pairwise against svelte-adapter-uws's own bench
+server with one shared client and workload:
+
+```sh
+bun bench/ws-fanout-bunserve.mjs           # this side; the uws side is
+                                           # node <uws>/bench/24-ws-adapter-uws.mjs
+bun bench/ws-fanout-client.mjs 200 8       # same client against either server
+bun bench/idle-rss.mjs --cmd "bun bench/ws-fanout-bunserve.mjs" --clients 1000
+bun bench/lease-engagement.mjs             # flow control against the REAL built server
+```
+
+Measured on one Windows x64 dev machine (Bun 1.3.14, Node 24; relative
+figures are the point, absolute ones will differ elsewhere):
+
+| workload | `svelte-adapter-bunserve` | `svelte-adapter-uws` |
+|---|---|---|
+| fan-out, 50 subscribers, 10 senders | 1.97M msg/s delivered (50.0x) | 1.95M msg/s delivered (50.0x) |
+| fan-out, 200 subscribers, 10 senders | 2.53M msg/s delivered (200.0x) | 2.38M msg/s delivered (200.0x) |
+| idle memory, 1000 held sockets | +2.5 KB/socket (62.5 MB baseline) | +2.4 KB/socket (108.7 MB baseline) |
+
+At 50 subscribers both sides deliver the senders' full output at a perfect
+fan-out ratio - the client, not either server, is the bottleneck - so the
+honest reading is parity-class throughput, not a ranking. The flow-control
+engagement proof is its own bench, not an estimate: a slow consumer opting
+into the `lease` capability against the real built server sees exactly one
+`lease-ok`, a sized window per grant (windows visibly shrink when the
+worker's heap tightens), one `request-n` per low-water window, and its whole
+paced backlog delivered (2000 sends through 30 windows in the recorded run).
 
 The unit suite covers the pure decision modules (range parsing, content
 negotiation, path canonicalization, proxy trust, header validation) and runs
