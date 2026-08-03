@@ -127,36 +127,6 @@ function wireJsonSend(ws, topic, event, data, compress) {
 }
 
 /**
- * Note this publish's seq against the topic's authoritative high-water mark -
- * the resume barrier's fallback dedup floor, and its ceiling on a watermark a
- * resume hook reports - LRU-bounded in notePublishedSeq. Only an explicit
- * numeric seq is a value that mark can hold: it is cluster-authoritative and
- * may arrive reordered, so it takes the monotone guard there. A `{ seq: true }`
- * counter seq belongs to an unrelated space and only keeps the topic recent.
- *
- * @param {string} topic
- * @param {number | null} seq
- * @param {{ seq?: boolean | number } | undefined} options
- */
-function recordPublishedSeq(topic, seq, options) {
-	if (seq === null) return;
-	notePublishedSeq(topic, seq, isAuthoritativeSeq(options));
-}
-
-/**
- * Whether a publish carries an explicit numeric (cluster-authoritative) seq,
- * as opposed to the local `{ seq: true }` counter. The resume dedup floor is
- * an authoritative-space quantity, so only authoritative frames are compared
- * against it.
- *
- * @param {{ seq?: boolean | number } | undefined} options
- * @returns {boolean}
- */
-function isAuthoritativeSeq(options) {
-	return !!(options && typeof options.seq === 'number');
-}
-
-/**
  * A batch published with one explicit cluster seq for all of its entries.
  *
  * FAIL FAST RATHER THAN CORRUPT THE WIRE, the same judgement stampExplicitSeq
@@ -193,10 +163,12 @@ function throwBatchExplicitSeq(topic, seq) {
  * decode desync poisoning exists for. Callers that passed a non-null state
  * read this immediately after the call and poison on it. A module flag rather
  * than a sentinel return or a callback: every existing `payload == null`
- * check stays exhaustive, and the fan-out walk allocates nothing for it. The
- * write that matters happens after wire.encode returns or throws, so a codec
- * that publishes re-entrantly (resetting the flag inside) cannot leave a
- * stale value behind.
+ * check stays exhaustive, and the fan-out walk allocates nothing for it.
+ * EVERY path writes the flag after wire.encode has returned or thrown -
+ * including the success and clean-decline paths - so the last write always
+ * describes the call that just finished, and a codec that publishes
+ * re-entrantly (an inner failure setting the flag mid-call) cannot leave the
+ * inner verdict behind for the outer read.
  */
 let encodeFailed = false;
 
@@ -217,10 +189,13 @@ let encodeFailed = false;
  * @returns {Uint8Array | null}
  */
 function safeEncode(wire, event, data, state) {
-	encodeFailed = false;
 	let payload;
 	try {
 		payload = wire.encode(event, data, state);
+		// Written AFTER encode returned, never before it runs: encode is app
+		// code and may publish re-entrantly, and an entry-time reset would
+		// let an inner call's failure survive an outer call's clean decline.
+		encodeFailed = false;
 	} catch (err) {
 		encodeFailed = true;
 		const { log, count } = encodeFailedThrottle();
@@ -1185,8 +1160,12 @@ export const platform = {
 		// nothing else. No contract anywhere calls that lane contiguous.
 		const server = getServer();
 		for (let i = 0; i < n; i++) {
+			// Never authoritative on the else-branch: a numeric batch-level
+			// seq threw above, so the captured options can only say counter
+			// (true) or nothing - and a counter seq only keeps the topic
+			// recent, it never writes the authoritative mark.
 			if (authoritative[i]) notePublishedSeq(topic, seqs[i], true);
-			else recordPublishedSeq(topic, seqs[i], options);
+			else if (seqs[i] !== null) notePublishedSeq(topic, seqs[i], false);
 		}
 		wsCounters.publishCount += n;
 		// Resume cutover in flight: hold the per-entry JSON envelopes a
@@ -1290,9 +1269,14 @@ export const platform = {
 			}
 			const updates = new Array(list.length);
 			for (let i = 0; i < list.length; i++) updates[i] = list[i].data;
-			const payload = safeEncode(wire, event + '-batch', { updates }, state);
+			// The schema version is read BEFORE the encode: `state` is the
+			// codec's own onAttach object, so this read can run app code (an
+			// accessor), and app code between safeEncode and the encodeFailed
+			// read below could run another encode and overwrite the flag.
+			// Same order as sendWireBatch.
 			const sv =
 				typeof state.schemaVersion === 'number' ? state.schemaVersion : wire.schemaVersion;
+			const payload = safeEncode(wire, event + '-batch', { updates }, state);
 			if (payload == null) {
 				// A FAILED batch encode may have advanced this connection's
 				// dictionaries partway - running the per-entry encodes below

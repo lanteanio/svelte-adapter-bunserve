@@ -674,6 +674,47 @@ test('a failing STATEFUL encode poisons the capability to JSON; a decline does n
 	}
 });
 
+test("an inner re-entrant failure cannot poison an outer codec's clean decline", () => {
+	// encode is app code and may publish re-entrantly. The failure flag is
+	// written after EVERY return path of the encode it describes - an
+	// entry-time reset instead would let an inner call's failure survive an
+	// outer call's clean decline, and one codec's bug would then poison a
+	// DIFFERENT codec's healthy connection.
+	const realError = console.error;
+	console.error = () => {};
+	try {
+		setServer(fakeServer());
+		const innerWire = { capability: 'cap:inner', schemaVersion: 1, encode: () => ({}) };
+		const outer = fakeWs({ topics: ['room'], caps: [CAP, 'cap:inner'] });
+		const outerWire = {
+			capability: CAP,
+			schemaVersion: 2,
+			state: { onAttach: () => ({}) },
+			encode: () => {
+				// The inner publish FAILS (wrong-type return, stateless codec:
+				// poisons nothing itself) and then this codec declines cleanly.
+				platform.publishWire('room', 'inner-moved', { x: 1 }, innerWire);
+				return null;
+			}
+		};
+		withConnections([outer], () => {
+			platform.publishWire('room', 'moved', { x: 1 }, outerWire);
+			assert.equal(
+				wireStatePoisoned(outer.ud, CAP),
+				false,
+				"the outer decline stayed a decline - the inner failure's flag did not leak"
+			);
+			assert.equal(
+				wireStatePoisoned(outer.ud, 'cap:inner'),
+				false,
+				'and the stateless inner codec never poisons anything'
+			);
+		});
+	} finally {
+		console.error = realError;
+	}
+});
+
 test('a failing stateful BATCH encode poisons and serves the JSON envelopes', () => {
 	// The batch form encodes every entry against the connection state in one
 	// call. A failure may have advanced the dictionaries partway, so the
