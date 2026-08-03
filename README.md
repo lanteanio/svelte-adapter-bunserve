@@ -517,6 +517,17 @@ carries `"seq":0`; a negative seq parses back off the wire as a different number
 the JSON envelope prints it in full. The counter lane and every shipped
 authority are 1-based, so a 0-based external source must offset by 1.
 
+One rule the integer check cannot enforce: a topic's explicit seqs must all
+come from ONE authority. The mark they advance is monotone - it only ever
+moves up - and no number carries the identity of the counter that issued it,
+so a single publish stamped from somewhere else (`{ seq: Date.now() }` in a
+one-off code path, a second partition's offsets, an upstream counter that
+restarted after a redeploy) pins the mark at that value for the life of the
+process. Every later resume window on that topic then dedups explicit frames
+against a floor from the wrong sequence space, silently. Keep one issuer per
+topic; when a topic's seq space must genuinely change, publish under a new
+topic name rather than reusing the old one under a new counter.
+
 A seq that breaks the rule THROWS a `TypeError` rather than being absorbed.
 Publishing it seq-less instead would degrade the client's resume dedup with
 nothing to notice it by, and falling back to the counter would be worse still:
