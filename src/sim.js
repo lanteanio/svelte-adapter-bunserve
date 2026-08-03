@@ -44,8 +44,10 @@ globalThis.WS_OPTIONS ??= normalizeWsOptions({ allowUnauthenticatedSubscribe: tr
 // A resolvable, fixed server origin: config.js reads ORIGIN once at import,
 // the same-origin default compares upgrades against it, and the sim's clients
 // send the matching Origin header exactly as a browser or the family client
-// would. A fixed value, so nothing about the environment leaks into a run.
-process.env.ORIGIN ??= 'http://sim.invalid';
+// would. Assigned UNCONDITIONALLY, unlike the globals above: an ambient
+// ORIGIN in the shell would win a `??=`, turn every sim upgrade cross-origin,
+// and drift the corpus for reasons outside the run.
+process.env.ORIGIN = 'http://sim.invalid';
 
 register('./runtime/sim-loader.mjs', import.meta.url);
 
@@ -59,6 +61,7 @@ const {
 	envelopePrefixCache,
 	maxAuthoritativeSeq,
 	pendingCloseHooks,
+	resetDraining,
 	resetProcessEpoch,
 	resumeBuffers,
 	setServer,
@@ -88,6 +91,7 @@ function resetSimState() {
 	envelopePrefixCache.clear();
 	pendingCloseHooks.clear();
 	capCounts.clear();
+	resetDraining();
 	_resetWireCodecRegistry();
 	_resetSharedWireIds();
 	wsCounters.closedWsAborts = 0;
@@ -233,9 +237,12 @@ export async function runSim(config = {}) {
 
 	// Install the seeded virtual environment across the seam for the duration
 	// of the run, then always restore the native environment. The process
-	// epoch LATCHES to the virtual epoch - the sibling sim's semantics - so
-	// the `subscribed` ack carries the same generation on both adapters and
-	// the seeded rng stream is not shifted by an epoch draw.
+	// epoch LATCHES instead of drawing - the sibling sim's semantics - so the
+	// seeded rng stream is not shifted by an epoch draw and every later uuid
+	// and fault decision stays stream-aligned across adapters. The latched
+	// VALUES differ on the wire: the sibling latches the full epoch-ms, while
+	// resetProcessEpoch squeezes it into this adapter's u32 epoch domain. The
+	// parity is draw order, not the ack value.
 	setRuntimeEnv(scheduler.buildEnv(rng), { force: true });
 	resetProcessEpoch(config.startEpoch ?? FIXED_EPOCH);
 	try {

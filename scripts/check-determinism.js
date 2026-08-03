@@ -6,7 +6,17 @@
  * lets a seeded harness replay behavior exactly; a raw call left anywhere is a
  * silent hole that makes a replay diverge.
  *
- * Dependency-free (no eslint), modeled on check-types.js, wired into pretest.
+ * Dependency-free (no eslint); CI runs it as `npm run check:determinism` in
+ * the unit job.
+ *
+ * Known evasion holes, accepted for a dependency-free line scanner (closing
+ * them means an import-graph-aware lint): an aliased import
+ * (`import { randomBytes as rb }`) escapes the name patterns; a reference
+ * that is not called on the same line (`const f = Date.now`) escapes the
+ * trailing-paren match; and ALLOW_FILES matches by basename, so ANY file
+ * named runtime.js is exempt wherever it lives. The scan is a ratchet
+ * against honest drift, not a sandbox against adversarial code - review
+ * still owns intent.
  *
  * Modes:
  *   - default: WARN. Prints a per-file summary of raw call sites and exits 0, so
@@ -142,7 +152,7 @@ console.log(`  ${files.length} framework source file(s) scanned, ${all.length} r
 const errors = all.filter((f) => strict || isEnforced(f.rel));
 const warnings = all.filter((f) => !errors.includes(f));
 
-// Per-file summary so pretest output stays bounded; --verbose lists each site.
+// Per-file summary so CI output stays bounded; --verbose lists each site.
 const byFile = new Map();
 for (const f of warnings) byFile.set(f.rel, (byFile.get(f.rel) || 0) + 1);
 if (byFile.size) {

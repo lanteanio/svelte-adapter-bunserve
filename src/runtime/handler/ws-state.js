@@ -280,6 +280,16 @@ export function isDraining() {
 }
 
 /**
+ * Un-latch the drain flag (simulation/test harness only). Production never
+ * un-drains - the process exits - but a sim runs many seeds in one process,
+ * and a drain-lane scenario would otherwise leave every later seed's upgrades
+ * refused with a 503.
+ */
+export function resetDraining() {
+	draining = false;
+}
+
+/**
  * Per-connection subscription cap.
  *
  * This is a real bound, not a formality. One connection reaching it pins a Set
@@ -382,10 +392,13 @@ export function processEpoch() {
  * the seed rather than of module-load randomness.
  */
 export function resetProcessEpoch(next) {
-	// A harness may LATCH a specific generation (the simulator uses the virtual
-	// epoch, matching the sibling adapter's sim semantics and keeping the
-	// seeded rng stream free of this draw); argless, it redraws through the
-	// seam exactly as module load did.
+	// A harness may LATCH a specific generation; argless, it redraws through
+	// the seam exactly as module load did. A latched value is squeezed into
+	// the epoch's u32 domain (`>>> 0`, drawProcessEpoch's range), so an
+	// epoch-ms input like 1700000000000 latches as its low 32 bits and the
+	// `subscribed` ack carries a different value than a sibling that latches
+	// the full ms. What latching preserves is the DRAW ORDER: no bytes leave
+	// the seeded rng stream for this epoch, on either adapter.
 	PROCESS_EPOCH = typeof next === 'number' ? (next >>> 0) : drawProcessEpoch();
 }
 
