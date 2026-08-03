@@ -77,8 +77,10 @@ Prototype phase. The build order:
    `publishWire`/`sendWire` and their batch variants, capability negotiation
    through the `hello` frame, the per-connection wire-id announce, the shared
    cohort split for stateless `shared` codecs, degrade-to-JSON on a dropped
-   stateful frame, and resume gap-fill with a live-frame barrier across the
-   cutover.
+   stateful frame or a failing stateful `encode` (a throw or a wrong-type
+   return poisons the capability for that connection; returning `null`
+   declines cleanly and keeps binary available), and resume gap-fill with a
+   live-frame barrier across the cutover.
    Known-open on the realtime tier: the pressure/protection surface is not
    implemented - those members are ABSENT from the platform rather than
    stubbed, so nothing reports success while doing nothing. The deferred

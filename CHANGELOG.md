@@ -217,14 +217,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capture disagree about who was excluded; swapping a `data` reference put
   different payloads on the two wires under one seq; and growing or shrinking
   the entries array changed which entries went out at all. The call now reads
-  its inputs once, at the top: `options` is copied (own enumerable
-  properties, one read) before anything can observe it, and each entry is
+  its inputs once, at the top: each documented option is read exactly once
+  into a private copy - named-field reads through the prototype chain, so a
+  seq carried on a prototype or by an inherited accessor is refused exactly
+  as an own one, rather than vanishing from a spread - and each entry is
   normalised into a private record - data reference, exclusion target,
   validated seq - that both publish lanes work from, so what the batch
   publishes is what the call was handed, whatever a payload's serialisation
   code mutates in between. Payload contents are the one deliberately live
   part: the record pins the reference, and the object behind it stays the
   app's own, as on every publish lane.
+
+- `publish` and `publishWire` read the caller's live `options.seq` on both
+  sides of the payload's serialisation: the seq was stamped from one read and
+  its AUTHORITY recorded from another, with the payload's `toJSON` running in
+  between. App code that changed `options.seq` across that boundary could
+  have a counter-stamped publish recorded as cluster-authoritative - a local
+  counter value written into the topic's authoritative mark, which is the
+  resume dedup floor, so a later gap-fill window discarded genuine
+  explicit-seq frames as already-seen. The inverse flip stripped a delivered
+  explicit seq of its authority in the resume capture. Both lanes now capture
+  their options in one read per field before any app code runs - the same
+  discipline `publishWireBatch` already had - so the value stamped is the
+  value recorded, on every lane.
 
 - `publishWireBatch` conflated an explicit seq of 0 with no seq at all. It
   round-tripped every stamped seq through the wire's 0 sentinel before handing
@@ -296,8 +311,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requested size, so it spun forever. One connection's codec bug took the whole
   process down, with no error and no frame. A wrong-type return is now a decline
   - logged, and served as the JSON envelope like any other - and the writer's
-  growth is `max(double, needed)`, which cannot fail to make progress from any
-  starting capacity including zero.
+  doubling is seeded to 1 when the buffer is empty, so it makes progress from
+  any starting capacity including zero while keeping the original allocation
+  behavior (an exact-fit `max(double, needed)` was measured reallocating on
+  every subsequent big write and rejected). A failing `encode` on a STATEFUL
+  codec - a throw or a wrong-type return, as distinct from a `null` decline -
+  now also poisons that connection's capability to JSON until reconnect: the
+  encode may have advanced the connection's dictionaries for a frame the
+  client never saw, the same decode desync a dropped stateful frame leaves.
+  The frame writer's varint refuses non-integers outright rather than spinning
+  on `Infinity` or writing garbage for `NaN`.
 
 - The `__replay:t` `truncated` marker was charged to no budget. Every other
   frame a client's own input buys goes through the per-connection control-egress

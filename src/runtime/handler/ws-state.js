@@ -785,8 +785,23 @@ export function stampExplicitSeq(seq, topic) {
  * @returns {number | null}
  */
 export function stampSeq(options, topic) {
-	if (!options || options.seq === undefined || options.seq === false) return null;
-	if (typeof options.seq === 'number') return stampExplicitSeq(options.seq, topic);
+	return stampSeqValue(options ? options.seq : undefined, topic);
+}
+
+/**
+ * Value form of stampSeq, for callers that read `options.seq` themselves -
+ * exactly once, before any app code could observe the call. The publish lanes
+ * decide seq, authority, and the resume capture from that single read, so the
+ * value stamped here is by construction the value recorded there, whatever a
+ * payload's toJSON does to the caller's options in between.
+ *
+ * @param {boolean | number | undefined} seqOption - the one read of `options.seq`
+ * @param {string} topic
+ * @returns {number | null}
+ */
+export function stampSeqValue(seqOption, topic) {
+	if (seqOption === undefined || seqOption === false) return null;
+	if (typeof seqOption === 'number') return stampExplicitSeq(seqOption, topic);
 	const current = topicSeqs.get(topic);
 	const next = (current ?? 0) + 1;
 	// Re-insert on every stamp so iteration order is least-recently-stamped

@@ -78,6 +78,7 @@ import {
 	withGateCounted,
 	stampExplicitSeq,
 	stampSeq,
+	stampSeqValue,
 	tombstonePendingSubscribe,
 	wsConnections,
 	wsCounters
@@ -184,12 +185,30 @@ function throwBatchExplicitSeq(topic, seq) {
 }
 
 /**
+ * Whether the most recent safeEncode call returned null because the codec
+ * FAILED (threw, or returned a wrong-type value) rather than declined. A
+ * decline is a codec's deliberate answer and leaves its per-connection state
+ * coherent by contract; a failure escaped partway, so a stateful codec's
+ * dictionaries may have advanced for a frame the client will never see - the
+ * decode desync poisoning exists for. Callers that passed a non-null state
+ * read this immediately after the call and poison on it. A module flag rather
+ * than a sentinel return or a callback: every existing `payload == null`
+ * check stays exhaustive, and the fan-out walk allocates nothing for it. The
+ * write that matters happens after wire.encode returns or throws, so a codec
+ * that publishes re-entrantly (resetting the flag inside) cannot leave a
+ * stale value behind.
+ */
+let encodeFailed = false;
+
+/**
  * Encode one wire frame, treating a throwing codec as a decline rather than
  * letting it abort a fan-out walk partway - some subscribers already have the
  * frame, and the seq is stamped and resume-captured, so a mid-walk escape
  * leaves the topic inconsistent. A failure is logged - throttled with decay,
  * because this runs inside the per-connection walk - and the connection takes
- * the JSON envelope like any other decline.
+ * the JSON envelope like any other decline; `encodeFailed` records that it
+ * was a failure, so stateful callers can poison the capability rather than
+ * keep referencing state the client never learned.
  *
  * @param {{ encode: Function }} wire
  * @param {string} event
@@ -198,10 +217,12 @@ function throwBatchExplicitSeq(topic, seq) {
  * @returns {Uint8Array | null}
  */
 function safeEncode(wire, event, data, state) {
+	encodeFailed = false;
 	let payload;
 	try {
 		payload = wire.encode(event, data, state);
 	} catch (err) {
+		encodeFailed = true;
 		const { log, count } = encodeFailedThrottle();
 		if (log) console.error(`[ws] wire.encode threw for ${wire.capability} ${event} (x${count})`, err);
 		return null;
@@ -215,6 +236,7 @@ function safeEncode(wire, event, data, state) {
 	// likely route, since a Promise is truthy and has no length. Buffer passes,
 	// being a Uint8Array subclass.
 	if (payload != null && !(payload instanceof Uint8Array)) {
+		encodeFailed = true;
 		const { log, count } = encodeFailedThrottle();
 		if (log) {
 			console.error(
@@ -483,14 +505,27 @@ export const platform = {
 	 * @returns {boolean} whether any local subscriber received it
 	 */
 	publish(topic, event, data, options) {
-		const seq = stampSeq(options, topic);
+		// The call's options are read first, one read per documented field
+		// into locals, before any app code can run. completeEnvelope's
+		// JSON.stringify calls any payload toJSON, and that code holds a live
+		// reference to the caller's options - an options.seq that answers the
+		// stamp with one value and the authority reads below with another
+		// would record a counter value in the authoritative mark, the
+		// cross-space clobber the resume floor exists to prevent. Locals
+		// rather than a copied object so the hot path allocates nothing, and
+		// named reads so a seq carried on a prototype is seen here exactly as
+		// every other lane sees it.
+		const seqOpt = options ? options.seq : undefined;
+		const jitterOpt = options ? options.jitterMs : undefined;
+		const compressOpt = options ? options.compress : undefined;
+		const seq = stampSeqValue(seqOpt, topic);
+		// Authority is decided from the same single read the stamp consumed.
+		const authoritative = typeof seqOpt === 'number';
 		// A de-herd window is carried verbatim so each client rolls its own
 		// delay. Rolling one server-side offset instead would defer every
 		// subscriber of this frame by the SAME amount, which is the stampede
 		// the option exists to prevent.
-		const jitterMs = options && typeof options.jitterMs === 'number' && options.jitterMs > 0
-			? options.jitterMs
-			: null;
+		const jitterMs = typeof jitterOpt === 'number' && jitterOpt > 0 ? jitterOpt : null;
 		const envelope = completeEnvelope(envelopePrefix(topic, event), data, seq, jitterMs);
 		// Everything that can still refuse this publish is resolved above this
 		// line: stampSeq on a seq the wire cannot carry, completeEnvelope on a
@@ -504,15 +539,15 @@ export const platform = {
 		// "publishes since boot" and drifts upward on the app's own bug in the
 		// one case where nothing was delivered to notice it by.
 		const server = getServer();
-		recordPublishedSeq(topic, seq, options);
+		if (seq !== null) notePublishedSeq(topic, seq, authoritative);
 		wsCounters.publishCount++;
-		const compress = ws_compression_on && (!options || options.compress !== false);
+		const compress = ws_compression_on && compressOpt !== false;
 		// A connection still gap-filling this topic (resume cutover in
 		// flight) is not yet subscribed to live, so hold the envelope it
 		// would have received; it flushes once its membership installs. One
 		// guarded size check on the path every publish takes.
 		if (resumeBuffers.size > 0) {
-			captureResumeFrame(topic, seq, envelope, compress, null, isAuthoritativeSeq(options));
+			captureResumeFrame(topic, seq, envelope, compress, null, authoritative);
 		}
 		const result = server.publish(topic, envelope, compress);
 		// Bun returns the byte count on delivery and 0 when the topic has no
@@ -656,32 +691,43 @@ export const platform = {
 		if (!wire || typeof wire.capability !== 'string') {
 			return this.publish(topic, event, data, options);
 		}
-		const seq = stampSeq(options, topic);
+		// One read per documented field into locals, before any app code runs
+		// - same discipline as publish() above and the batch lane below, and
+		// allocation-free for the same reason: the value the stamp consumes
+		// is the value the authority, compression and exclusion decisions
+		// below see, whatever a toJSON or accessor does to the caller's
+		// object in between.
+		const seqOpt = options ? options.seq : undefined;
+		const compressOpt = options ? options.compress : undefined;
+		const excludeOpt = options ? options.excludeWs : undefined;
+		const seq = stampSeqValue(seqOpt, topic);
+		// Authority is decided from the same single read the stamp consumed.
+		const authoritative = typeof seqOpt === 'number';
 		const envelope = completeEnvelope(envelopePrefix(topic, event), data, seq);
 		// Past all three refusal points before the mark or the count moves, as
 		// in publish() above and for the same reasons.
 		const server = getServer();
-		recordPublishedSeq(topic, seq, options);
+		if (seq !== null) notePublishedSeq(topic, seq, authoritative);
 		wsCounters.publishCount++;
 		// Binary codec frames (and this call's JSON-fallback frames) compress
 		// only when the caller opts in with `{ compress: true }` AND a
 		// compressor is configured. One decision governs the whole call so a
 		// plugin's intent applies to its binary and JSON-fallback frames
 		// alike; off by default keeps the high-frequency path uncompressed.
-		const compress = ws_compression_on && !!(options && options.compress === true);
+		const compress = ws_compression_on && compressOpt === true;
 
 		// Sender exclusion: when set, this one local socket must never receive
 		// the frame. The single native fan-out cannot skip a socket, so an
 		// excluding publish always takes the per-subscriber walk (the walk
 		// already hands caps-less connections the identical JSON envelope).
-		const excludeWs = (options && options.excludeWs) || null;
+		const excludeWs = excludeOpt || null;
 
 		// A resuming connection is not yet on the live membership, so it
 		// would receive nothing from any branch below; hold the JSON envelope
 		// it would have received as a caps-less subscriber - but never for the
 		// socket this publish excluded.
 		if (resumeBuffers.size > 0) {
-			captureResumeFrame(topic, seq, envelope, compress, excludeWs, isAuthoritativeSeq(options));
+			captureResumeFrame(topic, seq, envelope, compress, excludeWs, authoritative);
 		}
 
 		// JSON fast path: no live connection wants binary for this codec.
@@ -769,6 +815,12 @@ export const platform = {
 					// stamped with the schema version that state negotiated.
 					const payload = safeEncode(wire, event, data, state);
 					if (payload == null) {
+						// A FAILED encode (throw or wrong-type return) may have
+						// advanced this connection's dictionaries for a frame
+						// the client will never see - the same desync a dropped
+						// stateful frame leaves, and the same answer: JSON from
+						// here on. A clean decline poisons nothing.
+						if (encodeFailed) poisonWireState(ws, ud, wire.capability);
 						delivered = wireEnvelopeSend(ws, envelope, compress) || delivered;
 						continue;
 					}
@@ -987,16 +1039,20 @@ export const platform = {
 	 *   wire cannot carry
 	 */
 	publishWireBatch(topic, event, entries, wire, options) {
-		// The call-level options are captured FIRST: one shallow copy, own
-		// enumerable properties, read once, taken before any other app-
-		// observable read. Everything below runs app code sooner or later
-		// (completeEnvelope's JSON.stringify calls any toJSON, and the entries
-		// walk can trap through a Proxy), and app code holds live references
-		// to the caller's objects - an options.seq that answers the refusal
-		// below with one value and a later read with another would smuggle the
-		// refused batch-level seq form in for every counter-lane entry. The
-		// value refused and the value used are one read.
-		if (options) options = { ...options };
+		// The call-level options are captured FIRST: one explicit read per
+		// field, taken before any other app-observable read. Everything below
+		// runs app code sooner or later (completeEnvelope's JSON.stringify
+		// calls any toJSON, and the entries walk can trap through a Proxy),
+		// and app code holds live references to the caller's objects - an
+		// options.seq that answers the refusal below with one value and a
+		// later read with another would smuggle the refused batch-level seq
+		// form in for every counter-lane entry. The value refused and the
+		// value used are one read. Field reads rather than a spread, because a
+		// spread copies own enumerable properties only: a numeric seq carried
+		// on a prototype, or by an inherited accessor, would vanish from the
+		// copy and slip past a refusal every other read of the same object
+		// would have thrown on.
+		if (options) options = { seq: options.seq, compress: options.compress, excludeWs: options.excludeWs };
 		// Checked BEFORE the empty-batch no-op below. A batch-level seq is a
 		// property of the CALL, not of this tick's data, so whether it is
 		// refused must not depend on how many entries happened to be ready -
@@ -1156,10 +1212,9 @@ export const platform = {
 			}
 		}
 
-		// Declared before the helper that closes over it, so the two can be read
-		// together. Behaviour is unchanged: nothing between the old and new
-		// positions touches the flag, and the fast path below returns its own
-		// byte tally without consulting it.
+		// Declared here, before the helper that closes over it, so the two can
+		// be read together. The fast path below returns its own byte tally
+		// without consulting this flag.
 		let delivered = false;
 
 		const sendJson = (ws, list) => {
@@ -1239,12 +1294,30 @@ export const platform = {
 			const sv =
 				typeof state.schemaVersion === 'number' ? state.schemaVersion : wire.schemaVersion;
 			if (payload == null) {
+				// A FAILED batch encode may have advanced this connection's
+				// dictionaries partway - running the per-entry encodes below
+				// against that state would reference entries the client never
+				// learned. Poison and serve the JSON envelopes; only a clean
+				// decline earns the per-entry retry.
+				if (encodeFailed) {
+					poisonWireState(ws, ud, wire.capability);
+					sendJson(ws, envList);
+					continue;
+				}
 				// The codec declined the batch (older codec, unrepresentable
 				// entry): per-entry encodes with per-entry JSON fallback - the
 				// N publishWire bodies this call replaces.
 				for (let i = 0; i < list.length; i++) {
 					const p = safeEncode(wire, event, list[i].data, state);
 					if (p == null) {
+						// Same rule per entry: a failure poisons and the rest
+						// of the batch goes out as JSON; a decline costs only
+						// this entry's binary form.
+						if (encodeFailed) {
+							poisonWireState(ws, ud, wire.capability);
+							sendJson(ws, envList.slice(i));
+							break;
+						}
 						try {
 							if (ws.send(envList[i], false, compress) !== SEND_DROPPED) {
 								bumpOut(ws, envList[i]);
@@ -1348,6 +1421,12 @@ export const platform = {
 				// later broadcast) references against the same dictionary.
 				const state = ensureWireState(ws, ud, wire);
 				payload = safeEncode(wire, event, data, state);
+				// A failed encode against real per-connection state poisons,
+				// as on every stateful lane; with a null state (older client
+				// on the stateless schema) there is nothing to desync.
+				if (payload == null && state != null && encodeFailed) {
+					poisonWireState(ws, ud, wire.capability);
+				}
 				if (state != null && typeof state.schemaVersion === 'number') {
 					schemaVersion = state.schemaVersion;
 				}
@@ -1451,12 +1530,23 @@ export const platform = {
 			typeof state.schemaVersion === 'number' ? state.schemaVersion : wire.schemaVersion;
 		const payload = safeEncode(wire, event + '-batch', { updates }, state);
 		if (payload == null) {
+			// A FAILED batch encode may have advanced the dictionaries partway;
+			// poison and serve JSON rather than encode per entry against state
+			// the client never learned (see publishWireBatch).
+			if (encodeFailed) {
+				poisonWireState(ws, ud, wire.capability);
+				return sendJsonFrom(0);
+			}
 			// The codec declined the batch (older codec, unrepresentable
 			// entry): the N sendWire bodies this call replaces.
 			let result = 1;
 			for (let i = 0; i < entries.length; i++) {
 				const p = safeEncode(wire, event, entries[i].data, state);
 				if (p == null) {
+					if (encodeFailed) {
+						poisonWireState(ws, ud, wire.capability);
+						return sendJsonFrom(i);
+					}
 					result = wireJsonSend(ws, topic, event, entries[i].data, compress);
 					continue;
 				}

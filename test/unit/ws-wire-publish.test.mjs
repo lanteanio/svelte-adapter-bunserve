@@ -404,7 +404,7 @@ test('an options accessor cannot answer the seq refusal and the stamp differentl
 			const entries = [{ data: { x: 1 } }, { data: { x: 2 } }];
 			const ok = platform.publishWireBatch('room', 'moved', entries, wire, options);
 			assert.equal(ok, true);
-			assert.ok(reads >= 1, 'the accessor really was consulted');
+			assert.equal(reads, 1, 'the capture is the single read the accessor ever answers');
 			assert.deepEqual(
 				srv.published.map((p) => JSON.parse(p.payload).seq),
 				[1, 2],
@@ -417,6 +417,82 @@ test('an options accessor cannot answer the seq refusal and the stamp differentl
 	} finally {
 		maxAuthoritativeSeq.clear();
 		topicSeqs.clear();
+	}
+});
+
+test('a batch-level numeric seq carried on a prototype is refused like an own one', () => {
+	// The capture reads named fields through the prototype chain. A spread
+	// would copy own enumerable properties only, so a numeric seq sitting on
+	// a prototype - a class-based config object, an inherited accessor -
+	// would vanish from the copy and publish the batch seq-less, while
+	// publish() hands the same object to stampSeq, reads through the chain,
+	// and throws. One options object must mean one thing on every lane.
+	class Config {
+		get seq() {
+			return 500;
+		}
+	}
+	const statefulCodec = { capability: CAP, schemaVersion: 2, encode: () => null, state: {} };
+	try {
+		for (const wire of [statelessCodec(), statefulCodec]) {
+			for (const options of [Object.create({ seq: 500 }), new Config()]) {
+				const srv = fakeServer();
+				setServer(srv);
+				assert.throws(
+					() => platform.publishWireBatch('room', 'moved', [{ data: { x: 1 } }], wire, options),
+					(err) => err instanceof TypeError && /batch-level/.test(err.message),
+					'refused exactly like an own-property batch-level seq'
+				);
+				assert.equal(srv.published.length, 0, 'nothing was published');
+				assert.equal(maxAuthoritativeSeq.get('room'), undefined, 'and nothing was marked');
+			}
+		}
+	} finally {
+		maxAuthoritativeSeq.clear();
+		topicSeqs.clear();
+	}
+});
+
+test('app code flipping options.seq mid-publish cannot change what gets recorded', () => {
+	// stampSeq consumes options.seq before completeEnvelope runs the
+	// payload's toJSON; the authority decision and the resume capture read it
+	// after. Uncaptured, a toJSON that writes a number into the caller's
+	// options hands notePublishedSeq a COUNTER value marked authoritative - a
+	// local counter seq entering the cluster-authoritative dedup floor, the
+	// cross-space clobber that mark's own contract rules out, and the next
+	// gap-fill window then discards genuine explicit-seq frames as
+	// already-seen. The inverse flip would strip a delivered explicit seq of
+	// its authority. Both single lanes; the batch pins the same discipline in
+	// the accessor test above.
+	const lanes = {
+		publish: (data, opts) => platform.publish('room', 'said', data, opts),
+		publishWire: (data, opts) => platform.publishWire('room', 'moved', data, statelessCodec(), opts)
+	};
+	for (const [lane, run] of Object.entries(lanes)) {
+		setServer(fakeServer());
+		try {
+			const counterOpts = { seq: true };
+			run({ toJSON() { counterOpts.seq = 7; return { x: 1 }; } }, counterOpts);
+			assert.equal(counterOpts.seq, 7, lane + ': the mutation really ran');
+			assert.equal(topicSeqs.get('room'), 1, lane + ': the counter lane stamped normally');
+			assert.equal(
+				maxAuthoritativeSeq.get('room'),
+				undefined,
+				lane + ': the counter value never entered the authoritative space'
+			);
+
+			const explicitOpts = { seq: 9 };
+			run({ toJSON() { explicitOpts.seq = true; return { x: 1 }; } }, explicitOpts);
+			assert.equal(explicitOpts.seq, true, lane + ': the inverse mutation really ran');
+			assert.equal(
+				maxAuthoritativeSeq.get('room'),
+				9,
+				lane + ': the stamped explicit seq kept its authority'
+			);
+		} finally {
+			maxAuthoritativeSeq.clear();
+			topicSeqs.clear();
+		}
 	}
 });
 
@@ -489,6 +565,10 @@ test('a codec returning a non-Uint8Array declines, it does not hang the loop', {
 	} finally {
 		console.error = realError;
 	}
+	// An EXACT count, which holds only while the shared throttle enters this
+	// test with fewer than seven failures consumed (the schedule logs every
+	// one of the first nine). Earlier tests in this file fail no encodes, so
+	// that holds today; the any-offset contract is the bounded test below.
 	assert.equal(errors.length, 3, 'each bad return was reported');
 	assert.ok(errors[0].includes('Return a Uint8Array'), errors[0]);
 	assert.ok(errors[0].includes('object'), 'and named the type it got: ' + errors[0]);
@@ -533,6 +613,166 @@ test('a persistently broken codec produces a BOUNDED diagnostic, not one line pe
 	);
 });
 
+test('a failing STATEFUL encode poisons the capability to JSON; a decline does not', () => {
+	// A stateful codec mutates its per-connection state during encode -
+	// interned keys, advanced baselines. An encode that threw, or returned a
+	// wrong-type value, escaped partway: that state may now reference entries
+	// the client never received, and the next successful frame would decode
+	// against a dictionary the client does not have, silently. Same evidence
+	// as a dropped stateful frame, same recovery tier: JSON until reconnect.
+	// A null return is the codec's deliberate decline, leaves its state
+	// coherent by contract, and must keep binary available.
+	const realError = console.error;
+	console.error = () => {};
+	try {
+		for (const failure of ['throw', 'wrong-type']) {
+			setServer(fakeServer());
+			const capable = fakeWs({ topics: ['room'], caps: [CAP] });
+			let mode = 'ok';
+			const wire = {
+				capability: CAP,
+				schemaVersion: 2,
+				state: { onAttach: () => ({}) },
+				encode: () => {
+					if (mode === 'throw') throw new Error('codec died mid-encode');
+					if (mode === 'wrong-type') return {};
+					if (mode === 'decline') return null;
+					return new Uint8Array([4, 2]);
+				}
+			};
+			withConnections([capable], () => {
+				platform.publishWire('room', 'moved', { x: 1 }, wire);
+				assert.ok(
+					capable.sent.some((s) => s.payload instanceof Uint8Array),
+					failure + ': binary flowed while the codec behaved'
+				);
+				capable.sent.length = 0;
+				mode = 'decline';
+				platform.publishWire('room', 'moved', { x: 2 }, wire);
+				mode = 'ok';
+				platform.publishWire('room', 'moved', { x: 3 }, wire);
+				assert.equal(wireStatePoisoned(capable.ud, CAP), false, failure + ': a decline poisons nothing');
+				assert.ok(
+					capable.sent.some((s) => s.payload instanceof Uint8Array),
+					failure + ': binary still available after a decline'
+				);
+				capable.sent.length = 0;
+				mode = failure;
+				platform.publishWire('room', 'moved', { x: 4 }, wire);
+				assert.equal(wireStatePoisoned(capable.ud, CAP), true, failure + ': the failure poisoned');
+				mode = 'ok';
+				platform.publishWire('room', 'moved', { x: 5 }, wire);
+				assert.ok(capable.sent.length >= 2, failure + ': both frames were still delivered');
+				assert.ok(
+					capable.sent.every((s) => typeof s.payload === 'string'),
+					failure + ': JSON only, from the failing frame on'
+				);
+			});
+		}
+	} finally {
+		console.error = realError;
+	}
+});
+
+test('a failing stateful BATCH encode poisons and serves the JSON envelopes', () => {
+	// The batch form encodes every entry against the connection state in one
+	// call. A failure may have advanced the dictionaries partway, so the
+	// per-entry retry a clean decline earns would encode against state the
+	// client never learned; a failure serves the whole list as JSON and
+	// degrades the capability, exactly like the dropped-frame poisoning
+	// beside it.
+	const realError = console.error;
+	console.error = () => {};
+	try {
+		setServer(fakeServer());
+		const capable = fakeWs({ topics: ['room'], caps: [CAP] });
+		let fail = true;
+		const wire = {
+			capability: CAP,
+			schemaVersion: 2,
+			state: { onAttach: () => ({}) },
+			encode: (event) => {
+				if (fail && event === 'moved-batch') throw new Error('batch encode died');
+				return new Uint8Array([4, 2]);
+			}
+		};
+		withConnections([capable], () => {
+			const ok = platform.publishWireBatch(
+				'room',
+				'moved',
+				[{ data: { x: 1 } }, { data: { x: 2 } }],
+				wire
+			);
+			assert.equal(ok, true, 'the entries were still delivered');
+			assert.equal(capable.sent.length, 2, 'one JSON envelope per entry');
+			assert.ok(
+				capable.sent.every((s) => typeof s.payload === 'string'),
+				'no per-entry binary was built from the failed state'
+			);
+			assert.equal(wireStatePoisoned(capable.ud, CAP), true, 'the capability is poisoned');
+			fail = false;
+			capable.sent.length = 0;
+			platform.publishWireBatch('room', 'moved', [{ data: { x: 3 } }], wire);
+			assert.ok(
+				capable.sent.every((s) => typeof s.payload === 'string'),
+				'JSON until reconnect'
+			);
+		});
+	} finally {
+		console.error = realError;
+	}
+});
+
+test('a failing stateful encode poisons on the send lanes too', () => {
+	const realError = console.error;
+	console.error = () => {};
+	try {
+		setServer(fakeServer());
+		const capable = fakeWs({ topics: ['room'], caps: [CAP] });
+		let fail = true;
+		const wire = {
+			capability: CAP,
+			schemaVersion: 2,
+			state: { onAttach: () => ({}) },
+			encode: () => {
+				if (fail) throw new Error('encode died');
+				return new Uint8Array([4, 2]);
+			}
+		};
+		platform.sendWire(capable, 'room', 'snapshot', { x: 1 }, wire);
+		assert.equal(wireStatePoisoned(capable.ud, CAP), true, 'sendWire poisoned on the failure');
+		fail = false;
+		capable.sent.length = 0;
+		platform.sendWire(capable, 'room', 'snapshot', { x: 2 }, wire);
+		assert.ok(
+			capable.sent.every((s) => typeof s.payload === 'string'),
+			'JSON after the poison'
+		);
+
+		const capable2 = fakeWs({ topics: ['room'], caps: [CAP] });
+		let failBatch = true;
+		const wire2 = {
+			capability: CAP,
+			schemaVersion: 2,
+			state: { onAttach: () => ({}) },
+			encode: (event) => {
+				if (failBatch && event === 'snap-batch') throw new Error('batch encode died');
+				return new Uint8Array([4, 2]);
+			}
+		};
+		platform.sendWireBatch(capable2, 'room', 'snap', [{ data: { x: 1 } }, { data: { x: 2 } }], wire2);
+		assert.equal(
+			wireStatePoisoned(capable2.ud, CAP),
+			true,
+			'sendWireBatch poisoned on the batch failure'
+		);
+		assert.equal(capable2.sent.length, 2, 'both entries arrived as JSON envelopes');
+		assert.ok(capable2.sent.every((s) => typeof s.payload === 'string'));
+	} finally {
+		console.error = realError;
+	}
+});
+
 const statefulCodec = () => ({ capability: CAP, schemaVersion: 2, encode: () => null, state: {} });
 
 test('a publish refused on a PAYLOAD leaves no mark, on every atomic lane', () => {
@@ -562,7 +802,8 @@ test('a publish refused on a PAYLOAD leaves no mark, on every atomic lane', () =
 			)
 	};
 	for (const [lane, run] of Object.entries(lanes)) {
-		setServer(fakeServer());
+		const srv = fakeServer();
+		setServer(srv);
 		const capable = fakeWs({ topics: ['room'], caps: [CAP] });
 		try {
 			const before = platform.publishCount;
@@ -571,7 +812,11 @@ test('a publish refused on a PAYLOAD leaves no mark, on every atomic lane', () =
 			});
 			assert.equal(maxAuthoritativeSeq.get('room'), undefined, lane + ': marked nothing');
 			assert.equal(platform.publishCount, before, lane + ': counted nothing');
-			assert.equal(capable.sent.length, 0, lane + ': sent nothing');
+			// Both delivery routes: publish() reaches sockets only through the
+			// native fan-out, the wire lanes through the walk - asserting one
+			// of them would leave the other lane's assertion vacuous.
+			assert.equal(capable.sent.length, 0, lane + ': sent nothing on the walk');
+			assert.equal(srv.published.length, 0, lane + ': and nothing on the native fan-out');
 		} finally {
 			maxAuthoritativeSeq.clear();
 			topicSeqs.clear();
@@ -580,8 +825,8 @@ test('a publish refused on a PAYLOAD leaves no mark, on every atomic lane', () =
 });
 
 test('a refused publish leaves the { seq: true } counter advanced, on purpose', () => {
-	// The one piece of state a refusal does NOT rewind, pinned so it reads as a
-	// decision rather than as the next thing a review finds.
+	// The one piece of state a refusal does NOT rewind, pinned as a decision
+	// on the record.
 	//
 	// It cannot be rewound safely: completeEnvelope runs JSON.stringify, so a
 	// toJSON can publish re-entrantly and take the next counter value, and a
@@ -609,10 +854,11 @@ test('a refused publish leaves the { seq: true } counter advanced, on purpose', 
 });
 
 test('the stateless batch reroute keeps what already went out, and marks no more', () => {
-	// This lane is N independent publishWire calls, so it is NOT atomic and the
+	// This lane is N sequential publishWire calls, so it is NOT atomic and the
 	// contract is deliberately different: entry 0 really was delivered, so its
-	// mark and its count must STAND. What must not happen is the failing entry
-	// marking a seq that never reached a socket. Pinned explicitly so the
+	// mark and its count must STAND, the failing entry marks nothing, and the
+	// throw carries out of the call - entries AFTER the failure are never
+	// attempted, not published independently. Pinned explicitly so the
 	// asymmetry with the stateful lane above is a decision on the record rather
 	// than something a later reader has to infer from a passing suite.
 	setServer(fakeServer());
@@ -625,7 +871,11 @@ test('the stateless batch reroute keeps what already went out, and marks no more
 					platform.publishWireBatch(
 						'room',
 						'moved',
-						[{ data: { x: 1 }, seq: 40 }, { data: { n: 1n }, seq: 41 }],
+						[
+							{ data: { x: 1 }, seq: 40 },
+							{ data: { n: 1n }, seq: 41 },
+							{ data: { x: 3 }, seq: 42 }
+						],
 						statelessCodec()
 					),
 				TypeError
@@ -634,6 +884,11 @@ test('the stateless batch reroute keeps what already went out, and marks no more
 		assert.equal(maxAuthoritativeSeq.get('room'), 40, 'the entry that DID publish kept its mark');
 		assert.equal(platform.publishCount, before + 1, 'and its count');
 		assert.notEqual(maxAuthoritativeSeq.get('room'), 41, 'the entry that threw marked nothing');
+		assert.equal(
+			capable.sent.length,
+			2,
+			'announce plus one frame: the entry after the failure was never attempted'
+		);
 	} finally {
 		maxAuthoritativeSeq.clear();
 		topicSeqs.clear();
