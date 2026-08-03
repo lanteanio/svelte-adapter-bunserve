@@ -63,6 +63,9 @@ export function init({ platform }) {
  * client short of 21 and 22 for good - a seq the server stamped is not a seq
  * the client received.
  *
+ * A plan arms ONE window and is consumed by it, so a later resume of the same
+ * topic falls back to the default hook.
+ *
  * @type {Map<string, { report: number, publish: number[] }>}
  */
 const resumePlans = new Map();
@@ -84,6 +87,11 @@ export async function resume(ws, { sessionId, lastSeenSeqs, platform }) {
 			covered[topic] = typeof since === 'number' ? since : 0;
 			continue;
 		}
+		// Spent on use. A standing plan would replay its whole script into every
+		// later resume window on the topic - windows that asked for none of it -
+		// so a check reading those frames would be reading the fixture's memory
+		// rather than what the runtime did.
+		resumePlans.delete(topic);
 		// Published from inside the hook, so these land in the barrier window
 		// the resuming connection has open - the case the flush's dedup floor
 		// exists for. Deterministic by construction: no second connection has

@@ -623,9 +623,13 @@ offset straight back is the easiest hook to write and that value is client
 input: unbounded, it would let a client suppress precisely the frames the
 barrier is holding for it. (`test/fixture/src/ws-handler.js` echoes it on
 purpose - it is a controlled test double, not a pattern to copy. Its
-`fixture-resume-plan` lane is the opposite double: it reports a watermark the
-server really stamped, which is the only way the live suite can reach the
-boundary at all, since an echoed offset is always refused by the bound above.)
+`fixture-resume-plan` lane is the opposite double, and needs both halves of the
+contract to be one: it DELIVERS every frame it publishes into the window at or
+below its watermark before reporting it, because what a hook returns is what it
+delivered rather than what exists, and it reports a seq this server really
+stamped, because the bound above refuses any report on a topic carrying no
+explicit mark - which is every topic the rest of that suite publishes to. A plan
+arms one window and is spent by it.)
 
 A control frame is recognized by its `{"type"` prefix, so a control frame must
 put `type` first. Whitespace is stepped over in two bounded runs of 16 - before

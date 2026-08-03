@@ -214,28 +214,30 @@ try {
 
 	d.send({ type: 'subscribe', topic: SEQ_TOPIC, ref: 9, recover: { offset: 20 } });
 	await until(() => d.texts.some((t) => t.type === 'subscribed'), 'watermark recover subscribe');
-	const inWindow = d.texts.filter((t) => t.event === 'said' && t.data?.inWindow !== undefined);
+	const isInWindow = (t) => t.event === 'said' && t.data?.inWindow !== undefined;
+	const inWindow = d.texts.filter(isInWindow);
 	const viaHook = inWindow.filter((t) => t.data.viaHook === true).map((t) => t.data.inWindow);
 	const viaFlush = inWindow.filter((t) => t.data.viaHook !== true).map((t) => t.data.inWindow);
-	check('the hook delivers the frames its reported watermark claims',
-		viaHook.includes(21) && viaHook.includes(22),
+	// Exact sequences rather than membership. What this lane claims is that the
+	// client receives 21, 22 and 23 once each and in that order; a hook that
+	// delivered 22 before 21, or a flush that emitted a second frame above the
+	// watermark, satisfies every containment test while breaking the claim.
+	const sameSeqs = (got, want) => got.length === want.length && got.every((v, i) => v === want[i]);
+	check('the hook delivers exactly the frames its reported watermark claims, in order',
+		sameSeqs(viaHook, [21, 22]),
 		JSON.stringify(viaHook));
-	check('a watermark the server stamped is honoured: the flush re-sends nothing at or below it',
-		!viaFlush.includes(21) && !viaFlush.includes(22),
-		JSON.stringify(viaFlush));
-	check('and the frame above the watermark is delivered by the flush',
-		viaFlush.includes(23),
+	check('a watermark the server stamped is honoured: the flush drops everything at or below it and sends exactly what is above',
+		sameSeqs(viaFlush, [23]),
 		JSON.stringify(viaFlush));
 	// The point of the dedup is to drop RE-delivery, never data. With an honest
-	// report the client ends the resume holding all three seqs, each exactly
-	// once - the assertion the previous shape of this lane could not make.
-	// Counted per SEQ rather than per frame, deliberately: 21 and 22 reach the
-	// client as the hook's own replay frames, which are a different envelope
+	// report the client ends the resume holding all three seqs, in order, each
+	// exactly once - the assertion the previous shape of this lane could not
+	// make. Counted per SEQ rather than per frame, deliberately: 21 and 22 reach
+	// the client as the hook's own replay frames, which are a different envelope
 	// from the one published into the topic.
-	check('every seq in the window is accounted for exactly once, by replay or by flush',
-		[21, 22, 23].every((s) =>
-			viaHook.filter((v) => v === s).length + viaFlush.filter((v) => v === s).length === 1),
-		JSON.stringify({ viaHook, viaFlush }));
+	check('so the client ends the window holding 21, 22, 23 in that order, each exactly once',
+		sameSeqs(inWindow.map((t) => t.data.inWindow), [21, 22, 23]),
+		JSON.stringify(inWindow.map((t) => ({ seq: t.data.inWindow, viaHook: t.data.viaHook === true }))));
 	// The flushed envelope must still carry its wire seq: that field is what a
 	// real client records as its next watermark, and every check above reads the
 	// fixture's own payload marker instead, which a dropped seq would not touch.
@@ -244,14 +246,33 @@ try {
 		flushed23?.seq === 23,
 		JSON.stringify(flushed23));
 	const ackAt2 = d.texts.findIndex((t) => t.type === 'subscribed');
-	const above = d.texts.findIndex((t) => t.data?.inWindow === 23 && t.data?.viaHook !== true);
-	const lastHookAt = d.texts.findLastIndex((t) => t.data?.viaHook === true);
-	check('the surviving in-window frame arrives before the subscribed ack',
-		above !== -1 && ackAt2 !== -1 && above < ackAt2,
-		JSON.stringify({ above, ackAt2 }));
-	check('and after the hook replay it follows, so the client sees 21, 22, 23 in order',
-		lastHookAt !== -1 && lastHookAt < above,
-		JSON.stringify({ lastHookAt, above }));
+	const lastInWindowAt = d.texts.findLastIndex(isInWindow);
+	check('and the whole window arrives before the subscribed ack',
+		lastInWindowAt !== -1 && ackAt2 !== -1 && lastInWindowAt < ackAt2,
+		JSON.stringify({ lastInWindowAt, ackAt2 }));
+
+	// --- an armed plan is spent by the window it armed ----------------------
+	// This pair pins the FIXTURE rather than the runtime, and it earns its place
+	// because every check above is only worth its name while a plan arms exactly
+	// the one window it was armed for. A standing plan would replay its whole
+	// script into every later resume of the topic, so the next scenario added
+	// here would be reading a history the fixture keeps rewriting.
+	//
+	// Waited on the `resumed` ack rather than the replay frame, but NOT because
+	// of a flush: the standalone resume frame installs no membership, so it opens
+	// no barrier and has nothing to flush. The ack is written only after the
+	// hook's promise settles, and every send the hook makes is synchronous, so a
+	// still-armed plan's frames are on the socket ahead of the ack and cannot
+	// land after the count below is taken. That is a property of synchronous
+	// fan-out, so it is what would have to be rechecked if publish ever corks.
+	d.send({ type: 'resume', sessionId: 'second-window', lastSeenSeqs: { [SEQ_TOPIC]: 23 } });
+	await until(() => d.texts.some((t) => t.type === 'resumed'), 'second resume ack');
+	check('the second resume really reaches the hook',
+		d.texts.some((t) => t.event === 'replayed' && t.topic === SEQ_TOPIC && t.data?.sessionId === 'second-window'),
+		JSON.stringify(d.texts.filter((t) => t.event === 'replayed').map((t) => ({ topic: t.topic, session: t.data?.sessionId }))));
+	check('and a spent plan does not re-arm: the second window replays no in-window frame',
+		d.texts.filter(isInWindow).length === inWindow.length,
+		JSON.stringify(d.texts.filter(isInWindow).map((t) => t.data.inWindow)));
 
 	a.ws.close();
 	b.ws.close();
