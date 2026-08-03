@@ -304,8 +304,10 @@ export function grantSizeFor() {
 /**
  * Merge user-supplied pressure options on top of the safe defaults. Each
  * threshold accepts `false` to disable that signal. `sampleIntervalMs` is
- * clamped to a sane minimum to avoid pathological tight-loop sampling if
- * a user passes 0 or a negative number.
+ * clamped at both ends: under the minimum it resets to the default rather
+ * than spinning, and past the timer ceiling it caps, because a delay larger
+ * than that silently becomes 1ms on both runtimes - which would turn a
+ * config asking for RARE samples into the tightest possible loop.
  *
  * @param {{ memoryHeapUsedRatio?: number | false, publishRatePerSec?: number | false, subscriberRatio?: number | false, sampleIntervalMs?: number, topicPublishRatePerSec?: number | false, topicPublishBytesPerSec?: number | false } | undefined} opts
  */
