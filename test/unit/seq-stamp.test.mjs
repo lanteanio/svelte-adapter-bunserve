@@ -28,9 +28,8 @@ globalThis.WS_PATH = '/ws';
 register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { platform } = await import('../../src/runtime/handler/platform.js');
-const { maxAuthoritativeSeq, setServer, stampSeq, stampSeqValue, topicSeqs } = await import(
-	'../../src/runtime/handler/ws-state.js'
-);
+const { MAX_SEQ_TOPICS, maxAuthoritativeSeq, setServer, stampSeq, stampSeqValue, topicSeqs } =
+	await import('../../src/runtime/handler/ws-state.js');
 
 /** A fake native server recording the envelopes handed to it. */
 function fakeServer() {
@@ -93,6 +92,34 @@ test('an explicit number is taken as given, and never advances the counter', () 
 		assert.equal(stampSeqValue(5, 'room'), 5);
 		assert.equal(stampSeqValue(2 ** 53, 'room'), 2 ** 53, 'no ceiling: an event-store cursor passes through');
 		assert.equal(stampSeqValue(undefined, 'room'), 1, 'the counter is untouched by the explicit lane');
+	} finally {
+		reset();
+	}
+});
+
+test('the counter map is bounded, and at the cap the eviction is a true LRU', () => {
+	// The counter is now the DEFAULT, so this map is reached by every publish
+	// and its bound is what keeps an app publishing to client-named topics
+	// (room:<uuid>) from growing one entry per topic for the life of the
+	// process. The recency re-insert that makes the eviction LRU is only paid
+	// for once the map is AT the cap - below it nothing is ever evicted, and
+	// paying there costs an order of magnitude on the hottest primitive in the
+	// adapter. This pins the part that is load-bearing: at the cap, a topic
+	// that was just stamped outlives one that was not.
+	try {
+		for (let i = 0; i < MAX_SEQ_TOPICS; i++) stampSeqValue(undefined, `t:${i}`);
+		assert.equal(topicSeqs.size, MAX_SEQ_TOPICS, 'filled to exactly the cap');
+
+		assert.equal(stampSeqValue(undefined, 't:0'), 2, 'the oldest topic is stamped again');
+		stampSeqValue(undefined, 'fresh');
+
+		assert.equal(topicSeqs.size, MAX_SEQ_TOPICS, 'still exactly the cap');
+		assert.equal(topicSeqs.get('t:0'), 2, 'the re-stamped topic survived, counter intact');
+		assert.equal(topicSeqs.has('t:1'), false, 'the least recently stamped one went instead');
+
+		// An evicted topic restarts at 1 - the documented consequence, and the
+		// reason the bound warns rather than silently discarding.
+		assert.equal(stampSeqValue(undefined, 't:1'), 1);
 	} finally {
 		reset();
 	}

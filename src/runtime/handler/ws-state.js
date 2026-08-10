@@ -113,9 +113,9 @@ export const sharedTopics = new Map();
 
 /**
  * The highest EXPLICIT (cluster-authoritative) sequence number this server has
- * stamped per topic. ONE seq space: a `{ seq: true }` publish draws from the
- * local per-topic counter, which is an unrelated space, and never writes a
- * value here.
+ * stamped per topic. ONE seq space: a counter publish - which is every publish
+ * that does not hand in a number, the default included - draws from the local
+ * per-topic counter, an unrelated space, and never writes a value here.
  *
  * The resume barrier is the only consumer, and it asks this map a single
  * question - what is the highest seq this server could have issued for the
@@ -148,10 +148,12 @@ export const maxAuthoritativeSeq = new Map();
  *
  * A counter seq is not a value this mark can hold, so it refreshes recency and
  * nothing else, and only for a topic that already has a mark: the counter lane
- * must never be what creates an entry here. Re-inserting on every note keeps
- * iteration order least-recently-noted first, which makes the eviction a true
- * LRU, and keeps a topic that is busy in the counter lane from aging out of
- * this one.
+ * must never be what creates an entry here. Re-inserting keeps iteration order
+ * least-recently-noted first, which makes the eviction a true LRU and keeps a
+ * topic that is busy in the counter lane from aging out of this one. It is
+ * done only while the map is at the cap, because that is the only time
+ * anything is evicted - and with the counter now the DEFAULT, every publish to
+ * a marked topic reaches this line.
  *
  * @param {string} topic
  * @param {number} seq
@@ -164,12 +166,20 @@ export function notePublishedSeq(topic, seq, authoritative) {
 		// Recency only. No entry to keep recent means nothing to do - creating
 		// one would put a counter value in the authoritative space.
 		if (prev === undefined) return;
+		if (maxAuthoritativeSeq.size < MAX_SEQ_TOPICS) return;
 		maxAuthoritativeSeq.delete(topic);
 		maxAuthoritativeSeq.set(topic, prev);
 		return;
 	}
 	const next = prev === undefined || seq > prev ? seq : prev;
-	if (prev !== undefined) maxAuthoritativeSeq.delete(topic);
+	// The delete is what makes iteration order least-recently-noted first, and
+	// it is only worth paying for once something can actually be evicted:
+	// below the cap nothing ever is, and Map.set on an existing key updates it
+	// in place. See stampSeqValue for the measurement that made this
+	// conditional rather than unconditional.
+	if (prev !== undefined && maxAuthoritativeSeq.size >= MAX_SEQ_TOPICS) {
+		maxAuthoritativeSeq.delete(topic);
+	}
 	maxAuthoritativeSeq.set(topic, next);
 	if (maxAuthoritativeSeq.size > MAX_SEQ_TOPICS) {
 		const oldest = maxAuthoritativeSeq.keys().next().value;
@@ -424,7 +434,10 @@ export const wsCounters = {
 };
 
 /**
- * Per-topic sequence counters for `{ seq: true }` publishes.
+ * Per-topic sequence counters. This is the DEFAULT seq space: a publish
+ * draws from it unless it says `{ seq: false }` or hands in an explicit
+ * number, so `{ seq: true }` is one spelling of the default rather than the
+ * only way in.
  * @type {Map<string, number>}
  */
 export const topicSeqs = new Map();
@@ -966,9 +979,24 @@ export function stampSeqValue(seqOption, topic) {
 	if (typeof seqOption === 'number') return stampExplicitSeq(seqOption, topic);
 	const current = topicSeqs.get(topic);
 	const next = (current ?? 0) + 1;
-	// Re-insert on every stamp so iteration order is least-recently-stamped
-	// first, which makes the eviction below a true LRU.
-	if (current !== undefined) topicSeqs.delete(topic);
+	// Re-inserting on every stamp is what makes iteration order
+	// least-recently-stamped first, and therefore the eviction below a true
+	// LRU. It is only worth paying for once something can actually be evicted:
+	// while the map is under the cap nothing ever is, and Map.set on an
+	// existing key updates it in place without disturbing order.
+	//
+	// This is the hottest primitive in the adapter now that the counter is the
+	// DEFAULT rather than an opt-in - every publish reaches it. Measured at 32
+	// live topics, the unconditional delete-then-set costs 177 ns/stamp
+	// against 13 ns for the plain get-and-set; see
+	// bench/publish-seq-default-micro.mjs.
+	//
+	// What the condition costs in exchange is bounded and self-correcting:
+	// stamps taken BEFORE the map first fills do not record their recency, so
+	// the first eviction after it fills can take a topic that was hot early.
+	// From then on the map stays at the cap, every stamp re-orders, and the
+	// LRU is exact.
+	if (current !== undefined && topicSeqs.size >= MAX_SEQ_TOPICS) topicSeqs.delete(topic);
 	topicSeqs.set(topic, next);
 	if (topicSeqs.size > MAX_SEQ_TOPICS) {
 		const oldest = topicSeqs.keys().next().value;
