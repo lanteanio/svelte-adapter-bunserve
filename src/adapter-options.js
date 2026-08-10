@@ -25,6 +25,7 @@ export const KNOWN_ADAPTER_OPTIONS = [
 	'healthCheckPath',
 	'readinessCheckPath',
 	'staticCacheMaxFileSize',
+	'staticDotfiles',
 	'staticHeaders',
 	'websocket'
 ];
@@ -125,6 +126,25 @@ export function assertScalarOptions(opts) {
 				'as enabled while plainly meaning the opposite.'
 			);
 		}
+	}
+
+	// Its own check rather than a line in the loop above, because what the two
+	// values MEAN is the part worth saying: this one decides whether a file the
+	// developer never meant to publish is reachable, and a message that only
+	// says "must be a boolean" leaves them guessing which boolean is safe.
+	if ('staticDotfiles' in opts && typeof opts.staticDotfiles !== 'boolean') {
+		// JSON.stringify throws on a BigInt and erases functions and Symbols;
+		// String() throws on a null-prototype object. The tag form renders any
+		// object, String() everything else - so the message about a bad value
+		// cannot itself fail with a different error.
+		const shown = typeof opts.staticDotfiles === 'object' && opts.staticDotfiles !== null
+			? Object.prototype.toString.call(opts.staticDotfiles)
+			: String(opts.staticDotfiles);
+		throw new Error(
+			`adapter option \`staticDotfiles\` must be true or false - got ${shown} (${typeof opts.staticDotfiles}). ` +
+			'The default (false) refuses every dot-segment static path except .well-known/*; ' +
+			'true indexes and serves them all.'
+		);
 	}
 
 	for (const key of ['out', 'envPrefix']) {

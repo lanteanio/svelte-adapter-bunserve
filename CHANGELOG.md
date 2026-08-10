@@ -28,6 +28,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wanted, so an app pointing `handler` at a file it does not have is opting out
   - which is how a build with no realtime tier is expressed.
 
+- **BREAKING** Static paths with a dot-prefixed segment - a stray `.env`, an
+  `.htpasswd`, an editor backup, an unpacked `.git` - are no longer indexed
+  and answer `404`. The prerendered index is built by the same walk and
+  excludes them too. Everything SvelteKit copied out of
+  `static/` was served verbatim before, so a file that landed there by
+  accident was public to anyone who guessed the name, and `adapter-node`
+  refuses dotfiles by default - an app migrating from it gained that exposure
+  silently. The rule is segment-wise and applied while the index is built, so
+  there is no per-request check to bypass and an encoded request decodes to a
+  key the index never held. `.well-known/*` keeps serving (RFC 8615
+  discovery), carved out at the first segment only. The build names every
+  refused path once, so the change surfaces at build time rather than as a
+  production 404. Only the built server is affected: `vite dev` and
+  `vite preview` serve `static/` through SvelteKit and do not read the
+  option. `staticDotfiles: true` restores the previous indexing
+  exactly. svelte-adapter-uws made the same change, spelled the same way.
+
 ### Added
 
 - The pressure observability surface and LEASE/REQUEST_N flow control,

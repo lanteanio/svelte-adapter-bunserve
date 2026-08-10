@@ -50,6 +50,7 @@ const buildEnv = {
 	...process.env,
 	ADAPTER: 'bunserve',
 	NO_WS: '',
+	STATIC_DOTFILES: '',
 	NODE_ENV: 'production'
 };
 
@@ -70,6 +71,11 @@ if (built) {
 	// Skips itself on Windows, where the signal never reaches the handler.
 	await run('shutdown-check', [process.execPath, suite('shutdown-check.mjs')]);
 }
+
+// Runs its own builds rather than borrowing the one above: it needs BOTH
+// builds of the same static/ tree (default and opted-in), and it asserts what
+// the build PRINTED, which only a captured build gives it.
+await run('static-dotfiles-check', [process.execPath, suite('static-dotfiles-check.mjs')]);
 
 const builtNoWs = await run('build fixture (NO_WS)', [process.execPath, 'run', 'build'], {
 	cwd: fixtureDir,

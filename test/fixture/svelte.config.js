@@ -16,9 +16,15 @@ const which = process.env.ADAPTER || 'bunserve';
 // environment variable is a string, so `NO_WS=0` set to turn this off would
 // turn it on.
 const noWs = process.env.NO_WS === '1' || process.env.NO_WS === 'true';
+const dotfiles = process.env.STATIC_DOTFILES === '1' || process.env.STATIC_DOTFILES === 'true';
 
 let adapter;
-if (which === 'bunserve' && noWs) {
+if (which === 'bunserve' && dotfiles) {
+	// The opted-in build for test/live/static-dotfiles-check.mjs. Serving
+	// refuses dot-segment paths by default, so proving the escape hatch works
+	// takes a second build of the same static/ tree with the option on.
+	adapter = bunserve({ out: 'build-dotfiles', staticDotfiles: true });
+} else if (which === 'bunserve' && noWs) {
 	// The no-handler regression build for test/live/no-ws-check.mjs:
 	// `websocket.handler` points at a file the fixture does not have. That is
 	// the same no-handler state as an app that never opted into the realtime

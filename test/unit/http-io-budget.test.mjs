@@ -25,6 +25,7 @@ import path from 'node:path';
 
 globalThis.PRECOMPRESS = true;
 globalThis.STATIC_CACHE_MAX = 1024;
+globalThis.STATIC_DOTFILES = false;
 globalThis.ENV_PREFIX = '';
 
 register('../helpers/manifest-loader.mjs', import.meta.url);

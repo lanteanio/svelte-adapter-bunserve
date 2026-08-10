@@ -6,6 +6,7 @@ import { nodeResolve } from '@rollup/plugin-node-resolve';
 import commonjs from '@rollup/plugin-commonjs';
 import json from '@rollup/plugin-json';
 import { normalizeStaticHeaders } from './build-config.js';
+import { listExcludedDotPaths } from './static-scan.js';
 import { assertScalarOptions, unknownOptionWarnings } from './adapter-options.js';
 import { normalizeWsOptions } from './runtime/utils/ws-options.js';
 
@@ -41,6 +42,7 @@ export default function (opts = {}) {
 		healthCheckPath = '/healthz',
 		readinessCheckPath = '/readyz',
 		staticCacheMaxFileSize = DEFAULT_STATIC_CACHE_MAX_FILE_SIZE,
+		staticDotfiles = false,
 		websocket
 	} = opts;
 
@@ -310,6 +312,27 @@ export default function (opts = {}) {
 				);
 			}
 
+			// Dotfiles are excluded from the static index by default, so a
+			// dot-path in the output would 404 in production with nothing saying
+			// why. Say so here, where the file is still in front of the developer.
+			if (!staticDotfiles) {
+				const outBase = builder.config.kit.paths.base;
+				const refused = [...new Set([
+					...listExcludedDotPaths(`${out}/client${outBase}`),
+					...listExcludedDotPaths(`${out}/prerendered${outBase}`)
+				])];
+				if (refused.length) {
+					// Every offender is named - a refused directory collapses to one
+					// entry, so the list stays proportionate to what the developer
+					// actually dropped into static/.
+					builder.log.warn(
+						`[adapter-bunserve] not served - dotfiles are refused by default (a top-level ` +
+						`.well-known/ keeps serving its own non-dot files): ${refused.join(', ')}. ` +
+						'Rename the file to serve it, or set staticDotfiles: true to serve every dotfile.'
+					);
+				}
+			}
+
 			builder.copy(runtimeDir, out, {
 				filter: (file) => !SIM_LANE_FILES.has(path.basename(file)),
 				replace: {
@@ -321,6 +344,7 @@ export default function (opts = {}) {
 					READINESS_CHECK_PATH: JSON.stringify(readinessCheckPath),
 					STATIC_HEADERS: JSON.stringify(staticHeadersResult.headers),
 					STATIC_CACHE_MAX: JSON.stringify(staticCacheMaxFileSize),
+					STATIC_DOTFILES: JSON.stringify(staticDotfiles),
 					HTTP_OPTIONS: JSON.stringify({
 						compressCredentialedResponses: compressCredentialedResponses === true
 					}),

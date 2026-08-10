@@ -86,7 +86,12 @@ const ADAPTER_OPTION_GAPS = {};
 
 /** Top-level adapter options this adapter accepts that uws does not declare. */
 const ADAPTER_OPTION_EXTRAS = {
-	staticCacheMaxFileSize: 'drift: no equivalent in the pinned uws release'
+	staticCacheMaxFileSize: 'drift: no equivalent in the pinned uws release',
+	// Not drift: uws added this option in 2a78e11, after the commit this
+	// manifest pins. Both adapters refuse dot-segment static paths by default
+	// and spell the opt-out the same way. The entry goes when the pin moves
+	// past that commit, which the staleness check will demand.
+	staticDotfiles: 'ahead of the pin: uws adopted the same option in 2a78e11'
 };
 
 /** `websocket.*` keys uws declares and this adapter does not accept. */

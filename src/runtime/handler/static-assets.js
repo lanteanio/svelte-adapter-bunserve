@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest, prerendered } from '../manifest-bridge.js';
 import { mimeLookup } from '../utils/mime.js';
+import { excludedDotPath } from '../utils/dot-path.js';
 import { mergeStaticHeaders } from '../utils/static-headers.js';
 import { representationEtag } from '../utils/static-negotiate.js';
 import { planStaticResponse } from '../utils/static-plan.js';
@@ -12,6 +13,7 @@ import { response400 } from './http-helpers.js';
 
 /* global PRECOMPRESS */
 /* global STATIC_CACHE_MAX */
+/* global STATIC_DOTFILES */
 
 // File extensions that browsers cannot render inline. Serving these with
 // Content-Disposition: attachment prompts a download dialog instead of
@@ -41,8 +43,15 @@ const __dirname = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 function walk(dir, fn, prefix = '') {
 	if (!fs.existsSync(dir)) return;
 	for (const entry of fs.readdirSync(dir)) {
-		const abs = path.join(dir, entry);
 		const rel = prefix ? `${prefix}/${entry}` : entry;
+		// Dot-segment paths never enter the index, so the request path has
+		// nothing to bypass - the cache simply has no entry, and an encoded
+		// traversal decodes to a key that is not there. A refused directory is
+		// not descended into either, so an unpacked .git is never even read.
+		// `.well-known` stays served; excludedDotPath carries the exact rule,
+		// and the build warns about every path this skips.
+		if (!STATIC_DOTFILES && excludedDotPath(rel)) continue;
+		const abs = path.join(dir, entry);
 		if (fs.statSync(abs).isDirectory()) {
 			walk(abs, fn, rel);
 		} else {

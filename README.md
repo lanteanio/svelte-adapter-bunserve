@@ -671,6 +671,46 @@ The WebSocket handler is bundled by Rollup from project source, with SvelteKit's
 `$lib` alias resolved. There is no esbuild fallback, so the handler must be
 plain JavaScript resolvable by that plugin set.
 
+## Static files
+
+A static path with a dot-prefixed segment (`/.env`, `/deep/.hidden`,
+anything under `/.git/`) is left out of the static index and answers `404`.
+The files that land in `static/` by accident are exactly the sensitive ones -
+a stray `.env`, an `.htpasswd`, editor backups, an unpacked `.git` - and
+`adapter-node` refuses plain dotfiles too, so an app migrating from it keeps
+that posture. The exclusion is segment-wise and decided once while the index
+is built: there is no per-request check to bypass. An encoded request
+(`/%2Eenv`) reaches nothing either - the static lane looks the raw
+pathname up as a Map key and never decodes it, and the decoded spelling
+was never a key. A refused directory is not descended into, so an
+unpacked `.git` is never even read.
+
+A top-level `.well-known/` keeps serving its ordinary files - RFC 8615
+discovery (`security.txt`, ACME HTTP-01 challenges) is documented served
+behavior. The carve-out is narrow in both directions: it applies at the
+FIRST path segment only, so `x/.well-known/y` is not an escape hatch, and
+it exempts the segment itself rather than the tree under it, so a dotfile
+inside `.well-known/` is still refused.
+
+The build warning names each refused path once - a refused directory is a
+single entry, and a compressed `.br`/`.gz` sibling is covered by naming its
+source file - so the mistake surfaces at build time instead of as a
+production `404`. To serve dotfiles deliberately:
+
+```js
+adapter: bunserve({
+	staticDotfiles: true // index and serve every dotfile
+})
+```
+
+Everything above is the PRODUCTION server. Dev and preview serve `static/`
+through SvelteKit's own pipeline, which never reads `staticDotfiles` - and
+the two do not even agree with each other: `vite preview` refuses
+dotfiles, while `vite dev` serves them (its static middleware runs with
+sirv's dotfile filter off). So a dotfile you can fetch in dev is not
+evidence the built server will serve it. svelte-adapter-uws applies the
+same production rule and spells the option the same way.
+
 ## Versions at boot
 
 The first thing a built server logs is its resolved identity:
