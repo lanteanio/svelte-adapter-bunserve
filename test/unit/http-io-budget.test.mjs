@@ -294,6 +294,29 @@ test('a HEAD answers from the index alone, on both lanes and on the prerendered 
 	assert.equal(memoryHead.headers.get('content-length'), String(IDENTITY_BODY.length));
 	assert.deepEqual(costAtScale(() => serveStatic(small, NO_HEADERS, true)), scaled(per));
 
+	// Per REPRESENTATION, because that is what a browser HEADs and it is the
+	// half a count cannot see: a HEAD that answers content-encoding: br with
+	// the identity length tells a client sizing a download exactly the wrong
+	// number, and every budget above is satisfied while it does.
+	const headLengths = [
+		['memory br', small, ACCEPT.br, 'br', BR_BODY.length],
+		['memory gzip', small, ACCEPT.gzip, 'gzip', GZ_BODY.length],
+		['disk identity', big, NO_HEADERS, '', 4096],
+		['disk br', big, ACCEPT.br, 'br', 500],
+		['disk gzip', big, ACCEPT.gzip, 'gzip', 800]
+	];
+	for (const [name, entry, accept, encoding, length] of headLengths) {
+		/** @type {any} */
+		let res;
+		opened.length = 0;
+		assert.deepEqual(cost(() => { res = serveStatic(entry, /** @type {any} */ (accept), true); }), per, name);
+		assert.equal(res.body, null, `${name}: no body`);
+		assert.equal(res.headers.get('content-encoding'), encoding || null, `${name}: content-encoding`);
+		assert.equal(res.headers.get('content-length'), String(length),
+			`${name}: the length of the representation it says it is sending`);
+		assert.deepEqual(opened, [], `${name}: opened nothing`);
+	}
+
 	// The prerendered lane takes the same headOnly flag through a second
 	// function, on a page big enough to be served from disk - so a HEAD that
 	// produced a body would show up as a file open here.
@@ -340,6 +363,11 @@ test('a disk-lane range slices the identity file once', async () => {
 	opened.length = 0;
 	assert.deepEqual(cost(() => { res = serveStatic(big, RANGE); }), per);
 	assert.equal(res.status, 206);
+	assert.equal(res.headers.get('content-range'), 'bytes 0-9/4096');
+	// The requested ten bytes, not nine and not the whole file. The stub's
+	// body is a string, so the slice the disk lane takes is observable here
+	// exactly as the memory lane's subarray is.
+	assert.equal(await res.text(), 'FAKE-FILE-');
 	// Ranges are served from the identity representation only, whatever the
 	// request would otherwise have negotiated.
 	assert.deepEqual(opened, [path.join(dir, 'big.bin')]);
@@ -351,6 +379,8 @@ test('a disk-lane range slices the identity file once', async () => {
 	let head;
 	assert.deepEqual(cost(() => { head = serveStatic(big, RANGE, true); }), { response: 1, headers: 1, bunFile: 0, decode: 0 });
 	assert.equal(head.body, null);
+	assert.equal(head.headers.get('content-length'), '10');
+	assert.equal(head.headers.get('content-range'), 'bytes 0-9/4096');
 	assert.deepEqual(opened, []);
 });
 

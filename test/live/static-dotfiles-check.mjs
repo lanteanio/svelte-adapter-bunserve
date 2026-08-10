@@ -126,9 +126,13 @@ check('the warning names the remedy', defaultLog.includes('staticDotfiles: true'
 check('the warning does not name a served .well-known file',
 	!defaultLog.includes('.well-known/probe.txt'), defaultLog.slice(-400));
 // A compressed sibling is covered by naming its source file, so the list stays
-// proportionate to what the developer actually dropped into static/.
+// proportionate to what the developer actually dropped into static/. Scoped to
+// the warning line itself, and only meaningful if there IS one - without the
+// guard an absent warning makes this pass rather than fail alongside the check
+// above.
+const warnAt = defaultLog.indexOf('dotfiles are refused by default');
 check('the warning names no .br or .gz sibling',
-	!/\.(?:br|gz)[,\s]/.test(defaultLog.slice(defaultLog.indexOf('dotfiles are refused by default'))),
+	warnAt !== -1 && !/\.(?:br|gz)[,\s]/.test(defaultLog.slice(warnAt)),
 	defaultLog.slice(-400));
 
 const optinLog = await build({ STATIC_DOTFILES: '1' });

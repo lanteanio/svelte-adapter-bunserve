@@ -68,6 +68,15 @@ test('the predicate exempts .well-known at the first segment only', () => {
 	// Not an escape hatch: nested placement and dotfiles inside are refused.
 	assert.equal(excludedDotPath('x/.well-known/y'), true);
 	assert.equal(excludedDotPath('.well-known/.hidden'), true);
+	// And the exemption is one exact spelling, not a family. A prefix match, a
+	// whole-path prefix or a case-insensitive compare would each hand an
+	// attacker a directory name that reads like the allow-listed one and is
+	// not it - which is the whole boundary this predicate draws.
+	assert.equal(excludedDotPath('.well-knownx/a'), true);
+	assert.equal(excludedDotPath('.well-known-old/a'), true);
+	assert.equal(excludedDotPath('.well-known.bak/a'), true);
+	assert.equal(excludedDotPath('.WELL-KNOWN/a'), true);
+	assert.equal(excludedDotPath('.Well-Known/a'), true);
 });
 
 test('the build scan lists every refused path once and never enters a refused directory', () => {
@@ -192,8 +201,13 @@ test('a refused directory is never read, not merely filtered at the leaf', () =>
 		fs.rmSync(tmp, { recursive: true, force: true });
 	}
 
-	assert.equal(read.some((d) => d.includes('.git')), false, `walked into ${JSON.stringify(read)}`);
-	assert.equal(read.some((d) => d.endsWith('assets')), true, 'an ordinary directory is still walked');
+	// Compared RELATIVE to the scratch root: an absolute temp path is not ours
+	// to assume anything about, and one that happens to contain a dot segment
+	// (a `my.gitlab-cache` directory, say) would fail this on correct code and
+	// accuse the walk of descending into `.git`.
+	const walked = read.map((d) => path.relative(tmp, d));
+	assert.equal(walked.some((d) => d.split(path.sep)[0] === '.git'), false, `walked into ${JSON.stringify(walked)}`);
+	assert.equal(walked.includes('assets'), true, 'an ordinary directory is still walked');
 });
 
 test('the opt-in indexes every dotfile', () => {
