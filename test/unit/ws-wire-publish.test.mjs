@@ -273,9 +273,12 @@ test("a toJSON writing into the caller's options cannot hand later entries a seq
 			assert.equal(ok, true);
 			assert.equal(options.seq, 7, 'the mutation really ran');
 			assert.equal(srv.published.length, 2);
-			for (const p of srv.published) {
-				assert.equal(JSON.parse(p.payload).seq, undefined, 'no entry drew the injected seq');
-			}
+			// The options carried no seq, so every entry draws the per-topic
+			// counter - consecutively, and never the injected 7.
+			const stamped = srv.published.map((p) => JSON.parse(p.payload).seq);
+			assert.equal(stamped.includes(7), false, 'no entry drew the injected seq');
+			assert.equal(typeof stamped[0], 'number');
+			assert.equal(stamped[1], stamped[0] + 1, 'consecutive counter values');
 			assert.equal(maxAuthoritativeSeq.get('room'), undefined, 'and the topic was never marked');
 			maxAuthoritativeSeq.clear();
 		}

@@ -45,6 +45,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   option. `staticDotfiles: true` restores the previous indexing
   exactly. svelte-adapter-uws made the same change, spelled the same way.
 
+- **BREAKING (wire-visible)** A publish with no options - or with an options
+  object carrying no `seq` - now stamps the per-topic counter, where it
+  previously stamped nothing. `platform.publish(topic, event, data)` is the
+  most common call shape there is, and svelte-adapter-uws has always stamped
+  the counter for it, so the same app emitted `{...,"seq":N}` there and a
+  seq-less envelope here, silently. Envelopes on that call now carry a `seq`
+  field they did not carry before: a client that keyed on its ABSENCE - dedup
+  by "no seq means unordered", a schema validator with
+  `additionalProperties: false` - sees new bytes. `{ seq: false }` publishes
+  without one and is the way to keep the old shape; `{ seq: true }` and an
+  explicit `{ seq: <number> }` are unchanged. Counter seqs are process-local
+  and mark nothing, so resume dedup is unaffected.
+
 ### Added
 
 - The pressure observability surface and LEASE/REQUEST_N flow control,

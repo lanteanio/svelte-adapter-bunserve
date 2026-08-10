@@ -932,9 +932,9 @@ export function stampExplicitSeq(seq, topic) {
 
 /**
  * Stamp the next sequence number for a topic, or null when this publish opted
- * out. An explicit numeric `seq` is a cluster-authoritative value, taken as
- * given once it is one the wire can carry; `{ seq: true }` draws from the local
- * counter.
+ * out with `{ seq: false }`. An explicit numeric `seq` is a
+ * cluster-authoritative value, taken as given once it is one the wire can
+ * carry; absent options and `{ seq: true }` alike draw from the local counter.
  *
  * @param {{ seq?: boolean | number } | undefined} options
  * @param {string} topic
@@ -956,7 +956,13 @@ export function stampSeq(options, topic) {
  * @returns {number | null}
  */
 export function stampSeqValue(seqOption, topic) {
-	if (seqOption === undefined || seqOption === false) return null;
+	// ABSENT IS THE COUNTER, and only an explicit `false` opts out. A publish
+	// with no options is the most common call shape there is, and
+	// svelte-adapter-uws has always stamped the counter for it - so a
+	// seq-less envelope here made the same app emit different bytes on the
+	// two adapters, silently, on the call every app makes. `false` keeps
+	// meaning "no seq": that is the spelling an app uses to say so.
+	if (seqOption === false) return null;
 	if (typeof seqOption === 'number') return stampExplicitSeq(seqOption, topic);
 	const current = topicSeqs.get(topic);
 	const next = (current ?? 0) + 1;
@@ -970,11 +976,11 @@ export function stampSeqValue(seqOption, topic) {
 		if (!seqEvictionWarned) {
 			seqEvictionWarned = true;
 			console.warn(
-				`[ws] more than ${MAX_SEQ_TOPICS} topics have been published with { seq: true }; ` +
-				'the least recently used counters are being evicted. An evicted topic restarts ' +
-				'its sequence at 1, so a client holding an older seq for it sees the number go ' +
-				'backwards. Publish without { seq: true } on high-cardinality topics, or scope ' +
-				'them so the working set stays under the cap.'
+				`[ws] more than ${MAX_SEQ_TOPICS} topics carry a counter seq; the least recently ` +
+				'used counters are being evicted. An evicted topic restarts its sequence at 1, so ' +
+				'a client holding an older seq for it sees the number go backwards. The counter is ' +
+				'the DEFAULT: publish with { seq: false } on high-cardinality topics, or scope them ' +
+				'so the working set stays under the cap.'
 			);
 		}
 	}

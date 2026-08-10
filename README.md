@@ -206,7 +206,7 @@ export function POST({ platform }) {
 
 | member | notes |
 |---|---|
-| `publish(topic, event, data, options?)` | topic fan-out; `{ seq, jitterMs, compress }` |
+| `publish(topic, event, data, options?)` | topic fan-out; `{ seq, jitterMs, compress }`. `seq` DEFAULTS to the per-topic counter - a call with no options stamps one; `{ seq: false }` is the only way to publish without |
 | `send(ws, topic, event, data, options?)` | one connection; returns 0 enqueued / 1 sent / 2 dropped |
 | `sendTo(filter, topic, event, data, options?)` | filtered fan-out; the filter MUST be synchronous |
 | `subscribe(ws, topic, options?)` | server-side subscribe THROUGH the authorization hook; `null` on success, else a reason: `INVALID_TOPIC`, `SUBSCRIBE_NOT_CONFIGURED`, `INTERNAL_ERROR`, `FORBIDDEN` (what a hook returning `false` becomes), `RATE_LIMITED`, `CANCELLED`, `CLOSED`, or the hook's own string |
@@ -505,7 +505,7 @@ client:
 | `{"type":"error","code":"RESUME_FAILED"}` | the app's `resume` hook threw or rejected, so how much of the window it covered is unknown. Retrying does not help; drop the stored per-topic offsets and cold-resync |
 | `{"type":"error","code":"CONTROL_FLOOD","limit":B}` | this connection's control-frame budget is spent; the socket is then closed **4429** |
 | `{"type":"reconnect","afterMs":N,"windowMs":W}` | shutdown advice, before the drain closes the socket; `afterMs` is omitted when the advice carries no delay |
-| `{topic, event, data, seq?, j?}` | the data envelopes; `j` is the per-subscriber jitter in ms, present only when `publish` was given `jitterMs` |
+| `{topic, event, data, seq?, j?}` | the data envelopes; `seq` is present unless the publish said `{ seq: false }`; `j` is the per-subscriber jitter in ms, present only when `publish` was given `jitterMs` |
 
 Acks are sent only when the client supplied a `ref`; a `ref` over 128 BYTES is
 treated as absent. Every subscribe / unsubscribe reply names the topic it
@@ -571,6 +571,16 @@ covered is what makes the boundary exact.
 A topic this server has stamped no explicit seq for has no mark at all, which is
 not the same as a mark of 0: it dedups nothing, and the whole held window
 re-delivers.
+
+**A publish stamps a seq by default.** `platform.publish(topic, event, data)`
+with no options draws the per-topic counter, exactly as `{ seq: true }` does,
+and svelte-adapter-uws answers the same call the same way - the two adapters
+are drop-in replacements, so the same app has to put the same bytes on the
+wire under both. `{ seq: false }` is the one spelling that publishes without:
+the envelope then omits the field entirely, and the opt-out consumes no
+counter value, so the run continues where it left off. The counter is a
+process-local space and marks nothing, so none of this changes the resume
+boundary described above - only an explicit numeric seq does.
 
 An explicit `{ seq: <number> }` must be an INTEGER OF AT LEAST 1. There is no
 upper bound - the frame varint carries any magnitude exactly, so snowflake ids

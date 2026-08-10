@@ -166,10 +166,23 @@ export function message(ws, { data, isBinary, msg, platform }) {
 		platform.publish(msg.topic, 'said', msg.data, { seq: true });
 		return;
 	}
-	// The EXPLICIT (cluster) seq lane. The `{ seq: true }` drivers above draw
-	// from this process's counter, which never marks a topic as explicitly
-	// stamped - so nothing they publish can exercise the reported-watermark
-	// path at all.
+	// The BARE call: three arguments, no options object at all. Every other
+	// driver here passes one, so without this lane the default the adapter
+	// applies - the per-topic counter - is never executed over a real socket,
+	// and a client keying on `seq` could stop receiving one with the whole
+	// suite still green.
+	if (msg && msg.type === 'fixture-publish-bare') {
+		platform.publish(msg.topic, 'said', msg.data);
+		return;
+	}
+	// The opt-out, same lane: the only spelling that puts no seq on the wire.
+	if (msg && msg.type === 'fixture-publish-noseq') {
+		platform.publish(msg.topic, 'said', msg.data, { seq: false });
+		return;
+	}
+	// The EXPLICIT (cluster) seq lane. The counter drivers above never mark a
+	// topic as explicitly stamped - so nothing they publish can exercise the
+	// reported-watermark path at all.
 	if (msg && msg.type === 'fixture-publish-seq') {
 		platform.publish(msg.topic, 'said', msg.data, { seq: msg.seq });
 		return;

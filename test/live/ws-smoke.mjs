@@ -143,6 +143,29 @@ try {
 	check('publish reaches the publishing connection too (server.publish)', fanB.topic === 'room', JSON.stringify(fanB));
 	check('{seq:true} stamps a sequence number', typeof fanA.seq === 'number' && fanA.seq >= 1, JSON.stringify(fanA));
 
+	// --- the DEFAULT: a publish with no options at all ----------------------
+	// Every other driver in this fixture passes an options object, so the
+	// three-argument call an app reaches for first was never executed over a
+	// real socket. What the CLIENT receives is the assertion that matters:
+	// svelte-adapter-uws puts a counter seq on this exact call, and a
+	// drop-in replacement has to put the same bytes on the wire.
+	a.send(JSON.stringify({ type: 'subscribe', topic: 'seq-default', ref: 11 }));
+	await a.next(); // subscribed
+	a.send(JSON.stringify({ type: 'fixture-publish-bare', topic: 'seq-default', data: { n: 1 } }));
+	const bare1 = j(await a.next());
+	a.send(JSON.stringify({ type: 'fixture-publish-bare', topic: 'seq-default', data: { n: 2 } }));
+	const bare2 = j(await a.next());
+	check('a bare publish() stamps the counter, delivered as seq 1', bare1.seq === 1, JSON.stringify(bare1));
+	check('and the next one is 2', bare2.seq === 2, JSON.stringify(bare2));
+
+	a.send(JSON.stringify({ type: 'fixture-publish-noseq', topic: 'seq-default', data: { n: 3 } }));
+	const noseq = j(await a.next());
+	check('{seq:false} omits the field entirely', !('seq' in noseq), JSON.stringify(noseq));
+
+	a.send(JSON.stringify({ type: 'fixture-publish-bare', topic: 'seq-default', data: { n: 4 } }));
+	const bare3 = j(await a.next());
+	check('and the opt-out consumed no counter value', bare3.seq === 3, JSON.stringify(bare3));
+
 	// --- observability -----------------------------------------------------
 	a.send(JSON.stringify({ type: 'fixture-stats', topic: 'room' }));
 	const stats = j(await a.next());
