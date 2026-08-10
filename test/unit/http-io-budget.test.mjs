@@ -12,7 +12,7 @@ import path from 'node:path';
 // keep that true. The counters wrap the late-bound globals the lane actually
 // calls (Response, Headers, Bun.file, decodeURIComponent), so a regression
 // that adds a per-request disk touch, an extra header build, or a lost cache
-// shows up as a changed COUNT under 6x load, deterministically.
+// shows up as a changed COUNT under load, deterministically.
 //
 // EVERY BRANCH THAT ANSWERS A REQUEST IS DRIVEN HERE, not just the happy one.
 // A budget only gates the branches the test actually executes, and the
@@ -21,18 +21,29 @@ import path from 'node:path';
 // negotiates), the disk lane past the identity GET, ranges, HEAD, the
 // canonical-form redirect, and the malformed-path refusal.
 //
-// NOT covered, honestly, and the boundary is exact: this file measures what
-// `serveStatic` and `tryPrerendered` cost. It does NOT cover per-response
-// socket writes - Bun.serve owns the transmit path, the adapter hands it a
-// Response and never touches the socket, so there is no seam to count through
-// - and it does not cover the dispatch above these two functions, where
-// server.js builds one `new URL(req.url)` per request. That URL is a real
-// per-request cost on a countable global; it is simply not in this lane.
+// AND THE COUNT IS NOT THE ONLY THING ASSERTED. A budget of one Headers and
+// one Response says nothing about WHICH representation came back, so the
+// nastiest bugs in this lane - serving identity bytes under a
+// `content-encoding: br` header, or handing a HEAD the whole body - are
+// invisible to a counter. Each representation is therefore checked for its
+// own bytes and its own status beside its budget.
 //
-// One further limit on the disk numbers: `Bun.file` is stubbed here, so what
-// is counted is CALL ARITY, not file handles. Real Bun.file is lazy and opens
-// nothing until the body is read, so "one Bun.file per GET" gates the code
-// path rather than measuring the syscall.
+// WHAT IS NOT COVERED, and the boundary is exact:
+//   - Only four globals are counted: Response, Headers, Bun.file and
+//     decodeURIComponent. Any other per-request allocation - an array rebuilt
+//     inside entryHeaders, say - is free as far as these numbers go, and so is
+//     the Map lookup the opening line of this comment promises.
+//   - Per-response socket writes. Bun.serve owns the transmit path: the
+//     adapter hands it a Response and never touches the socket, so there is no
+//     seam to count through.
+//   - The dispatch ABOVE these two functions. server.js builds one
+//     `new URL(req.url)` per request, including every static-cache hit. That
+//     is a real per-request cost on a countable global; it is simply not in
+//     this lane.
+//   - Bun.file is stubbed here, so the disk numbers are CALL ARITY, not file
+//     handles: real Bun.file is lazy and opens nothing until the body is read.
+//     The stub does record its ARGUMENT, so which file a representation chose
+//     is asserted even though the handle is not real.
 //
 // Lowering a budget needs no discussion. RAISING one is a design decision -
 // it says a response now costs more I/O - so record the reason in the comment
@@ -46,6 +57,8 @@ globalThis.ENV_PREFIX = '';
 register('../helpers/manifest-loader.mjs', import.meta.url);
 
 const counts = { response: 0, headers: 0, bunFile: 0, decode: 0 };
+/** Every path handed to Bun.file, in order. */
+const opened = [];
 
 const RealResponse = globalThis.Response;
 const RealHeaders = globalThis.Headers;
@@ -71,9 +84,14 @@ globalThis.decodeURIComponent = (s) => {
 // The overflow lane hands Bun.file's return straight to Response as the body,
 // and a range slices it first; a string is a valid BodyInit under Node and
 // answers .slice, so the count is taken and the Response still constructs.
+// The path is recorded because the COUNT cannot tell br from identity: a disk
+// lane that ignored negotiation would open the wrong file the right number of
+// times.
 globalThis.Bun = {
-	file: () => {
+	/** @param {string} p */
+	file: (p) => {
 		counts.bunFile++;
+		opened.push(String(p));
 		return 'FAKE-FILE-BODY';
 	}
 };
@@ -87,26 +105,37 @@ const { prerendered } = await import('../../src/runtime/manifest-bridge.js');
 // A scratch asset tree. Both lanes carry smaller .br/.gz variants, so
 // negotiation is real on each: without them the disk lane can only ever be
 // exercised as an identity GET, and its compressed arms - the ones a browser
-// actually reaches - are dead to every budget below.
+// actually reaches - are dead to every budget below. Each file's bytes are
+// distinct so the representation that came back is identifiable from the body
+// alone.
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunserve-http-budget-'));
-fs.writeFileSync(path.join(dir, 'small.js'), 'x'.repeat(400));
-fs.writeFileSync(path.join(dir, 'small.js.br'), 'b'.repeat(80));
-fs.writeFileSync(path.join(dir, 'small.js.gz'), 'g'.repeat(120));
+const IDENTITY_BODY = 'x'.repeat(400);
+const BR_BODY = 'b'.repeat(80);
+const GZ_BODY = 'g'.repeat(120);
+fs.writeFileSync(path.join(dir, 'small.js'), IDENTITY_BODY);
+fs.writeFileSync(path.join(dir, 'small.js.br'), BR_BODY);
+fs.writeFileSync(path.join(dir, 'small.js.gz'), GZ_BODY);
 fs.writeFileSync(path.join(dir, 'big.bin'), 'y'.repeat(4096));
 fs.writeFileSync(path.join(dir, 'big.bin.br'), 'b'.repeat(500));
 fs.writeFileSync(path.join(dir, 'big.bin.gz'), 'g'.repeat(800));
-// A directory-style prerendered page, so the canonical-form redirect and the
-// serve-the-trailing-slash-form branch are reachable.
+// Two directory-style prerendered pages: a small one for the canonical-form
+// redirect and its target, and one past the cache cap so the prerendered
+// lane's HEAD is measured on the DISK lane, where a body it should not have
+// produced costs a file open.
 fs.mkdirSync(path.join(dir, 'docs'));
 fs.writeFileSync(path.join(dir, 'docs', 'index.html'), '<h1>docs</h1>');
+fs.mkdirSync(path.join(dir, 'bigdocs'));
+fs.writeFileSync(path.join(dir, 'bigdocs', 'index.html'), '<p>' + 'd'.repeat(2000) + '</p>');
 cacheDir(dir, '', false, null);
 prerendered.add('/docs');
+prerendered.add('/bigdocs');
 const small = /** @type {any} */ (staticCache.get('/small.js'));
 const big = /** @type {any} */ (staticCache.get('/big.bin'));
 assert.ok(small && big, 'the scratch assets indexed');
 assert.ok(small.hasBr && small.hasGz, 'the memory lane negotiates both codings');
 assert.ok(big.hasBr && big.hasGz, 'and so does the disk lane');
 assert.ok(big.file && !big.buffer, 'big.bin took the disk lane');
+assert.ok(/** @type {any} */ (staticCache.get('/bigdocs/'))?.file, 'the big prerendered page took the disk lane');
 process.on('exit', () => fs.rmSync(dir, { recursive: true, force: true }));
 
 /**
@@ -125,26 +154,36 @@ function cost(fn) {
 }
 
 /**
- * The same call six times over, as one measurement. Every budget is stated
- * this way rather than once: a single call cannot tell a fixed cost from one
- * that grows, and growth is the regression these gates exist to catch.
+ * How many times a budget is measured. Every budget is stated at scale rather
+ * than once, because a single call cannot tell a fixed cost from one that
+ * grows.
  *
- * @param {() => void} fn
+ * The number is large deliberately. A window of six only catches growth with a
+ * period of six or less: a disk touch taken every 64th request, or a second
+ * header build once an entry has been served forty times, is exactly the shape
+ * a cache or a pool regression takes, and it hides completely inside a short
+ * window. Two hundred is past any amortization period a per-response cache
+ * would plausibly use and still costs milliseconds.
  */
-function costOfSix(fn) {
+const SCALE = 200;
+
+/**
+ * @param {(i: number) => void} fn
+ */
+function costAtScale(fn) {
 	return cost(() => {
-		for (let i = 0; i < 6; i++) fn();
+		for (let i = 0; i < SCALE; i++) fn(i);
 	});
 }
 
 /**
  * @param {{ response: number, headers: number, bunFile: number, decode: number }} per
  */
-const times6 = (per) => ({
-	response: per.response * 6,
-	headers: per.headers * 6,
-	bunFile: per.bunFile * 6,
-	decode: per.decode * 6
+const scaled = (per) => ({
+	response: per.response * SCALE,
+	headers: per.headers * SCALE,
+	bunFile: per.bunFile * SCALE,
+	decode: per.decode * SCALE
 });
 
 // Header objects are built OUTSIDE every measured closure. A `new Headers()`
@@ -163,7 +202,7 @@ const RANGE = new Headers({ range: 'bytes=0-9' });
 const UNSATISFIABLE_RANGE = new Headers({ range: 'bytes=9999-' });
 const CONDITIONAL = new Headers({ 'if-none-match': /** @type {string} */ (small.etag) });
 
-test('a cached asset costs one Headers and one Response, and 6x costs exactly 6x', () => {
+test('a cached asset costs one Headers and one Response, and load does not change that', () => {
 	// headers: 1 is the single entryHeaders build from the tuples baked at
 	// index time - the "single Headers construction" the static lane's
 	// design comments promise. The Response constructor contributes zero
@@ -172,103 +211,189 @@ test('a cached asset costs one Headers and one Response, and 6x costs exactly 6x
 	// of the count. If this gate ever fails with headers off by a constant
 	// per Response across every test here, suspect undici first.
 	const per = { response: 1, headers: 1, bunFile: 0, decode: 0 };
-	assert.deepEqual(cost(() => serveStatic(small, NO_HEADERS)), per);
+	/** @type {any} */
+	let res;
+	assert.deepEqual(cost(() => { res = serveStatic(small, NO_HEADERS); }), per);
+	assert.equal(res.status, 200);
 	assert.deepEqual(
-		costOfSix(() => serveStatic(small, NO_HEADERS)),
-		times6(per),
-		'6x the requests must not change the per-request count of anything'
+		costAtScale(() => serveStatic(small, NO_HEADERS)),
+		scaled(per),
+		'the per-request count of everything must be flat under load'
 	);
 });
 
-test('every memory-lane representation costs one Headers, one Response and no disk', () => {
+test('every memory-lane representation costs one Headers, one Response and no disk', async () => {
 	// The compressed arms are what a browser actually gets, and they build
 	// their headers from a DIFFERENT precomputed tuple list than identity -
 	// so a per-request build added there is invisible to the identity budget
-	// above.
+	// above. The BODY is asserted beside the count because a budget cannot
+	// see the worst bug this lane has: identity bytes under a compressed
+	// content-encoding, which every client would decode into garbage.
 	const per = { response: 1, headers: 1, bunFile: 0, decode: 0 };
-	for (const [name, accept] of [['identity', NO_HEADERS], ['br', ACCEPT.br], ['gzip', ACCEPT.gzip]]) {
-		assert.deepEqual(cost(() => serveStatic(small, /** @type {Headers} */ (accept))), per, name);
-		assert.deepEqual(costOfSix(() => serveStatic(small, /** @type {Headers} */ (accept))), times6(per), name);
+	const cases = [
+		['identity', NO_HEADERS, '', IDENTITY_BODY],
+		['br', ACCEPT.br, 'br', BR_BODY],
+		['gzip', ACCEPT.gzip, 'gzip', GZ_BODY]
+	];
+	for (const [name, accept, encoding, body] of cases) {
+		/** @type {any} */
+		let res;
+		assert.deepEqual(cost(() => { res = serveStatic(small, /** @type {any} */ (accept)); }), per, name);
+		assert.equal(res.status, 200, name);
+		assert.equal(res.headers.get('content-encoding'), encoding || null, `${name}: content-encoding`);
+		assert.equal(await res.text(), body, `${name}: the bytes of that representation`);
+		assert.deepEqual(costAtScale(() => serveStatic(small, /** @type {any} */ (accept))), scaled(per), name);
 	}
 	// A coding LIST resolves to br - the same branch, stated so the loop above
 	// is not read as covering four distinct representations.
-	const listed = /** @type {any} */ (serveStatic(small, ACCEPT.list));
-	assert.equal(listed.headers.get('content-encoding'), 'br');
+	assert.equal(serveStatic(small, ACCEPT.list).headers.get('content-encoding'), 'br');
 });
 
-test('the disk lane costs exactly one Bun.file per GET, on every representation', () => {
+test('the disk lane costs one Bun.file per GET and opens the negotiated file', async () => {
+	// Which file was opened is the assertion the count cannot make: a disk
+	// lane that ignored negotiation would open the identity file exactly once
+	// per request and satisfy every budget here while serving br headers over
+	// uncompressed bytes.
 	const per = { response: 1, headers: 1, bunFile: 1, decode: 0 };
-	for (const [name, accept] of [['identity', NO_HEADERS], ['br', ACCEPT.br], ['gzip', ACCEPT.gzip]]) {
-		assert.deepEqual(cost(() => serveStatic(big, /** @type {Headers} */ (accept))), per, name);
-		assert.deepEqual(
-			costOfSix(() => serveStatic(big, /** @type {Headers} */ (accept))),
-			times6(per),
-			`${name}: one file handle per request, no growth`
-		);
+	const cases = [
+		['identity', NO_HEADERS, '', 'big.bin'],
+		['br', ACCEPT.br, 'br', 'big.bin.br'],
+		['gzip', ACCEPT.gzip, 'gzip', 'big.bin.gz']
+	];
+	for (const [name, accept, encoding, file] of cases) {
+		opened.length = 0;
+		/** @type {any} */
+		let res;
+		assert.deepEqual(cost(() => { res = serveStatic(big, /** @type {any} */ (accept)); }), per, name);
+		assert.equal(res.status, 200, name);
+		assert.equal(res.headers.get('content-encoding'), encoding || null, `${name}: content-encoding`);
+		assert.deepEqual(opened, [path.join(dir, /** @type {string} */ (file))], `${name}: opened file`);
+		assert.deepEqual(costAtScale(() => serveStatic(big, /** @type {any} */ (accept))), scaled(per), name);
 	}
 });
 
-test('a HEAD answers from the index alone, on both lanes', () => {
-	// The body source is never opened: that is the whole claim of a HEAD, and
-	// it is the one place where "the same headers as a GET" could quietly be
-	// paid for with a disk touch.
-	const diskHead = { response: 1, headers: 1, bunFile: 0, decode: 0 };
-	assert.deepEqual(cost(() => serveStatic(big, NO_HEADERS, true)), diskHead);
-	assert.deepEqual(costOfSix(() => serveStatic(big, NO_HEADERS, true)), times6(diskHead));
+test('a HEAD answers from the index alone, on both lanes and on the prerendered lane', async () => {
+	// The body source is never opened, and no body comes back: that is the
+	// whole claim of a HEAD, and a count alone cannot see the second half.
+	// Content-Length still has to describe the body a GET would have sent.
+	const per = { response: 1, headers: 1, bunFile: 0, decode: 0 };
 
-	const memoryHead = { response: 1, headers: 1, bunFile: 0, decode: 0 };
-	assert.deepEqual(cost(() => serveStatic(small, NO_HEADERS, true)), memoryHead);
-	assert.deepEqual(costOfSix(() => serveStatic(small, NO_HEADERS, true)), times6(memoryHead));
+	/** @type {any} */
+	let diskHead;
+	opened.length = 0;
+	assert.deepEqual(cost(() => { diskHead = serveStatic(big, NO_HEADERS, true); }), per);
+	assert.equal(diskHead.body, null, 'a disk-lane HEAD carries no body');
+	assert.equal(diskHead.headers.get('content-length'), '4096');
+	assert.deepEqual(opened, [], 'and opened nothing');
+	assert.deepEqual(costAtScale(() => serveStatic(big, NO_HEADERS, true)), scaled(per));
+
+	/** @type {any} */
+	let memoryHead;
+	assert.deepEqual(cost(() => { memoryHead = serveStatic(small, NO_HEADERS, true); }), per);
+	assert.equal(memoryHead.body, null, 'a memory-lane HEAD carries no body');
+	assert.equal(memoryHead.headers.get('content-length'), String(IDENTITY_BODY.length));
+	assert.deepEqual(costAtScale(() => serveStatic(small, NO_HEADERS, true)), scaled(per));
+
+	// The prerendered lane takes the same headOnly flag through a second
+	// function, on a page big enough to be served from disk - so a HEAD that
+	// produced a body would show up as a file open here.
+	/** @type {any} */
+	let pageHead;
+	opened.length = 0;
+	assert.deepEqual(cost(() => { pageHead = tryPrerendered('/bigdocs/', '', NO_HEADERS, true); }), per);
+	assert.equal(pageHead.status, 200);
+	assert.equal(pageHead.body, null, 'a prerendered HEAD carries no body');
+	assert.deepEqual(opened, [], 'and opened nothing');
 });
 
 test('a 304 costs one Response and no header build at all', () => {
 	const per = { response: 1, headers: 0, bunFile: 0, decode: 0 };
-	assert.deepEqual(cost(() => serveStatic(small, CONDITIONAL)), per);
-	assert.deepEqual(costOfSix(() => serveStatic(small, CONDITIONAL)), times6(per));
+	/** @type {any} */
+	let res;
+	assert.deepEqual(cost(() => { res = serveStatic(small, CONDITIONAL); }), per);
+	assert.equal(res.status, 304);
+	assert.deepEqual(costAtScale(() => serveStatic(small, CONDITIONAL)), scaled(per));
 });
 
-test('a memory-lane range is one Headers, one Response and zero disk', () => {
+test('a memory-lane range is one Headers, one Response and zero disk', async () => {
 	// The 206 path builds its headers from the identity tuples and then sets
 	// content-range on the SAME object - one build, not two.
 	const per = { response: 1, headers: 1, bunFile: 0, decode: 0 };
-	assert.deepEqual(cost(() => serveStatic(small, RANGE)), per, 'a buffer range is a subarray');
-	assert.deepEqual(cost(() => serveStatic(small, RANGE, true)), per, 'and a HEAD of one costs the same');
-	assert.deepEqual(costOfSix(() => serveStatic(small, RANGE)), times6(per));
+	/** @type {any} */
+	let res;
+	assert.deepEqual(cost(() => { res = serveStatic(small, RANGE); }), per, 'a buffer range is a subarray');
+	assert.equal(res.status, 206);
+	assert.equal(res.headers.get('content-range'), `bytes 0-9/${IDENTITY_BODY.length}`);
+	assert.equal(await res.text(), IDENTITY_BODY.slice(0, 10));
+	/** @type {any} */
+	let head;
+	assert.deepEqual(cost(() => { head = serveStatic(small, RANGE, true); }), per, 'and a HEAD of one costs the same');
+	assert.equal(head.body, null);
+	assert.equal(head.headers.get('content-length'), '10');
+	assert.deepEqual(costAtScale(() => serveStatic(small, RANGE)), scaled(per));
 });
 
-test('a disk-lane range slices the file once', () => {
+test('a disk-lane range slices the identity file once', async () => {
 	const per = { response: 1, headers: 1, bunFile: 1, decode: 0 };
-	assert.deepEqual(cost(() => serveStatic(big, RANGE)), per);
-	assert.deepEqual(costOfSix(() => serveStatic(big, RANGE)), times6(per));
+	/** @type {any} */
+	let res;
+	opened.length = 0;
+	assert.deepEqual(cost(() => { res = serveStatic(big, RANGE); }), per);
+	assert.equal(res.status, 206);
+	// Ranges are served from the identity representation only, whatever the
+	// request would otherwise have negotiated.
+	assert.deepEqual(opened, [path.join(dir, 'big.bin')]);
+	assert.deepEqual(costAtScale(() => serveStatic(big, RANGE)), scaled(per));
 	// A HEAD of a range states the length instead of producing bytes, so the
 	// file is not opened at all.
-	assert.deepEqual(cost(() => serveStatic(big, RANGE, true)), { response: 1, headers: 1, bunFile: 0, decode: 0 });
+	opened.length = 0;
+	/** @type {any} */
+	let head;
+	assert.deepEqual(cost(() => { head = serveStatic(big, RANGE, true); }), { response: 1, headers: 1, bunFile: 0, decode: 0 });
+	assert.equal(head.body, null);
+	assert.deepEqual(opened, []);
 });
 
 test('an unsatisfiable range costs one Response and builds no headers', () => {
 	const per = { response: 1, headers: 0, bunFile: 0, decode: 0 };
-	assert.deepEqual(cost(() => serveStatic(small, UNSATISFIABLE_RANGE)), per);
-	assert.deepEqual(costOfSix(() => serveStatic(small, UNSATISFIABLE_RANGE)), times6(per));
+	/** @type {any} */
+	let res;
+	assert.deepEqual(cost(() => { res = serveStatic(small, UNSATISFIABLE_RANGE); }), per);
+	assert.equal(res.status, 416);
+	assert.equal(res.headers.get('content-range'), `bytes */${IDENTITY_BODY.length}`);
+	assert.deepEqual(costAtScale(() => serveStatic(small, UNSATISFIABLE_RANGE)), scaled(per));
 });
 
 test('the canonical-form redirect and the page it points at cost one Response each', () => {
 	const redirect = { response: 1, headers: 0, bunFile: 0, decode: 0 };
-	assert.deepEqual(cost(() => tryPrerendered('/docs', '', NO_HEADERS)), redirect);
-	assert.deepEqual(costOfSix(() => tryPrerendered('/docs', '', NO_HEADERS)), times6(redirect));
+	/** @type {any} */
+	let res;
+	assert.deepEqual(cost(() => { res = tryPrerendered('/docs', '', NO_HEADERS); }), redirect);
+	assert.equal(res.status, 308);
+	assert.equal(res.headers.get('location'), '/docs/');
+	assert.deepEqual(costAtScale(() => tryPrerendered('/docs', '', NO_HEADERS)), scaled(redirect));
 
 	const served = { response: 1, headers: 1, bunFile: 0, decode: 0 };
-	assert.deepEqual(cost(() => tryPrerendered('/docs/', '', NO_HEADERS)), served);
+	/** @type {any} */
+	let page;
+	assert.deepEqual(cost(() => { page = tryPrerendered('/docs/', '', NO_HEADERS); }), served);
+	assert.equal(page.status, 200);
 });
 
 test('a malformed encoded path decodes once and refuses', () => {
 	// The failed decode is not memoized as a hit that skips the decode - it is
 	// memoized as null - so a repeat costs no second decode and still refuses.
 	decodeCache.clear();
-	const first = cost(() => tryPrerendered('/%E0%A4%A', '', NO_HEADERS));
-	assert.deepEqual(first, { response: 1, headers: 0, bunFile: 0, decode: 1 });
+	/** @type {any} */
+	let res;
 	assert.deepEqual(
-		costOfSix(() => tryPrerendered('/%E0%A4%A', '', NO_HEADERS)),
-		{ response: 6, headers: 0, bunFile: 0, decode: 0 },
+		cost(() => { res = tryPrerendered('/%E0%A4%A', '', NO_HEADERS); }),
+		{ response: 1, headers: 0, bunFile: 0, decode: 1 }
+	);
+	assert.equal(res.status, 400);
+	assert.deepEqual(
+		costAtScale(() => tryPrerendered('/%E0%A4%A', '', NO_HEADERS)),
+		{ response: SCALE, headers: 0, bunFile: 0, decode: 0 },
 		'a refused path is remembered, not re-decoded'
 	);
 });
@@ -280,12 +405,10 @@ test('a path with no percent-encoding never decodes at all', () => {
 	// cache insert per distinct plain path, and every other test here would
 	// still pass because every other test hands in an encoded one.
 	decodeCache.clear();
-	const plain = costOfSix(() => tryPrerendered('/plain/path/here', '', NO_HEADERS));
-	assert.equal(plain.decode, 0, 'an unencoded path must not reach decodeURIComponent');
-	const distinct = cost(() => {
-		for (let i = 0; i < 6; i++) tryPrerendered(`/plain/${i}`, '', NO_HEADERS);
-	});
-	assert.equal(distinct.decode, 0, 'and neither must six distinct ones');
+	assert.equal(costAtScale(() => tryPrerendered('/plain/path/here', '', NO_HEADERS)).decode, 0,
+		'an unencoded path must not reach decodeURIComponent');
+	assert.equal(costAtScale((i) => tryPrerendered(`/plain/${i}`, '', NO_HEADERS)).decode, 0,
+		'and neither must distinct ones');
 	assert.equal(decodeCache.size, 0, 'nor may they consume the decode cache');
 });
 
@@ -295,33 +418,37 @@ test('repeated encoded paths cost one decode; the cache is doing its job', () =>
 	decodeCache.clear();
 	const one = cost(() => tryPrerendered('/caf%C3%A9', '', NO_HEADERS));
 	assert.equal(one.decode, 1, 'the first sighting decodes');
-	assert.equal(costOfSix(() => tryPrerendered('/caf%C3%A9', '', NO_HEADERS)).decode, 0,
-		'6x the same path must not decode again');
+	assert.equal(costAtScale(() => tryPrerendered('/caf%C3%A9', '', NO_HEADERS)).decode, 0,
+		'the same path under load must not decode again');
 });
 
-test('the decode cache is bounded, and an evicted path decodes again', () => {
+test('the decode cache is bounded at 256, and an evicted path decodes again', () => {
 	// The bound is what keeps a flood of distinct encoded paths from growing
-	// the cache without limit. Nothing else in the suite reaches it, so
-	// removing the eviction is otherwise invisible.
+	// the cache without limit. The literal is pinned rather than compared
+	// against the constant it is measuring: a cache of one entry, or of two
+	// hundred thousand, would satisfy "size === DECODE_CACHE_MAX" and neither
+	// is the bound this lane means.
+	assert.equal(DECODE_CACHE_MAX, 256, 'raising this is a memory decision, so state it here too');
 	decodeCache.clear();
-	for (let i = 0; i < DECODE_CACHE_MAX; i++) tryPrerendered(`/fill-%2F${i}`, '', NO_HEADERS);
-	assert.equal(decodeCache.size, DECODE_CACHE_MAX, 'the cache filled to exactly the cap');
-	const overflow = cost(() => tryPrerendered('/overflow-%2F', '', NO_HEADERS));
-	assert.equal(overflow.decode, 1);
-	assert.ok(decodeCache.size <= DECODE_CACHE_MAX, `cache grew past the cap: ${decodeCache.size}`);
+	for (let i = 0; i < 256; i++) tryPrerendered(`/fill-%2F${i}`, '', NO_HEADERS);
+	assert.equal(decodeCache.size, 256, 'the cache filled to exactly the cap');
+	assert.equal(cost(() => tryPrerendered('/overflow-%2F', '', NO_HEADERS)).decode, 1);
+	assert.equal(decodeCache.size, 256, 'and stayed there');
 	// The oldest entry was the one evicted, so it pays for a decode again.
 	assert.equal(cost(() => tryPrerendered('/fill-%2F0', '', NO_HEADERS)).decode, 1);
 	decodeCache.clear();
 });
 
 test('SELF-CHECK: the detector sees work that genuinely scales', () => {
-	// Six DISTINCT encoded paths must cost six decodes - if this passes with
-	// fewer, the counter is broken and every gate above is vacuous.
+	// Distinct encoded paths must cost one decode each - if this passes with
+	// fewer, the counter is broken and every gate above is vacuous. Kept under
+	// the decode cache's own bound so eviction is not what produces the count.
 	decodeCache.clear();
-	const six = cost(() => {
-		for (let i = 0; i < 6; i++) tryPrerendered(`/self-check-%2${i}`, '', NO_HEADERS);
+	const distinct = cost(() => {
+		for (let i = 0; i < 200; i++) tryPrerendered(`/self-check-%2F${i}`, '', NO_HEADERS);
 	});
-	assert.equal(six.decode, 6);
-	// And the response counter: six real serves are six Responses.
-	assert.equal(costOfSix(() => serveStatic(small, NO_HEADERS)).response, 6);
+	assert.equal(distinct.decode, 200);
+	// And the response counter: real serves are real Responses.
+	assert.equal(costAtScale(() => serveStatic(small, NO_HEADERS)).response, SCALE);
+	decodeCache.clear();
 });
