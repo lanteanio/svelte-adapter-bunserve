@@ -723,7 +723,8 @@ same production rule and spells the option the same way.
 
 ## Versions at boot
 
-The first thing a built server logs is its resolved identity:
+A built server logs its resolved identity while it boots, before the line
+announcing what it is listening on:
 
 ```
 svelte-adapter-bunserve 0.0.1 (protocol rev 1, svelte-realtime 0.4.2, svelte-adapter-uws-extensions not installed)
