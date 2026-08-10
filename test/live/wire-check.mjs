@@ -190,17 +190,25 @@ try {
 	const d = client('watermark');
 	await d.opened;
 	// The plan is armed BEFORE the resume window opens: on resume, the hook
-	// publishes explicit seqs 21..23 from inside the window, DELIVERS 21 and 22
+	// publishes explicit seqs 21..25 from inside the window, DELIVERS 21 and 22
 	// to this socket itself, and reports 22 as covered. 22 is then a seq the
 	// server both stamped and sent, so the report survives the ceiling AND is
-	// true; the flush owes the client exactly 23. Delivering them is what makes
-	// the report honest - reporting a merely-stamped 22 would have the flush
-	// drop 21 and 22 as already-held while this client never received them.
+	// true; the flush owes the client 23, 24 and 25. Delivering them is what
+	// makes the report honest - reporting a merely-stamped 22 would have the
+	// flush drop 21 and 22 as already-held while this client never received
+	// them.
+	//
+	// THREE frames above the watermark, not one. With a single frame above the
+	// floor the flush has nothing to order, so this lane could not observe an
+	// out-of-order or duplicated flush at all: every permutation of a one-frame
+	// sequence is that sequence. The dedup boundary and the flush's ordering are
+	// separate properties, and the window has to be wide enough on both sides to
+	// see either fail.
 	d.send({
 		type: 'fixture-resume-plan',
 		topic: SEQ_TOPIC,
 		report: 22,
-		publish: [21, 22, 23]
+		publish: [21, 22, 23, 24, 25]
 	});
 	await until(() => d.texts.some((t) => t.event === 'resume-planned'), 'resume plan armed');
 	// A pre-window explicit publish, so the topic is already marked when the
@@ -219,32 +227,35 @@ try {
 	const viaHook = inWindow.filter((t) => t.data.viaHook === true).map((t) => t.data.inWindow);
 	const viaFlush = inWindow.filter((t) => t.data.viaHook !== true).map((t) => t.data.inWindow);
 	// Exact sequences rather than membership. What this lane claims is that the
-	// client receives 21, 22 and 23 once each and in that order; a hook that
-	// delivered 22 before 21, or a flush that emitted a second frame above the
-	// watermark, satisfies every containment test while breaking the claim.
+	// client receives 21 through 25 once each and in that order; a hook that
+	// delivered 22 before 21, a flush that emitted 25 before 24, or a flush that
+	// repeated a frame, satisfies every containment test while breaking the
+	// claim.
 	const sameSeqs = (got, want) => got.length === want.length && got.every((v, i) => v === want[i]);
 	check('the hook delivers exactly the frames its reported watermark claims, in order',
 		sameSeqs(viaHook, [21, 22]),
 		JSON.stringify(viaHook));
 	check('a watermark the server stamped is honoured: the flush drops everything at or below it and sends exactly what is above',
-		sameSeqs(viaFlush, [23]),
+		sameSeqs(viaFlush, [23, 24, 25]),
 		JSON.stringify(viaFlush));
 	// The point of the dedup is to drop RE-delivery, never data. With an honest
-	// report the client ends the resume holding all three seqs, in order, each
-	// exactly once - the assertion the previous shape of this lane could not
-	// make. Counted per SEQ rather than per frame, deliberately: 21 and 22 reach
-	// the client as the hook's own replay frames, which are a different envelope
-	// from the one published into the topic.
-	check('so the client ends the window holding 21, 22, 23 in that order, each exactly once',
-		sameSeqs(inWindow.map((t) => t.data.inWindow), [21, 22, 23]),
+	// report the client ends the resume holding every seq in the window, in
+	// order, each exactly once. Counted per SEQ rather than per frame,
+	// deliberately: 21 and 22 reach the client as the hook's own replay frames,
+	// which are a different envelope from the one published into the topic.
+	check('so the client ends the window holding 21 through 25 in that order, each exactly once',
+		sameSeqs(inWindow.map((t) => t.data.inWindow), [21, 22, 23, 24, 25]),
 		JSON.stringify(inWindow.map((t) => ({ seq: t.data.inWindow, viaHook: t.data.viaHook === true }))));
-	// The flushed envelope must still carry its wire seq: that field is what a
-	// real client records as its next watermark, and every check above reads the
-	// fixture's own payload marker instead, which a dropped seq would not touch.
-	const flushed23 = d.texts.find((t) => t.data?.inWindow === 23 && t.data?.viaHook !== true);
-	check('and the flushed frame carries the wire seq the client resumes from',
-		flushed23?.seq === 23,
-		JSON.stringify(flushed23));
+	// Every flushed envelope must still carry its OWN wire seq: that field is
+	// what a real client records as its next watermark, and every check above
+	// reads the fixture's own payload marker instead, which a dropped or
+	// mismatched seq would not touch. Asserted per frame rather than on one of
+	// them, because a flush that stamped the whole batch with a single seq is
+	// exactly the shape that leaves a client's watermark wrong.
+	const flushedFrames = d.texts.filter((t) => t.data?.inWindow >= 23 && t.data?.viaHook !== true);
+	check('and every flushed frame carries the wire seq the client resumes from',
+		sameSeqs(flushedFrames.map((t) => t.seq), [23, 24, 25]),
+		JSON.stringify(flushedFrames.map((t) => ({ seq: t.seq, marker: t.data?.inWindow }))));
 	const ackAt2 = d.texts.findIndex((t) => t.type === 'subscribed');
 	const lastInWindowAt = d.texts.findLastIndex(isInWindow);
 	check('and the whole window arrives before the subscribed ack',
