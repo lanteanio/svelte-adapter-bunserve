@@ -505,7 +505,7 @@ client:
 | `{"type":"error","code":"RESUME_FAILED"}` | the app's `resume` hook threw or rejected, so how much of the window it covered is unknown. Retrying does not help; drop the stored per-topic offsets and cold-resync |
 | `{"type":"error","code":"CONTROL_FLOOD","limit":B}` | this connection's control-frame budget is spent; the socket is then closed **4429** |
 | `{"type":"reconnect","afterMs":N,"windowMs":W}` | shutdown advice, before the drain closes the socket; `afterMs` is omitted when the advice carries no delay |
-| `{topic, event, data, seq?, j?}` | the data envelopes; `seq` is present unless the publish said `{ seq: false }`; `j` is the per-subscriber jitter in ms, present only when `publish` was given `jitterMs` |
+| `{topic, event, data, seq?, j?}` | the data envelopes. On the PUBLISH lanes `seq` is present unless the call said `{ seq: false }`; the single-target lanes (`send`, `sendTo`, and the JSON fallbacks of `sendWire`/`sendWireBatch`) never carry one and have no seq option, so an absent `seq` does not by itself mean a publisher opted out. `j` is the per-subscriber jitter in ms, present only when `publish` was given `jitterMs` |
 
 Acks are sent only when the client supplied a `ref`; a `ref` over 128 BYTES is
 treated as absent. Every subscribe / unsubscribe reply names the topic it
@@ -578,9 +578,16 @@ and svelte-adapter-uws answers the same call the same way - the two adapters
 are drop-in replacements, so the same app has to put the same bytes on the
 wire under both. `{ seq: false }` is the one spelling that publishes without:
 the envelope then omits the field entirely, and the opt-out consumes no
-counter value, so the run continues where it left off. The counter is a
-process-local space and marks nothing, so none of this changes the resume
-boundary described above - only an explicit numeric seq does.
+counter value, so the run continues where it left off.
+
+A counter seq is not a MARK: it is a process-local space, it never writes
+a value into the authoritative marks above, and only an explicit numeric
+seq can raise a resume boundary. It is not entirely inert either, and the
+one place it shows is worth knowing about: publishing to a topic that
+already carries a mark keeps that mark RECENT, so once an app is past
+10,000 marked topics and the LRU is evicting, a bare publish influences
+which topic keeps its dedup floor and which loses it. The value never
+moves; only the eviction order does.
 
 An explicit `{ seq: <number> }` must be an INTEGER OF AT LEAST 1. There is no
 upper bound - the frame varint carries any magnitude exactly, so snowflake ids

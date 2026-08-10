@@ -213,8 +213,8 @@ try {
 	await until(() => d.texts.some((t) => t.event === 'resume-planned'), 'resume plan armed');
 	// A pre-window explicit publish, so the topic is already marked when the
 	// window opens rather than being marked only from inside it. It does not
-	// decide this lane's outcome - the in-window publishes raise the mark to 23
-	// on their own, so the ceiling is 23 either way - it keeps the scenario a
+	// decide this lane's outcome - the in-window publishes raise the mark to 25
+	// on their own, so the ceiling is 25 either way - it keeps the scenario a
 	// resume of an established topic. The ceiling-against-a-pre-window-mark
 	// interaction itself is pinned in the unit lane.
 	d.send({ type: 'fixture-publish-seq', topic: SEQ_TOPIC, seq: 20, data: { pre: true } });

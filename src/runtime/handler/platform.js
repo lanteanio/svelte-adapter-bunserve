@@ -1041,8 +1041,9 @@ export const platform = {
 	 *   form is looked up as `<event>-batch` with `{ updates }` data.
 	 * @param {Array<{ data: any, excludeWs?: any, seq?: number }>} entries
 	 * @param {{ capability: string, schemaVersion: number, encode: Function, state?: any }} wire
-	 * @param {{ seq?: boolean, compress?: boolean }} [options] - `seq` is the
-	 *   counter opt-in only; a number here is the refused batch-level form.
+	 * @param {{ seq?: boolean, compress?: boolean }} [options] - the counter is
+	 *   the default, here as everywhere: absent options stamp one per entry,
+	 *   `false` stamps none, and a number is the refused batch-level form.
 	 * @returns {boolean}
 	 * @throws {TypeError} on a batch-level explicit seq, or an entry seq the
 	 *   wire cannot carry

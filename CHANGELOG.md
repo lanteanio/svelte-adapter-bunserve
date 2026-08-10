@@ -56,7 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `additionalProperties: false` - sees new bytes. `{ seq: false }` publishes
   without one and is the way to keep the old shape; `{ seq: true }` and an
   explicit `{ seq: <number> }` are unchanged. Counter seqs are process-local
-  and mark nothing, so resume dedup is unaffected.
+  and never write an authoritative mark, so no resume boundary moves. They
+  do keep an already-marked topic recent, so past the 10,000-topic LRU
+  bound a bare publish can change which topic keeps its dedup floor.
 
 ### Added
 
