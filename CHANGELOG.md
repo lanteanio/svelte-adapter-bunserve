@@ -59,6 +59,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and never write an authoritative mark, so no resume boundary moves. They
   do keep an already-marked topic recent, so past the 10,000-topic LRU
   bound a bare publish can change which topic keeps its dedup floor.
+- The two bounded per-topic seq maps evict second-chance rather than by exact
+  least-recently-used order. Exact order meant deleting and re-adding a key on
+  every touch, which is not flat in map size - measured under Bun, 692 ns at
+  the 10,000-topic bound against about 20 ns for a plain set - and since the
+  counter became the default that sat on every publish. A topic still being
+  published to is still not what gets thrown away; what is given up is
+  precision among topics that were all touched recently. Per bare publish the
+  stamp costs 19 ns on a small working set and 31 ns at the bound, against 150
+  and 790 before.
 
 ### Added
 

@@ -1048,8 +1048,8 @@ export function stampSeqValue(seqOption, topic) {
 		if (!seqEvictionWarned) {
 			seqEvictionWarned = true;
 			console.warn(
-				`[ws] more than ${MAX_SEQ_TOPICS} topics carry a counter seq; the least recently ` +
-				'used counters are being evicted. An evicted topic restarts its sequence at 1, so ' +
+				`[ws] more than ${MAX_SEQ_TOPICS} topics carry a counter seq; the counters that ` +
+				'have gone quiet are being evicted. An evicted topic restarts its sequence at 1, so ' +
 				'a client holding an older seq for it sees the number go backwards. The counter is ' +
 				'the DEFAULT: publish with { seq: false } on high-cardinality topics, or scope them ' +
 				'so the working set stays under the cap.'
