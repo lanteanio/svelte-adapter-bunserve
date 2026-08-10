@@ -97,29 +97,54 @@ test('an explicit number is taken as given, and never advances the counter', () 
 	}
 });
 
-test('the counter map is bounded, and at the cap the eviction is a true LRU', () => {
+test('the counter map is bounded, and a topic still being published to is not what is thrown away', () => {
 	// The counter is now the DEFAULT, so this map is reached by every publish
 	// and its bound is what keeps an app publishing to client-named topics
 	// (room:<uuid>) from growing one entry per topic for the life of the
-	// process. The recency re-insert that makes the eviction LRU is only paid
-	// for once the map is AT the cap - below it nothing is ever evicted, and
-	// paying there costs an order of magnitude on the hottest primitive in the
-	// adapter. This pins the part that is load-bearing: at the cap, a topic
-	// that was just stamped outlives one that was not.
+	// process. Eviction is second-chance rather than exact LRU - keeping the
+	// map in use order costs an order of magnitude per stamp at this size -
+	// so what is pinned here is the property that actually matters: a topic
+	// touched since the last sweep outlives topics that were not.
+	//
+	// The refreshed topic is deliberately NOT the oldest key. A sweep that
+	// only ever spared the entry it was about to evict would satisfy an
+	// oldest-key version of this test while letting every other hot topic age
+	// out and restart at seq 1, which is the user-visible harm.
 	try {
 		for (let i = 0; i < MAX_SEQ_TOPICS; i++) stampSeqValue(undefined, `t:${i}`);
 		assert.equal(topicSeqs.size, MAX_SEQ_TOPICS, 'filled to exactly the cap');
 
-		assert.equal(stampSeqValue(undefined, 't:0'), 2, 'the oldest topic is stamped again');
-		stampSeqValue(undefined, 'fresh');
+		assert.equal(stampSeqValue(undefined, 't:5'), 2, 'a topic in the middle is stamped again');
+		for (let i = 0; i < 6; i++) stampSeqValue(undefined, `fresh:${i}`);
 
 		assert.equal(topicSeqs.size, MAX_SEQ_TOPICS, 'still exactly the cap');
-		assert.equal(topicSeqs.get('t:0'), 2, 'the re-stamped topic survived, counter intact');
-		assert.equal(topicSeqs.has('t:1'), false, 'the least recently stamped one went instead');
+		assert.equal(topicSeqs.get('t:5'), 2, 'the re-stamped topic survived, counter intact');
+		for (const gone of ['t:0', 't:1', 't:2', 't:3', 't:4', 't:6']) {
+			assert.equal(topicSeqs.has(gone), false, `${gone} was not touched and went instead`);
+		}
 
 		// An evicted topic restarts at 1 - the documented consequence, and the
 		// reason the bound warns rather than silently discarding.
-		assert.equal(stampSeqValue(undefined, 't:1'), 1);
+		assert.equal(stampSeqValue(undefined, 't:0'), 1);
+	} finally {
+		reset();
+	}
+});
+
+test('the bound holds however many topics arrive', () => {
+	// The eviction runs before the insert, so the map is never even
+	// transiently over its bound - and an app churning through topics faster
+	// than the cap must not be able to walk it upward.
+	try {
+		for (let i = 0; i < MAX_SEQ_TOPICS * 2; i++) {
+			stampSeqValue(undefined, `churn:${i}`);
+			if (topicSeqs.size > MAX_SEQ_TOPICS) {
+				assert.fail(`the map grew to ${topicSeqs.size} at topic ${i}`);
+			}
+		}
+		assert.equal(topicSeqs.size, MAX_SEQ_TOPICS);
+		// The most recent arrivals are the ones still held.
+		assert.equal(topicSeqs.has(`churn:${MAX_SEQ_TOPICS * 2 - 1}`), true);
 	} finally {
 		reset();
 	}

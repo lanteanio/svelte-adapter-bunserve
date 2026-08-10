@@ -1025,8 +1025,9 @@ export const platform = {
 	 * satisfy it for N entries. A batch-level `{ seq: <number> }` therefore
 	 * THROWS, exactly as a per-entry seq the wire cannot carry does - see
 	 * throwBatchExplicitSeq for why absorbing it either way loses data silently.
-	 * `{ seq: true }` is unaffected: the counter increments per entry, which is
-	 * already one seq per entry.
+	 * The counter is unaffected, whether it was asked for with `{ seq: true }`
+	 * or simply left as the default: it increments per entry, which is already
+	 * one seq per entry.
 	 *
 	 * The batch is read ONCE, at the top of the call: `entries` and `options`
 	 * are captured (own enumerable properties) into private records, so

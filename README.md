@@ -623,16 +623,18 @@ reason. One number cannot be the one-seq-per-entry the method publishes, and
 stamping all N entries with it is precisely what lets a partial delivery dedup
 the whole batch away: the client reports that shared seq as its watermark and
 the floor discards every entry at or below it, including the ones it never
-received. Put the cluster seq on each entry (`{ data, seq }`), or use
-`{ seq: true }` for the local counter, which already increments per entry. The
-call is refused even when the batch is empty, because the seq is a property of
-the call rather than of that tick's data.
+received. Put the cluster seq on each entry (`{ data, seq }`), or leave the
+seq to the local counter, which already increments per entry - that is what
+a batch with no seq option, or with `{ seq: true }`, does. The call is
+refused even when the batch is empty, because the seq is a property of the
+call rather than of that tick's data.
 
-Only explicit-seq frames are measured against the boundary at all. A
-`{ seq: true }` frame draws from this process's own per-topic counter, an
-unrelated space, so it is never deduped and always flushes - and publishing one
-does not move the mark a reported boundary is checked against. A topic published
-both ways therefore behaves the same as one published with explicit seqs only.
+Only explicit-seq frames are measured against the boundary at all. A counter
+frame - the default, and equally `{ seq: true }` - draws from this process's
+own per-topic counter, an unrelated space, so it is never deduped and always
+flushes, and publishing one does not move the mark a reported boundary is
+checked against. A topic published both ways therefore behaves the same as
+one published with explicit seqs only.
 
 The reported boundary is trusted only up to the highest seq this server has
 stamped for the topic. That bound exists because echoing the client's own

@@ -148,12 +148,10 @@ export const maxAuthoritativeSeq = new Map();
  *
  * A counter seq is not a value this mark can hold, so it refreshes recency and
  * nothing else, and only for a topic that already has a mark: the counter lane
- * must never be what creates an entry here. Re-inserting keeps iteration order
- * least-recently-noted first, which makes the eviction a true LRU and keeps a
- * topic that is busy in the counter lane from aging out of this one. It is
- * done only while the map is at the cap, because that is the only time
- * anything is evicted - and with the counter now the DEFAULT, every publish to
- * a marked topic reaches this line.
+ * must never be what creates an entry here. Keeping a topic that is busy in
+ * the counter lane from aging out of this one is the whole point of that
+ * refresh - and with the counter now the DEFAULT, every publish to a marked
+ * topic reaches it.
  *
  * @param {string} topic
  * @param {number} seq
@@ -162,30 +160,83 @@ export const maxAuthoritativeSeq = new Map();
 export function notePublishedSeq(topic, seq, authoritative) {
 	if (typeof seq !== 'number' || Number.isNaN(seq)) return;
 	const prev = maxAuthoritativeSeq.get(topic);
-	if (!authoritative) {
-		// Recency only. No entry to keep recent means nothing to do - creating
-		// one would put a counter value in the authoritative space.
-		if (prev === undefined) return;
-		if (maxAuthoritativeSeq.size < MAX_SEQ_TOPICS) return;
-		maxAuthoritativeSeq.delete(topic);
-		maxAuthoritativeSeq.set(topic, prev);
+	if (prev !== undefined) {
+		if (maxAuthoritativeSeq.size >= MAX_SEQ_TOPICS) {
+			noteRecentlyUsed(maxAuthoritativeSeqRecent, topic);
+		}
+		// Recency only for a counter seq. A value it cannot hold must not be
+		// written, and there is nothing else left to do.
+		if (!authoritative) return;
+		if (seq > prev) maxAuthoritativeSeq.set(topic, seq);
 		return;
 	}
-	const next = prev === undefined || seq > prev ? seq : prev;
-	// The delete is what makes iteration order least-recently-noted first, and
-	// it is only worth paying for once something can actually be evicted:
-	// below the cap nothing ever is, and Map.set on an existing key updates it
-	// in place. See stampSeqValue for the measurement that made this
-	// conditional rather than unconditional.
-	if (prev !== undefined && maxAuthoritativeSeq.size >= MAX_SEQ_TOPICS) {
-		maxAuthoritativeSeq.delete(topic);
+	// No entry yet, and the counter lane must never be what creates one -
+	// that would put a local value in the authoritative space.
+	if (!authoritative) return;
+	if (maxAuthoritativeSeq.size >= MAX_SEQ_TOPICS) {
+		evictOne(maxAuthoritativeSeq, maxAuthoritativeSeqRecent);
 	}
-	maxAuthoritativeSeq.set(topic, next);
-	if (maxAuthoritativeSeq.size > MAX_SEQ_TOPICS) {
-		const oldest = maxAuthoritativeSeq.keys().next().value;
-		if (oldest !== undefined) maxAuthoritativeSeq.delete(oldest);
-	}
+	maxAuthoritativeSeq.set(topic, seq);
 }
+
+/**
+ * Mark a key as used since the last eviction swept past it.
+ *
+ * This is the recency half of the CLOCK eviction below, and it is deliberately
+ * a Set rather than the re-insert it replaced. Keeping a Map in
+ * least-recently-used ORDER means deleting and re-adding the key on every
+ * touch, and Map.delete is not flat in map size: measured under Bun, a
+ * delete-then-set costs 143 ns at 32 entries and 692 ns at 10,000, while a
+ * plain set costs about 20 ns at both. Since the counter became the default
+ * that cost sits on every publish, and it would have been worst exactly where
+ * the map is full - the state a busy deployment lives in.
+ *
+ * The flag is only worth setting while something can be evicted, which is only
+ * while the map is at the cap.
+ *
+ * @param {Set<string>} recent
+ * @param {string} key
+ */
+function noteRecentlyUsed(recent, key) {
+	// A caller that clears the map from outside (the simulation reset) leaves
+	// ghosts behind that no sweep will ever visit. Dropping the whole flag set
+	// when it outgrows the bound is self-healing: CLOCK with no flags set is
+	// still correct, it just evicts in insertion order for one round.
+	if (recent.size >= MAX_SEQ_TOPICS) recent.clear();
+	recent.add(key);
+}
+
+/**
+ * Evict one entry, second-chance style: sweep from the oldest, clearing the
+ * used flag of anything that was touched since the last sweep, and evict the
+ * first entry that was not.
+ *
+ * This is CLOCK rather than exact LRU, and the difference is the point: exact
+ * LRU needs the map kept in use order, which is the per-touch cost that does
+ * not scale. What CLOCK gives up is precision among entries that were all
+ * touched recently; what it keeps is the property that matters here, that a
+ * topic still being published to is not the one thrown away. The sweep is
+ * bounded by the map size and runs only when a NEW topic arrives at a full
+ * map, so it is amortized against at least that many stamps.
+ *
+ * @param {Map<string, number>} map
+ * @param {Set<string>} recent
+ */
+function evictOne(map, recent) {
+	for (const key of map.keys()) {
+		// Touched since the last sweep: spend the second chance and move on.
+		if (recent.delete(key)) continue;
+		map.delete(key);
+		return;
+	}
+	// Everything held a second chance and has now spent it. Take the oldest.
+	const oldest = map.keys().next().value;
+	if (oldest !== undefined) map.delete(oldest);
+}
+
+/** Used-since-last-sweep flags for the two bounded seq maps. */
+const topicSeqsRecent = new Set();
+const maxAuthoritativeSeqRecent = new Set();
 
 /**
  * Open live-frame buffers per topic with a resume in flight, topic -> the Set
@@ -978,29 +1029,22 @@ export function stampSeqValue(seqOption, topic) {
 	if (seqOption === false) return null;
 	if (typeof seqOption === 'number') return stampExplicitSeq(seqOption, topic);
 	const current = topicSeqs.get(topic);
-	const next = (current ?? 0) + 1;
-	// Re-inserting on every stamp is what makes iteration order
-	// least-recently-stamped first, and therefore the eviction below a true
-	// LRU. It is only worth paying for once something can actually be evicted:
-	// while the map is under the cap nothing ever is, and Map.set on an
-	// existing key updates it in place without disturbing order.
-	//
-	// This is the hottest primitive in the adapter now that the counter is the
-	// DEFAULT rather than an opt-in - every publish reaches it. Measured at 32
-	// live topics, the unconditional delete-then-set costs 177 ns/stamp
-	// against 13 ns for the plain get-and-set; see
-	// bench/publish-seq-default-micro.mjs.
-	//
-	// What the condition costs in exchange is bounded and self-correcting:
-	// stamps taken BEFORE the map first fills do not record their recency, so
-	// the first eviction after it fills can take a topic that was hot early.
-	// From then on the map stays at the cap, every stamp re-orders, and the
-	// LRU is exact.
-	if (current !== undefined && topicSeqs.size >= MAX_SEQ_TOPICS) topicSeqs.delete(topic);
-	topicSeqs.set(topic, next);
-	if (topicSeqs.size > MAX_SEQ_TOPICS) {
-		const oldest = topicSeqs.keys().next().value;
-		if (oldest !== undefined) topicSeqs.delete(oldest);
+	if (current !== undefined) {
+		// The stamp of an existing topic is the hottest primitive in the
+		// adapter now that the counter is the DEFAULT rather than an opt-in:
+		// every publish reaches it. It is one Map.set, which is flat in map
+		// size, plus a recency mark that is only taken while something can
+		// actually be evicted. See noteRecentlyUsed for what that mark
+		// replaced and what it costs.
+		if (topicSeqs.size >= MAX_SEQ_TOPICS) noteRecentlyUsed(topicSeqsRecent, topic);
+		const next = current + 1;
+		topicSeqs.set(topic, next);
+		return next;
+	}
+	// A topic seen for the first time is the only thing that can push the map
+	// over its bound, so it is the only path that pays for an eviction.
+	if (topicSeqs.size >= MAX_SEQ_TOPICS) {
+		evictOne(topicSeqs, topicSeqsRecent);
 		if (!seqEvictionWarned) {
 			seqEvictionWarned = true;
 			console.warn(
@@ -1012,7 +1056,8 @@ export function stampSeqValue(seqOption, topic) {
 			);
 		}
 	}
-	return next;
+	topicSeqs.set(topic, 1);
+	return 1;
 }
 
 let seqEvictionWarned = false;

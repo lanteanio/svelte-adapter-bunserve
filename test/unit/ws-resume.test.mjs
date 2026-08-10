@@ -550,8 +550,8 @@ test('LRU eviction cannot pull the ceiling below the pre-window mark', () => {
 });
 
 test('an explicit publish refreshes recency too', () => {
-	// The explicit lane re-inserts on every note for the same reason the counter
-	// lane does. Without it a topic that is hot in the explicit lane keeps its
+	// The explicit lane marks recency for the same reason the counter lane
+	// does. Without it a topic that is hot in the explicit lane keeps its
 	// original slot and ages out while it is still busy, losing the resume floor
 	// for a topic actively receiving the seqs that floor is made of.
 	notePublishedSeq('hot', 1, true);
@@ -560,6 +560,9 @@ test('an explicit publish refreshes recency too', () => {
 	notePublishedSeq('new', 1, true);
 	assert.equal(maxAuthoritativeSeq.get('hot'), 2, 'kept, and raised');
 	assert.equal(maxAuthoritativeSeq.has('f:0'), false, 'the least recent topic went instead');
+	// Cleared like its neighbours: leaving the map at its cap hands the next
+	// test a different regime than the one it was written against.
+	maxAuthoritativeSeq.clear();
 });
 
 test('a counter value above the mark cannot raise the ceiling', () => {
