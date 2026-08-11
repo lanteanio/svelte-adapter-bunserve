@@ -182,14 +182,15 @@ export function notePublishedSeq(topic, seq, authoritative) {
 /**
  * Mark a key as used since the last eviction swept past it.
  *
- * This is the recency half of the CLOCK eviction below, and it is deliberately
- * a Set rather than the re-insert it replaced. Keeping a Map in
+ * This is the recency half of the eviction below, and it is deliberately a
+ * Set rather than the re-insert it replaced. Keeping a Map in
  * least-recently-used ORDER means deleting and re-adding the key on every
  * touch, and Map.delete is not flat in map size: measured under Bun, a
- * delete-then-set costs 143 ns at 32 entries and 692 ns at 10,000, while a
- * plain set costs about 20 ns at both. Since the counter became the default
- * that cost sits on every publish, and it would have been worst exactly where
- * the map is full - the state a busy deployment lives in.
+ * delete-then-set at the 10,000-entry bound costs about 700 ns, more than an
+ * order of magnitude above a plain set. Since the counter became the default
+ * that cost sat on every publish, and it was worst exactly where the map is
+ * full - the state a busy deployment lives in. The per-publish figures are in
+ * bench/publish-seq-default-micro.mjs, which reports all three regimes.
  *
  * The flag is only worth setting while something can be evicted, which is only
  * while the map is at the cap.
@@ -197,46 +198,112 @@ export function notePublishedSeq(topic, seq, authoritative) {
  * @param {Set<string>} recent
  * @param {string} key
  */
-function noteRecentlyUsed(recent, key) {
-	// A caller that clears the map from outside (the simulation reset) leaves
-	// ghosts behind that no sweep will ever visit. Dropping the whole flag set
-	// when it outgrows the bound is self-healing: CLOCK with no flags set is
-	// still correct, it just evicts in insertion order for one round.
-	if (recent.size >= MAX_SEQ_TOPICS) recent.clear();
+export function noteRecentlyUsed(recent, key) {
+	// Only when the flag is not already held: re-adding cannot grow the Set, so
+	// clearing on that path would throw away every earned flag for nothing.
+	if (!recent.has(key) && recent.size >= MAX_SEQ_TOPICS) recent.clear();
 	recent.add(key);
 }
 
 /**
- * Evict one entry, second-chance style: sweep from the oldest, clearing the
- * used flag of anything that was touched since the last sweep, and evict the
- * first entry that was not.
+ * How many entries one eviction will examine before it stops looking for an
+ * unflagged victim and takes the oldest it saw.
  *
- * This is CLOCK rather than exact LRU, and the difference is the point: exact
- * LRU needs the map kept in use order, which is the per-touch cost that does
- * not scale. What CLOCK gives up is precision among entries that were all
- * touched recently; what it keeps is the property that matters here, that a
- * topic still being published to is not the one thrown away. The sweep is
- * bounded by the map size and runs only when a NEW topic arrives at a full
- * map, so it is amortized against at least that many stamps.
+ * Without a limit, a sweep across a map where everything is flagged does work
+ * proportional to the whole map on a single insert. With it, one eviction
+ * costs at most this many re-inserts - and reaching the limit means at least
+ * this many DISTINCT topics were published to since the last eviction, so the
+ * cost is amortized against at least that many stamps.
+ */
+export const SWEEP_LIMIT = 32;
+
+/**
+ * Evict one entry, second-chance style: sweep from the oldest, spend the used
+ * flag of anything touched since the last sweep, and evict the first entry
+ * that had none.
+ *
+ * A SPARED ENTRY IS MOVED TO THE BACK, and that is the load-bearing half. The
+ * map is the eviction queue, so an entry left where it is comes up again on
+ * the very next eviction with its flag already spent - a reprieve of exactly
+ * one eviction, which is not the property this is here for. Requeued, it gets
+ * a full lap: a topic still being published to survives as many evictions as
+ * there are entries ahead of it.
+ *
+ * That is what makes this CLOCK rather than exact LRU. The requeue is paid
+ * only while evicting, which happens only when a NEW topic arrives at a full
+ * map, and only for topics that earned a flag; exact LRU pays the same
+ * re-insert on every touch of every topic, which is the cost that does not
+ * scale. What is given up is precision among entries that were all touched
+ * within the same lap.
+ *
+ * The map must not be mutated while its own key iterator is live - an entry
+ * re-added during iteration is visited again - so the spared keys are
+ * collected first and requeued after the sweep.
+ *
+ * Exported for the unit lane: every property above is about eviction ORDER
+ * over many rounds, and reaching it through the two live maps means filling
+ * ten thousand entries per assertion. Driven directly with a handful of keys,
+ * a full lap is five rounds.
  *
  * @param {Map<string, number>} map
  * @param {Set<string>} recent
  */
-function evictOne(map, recent) {
+export function evictOne(map, recent) {
+	/** @type {string[]} */
+	const spared = [];
+	/** @type {string | undefined} */
+	let victim;
 	for (const key of map.keys()) {
-		// Touched since the last sweep: spend the second chance and move on.
-		if (recent.delete(key)) continue;
-		map.delete(key);
-		return;
+		if (!recent.delete(key)) {
+			victim = key;
+			break;
+		}
+		spared.push(key);
+		if (spared.length >= SWEEP_LIMIT) break;
 	}
-	// Everything held a second chance and has now spent it. Take the oldest.
-	const oldest = map.keys().next().value;
-	if (oldest !== undefined) map.delete(oldest);
+	// Every entry the sweep looked at was in use. Take the oldest of them: it
+	// is the one that has gone longest without being re-inserted, and the
+	// alternative is scanning a map that is entirely hot.
+	if (victim === undefined) victim = spared.shift();
+	if (victim === undefined) return;
+	map.delete(victim);
+	// Requeue AFTER the iterator is done with the map.
+	for (let i = 0; i < spared.length; i++) {
+		const key = spared[i];
+		const value = map.get(key);
+		if (value === undefined) continue;
+		map.delete(key);
+		map.set(key, value);
+	}
 }
 
-/** Used-since-last-sweep flags for the two bounded seq maps. */
-const topicSeqsRecent = new Set();
-const maxAuthoritativeSeqRecent = new Set();
+/**
+ * Used-since-last-sweep flags for the two bounded seq maps.
+ *
+ * Exported beside the maps they belong to, and for the same reason: the
+ * policy they encode - a flag is only worth setting while something can be
+ * evicted, and only one is ever spent per sweep - is invisible from the
+ * outside until a map is at its cap, which is ten thousand entries away from
+ * anything a test would otherwise set up.
+ */
+export const topicSeqsRecent = new Set();
+export const maxAuthoritativeSeqRecent = new Set();
+
+/**
+ * Drop every per-topic seq counter, mark and recency flag.
+ *
+ * The recency flags are module-private, so a caller clearing the two maps
+ * directly would leave them behind - and a flag for a topic name that is later
+ * re-created spares it an eviction it never earned. That is a determinism
+ * hazard rather than a leak (the flags are bounded), which is exactly the kind
+ * of state the simulation reset exists to put back to zero.
+ */
+export function resetSeqState() {
+	topicSeqs.clear();
+	maxAuthoritativeSeq.clear();
+	topicSeqsRecent.clear();
+	maxAuthoritativeSeqRecent.clear();
+}
 
 /**
  * Open live-frame buffers per topic with a resume in flight, topic -> the Set

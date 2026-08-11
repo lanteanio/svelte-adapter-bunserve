@@ -61,13 +61,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bound a bare publish can change which topic keeps its dedup floor.
 - The two bounded per-topic seq maps evict second-chance rather than by exact
   least-recently-used order. Exact order meant deleting and re-adding a key on
-  every touch, which is not flat in map size - measured under Bun, 692 ns at
-  the 10,000-topic bound against about 20 ns for a plain set - and since the
-  counter became the default that sat on every publish. A topic still being
-  published to is still not what gets thrown away; what is given up is
-  precision among topics that were all touched recently. Per bare publish the
-  stamp costs 19 ns on a small working set and 31 ns at the bound, against 150
-  and 790 before.
+  every touch, and Map.delete is not flat in map size - measured under Bun,
+  about 700 ns at the 10,000-topic bound, more than an order of magnitude
+  above a plain set - so once the counter became the default that sat on every
+  publish. A topic still being published to is still not what gets thrown
+  away: a topic touched since the last sweep is moved to the back of the
+  queue, so it outlives every entry ahead of it. What is given up is
+  precision among topics all touched within the same lap. Measured per bare
+  publish, against a 51 ns envelope build: the counter stamp costs 17 ns on a
+  small working set and 32 ns with the map at its bound, where keeping exact
+  order cost about 700 ns.
 
 ### Added
 

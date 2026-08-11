@@ -61,7 +61,6 @@ const {
 	capCounts,
 	envelopePrefixCache,
 	lastPublishWarnAt,
-	maxAuthoritativeSeq,
 	pendingCloseHooks,
 	pressureListeners,
 	pressureSnapshot,
@@ -72,7 +71,7 @@ const {
 	topicPublishStats,
 	setServer,
 	sharedTopics,
-	topicSeqs,
+	resetSeqState,
 	wsConnections,
 	wsCounters
 } = await import('./runtime/handler/ws-state.js');
@@ -100,8 +99,10 @@ export { resetProcessEpoch };
 function resetSimState() {
 	wsConnections.clear();
 	sharedTopics.clear();
-	maxAuthoritativeSeq.clear();
-	topicSeqs.clear();
+	// One call rather than two clears: the seq lane also carries private
+	// recency flags, and a flag surviving a reset spares a re-created topic an
+	// eviction it never earned.
+	resetSeqState();
 	resumeBuffers.clear();
 	envelopePrefixCache.clear();
 	pendingCloseHooks.clear();

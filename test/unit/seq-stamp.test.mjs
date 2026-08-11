@@ -28,8 +28,19 @@ globalThis.WS_PATH = '/ws';
 register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { platform } = await import('../../src/runtime/handler/platform.js');
-const { MAX_SEQ_TOPICS, maxAuthoritativeSeq, setServer, stampSeq, stampSeqValue, topicSeqs } =
-	await import('../../src/runtime/handler/ws-state.js');
+const {
+	MAX_SEQ_TOPICS,
+	SWEEP_LIMIT,
+	evictOne,
+	maxAuthoritativeSeq,
+	noteRecentlyUsed,
+	resetSeqState,
+	setServer,
+	stampSeq,
+	stampSeqValue,
+	topicSeqs,
+	topicSeqsRecent
+} = await import('../../src/runtime/handler/ws-state.js');
 
 /** A fake native server recording the envelopes handed to it. */
 function fakeServer() {
@@ -45,8 +56,23 @@ function fakeServer() {
 }
 
 function reset() {
-	topicSeqs.clear();
-	maxAuthoritativeSeq.clear();
+	// Through the module's own reset, so the private recency flags go too. A
+	// flag surviving into the next test spares a re-created topic an eviction
+	// it never earned, which is a test-order dependency that only appears once
+	// a test has filled a map to its cap.
+	resetSeqState();
+}
+
+/**
+ * A small stand-in for one of the bounded seq maps, so eviction ORDER can be
+ * asserted over a full lap without filling ten thousand entries per round.
+ *
+ * @param {string[]} keys - in insertion order
+ * @param {string[]} [used] - keys flagged as touched since the last sweep
+ */
+function queue(keys, used = []) {
+	const map = new Map(keys.map((k, i) => [k, i + 1]));
+	return { map, recent: new Set(used) };
 }
 
 test('absent options draw the per-topic counter, 1, 2, 3', () => {
@@ -126,6 +152,102 @@ test('the counter map is bounded, and a topic still being published to is not wh
 		// An evicted topic restarts at 1 - the documented consequence, and the
 		// reason the bound warns rather than silently discarding.
 		assert.equal(stampSeqValue(undefined, 't:0'), 1);
+	} finally {
+		reset();
+	}
+});
+
+test('an untouched entry at the front is what an eviction takes', () => {
+	const { map, recent } = queue(['a', 'b', 'c']);
+	evictOne(map, recent);
+	assert.deepEqual([...map.keys()], ['b', 'c']);
+});
+
+test('a touched entry is spared, moved to the back, and has spent its flag', () => {
+	// Moving it is the load-bearing half. Left where it is, it comes up again
+	// on the very NEXT eviction with its flag already spent, so being
+	// published to buys a reprieve of exactly one round.
+	const { map, recent } = queue(['a', 'b', 'c'], ['a']);
+	evictOne(map, recent);
+	assert.deepEqual([...map.keys()], ['c', 'a'], 'b went; a moved to the back');
+	assert.equal(recent.has('a'), false, 'and the flag it was spared by is spent');
+});
+
+test('a topic touched once survives a full lap of evictions', () => {
+	// The property the whole scheme exists for, stated over rounds rather than
+	// over one call: a topic still being published to outlives every topic
+	// that has gone quiet, not merely the next one in line.
+	const { map, recent } = queue(['a', 'b', 'c', 'd', 'e'], ['a']);
+	for (let i = 0; i < 4; i++) evictOne(map, recent);
+	assert.deepEqual([...map.keys()], ['a'], 'the touched one is the last standing');
+});
+
+test('a sweep where everything is in use still evicts, and takes the oldest it saw', () => {
+	// Otherwise an insert into a fully hot map adds without removing, and the
+	// bound this whole structure exists for stops holding.
+	const { map, recent } = queue(['a', 'b', 'c'], ['a', 'b', 'c']);
+	evictOne(map, recent);
+	assert.equal(map.size, 2, 'something was evicted');
+	assert.deepEqual([...map.keys()], ['b', 'c'], 'the oldest of the hot entries went, the rest keep their order');
+	assert.deepEqual([...recent], [], 'every flag examined was spent');
+});
+
+test('an empty queue is not something an eviction can trip over', () => {
+	const { map, recent } = queue([]);
+	evictOne(map, recent);
+	assert.equal(map.size, 0);
+});
+
+test('one eviction examines a bounded window, however hot the queue is', () => {
+	// Without the bound, a single insert into a map where everything is in use
+	// does work proportional to the whole map - and it would do it on every
+	// insert, since the requeue keeps the flags coming.
+	const keys = Array.from({ length: SWEEP_LIMIT + 40 }, (_, i) => `k${i}`);
+	const { map, recent } = queue(keys, keys);
+	evictOne(map, recent);
+	assert.equal(map.has('k0'), false, 'the oldest of the examined window went');
+	assert.equal(
+		[...map.keys()][0],
+		`k${SWEEP_LIMIT}`,
+		'and only the window was requeued - the first entry past it is now at the front'
+	);
+	assert.equal(recent.size, keys.length - SWEEP_LIMIT, 'flags outside the window are untouched');
+});
+
+test('the recency flag is only set while something can be evicted', () => {
+	// Below the cap nothing is ever evicted, so a flag there is pure cost on
+	// the hottest primitive in the adapter.
+	try {
+		for (let i = 0; i < 50; i++) stampSeqValue(undefined, `t:${i}`);
+		for (let i = 0; i < 50; i++) stampSeqValue(undefined, `t:${i}`);
+		assert.equal(topicSeqsRecent.size, 0, 'no flags below the cap');
+	} finally {
+		reset();
+	}
+});
+
+test('a flag set at its bound is dropped only when a NEW key would grow it', () => {
+	// Re-flagging a key already in the set cannot grow it, so clearing there
+	// would throw away every earned flag for nothing - and the next eviction
+	// would take a topic published to moments earlier.
+	const recent = new Set();
+	for (let i = 0; i < MAX_SEQ_TOPICS; i++) recent.add(`k${i}`);
+	noteRecentlyUsed(recent, 'k0');
+	assert.equal(recent.size, MAX_SEQ_TOPICS, 'a key already flagged keeps the set intact');
+	noteRecentlyUsed(recent, 'brand-new');
+	assert.equal(recent.size, 1, 'a key that would grow it past the bound resets it');
+	assert.deepEqual([...recent], ['brand-new']);
+});
+
+test('the seq reset clears the recency flags, not just the maps', () => {
+	// A flag surviving a reset spares a re-created topic an eviction it never
+	// earned, which is a determinism hazard and a test-order dependency.
+	try {
+		topicSeqsRecent.add('ghost');
+		stampSeqValue(undefined, 'ghost');
+		resetSeqState();
+		assert.equal(topicSeqs.size, 0);
+		assert.equal(topicSeqsRecent.size, 0);
 	} finally {
 		reset();
 	}

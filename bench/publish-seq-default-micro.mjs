@@ -84,4 +84,27 @@ function report(label, cold) {
 
 report('small working set', 0);
 report('map at its bound', MAX_SEQ_TOPICS - HOT);
-console.log();
+
+// The third regime, and the only one that pays for an eviction: an app
+// publishing to client-named topics, where most publishes are to a topic the
+// map has never seen. Reported separately because it is not a per-publish cost
+// the other two hide - it is a different workload, and the sweep it triggers
+// is the whole reason the recency flags exist.
+{
+	const NEW_TOPICS = 20_000;
+	// A hot set is stamped between arrivals so the sweep has flags to spend -
+	// an all-cold churn never examines more than one entry and would report a
+	// best case that no app with any repeat traffic sees.
+	const HOT_PER_ARRIVAL = 4;
+	topicSeqs.clear();
+	for (let i = 0; i < MAX_SEQ_TOPICS; i++) stampSeqValue(undefined, 'fill:' + i);
+	const t0 = Bun.nanoseconds();
+	for (let i = 0; i < NEW_TOPICS; i++) {
+		for (let h = 0; h < HOT_PER_ARRIVAL; h++) stampSeqValue(undefined, topics[(i + h) & (HOT - 1)]);
+		stampSeqValue(undefined, 'arrival:' + i);
+	}
+	const ns = Bun.nanoseconds() - t0;
+	console.log(`\n  new topics arriving at a full map (${topicSeqs.size} topics in the map)`);
+	console.log(`    per arrival, incl. the eviction sweep and ${HOT_PER_ARRIVAL} hot stamps: ${(ns / NEW_TOPICS).toFixed(0)} ns`);
+	console.log(`    the sweep is bounded, so this does not grow with the map\n`);
+}
