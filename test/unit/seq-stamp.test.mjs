@@ -273,9 +273,9 @@ test('the bound holds however many topics arrive', () => {
 });
 
 test('platform.publish with no options argument delivers seq 1, then 2', () => {
-	// The card this pins exists because every fixture and test site passed an
-	// options object, so the three-argument arity - the one an app reaches for
-	// first - was never executed anywhere.
+	// The three-argument arity is the one an app reaches for first, and it was
+	// executed nowhere: every fixture and test site passed an options object,
+	// so the default had no coverage in either direction.
 	const srv = fakeServer();
 	setServer(srv);
 	try {
