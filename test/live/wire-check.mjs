@@ -189,7 +189,7 @@ try {
 	const SEQ_TOPIC = 'wire:seqroom';
 	const d = client('watermark');
 	await d.opened;
-	// The plan is armed BEFORE the resume window opens: on resume, the hook
+	// The script is armed BEFORE the resume window opens: on resume, the hook
 	// publishes explicit seqs 21..25 from inside the window, DELIVERS 21 and 22
 	// to this socket itself, and reports 22 as covered. 22 is then a seq the
 	// server both stamped and sent, so the report survives the ceiling AND is
@@ -205,12 +205,12 @@ try {
 	// separate properties, and the window has to be wide enough on both sides to
 	// see either fail.
 	d.send({
-		type: 'fixture-resume-plan',
+		type: 'fixture-resume-script',
 		topic: SEQ_TOPIC,
 		report: 22,
 		publish: [21, 22, 23, 24, 25]
 	});
-	await until(() => d.texts.some((t) => t.event === 'resume-planned'), 'resume plan armed');
+	await until(() => d.texts.some((t) => t.event === 'resume-scripted'), 'resume script armed');
 	// A pre-window explicit publish, so the topic is already marked when the
 	// window opens rather than being marked only from inside it. It does not
 	// decide this lane's outcome - the in-window publishes raise the mark to 25
@@ -262,18 +262,18 @@ try {
 		lastInWindowAt !== -1 && ackAt2 !== -1 && lastInWindowAt < ackAt2,
 		JSON.stringify({ lastInWindowAt, ackAt2 }));
 
-	// --- an armed plan is spent by the window it armed ----------------------
+	// --- an armed script is spent by the window it armed ----------------------
 	// This pair pins the FIXTURE rather than the runtime, and it earns its place
-	// because every check above is only worth its name while a plan arms exactly
-	// the one window it was armed for. A standing plan would replay its whole
-	// script into every later resume of the topic, so the next scenario added
-	// here would be reading a history the fixture keeps rewriting.
+	// because every check above is only worth its name while a script arms exactly
+	// the one window it was armed for. A standing script would replay itself
+	// into every later resume of the topic, so the next scenario added here
+	// would be reading a history the fixture keeps rewriting.
 	//
 	// Waited on the `resumed` ack rather than the replay frame, but NOT because
 	// of a flush: the standalone resume frame installs no membership, so it opens
 	// no barrier and has nothing to flush. The ack is written only after the
 	// hook's promise settles, and every send the hook makes is synchronous, so a
-	// still-armed plan's frames are on the socket ahead of the ack and cannot
+	// still-armed script's frames are on the socket ahead of the ack and cannot
 	// land after the count below is taken. That is a property of synchronous
 	// fan-out, so it is what would have to be rechecked if publish ever corks.
 	d.send({ type: 'resume', sessionId: 'second-window', lastSeenSeqs: { [SEQ_TOPIC]: 23 } });
@@ -281,7 +281,7 @@ try {
 	check('the second resume really reaches the hook',
 		d.texts.some((t) => t.event === 'replayed' && t.topic === SEQ_TOPIC && t.data?.sessionId === 'second-window'),
 		JSON.stringify(d.texts.filter((t) => t.event === 'replayed').map((t) => ({ topic: t.topic, session: t.data?.sessionId }))));
-	check('and a spent plan does not re-arm: the second window replays no in-window frame',
+	check('and a spent script does not re-arm: the second window replays no in-window frame',
 		d.texts.filter(isInWindow).length === inWindow.length,
 		JSON.stringify(d.texts.filter(isInWindow).map((t) => t.data.inWindow)));
 

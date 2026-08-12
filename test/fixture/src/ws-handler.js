@@ -46,29 +46,29 @@ export function init({ platform }) {
 }
 
 /**
- * Per-topic scripts for the honest-watermark lane, armed by `fixture-resume-plan`.
+ * Per-topic scripts for the honest-watermark lane, armed by `fixture-resume-script`.
  *
  * The default hook below reports the offset the CLIENT presented, which is the
  * natural hook shape but is useless for testing the dedup boundary: the runtime
  * trusts a reported watermark only up to what it has actually stamped, so an
  * echoed client offset on a topic with no explicit mark is always refused and
- * the boundary is never exercised. A planned topic instead publishes known
+ * the boundary is never exercised. A scripted topic instead publishes known
  * explicit seqs INSIDE the barrier window, DELIVERS the ones at or below
  * `report` to the resuming socket itself, and reports `report` as covered.
  *
  * The delivery is what makes the report TRUE, and it is not a formality: the
  * hook's contract is the highest seq it actually delivered, and the flush drops
- * everything at or below what it returns. A plan that published 21, 22 and 23
+ * everything at or below what it returns. A script that published 21, 22 and 23
  * into the topic and reported 22 without sending anything would leave the
  * client short of 21 and 22 for good - a seq the server stamped is not a seq
  * the client received.
  *
- * A plan arms ONE window and is consumed by it, so a later resume of the same
+ * A script arms ONE window and is consumed by it, so a later resume of the same
  * topic falls back to the default hook.
  *
  * @type {Map<string, { report: number, publish: number[] }>}
  */
-const resumePlans = new Map();
+const resumeScripts = new Map();
 
 /**
  * Gap-fill for a recover offset or a standalone resume frame. Awaits a real
@@ -82,33 +82,33 @@ export async function resume(ws, { sessionId, lastSeenSeqs, platform }) {
 	const covered = {};
 	for (const [topic, since] of Object.entries(lastSeenSeqs)) {
 		platform.send(ws, topic, 'replayed', { sessionId, since });
-		const plan = resumePlans.get(topic);
-		if (plan === undefined) {
+		const script = resumeScripts.get(topic);
+		if (script === undefined) {
 			covered[topic] = typeof since === 'number' ? since : 0;
 			continue;
 		}
-		// Spent on use. A standing plan would replay its whole script into every
-		// later resume window on the topic - windows that asked for none of it -
-		// so a check reading those frames would be reading the fixture's memory
+		// Spent on use. A standing script would replay itself into every later
+		// resume window on the topic - windows that asked for none of it - so a
+		// check reading those frames would be reading the fixture's memory
 		// rather than what the runtime did.
-		resumePlans.delete(topic);
+		resumeScripts.delete(topic);
 		// Published from inside the hook, so these land in the barrier window
 		// the resuming connection has open - the case the flush's dedup floor
 		// exists for. Deterministic by construction: no second connection has
 		// to race the 30 ms above.
-		for (const seq of plan.publish) {
+		for (const seq of script.publish) {
 			platform.publish(topic, 'said', { inWindow: seq }, { seq });
 		}
 		// Now DELIVER everything the report is about to claim. Derived from
-		// `report` rather than listed separately on the plan so the fixture
+		// `report` rather than listed separately on the script so the fixture
 		// cannot arm a watermark it did not honour: the frames the flush will
 		// drop are exactly the frames sent here.
-		for (const seq of plan.publish) {
-			if (seq <= plan.report) {
+		for (const seq of script.publish) {
+			if (seq <= script.report) {
 				platform.send(ws, topic, 'said', { inWindow: seq, viaHook: true });
 			}
 		}
-		covered[topic] = plan.report;
+		covered[topic] = script.report;
 	}
 	return covered;
 }
@@ -187,9 +187,9 @@ export function message(ws, { data, isBinary, msg, platform }) {
 		platform.publish(msg.topic, 'said', msg.data, { seq: msg.seq });
 		return;
 	}
-	if (msg && msg.type === 'fixture-resume-plan') {
-		resumePlans.set(msg.topic, { report: msg.report, publish: msg.publish });
-		platform.send(ws, '__fixture', 'resume-planned', { topic: msg.topic });
+	if (msg && msg.type === 'fixture-resume-script') {
+		resumeScripts.set(msg.topic, { report: msg.report, publish: msg.publish });
+		platform.send(ws, '__fixture', 'resume-scripted', { topic: msg.topic });
 		return;
 	}
 	// Wire-tier drivers, one per platform member the wire suite asserts.
