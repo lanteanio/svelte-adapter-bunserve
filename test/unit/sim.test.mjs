@@ -31,6 +31,20 @@ function fingerprintOf(result) {
 	return (h >>> 0).toString(16).padStart(8, '0');
 }
 
+test('the committed corpus records which commit blessed it', () => {
+	// A seed plus a commit is the whole bug report this corpus exists to make
+	// possible, and the seeds alone are half of one. The bless used to read an
+	// environment variable nothing exported, so every entry recorded null and
+	// nothing noticed for as long as the corpus existed. A `-dirty` suffix is
+	// legal and honest - it says the blessing tree did not match that commit -
+	// but the committed baseline should not carry one.
+	assert.match(
+		corpus.gitCommit ?? '',
+		/^[0-9a-f]{40}$/,
+		'bless with `node scripts/sim-golden.js --update` from a clean tree'
+	);
+});
+
 test('an unfaulted run is clean, reproduces itself, and matches its corpus entry', async () => {
 	const r = await runSim({ seed: '1' });
 	assert.equal(r.invariantViolations.length, 0, JSON.stringify(r.invariantViolations));
