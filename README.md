@@ -866,14 +866,22 @@ npm test   # requires Node 22+ for the test-runner glob
 `test/unit/io-budget.test.mjs` is the performance gate in that lane, and
 `test/unit/http-io-budget.test.mjs` is its HTTP twin: per-response operation
 counts for the static lane (Headers and Response constructions, `Bun.file`
-opens, pathname decodes), pinned exactly and under 6x load. Both count
-OPERATIONS - encode calls, native publishes, socket writes - and never measure
-time, because a wall-clock assertion cannot gate CI: it fails on a busy runner,
-gets retried until green, and is then ignored. The gates that matter most are
-the scaling ones, of the shape "6x the input must not increase the count of X",
-which is what catches a lost encode-once or a fan-out that quietly became a
-per-connection walk. The file ends with a self-check pointing the detector at a
-case that genuinely scales, so the gates cannot pass vacuously.
+opens, pathname decodes), each pinned exactly. Both count OPERATIONS - encode
+calls, native publishes, socket writes - and never measure time, because a
+wall-clock assertion cannot gate CI: it fails on a busy runner, gets retried
+until green, and is then ignored.
+
+The two scale differently, and each shape catches what the other cannot. The
+fan-out gate grows the INPUT: "6x the connections must not increase the count
+of X", which is what catches a lost encode-once or a fan-out that quietly
+became a per-connection walk. The HTTP gate repeats the SAME request 200 times
+and requires the count to grow exactly linearly, which is what catches a cost
+that is amortized rather than absent - a disk touch taken every 64th request,
+or a second header build once an entry has been served forty times, hides
+completely inside a short window and is exactly the shape a cache or pool
+regression takes. Every budget in that file is stated at both one call and 200.
+It ends with a self-check pointing the detector at a case that genuinely
+scales, so the gates cannot pass vacuously.
 
 Lowering a budget needs no discussion. RAISING one is a design decision - it
 says the adapter now does more I/O per unit of work - so record the reason in

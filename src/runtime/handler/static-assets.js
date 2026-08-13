@@ -327,7 +327,11 @@ export function serveStatic(entry, requestHeaders, headOnly = false) {
 }
 
 // Bounded cache for decoded URI pathnames. Avoids repeated decodeURIComponent
-// calls for the same encoded path. Uses Map insertion order for LRU eviction.
+// calls for the same encoded path. Evicts in INSERTION order, not use order: a
+// hit returns without touching the entry's position, so a hot path inserted
+// early is evicted ahead of a cold one inserted late. Keeping use order would
+// cost a delete and a re-insert on every hit, which is the wrong trade for a
+// cache this size whose miss costs one decodeURIComponent.
 export const DECODE_CACHE_MAX = 256;
 
 /**

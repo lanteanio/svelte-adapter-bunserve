@@ -315,6 +315,13 @@ test('a HEAD answers from the index alone, on both lanes and on the prerendered 
 		assert.equal(res.headers.get('content-length'), String(length),
 			`${name}: the length of the representation it says it is sending`);
 		assert.deepEqual(opened, [], `${name}: opened nothing`);
+		opened.length = 0;
+		assert.deepEqual(
+			costAtScale(() => serveStatic(entry, /** @type {any} */ (accept), true)),
+			scaled(per),
+			`${name}: under load`
+		);
+		assert.deepEqual(opened, [], `${name}: and opened nothing under load either`);
 	}
 
 	// The prerendered lane takes the same headOnly flag through a second
@@ -327,6 +334,9 @@ test('a HEAD answers from the index alone, on both lanes and on the prerendered 
 	assert.equal(pageHead.status, 200);
 	assert.equal(pageHead.body, null, 'a prerendered HEAD carries no body');
 	assert.deepEqual(opened, [], 'and opened nothing');
+	opened.length = 0;
+	assert.deepEqual(costAtScale(() => tryPrerendered('/bigdocs/', '', NO_HEADERS, true)), scaled(per));
+	assert.deepEqual(opened, [], 'nor under load');
 });
 
 test('a 304 costs one Response and no header build at all', () => {
@@ -354,6 +364,7 @@ test('a memory-lane range is one Headers, one Response and zero disk', async () 
 	assert.equal(head.body, null);
 	assert.equal(head.headers.get('content-length'), '10');
 	assert.deepEqual(costAtScale(() => serveStatic(small, RANGE)), scaled(per));
+	assert.deepEqual(costAtScale(() => serveStatic(small, RANGE, true)), scaled(per), 'the HEAD too');
 });
 
 test('a disk-lane range slices the identity file once', async () => {
@@ -382,6 +393,12 @@ test('a disk-lane range slices the identity file once', async () => {
 	assert.equal(head.headers.get('content-length'), '10');
 	assert.equal(head.headers.get('content-range'), 'bytes 0-9/4096');
 	assert.deepEqual(opened, []);
+	assert.deepEqual(
+		costAtScale(() => serveStatic(big, RANGE, true)),
+		scaled({ response: 1, headers: 1, bunFile: 0, decode: 0 }),
+		'the HEAD too'
+	);
+	assert.deepEqual(opened, [], 'and it opened nothing under load either');
 });
 
 test('an unsatisfiable range costs one Response and builds no headers', () => {
@@ -408,6 +425,7 @@ test('the canonical-form redirect and the page it points at cost one Response ea
 	let page;
 	assert.deepEqual(cost(() => { page = tryPrerendered('/docs/', '', NO_HEADERS); }), served);
 	assert.equal(page.status, 200);
+	assert.deepEqual(costAtScale(() => tryPrerendered('/docs/', '', NO_HEADERS)), scaled(served));
 });
 
 test('a malformed encoded path decodes once and refuses', () => {
