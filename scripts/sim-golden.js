@@ -22,6 +22,7 @@
 //   node scripts/sim-golden.js --against <corpus>  additionally require fingerprint equality with a sibling corpus file
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { dirname } from 'node:path';
 import process from 'node:process';
 import { runSimSwarm, buildSimGoldens, checkSimGoldens } from '../src/sim.js';
@@ -37,7 +38,35 @@ const CONFIG = {
 const update = process.argv.includes('--update');
 const againstIdx = process.argv.indexOf('--against');
 const againstPath = againstIdx !== -1 ? process.argv[againstIdx + 1] : null;
-const gitCommit = process.env.GIT_COMMIT || null;
+/**
+ * Which commit produced a corpus. A seed plus a commit IS the bug report this
+ * corpus exists to make possible, and reading GIT_COMMIT alone recorded null
+ * every time, because nothing exports it - so the corpus kept the seeds and
+ * dropped the half a reader needs to check them out.
+ *
+ * A blessing from a MODIFIED tree does not describe HEAD, and a hash that
+ * claims it does is worse than no hash: the reproducer would be run against
+ * code that never produced it. Such a run is marked `-dirty`, the same
+ * convention `git describe --dirty` uses.
+ *
+ * The environment still wins where it is set, which is how CI passes the
+ * commit it checked out. No git, no repository, no commit: null, exactly as
+ * before.
+ */
+function resolveGitCommit() {
+	if (process.env.GIT_COMMIT) return process.env.GIT_COMMIT;
+	try {
+		const opts = { encoding: /** @type {const} */ ('utf8'), stdio: /** @type {const} */ (['ignore', 'pipe', 'ignore']) };
+		const sha = execFileSync('git', ['rev-parse', 'HEAD'], opts).trim();
+		if (!sha) return null;
+		const modified = execFileSync('git', ['status', '--porcelain'], opts).trim() !== '';
+		return modified ? `${sha}-dirty` : sha;
+	} catch {
+		return null;
+	}
+}
+
+const gitCommit = resolveGitCommit();
 
 /**
  * The sibling-corpus equality check: every seed present in both corpora must
