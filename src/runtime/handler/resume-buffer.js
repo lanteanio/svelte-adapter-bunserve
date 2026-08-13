@@ -184,12 +184,13 @@ export function flushResumeTopic(handle, topic, coveredSeq) {
 	//
 	// The ceiling is the HIGHER of the topic's mark now and its mark at window
 	// open. The mark itself only moves up, so the one way the live value lands
-	// below the snapshot is LRU eviction dropping the topic and a later publish
-	// re-seeding it low. The snapshot is still a seq this server stamped, so it
-	// remains a valid ceiling, and a ceiling below `entry.before` would make the
-	// fallback HIGHER than the value it rejected, dropping in-window frames the
-	// hook never covered. The comparison form is total: it needs no special case
-	// for an unmarked topic (`NO_MARK`) or for a value nothing orders.
+	// below the snapshot is the bounded-map eviction dropping the topic and a
+	// later publish re-seeding it low. The snapshot is still a seq this server
+	// stamped, so it remains a valid ceiling, and a ceiling below `entry.before`
+	// would make the fallback HIGHER than the value it rejected, dropping
+	// in-window frames the hook never covered. The comparison form is total: it
+	// needs no special case for an unmarked topic (`NO_MARK`) or for a value
+	// nothing orders.
 	//
 	// The fallback is the pre-window mark - the same floor a hook that reports
 	// nothing gets. Conservative, NOT lossless: a reordered explicit seq captured

@@ -2,7 +2,7 @@
 // live pressureSnapshot, and fires the pressure/publish-rate listeners. The
 // sibling adapter's module of the same name also carries bumpIn/bumpOut (here
 // in ws-stats.js), the topic-registry cardinality warning (superseded here by
-// the seq-topic LRU eviction warning in ws-state.js - this adapter caps the
+// the seq-topic eviction warning in ws-state.js - this adapter caps the
 // registry at MAX_SEQ_TOPICS, so the sibling's million-topic threshold is
 // unreachable), and the publishBatched frame-size warning (no publishBatched
 // lane exists here).

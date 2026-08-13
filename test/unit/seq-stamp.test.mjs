@@ -123,14 +123,15 @@ test('an explicit number is taken as given, and never advances the counter', () 
 	}
 });
 
-test('the counter map is bounded, and a topic still being published to is not what is thrown away', () => {
+test('the counter map is bounded, and a quiet topic is what an eviction reaches for', () => {
 	// The counter is now the DEFAULT, so this map is reached by every publish
 	// and its bound is what keeps an app publishing to client-named topics
 	// (room:<uuid>) from growing one entry per topic for the life of the
 	// process. Eviction is second-chance rather than exact LRU - keeping the
 	// map in use order costs an order of magnitude per stamp at this size -
 	// so what is pinned here is the property that actually matters: a topic
-	// touched since the last sweep outlives topics that were not.
+	// touched since the last sweep outlives topics that were not. Its limit -
+	// an examined window with no quiet entry in it - is the next test.
 	//
 	// The refreshed topic is deliberately NOT the oldest key. A sweep that
 	// only ever spared the entry it was about to evict would satisfy an
@@ -157,6 +158,45 @@ test('the counter map is bounded, and a topic still being published to is not wh
 	}
 });
 
+test('at the cap, a uniformly hot front evicts an ACTIVE topic and its counter restarts at 1', () => {
+	// The limit of the guarantee above, driven through the live map because it
+	// is what an operator is told to expect. One eviction examines at most
+	// SWEEP_LIMIT entries; where every one of them was published to since the
+	// last sweep there is no quiet victim within reach and the oldest of them
+	// goes anyway. The user-visible harm is the last assertion: a topic being
+	// published to right now restarts at seq 1, so a client holding an older
+	// seq for it sees the number go backwards.
+	//
+	// Scanning past the window to avoid this is the unbounded sweep the limit
+	// exists to prevent, and a working set genuinely larger than the cap has no
+	// quiet topic to evict at all. So it is documented rather than fixed - in
+	// the eviction warning, the README and evictOne's own comment - and pinned
+	// here so the documented shape cannot drift away from the implemented one.
+	try {
+		for (let i = 0; i < MAX_SEQ_TOPICS; i++) stampSeqValue(undefined, `t:${i}`);
+		// Exactly the window, and the OLDEST entries: these are the ones an
+		// eviction reaches first, and they are all in use.
+		for (let i = 0; i < SWEEP_LIMIT; i++) {
+			assert.equal(stampSeqValue(undefined, `t:${i}`), 2, `t:${i} is stamped again`);
+		}
+		assert.equal(topicSeqsRecent.size, SWEEP_LIMIT, 'the whole window is flagged');
+
+		stampSeqValue(undefined, 'fresh');
+
+		assert.equal(topicSeqs.size, MAX_SEQ_TOPICS, 'still exactly the cap');
+		assert.equal(topicSeqs.has('t:0'), false, 'the oldest of the hot window went, though it was in use');
+		for (let i = 1; i < SWEEP_LIMIT; i++) {
+			assert.equal(topicSeqs.get(`t:${i}`), 2, `t:${i} was spared with its counter intact`);
+		}
+		assert.equal([...topicSeqs.keys()][0], `t:${SWEEP_LIMIT}`, 'the window was requeued behind the rest');
+		assert.equal(topicSeqsRecent.size, 0, 'and every flag the sweep examined was spent');
+
+		assert.equal(stampSeqValue(undefined, 't:0'), 1, 'an ACTIVE topic restarted its counter');
+	} finally {
+		reset();
+	}
+});
+
 test('an untouched entry at the front is what an eviction takes', () => {
 	const { map, recent } = queue(['a', 'b', 'c']);
 	evictOne(map, recent);
@@ -175,8 +215,8 @@ test('a touched entry is spared, moved to the back, and has spent its flag', () 
 
 test('a topic touched once survives a full lap of evictions', () => {
 	// The property the whole scheme exists for, stated over rounds rather than
-	// over one call: a topic still being published to outlives every topic
-	// that has gone quiet, not merely the next one in line.
+	// over one call: a topic still being published to outlives the quiet ones
+	// ahead of it, not merely the next one in line.
 	const { map, recent } = queue(['a', 'b', 'c', 'd', 'e'], ['a']);
 	for (let i = 0; i < 4; i++) evictOne(map, recent);
 	assert.deepEqual([...map.keys()], ['a'], 'the touched one is the last standing');

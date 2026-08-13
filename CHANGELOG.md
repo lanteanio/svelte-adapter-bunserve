@@ -57,16 +57,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without one and is the way to keep the old shape; `{ seq: true }` and an
   explicit `{ seq: <number> }` are unchanged. Counter seqs are process-local
   and never write an authoritative mark, so no resume boundary moves. They
-  do keep an already-marked topic recent, so past the 10,000-topic LRU
-  bound a bare publish can change which topic keeps its dedup floor.
+  do keep an already-marked topic recent, so past the 10,000-topic bound a
+  bare publish can change which topic keeps its dedup floor.
 - The two bounded per-topic seq maps evict second-chance rather than by exact
   least-recently-used order. Exact order meant deleting and re-adding a key on
   every touch, and Map.delete is not flat in map size - measured under Bun,
   about 700 ns at the 10,000-topic bound, more than an order of magnitude
   above a plain set - so once the counter became the default that sat on every
-  publish. A topic still being published to is still not what gets thrown
-  away: a topic touched since the last sweep is moved to the back of the
-  queue, so it outlives every entry ahead of it. What is given up is
+  publish. A topic touched since the last sweep is spared and moved to the
+  back of the queue, so it outlives every entry ahead of it and a quiet topic
+  is what an eviction reaches for. One eviction examines at most 32 entries:
+  where those are all in use it evicts the oldest of them, so an app whose
+  live topic set is larger than the cap does have active topics evicted, and
+  their counters restart at 1. What is given up against exact order is
   precision among topics all touched within the same lap. Measured per bare
   publish, against a 51 ns envelope build: the counter stamp costs 17 ns on a
   small working set and 32 ns with the map at its bound, where keeping exact

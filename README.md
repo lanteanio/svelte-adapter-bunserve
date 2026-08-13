@@ -585,9 +585,24 @@ a value into the authoritative marks above, and only an explicit numeric
 seq can raise a resume boundary. It is not entirely inert either, and the
 one place it shows is worth knowing about: publishing to a topic that
 already carries a mark keeps that mark RECENT, so once an app is past
-10,000 marked topics and the LRU is evicting, a bare publish influences
+10,000 marked topics and the bound is evicting, a bare publish influences
 which topic keeps its dedup floor and which loses it. The value never
 moves; only the eviction order does.
+
+**What the 10,000-topic bound evicts.** Both per-topic seq maps - the counters
+and the authoritative marks - hold at most 10,000 entries, and a new topic
+arriving at a full map evicts one. The policy is second-chance, not LRU: a
+topic published to since the eviction last swept past it is spared and moved
+to the back of the queue, so a quiet topic is what an eviction reaches for.
+One eviction examines at most 32 entries, though, and where those 32 oldest
+entries have ALL been published to recently there is no quiet topic within
+reach and the oldest of them is evicted anyway. An app whose live topic set
+is genuinely larger than the cap therefore has active topics evicted - a
+counter restarts at 1 and a client holding an older seq sees the number go
+backwards; an authoritative mark is lost outright and the next resume on that
+topic dedups nothing and re-delivers its whole held window. Scope the topics
+or publish high-cardinality ones with `{ seq: false }` to stay under the cap;
+the adapter warns once when it starts evicting.
 
 An explicit `{ seq: <number> }` must be an INTEGER OF AT LEAST 1. There is no
 upper bound - the frame varint carries any magnitude exactly, so snowflake ids

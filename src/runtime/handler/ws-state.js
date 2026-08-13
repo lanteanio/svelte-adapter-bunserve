@@ -124,20 +124,21 @@ export const sharedTopics = new Map();
  * holding the max of two spaces cannot answer that for a topic published both
  * ways, which is why the counter lane stays out of it.
  *
- * LRU-bounded exactly like `topicSeqs`, and for the same reason: an app that
- * publishes explicit seqs to client-named topics (`room:<uuid>`) would
- * otherwise grow one entry per topic ever published, for the life of the
- * process. An evicted topic loses its mark outright, and a resume then dedups
- * nothing for it: every reported watermark is refused and the whole held window
- * re-delivers, up to `MAX_RESUME_BUFFERED_FRAMES`. Duplicates on a topic that
- * has gone quiet, never a gap.
+ * Bounded exactly like `topicSeqs`, by the same second-chance eviction and for
+ * the same reason: an app that publishes explicit seqs to client-named topics
+ * (`room:<uuid>`) would otherwise grow one entry per topic ever published, for
+ * the life of the process. An evicted topic loses its mark outright, and a
+ * resume then dedups nothing for it: every reported watermark is refused and
+ * the whole held window re-delivers, up to `MAX_RESUME_BUFFERED_FRAMES`.
+ * Duplicates, never a gap - and a quiet topic is the one the eviction reaches
+ * for, but see `evictOne` for the case where it cannot find one.
  * @type {Map<string, number>}
  */
 export const maxAuthoritativeSeq = new Map();
 
 /**
  * Note one published seq against a topic's authoritative high-water mark,
- * LRU-bounded.
+ * bounded by the second-chance eviction in `evictOne`.
  *
  * An `authoritative` (explicit numeric, cluster-stamped) seq may arrive
  * reordered, so the mark only ever moves UP.
@@ -229,12 +230,23 @@ export const SWEEP_LIMIT = 32;
  * a full lap: a topic still being published to survives as many evictions as
  * there are entries ahead of it.
  *
+ * WITH ONE EXCEPTION, and it is not a rare one on the workload that reaches
+ * this bound at all: the sweep gives up after `SWEEP_LIMIT` entries. When
+ * every entry it examined was in use there is no quiet victim within reach,
+ * and the oldest of the examined entries is evicted even though it was
+ * published to. So an ACTIVE topic can be evicted, and can restart its
+ * counter at 1, whenever the oldest stretch of the queue is uniformly hot.
+ * Scanning further to avoid it is the unbounded sweep the limit exists to
+ * prevent, and at a working set genuinely larger than the cap no policy can
+ * evict only quiet topics - there are none. Anything documented for an
+ * operator has to say this rather than promise around it.
+ *
  * That is what makes this CLOCK rather than exact LRU. The requeue is paid
  * only while evicting, which happens only when a NEW topic arrives at a full
  * map, and only for topics that earned a flag; exact LRU pays the same
  * re-insert on every touch of every topic, which is the cost that does not
  * scale. What is given up is precision among entries that were all touched
- * within the same lap.
+ * within the same lap, and the guarantee above at the window's edge.
  *
  * The map must not be mutated while its own key iterator is live - an entry
  * re-added during iteration is visited again - so the spared keys are
@@ -1115,11 +1127,12 @@ export function stampSeqValue(seqOption, topic) {
 		if (!seqEvictionWarned) {
 			seqEvictionWarned = true;
 			console.warn(
-				`[ws] more than ${MAX_SEQ_TOPICS} topics carry a counter seq; the counters that ` +
-				'have gone quiet are being evicted. An evicted topic restarts its sequence at 1, so ' +
-				'a client holding an older seq for it sees the number go backwards. The counter is ' +
-				'the DEFAULT: publish with { seq: false } on high-cardinality topics, or scope them ' +
-				'so the working set stays under the cap.'
+				`[ws] more than ${MAX_SEQ_TOPICS} topics carry a counter seq; counters are being ` +
+				'evicted to hold that cap. A topic that has gone quiet goes first, but where the oldest ' +
+				'counters are all still being published to, one of THOSE is evicted. An evicted topic ' +
+				'restarts its sequence at 1, so a client holding an older seq for it sees the number go ' +
+				'backwards. The counter is the DEFAULT: publish with { seq: false } on high-cardinality ' +
+				'topics, or scope them so the working set stays under the cap.'
 			);
 		}
 	}
