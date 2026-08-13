@@ -54,14 +54,24 @@ const CORPUS_PATH = join(REPO_ROOT, CONFIG.file);
 const CORPUS_LABEL = process.cwd() === REPO_ROOT.replace(/[\\/]$/, '') ? CONFIG.file : CORPUS_PATH;
 
 const update = process.argv.includes('--update');
+// Both spellings, because `indexOf('--against')` cannot see `--against=path`
+// and the miss is silent: the flag disappears, the gate runs, and it reports
+// success without ever making the comparison that was asked for. A flag whose
+// failure mode is a false pass has to accept the way people write it.
 const againstIdx = process.argv.indexOf('--against');
-const againstPath = againstIdx !== -1 ? process.argv[againstIdx + 1] : null;
-if (againstIdx !== -1 && (!againstPath || againstPath.startsWith('--'))) {
-	// Silently ignoring it would run the gate and report success without ever
-	// making the cross-adapter comparison the flag was typed to request. A
-	// value that looks like another flag is caught here rather than after a
-	// full swarm, which is where reading it as a filename would fail.
-	console.error('sim-golden: --against needs a path to a sibling corpus file.');
+const againstInline = process.argv.find((a) => a.startsWith('--against='));
+const againstRequested = againstIdx !== -1 || againstInline !== undefined;
+const againstPath = againstInline !== undefined
+	? againstInline.slice('--against='.length)
+	: (againstIdx !== -1 ? process.argv[againstIdx + 1] ?? null : null);
+if (againstRequested && (!againstPath || againstPath.startsWith('--'))) {
+	// A value that looks like another flag is refused here rather than after a
+	// full swarm, which is where reading it as a filename would fail. A real
+	// file whose name starts with `--` is still reachable as `./--name.json`.
+	console.error(
+		'sim-golden: --against needs a path to a sibling corpus file' +
+		`${againstPath ? ` (got ${JSON.stringify(againstPath)})` : ''}.`
+	);
 	process.exit(1);
 }
 /**

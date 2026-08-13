@@ -283,14 +283,20 @@ test('the bound and the sweep window are the numbers the docs state', () => {
 	// pinned here because reaching them means loading ws-state.js, which this
 	// file already does.
 	//
-	// WHICH COPY A SERVER ACTUALLY ENFORCES is the DEFAULTS one: the build
-	// injects the fully normalized options whenever there is a WebSocket
-	// surface at all, and normalizeWsOptions never drops a key, so the left
-	// side of every `??` is always present. The fallback resolves only where
-	// WS_OPTIONS is null - a build with no WebSocket surface, where the bound
-	// gates nothing. It is pinned anyway because two literals for one
-	// documented number can drift apart silently, and the surviving one would
-	// then be whichever a future refactor happens to keep.
+	// WHICH COPY A SERVER ACTUALLY ENFORCES is the DEFAULTS one. The build
+	// serializes the normalized options into the payload whenever there is a
+	// WebSocket surface, and normalization derives these two from DEFAULTS
+	// unconditionally, so both keys are present in every WS-enabled build and
+	// the left side of each `??` wins. (Not a general rule about the injected
+	// object: JSON.stringify drops an undefined-valued key, which is why one
+	// build carries no `pressure` at all. It holds for these two because they
+	// are always numbers.)
+	//
+	// A fallback resolves wherever its KEY is absent - a build with no
+	// WebSocket surface, where the bound gates nothing, and a test lane that
+	// sets a partial WS_OPTIONS, which is how this file reaches it. Pinned
+	// anyway, because two literals for one documented number drift apart
+	// silently and the survivor of a refactor is whichever copy it keeps.
 	assert.equal(MAX_SUBSCRIPTIONS_PER_CONNECTION, 10_000);
 	assert.equal(MAX_CONTROL_EGRESS_BYTES, 4 * 1024 * 1024);
 });
