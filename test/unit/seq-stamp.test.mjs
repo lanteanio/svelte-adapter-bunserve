@@ -292,11 +292,13 @@ test('the bound and the sweep window are the numbers the docs state', () => {
 	// build carries no `pressure` at all. It holds for these two because they
 	// are always numbers.)
 	//
-	// A fallback resolves wherever its KEY is absent - a build with no
-	// WebSocket surface, where the bound gates nothing, and a test lane that
-	// sets a partial WS_OPTIONS, which is how this file reaches it. Pinned
-	// anyway, because two literals for one documented number drift apart
-	// silently and the survivor of a refactor is whichever copy it keeps.
+	// A fallback resolves wherever its KEY is absent. This file reaches it the
+	// blunt way, with WS_OPTIONS null at the top - the same shape as a build
+	// with no WebSocket surface, where the bound gates nothing. A partial
+	// WS_OPTIONS reaches it too, which is worth knowing before writing a test
+	// that sets one and expects the documented number. Pinned anyway, because
+	// two literals for one documented number drift apart silently and the
+	// survivor of a refactor is whichever copy it keeps.
 	assert.equal(MAX_SUBSCRIPTIONS_PER_CONNECTION, 10_000);
 	assert.equal(MAX_CONTROL_EGRESS_BYTES, 4 * 1024 * 1024);
 });

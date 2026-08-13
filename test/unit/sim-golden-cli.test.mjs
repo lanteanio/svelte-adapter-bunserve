@@ -43,10 +43,16 @@ test('--against with no value refuses instead of quietly skipping the comparison
 test('--against followed by another flag refuses, and names what it was given', () => {
 	// Otherwise the next flag is read as a filename, which fails only after the
 	// whole corpus has been built.
-	const { status, stderr } = run(['--against', '--update']);
+	//
+	// Deliberately NOT `--update` here, though that is the realistic typo: any
+	// `--xxx` proves the same property, and `--update` is the one value that
+	// also arms the script's only destructive path against the committed
+	// corpus. Should this guard ever regress, a test written that way blesses
+	// a new corpus as a side effect of failing.
+	const { status, stderr } = run(['--against', '--verbose']);
 	assert.equal(status, 1);
 	assert.match(stderr, /--against needs a path/);
-	assert.match(stderr, /"--update"/, 'the offending value is echoed, not just the rule');
+	assert.match(stderr, /"--verbose"/, 'the offending value is echoed, not just the rule');
 });
 
 test('the --against=path spelling is seen at all', () => {
@@ -60,7 +66,16 @@ test('the --against=path spelling is seen at all', () => {
 });
 
 test('an inline value that is another flag is refused too', () => {
-	const { status, stderr } = run(['--against=--update']);
+	const { status, stderr } = run(['--against=--verbose']);
 	assert.equal(status, 1);
-	assert.match(stderr, /"--update"/);
+	assert.match(stderr, /"--verbose"/);
+});
+
+test('both spellings at once is refused rather than one of them silently winning', () => {
+	// The inline form is found by spelling rather than by position, so it wins
+	// from either side and the other path is discarded without a word - which
+	// is the same silent substitution this flag is being fixed for.
+	const { status, stderr } = run(['--against', 'a.json', '--against=b.json']);
+	assert.equal(status, 1);
+	assert.match(stderr, /--against was given twice/);
 });

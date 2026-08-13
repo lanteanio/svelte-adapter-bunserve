@@ -20,6 +20,7 @@
 //   node scripts/sim-golden.js                     verify HEAD against the committed corpus (exit 1 on drift)
 //   node scripts/sim-golden.js --update            regenerate + bless the corpus (refuses a broken/nondeterministic swarm)
 //   node scripts/sim-golden.js --against <corpus>  additionally require fingerprint equality with a sibling corpus file
+//   node scripts/sim-golden.js --against=<corpus>  the same flag, either spelling
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -61,6 +62,14 @@ const update = process.argv.includes('--update');
 const againstIdx = process.argv.indexOf('--against');
 const againstInline = process.argv.find((a) => a.startsWith('--against='));
 const againstRequested = againstIdx !== -1 || againstInline !== undefined;
+if (againstIdx !== -1 && againstInline !== undefined) {
+	// The inline form is found by SPELLING rather than by position, so it wins
+	// from either side and the other path is dropped in silence. Refusing is
+	// the honest answer: the run would otherwise report a clean comparison
+	// against a corpus the caller did not name.
+	console.error('sim-golden: --against was given twice; pass one sibling corpus path.');
+	process.exit(1);
+}
 const againstPath = againstInline !== undefined
 	? againstInline.slice('--against='.length)
 	: (againstIdx !== -1 ? process.argv[againstIdx + 1] ?? null : null);
@@ -189,7 +198,9 @@ function compareAgainst(corpus, siblingFile) {
 		if (mine === e.fingerprint) same++;
 		else diffs.push(`seed ${e.seed}: ours ${mine} vs sibling ${e.fingerprint}`);
 	}
-	console.log(`sim-golden --against: ${same}/${sibling.entries.length} sibling fingerprints identical`);
+	// Naming the file is the point: "40/40 identical" against the wrong corpus
+	// reads exactly like the right one.
+	console.log(`sim-golden --against ${siblingFile}: ${same}/${sibling.entries.length} sibling fingerprints identical`);
 	for (const d of diffs.slice(0, 10)) console.error('  ' + d);
 	return diffs.length === 0;
 }
