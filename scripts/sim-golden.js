@@ -62,12 +62,16 @@ const update = process.argv.includes('--update');
 const againstIdx = process.argv.indexOf('--against');
 const againstInline = process.argv.find((a) => a.startsWith('--against='));
 const againstRequested = againstIdx !== -1 || againstInline !== undefined;
-if (againstIdx !== -1 && againstInline !== undefined) {
-	// The inline form is found by SPELLING rather than by position, so it wins
-	// from either side and the other path is dropped in silence. Refusing is
-	// the honest answer: the run would otherwise report a clean comparison
-	// against a corpus the caller did not name.
-	console.error('sim-golden: --against was given twice; pass one sibling corpus path.');
+// Counted, not compared: whichever occurrence this file picks - the first by
+// index for the space form, the first by spelling for the inline one - every
+// other path is dropped in silence, and the run then reports a clean
+// comparison against a corpus the caller did not name. Two of the SAME
+// spelling drop one exactly as a mixed pair does, so the count is the rule.
+// It also means the first path wins rather than the last, which is the
+// opposite of what appending an override to a command line would suggest.
+const againstCount = process.argv.filter((a) => a === '--against' || a.startsWith('--against=')).length;
+if (againstCount > 1) {
+	console.error('sim-golden: --against was given more than once; pass one sibling corpus path.');
 	process.exit(1);
 }
 const againstPath = againstInline !== undefined
