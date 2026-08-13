@@ -43,11 +43,18 @@ test('the committed corpus records which commit blessed it', () => {
 	// moves, and at that moment the code that produced it is not any commit
 	// yet. What is being pinned is that the provenance is recorded at all.
 	// Either object format, since the shape is git's and not ours.
+	// Case-insensitive because the value can arrive from GIT_COMMIT, which is
+	// unvalidated: git only ever writes lowercase, and rejecting an uppercase
+	// sha would be a trap rather than a check. Shape is all this can gate - a
+	// wrong-but-well-formed sha needs a git call, which does not belong in a
+	// unit test.
 	assert.match(
 		corpus.gitCommit ?? '',
-		/^([0-9a-f]{40}|[0-9a-f]{64})(-dirty)?$/,
-		'no provenance recorded: re-bless with `node scripts/sim-golden.js --update` ' +
-			'inside a git checkout, or set GIT_COMMIT to the commit being blessed'
+		/^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})(-dirty)?$/,
+		`corpus provenance is ${JSON.stringify(corpus.gitCommit)}, which is not a commit ` +
+			'sha with an optional -dirty suffix. Re-bless with ' +
+			'`node scripts/sim-golden.js --update` inside a git checkout, or set GIT_COMMIT ' +
+			'to the full sha being blessed (a tag, branch or short sha will not do)'
 	);
 });
 

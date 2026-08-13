@@ -899,14 +899,15 @@ at exactly 200 times its per-response value. That is what catches a cost which
 is amortized rather than absent: a disk touch taken every 64th request, or a
 second header build once an entry has been served forty times, hides completely
 inside a short window and is exactly the shape a cache or pool regression
-takes. The decode budgets are the inverse and are the reason the repetition is
-not always of an identical request - what they require is that a second sighting
-of a path, and two hundred distinct unencoded ones, add NO decodes at all.
+takes. The decode budgets are the inverse, and the reason the repetition is not
+always of an identical request: what they require is that a SECOND sighting of
+a path, and two hundred distinct unencoded ones, add no decodes at all.
 
-Every budget that can be stated at scale is, the exception being the pair that
-measures the decode cache's own eviction, which happens once by definition. The
-file ends with a self-check aimed at work that genuinely scales, so the gates
-cannot pass vacuously.
+Every budget that can be stated at scale is. The exceptions are all one shape -
+a FIRST decode, measured once because a first sighting happens once, whether
+that is a malformed path, a fresh one, or an entry the cache has evicted and
+must decode again. The file ends with a self-check aimed at work that genuinely
+scales, so the gates cannot pass vacuously.
 
 Lowering a budget needs no discussion. RAISING one is a design decision - it
 says the adapter now does more I/O per unit of work - so record the reason in
@@ -947,11 +948,13 @@ performance statement, never a capability statement.
 A change that deliberately moves a fingerprint is blessed with
 `node scripts/sim-golden.js --update`, and the corpus diff is the reviewable
 record of what moved. The corpus records the commit it was blessed from,
-because a seed without one is half a bug report. Blessing from a tree that
-differs from `HEAD` records that commit with a `-dirty` suffix, which is the
-usual outcome and not a problem to fix: it means the fingerprints came from
+because a seed without one is half a bug report. Blessing while any TRACKED
+file differs from `HEAD` records that commit with a `-dirty` suffix, which is
+the usual outcome and not a problem to fix: it means the fingerprints came from
 that commit's working tree, and the source diff sitting beside the corpus diff
-is the other half.
+is the other half. Untracked files are not counted, and neither is the corpus
+itself. Set `GIT_COMMIT` to record a full sha directly instead, which is what a
+CI job that already knows its checkout would do.
 
 The publishing surface has its own gate, run in CI on every push:
 

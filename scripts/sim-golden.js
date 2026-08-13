@@ -23,22 +23,29 @@
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import process from 'node:process';
 import { runSimSwarm, buildSimGoldens, checkSimGoldens } from '../src/sim.js';
 
-// This file's own checkout, so the provenance probe below asks git about THIS
-// tree rather than about whatever directory the script was invoked from.
+// This file's own checkout. Both the corpus and the provenance probe resolve
+// against it rather than against the invoking directory: run from anywhere
+// else, a cwd-relative corpus path made `--update` WRITE A NEW FILE under that
+// directory and exit 0, so a contributor was told 40 goldens were blessed
+// while the real corpus went untouched.
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 const FAULT_PROFILE = { drop: 0.25, duplicate: 0.15, reorder: 0.5, maxJitterMs: 30 };
 
 const CONFIG = {
 	name: 'adapter-single',
+	// Repo-relative: this spelling is what the git pathspec and every message
+	// want. CORPUS_PATH is what the filesystem gets.
 	file: 'test/dst-goldens/adapter-single.golden.json',
 	swarm: { count: 40, startSeed: 1, faultMode: 'random', faultProbability: 0.25, faultProfile: FAULT_PROFILE, base: {} }
 };
+
+const CORPUS_PATH = join(REPO_ROOT, CONFIG.file);
 
 const update = process.argv.includes('--update');
 const againstIdx = process.argv.indexOf('--against');
@@ -82,7 +89,7 @@ function resolveGitCommit() {
 	if (process.env.GIT_COMMIT) return process.env.GIT_COMMIT;
 	const opts = {
 		encoding: /** @type {const} */ ('utf8'),
-		stdio: /** @type {const} */ (['ignore', 'pipe', 'ignore']),
+		stdio: /** @type {const} */ (['ignore', 'pipe', 'pipe']),
 		cwd: REPO_ROOT,
 		timeout: 10_000
 	};
@@ -96,15 +103,28 @@ function resolveGitCommit() {
 	try {
 		execFileSync('git', ['diff', '--quiet', 'HEAD', '--', '.', `:(exclude)${CONFIG.file}`], opts);
 		return sha;
-	} catch {
+	} catch (err) {
+		// Exit 1 IS the answer: git says the tree differs. Any other status
+		// means the question went unanswered - a corrupt index, a git too old
+		// for pathspec exclusion, the timeout above - and the tree may well be
+		// clean. `-dirty` is still the right record, since it claims less than
+		// the truth rather than more, but silently marking a clean tree is how
+		// someone spends an afternoon on a suffix that means nothing.
+		if (err?.status !== 1) {
+			const detail = String(err?.stderr || err?.message || '').trim().split('\n')[0];
+			console.warn(
+				`sim-golden: could not determine whether the tree matches ${sha.slice(0, 8)}` +
+				`${detail ? ` (${detail})` : ''}; recording -dirty.`
+			);
+		}
 		return `${sha}-dirty`;
 	}
 }
 
-// Only a blessing records provenance. On the verify path the value reaches no
-// output and no comparison, so resolving it would be two git subprocesses per
-// CI run for a field nothing reads.
-const gitCommit = update ? resolveGitCommit() : (process.env.GIT_COMMIT || null);
+// Only a blessing records provenance. On the verify path this value reaches no
+// output, no fingerprint and no comparison, so it is null there rather than
+// resolved: two git subprocesses per CI run for a field nothing reads.
+const gitCommit = update ? resolveGitCommit() : null;
 
 /**
  * The sibling-corpus equality check: every seed present in both corpora must
@@ -156,7 +176,7 @@ async function buildCorpus() {
 async function verify() {
 	let corpus;
 	try {
-		corpus = JSON.parse(readFileSync(CONFIG.file, 'utf8'));
+		corpus = JSON.parse(readFileSync(CORPUS_PATH, 'utf8'));
 	} catch (err) {
 		console.error(`sim-golden: cannot read corpus ${CONFIG.file} (${err.message}). Run \`node scripts/sim-golden.js --update\`.`);
 		return false;
@@ -193,8 +213,8 @@ if (update) {
 		console.error('sim-golden --update: REFUSING to bless a corpus that diverges from the sibling. Nothing written.');
 		process.exit(1);
 	}
-	mkdirSync(dirname(CONFIG.file), { recursive: true });
-	writeFileSync(CONFIG.file, JSON.stringify(corpus, null, 2) + '\n', 'utf8');
+	mkdirSync(dirname(CORPUS_PATH), { recursive: true });
+	writeFileSync(CORPUS_PATH, JSON.stringify(corpus, null, 2) + '\n', 'utf8');
 	console.log(`sim-golden --update: wrote ${corpus.entries.length} golden(s) to ${CONFIG.file}`);
 } else {
 	if (!(await verify())) process.exit(1);
