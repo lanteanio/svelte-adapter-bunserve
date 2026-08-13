@@ -157,11 +157,11 @@ function cost(fn) {
  * How many times a budget is measured. Every budget that CAN be stated at
  * scale is, because a single call cannot tell a fixed cost from one that
  * grows. The exceptions are all one shape: a FIRST decode is measured once,
- * because a first sighting happens once. That covers the first decode of a
- * malformed path and of a fresh one, and both halves of the eviction pair -
- * an evicted entry is re-decoded on its next sighting, which is again a
- * first. Repeating any of them would measure the cached path instead, which
- * is a different claim and is asserted separately.
+ * because a first sighting happens once. There are four - a malformed path, a
+ * fresh path, the fresh path that overflows the cache, and the evicted entry
+ * that must decode again - and each is a first sighting of a path this cache
+ * does not hold. Repeating one would measure the cached path instead, which is
+ * the separate claim the scaled decode budgets make.
  *
  * The number is large deliberately. A window of six only catches growth with a
  * period of six or less: a disk touch taken every 64th request, or a second

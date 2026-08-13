@@ -36,12 +36,14 @@ test('the bounds the README documents are the bounds an app gets', () => {
 	assert.equal(options.maxConcurrentUnsubscribeHooks, 64);
 	assert.equal(options.maxQueuedUnsubscribeHooks, 1024);
 	assert.equal(options.maxControlEgressBytes, 4 * 1024 * 1024);
-	// The four defaults that decide what an unauthenticated client may reach.
-	// Each is documented as false, and each is a widening if it flips.
-	assert.equal(options.publishToSelf, false);
+	// The three defaults that decide what a client may reach. Each is
+	// documented as false, and each is a widening if it flips.
 	assert.equal(options.allowNonAsciiTopics, false);
 	assert.equal(options.allowSystemTopicSubscribe, false);
 	assert.equal(options.allowUnauthenticatedSubscribe, false);
+	// Echo policy rather than access control - whether a publisher is sent its
+	// own message - but documented as false and pinned for the same reason.
+	assert.equal(options.publishToSelf, false);
 });
 
 test('idleTimeout at the Bun ceiling is accepted', () => {

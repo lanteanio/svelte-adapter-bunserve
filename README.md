@@ -619,9 +619,14 @@ its own first eviction:
   there is no publish-side opt-out here: scoping the topics that carry
   explicit seqs is the only lever.
 
-The two maps therefore hold different topic sets, and a publish feeds at most
-one of them: a bare or `{ seq: true }` publish feeds the counters, an explicit
-`{ seq: <number> }` feeds the marks, and `{ seq: false }` feeds neither.
+One publish therefore WRITES A SEQ into at most one of the two maps, and there
+are only two guards deciding which: an explicit number goes to the marks,
+`{ seq: false }` writes nothing anywhere, and everything else - a bare publish,
+`{}`, `{ seq: true }` - draws the counter. The two maps still overlap, because
+a topic published both ways is in both, and a bare publish to a topic that
+already carries a mark keeps that mark RECENT even though it writes no value
+there. Past the cap that recency is what decides which topic keeps its dedup
+floor, so "writes no seq" is not the same as "does not touch it".
 
 An explicit `{ seq: <number> }` must be an INTEGER OF AT LEAST 1. There is no
 upper bound - the frame varint carries any magnitude exactly, so snowflake ids
@@ -903,9 +908,9 @@ takes. The decode budgets are the inverse, and the reason the repetition is not
 always of an identical request: what they require is that a SECOND sighting of
 a path, and two hundred distinct unencoded ones, add no decodes at all.
 
-Every budget that can be stated at scale is. The exceptions are all one shape -
-a FIRST decode, measured once because a first sighting happens once, whether
-that is a malformed path, a fresh one, or an entry the cache has evicted and
+Every budget that can be stated at scale is. The four exceptions are all one
+shape - a FIRST decode, measured once because a first sighting happens once,
+whether the path is malformed, merely new, or one the cache has evicted and
 must decode again. The file ends with a self-check aimed at work that genuinely
 scales, so the gates cannot pass vacuously.
 

@@ -47,9 +47,21 @@ const CONFIG = {
 
 const CORPUS_PATH = join(REPO_ROOT, CONFIG.file);
 
+// What to CALL the corpus in output. The repo-relative spelling is the one a
+// contributor recognises, but it names nothing from another directory - and
+// "which file did that write" is the exact question a stray corpus used to
+// leave open, so a run from elsewhere gets the full path.
+const CORPUS_LABEL = process.cwd() === REPO_ROOT.replace(/[\\/]$/, '') ? CONFIG.file : CORPUS_PATH;
+
 const update = process.argv.includes('--update');
 const againstIdx = process.argv.indexOf('--against');
 const againstPath = againstIdx !== -1 ? process.argv[againstIdx + 1] : null;
+if (againstIdx !== -1 && !againstPath) {
+	// Silently ignoring it would run the gate and report success without ever
+	// making the cross-adapter comparison the flag was typed to request.
+	console.error('sim-golden: --against needs a path to a sibling corpus file.');
+	process.exit(1);
+}
 /**
  * Which commit produced a corpus. A seed plus a commit IS the bug report this
  * corpus exists to make possible, and reading GIT_COMMIT alone recorded null
@@ -133,9 +145,26 @@ const gitCommit = update ? resolveGitCommit() : null;
  * a capability statement - runnable wherever a sibling corpus file is at hand
  * (the uws checkout is not present in this repo's CI, so this is a local
  * ritual like probe:uws, and the committed corpus diff is its record).
+ *
+ * `siblingFile` is the one path here that stays relative to the INVOKING
+ * directory, because a person typed it on the command line.
  */
 function compareAgainst(corpus, siblingFile) {
-	const sibling = JSON.parse(readFileSync(siblingFile, 'utf8'));
+	/** @type {any} */
+	let sibling;
+	try {
+		sibling = JSON.parse(readFileSync(siblingFile, 'utf8'));
+	} catch (err) {
+		// A stack trace here reads as a crash in the gate rather than as what
+		// it is: a path that was typed wrong, relative to the wrong directory,
+		// or a sibling checkout that is not where it was expected.
+		console.error(`sim-golden --against: cannot read sibling corpus ${siblingFile} (${err.message}).`);
+		return false;
+	}
+	if (!Array.isArray(sibling.entries)) {
+		console.error(`sim-golden --against: ${siblingFile} carries no entries array; is it a golden corpus?`);
+		return false;
+	}
 	const ours = new Map(corpus.entries.map((e) => [e.seed, e.fingerprint]));
 	let same = 0;
 	const diffs = [];
@@ -178,7 +207,7 @@ async function verify() {
 	try {
 		corpus = JSON.parse(readFileSync(CORPUS_PATH, 'utf8'));
 	} catch (err) {
-		console.error(`sim-golden: cannot read corpus ${CONFIG.file} (${err.message}). Run \`node scripts/sim-golden.js --update\`.`);
+		console.error(`sim-golden: cannot read corpus ${CORPUS_LABEL} (${err.message}). Run \`node scripts/sim-golden.js --update\`.`);
 		return false;
 	}
 	const swarm = corpus.swarm || {};
@@ -215,7 +244,7 @@ if (update) {
 	}
 	mkdirSync(dirname(CORPUS_PATH), { recursive: true });
 	writeFileSync(CORPUS_PATH, JSON.stringify(corpus, null, 2) + '\n', 'utf8');
-	console.log(`sim-golden --update: wrote ${corpus.entries.length} golden(s) to ${CONFIG.file}`);
+	console.log(`sim-golden --update: wrote ${corpus.entries.length} golden(s) to ${CORPUS_LABEL}`);
 } else {
 	if (!(await verify())) process.exit(1);
 	console.log('sim-golden: corpus matches HEAD.');

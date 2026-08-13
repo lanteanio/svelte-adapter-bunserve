@@ -29,7 +29,9 @@ register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { platform } = await import('../../src/runtime/handler/platform.js');
 const {
+	MAX_CONTROL_EGRESS_BYTES,
 	MAX_SEQ_TOPICS,
+	MAX_SUBSCRIPTIONS_PER_CONNECTION,
 	SWEEP_LIMIT,
 	evictOne,
 	maxAuthoritativeSeq,
@@ -275,6 +277,14 @@ test('the bound and the sweep window are the numbers the docs state', () => {
 	// why nothing else would notice.
 	assert.equal(SWEEP_LIMIT, 32);
 	assert.equal(MAX_SEQ_TOPICS, 10_000);
+	// Two bounds the README also quotes exist TWICE in source: once in the
+	// DEFAULTS object and once as the `??` fallback beside the option read.
+	// ws-options.test.mjs pins the DEFAULTS copy; these are the fallbacks,
+	// pinned here because reaching them means loading ws-state.js, which this
+	// file already does. They are what an unconfigured server runs on, and the
+	// two copies can otherwise drift apart with the whole suite green.
+	assert.equal(MAX_SUBSCRIPTIONS_PER_CONNECTION, 10_000);
+	assert.equal(MAX_CONTROL_EGRESS_BYTES, 4 * 1024 * 1024);
 });
 
 test('the mark map warns on its own first eviction, and only once', () => {
