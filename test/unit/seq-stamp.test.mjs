@@ -281,8 +281,16 @@ test('the bound and the sweep window are the numbers the docs state', () => {
 	// DEFAULTS object and once as the `??` fallback beside the option read.
 	// ws-options.test.mjs pins the DEFAULTS copy; these are the fallbacks,
 	// pinned here because reaching them means loading ws-state.js, which this
-	// file already does. They are what an unconfigured server runs on, and the
-	// two copies can otherwise drift apart with the whole suite green.
+	// file already does.
+	//
+	// WHICH COPY A SERVER ACTUALLY ENFORCES is the DEFAULTS one: the build
+	// injects the fully normalized options whenever there is a WebSocket
+	// surface at all, and normalizeWsOptions never drops a key, so the left
+	// side of every `??` is always present. The fallback resolves only where
+	// WS_OPTIONS is null - a build with no WebSocket surface, where the bound
+	// gates nothing. It is pinned anyway because two literals for one
+	// documented number can drift apart silently, and the surviving one would
+	// then be whichever a future refactor happens to keep.
 	assert.equal(MAX_SUBSCRIPTIONS_PER_CONNECTION, 10_000);
 	assert.equal(MAX_CONTROL_EGRESS_BYTES, 4 * 1024 * 1024);
 });

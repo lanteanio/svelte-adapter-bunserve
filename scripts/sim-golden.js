@@ -56,9 +56,11 @@ const CORPUS_LABEL = process.cwd() === REPO_ROOT.replace(/[\\/]$/, '') ? CONFIG.
 const update = process.argv.includes('--update');
 const againstIdx = process.argv.indexOf('--against');
 const againstPath = againstIdx !== -1 ? process.argv[againstIdx + 1] : null;
-if (againstIdx !== -1 && !againstPath) {
+if (againstIdx !== -1 && (!againstPath || againstPath.startsWith('--'))) {
 	// Silently ignoring it would run the gate and report success without ever
-	// making the cross-adapter comparison the flag was typed to request.
+	// making the cross-adapter comparison the flag was typed to request. A
+	// value that looks like another flag is caught here rather than after a
+	// full swarm, which is where reading it as a filename would fail.
 	console.error('sim-golden: --against needs a path to a sibling corpus file.');
 	process.exit(1);
 }
@@ -161,7 +163,10 @@ function compareAgainst(corpus, siblingFile) {
 		console.error(`sim-golden --against: cannot read sibling corpus ${siblingFile} (${err.message}).`);
 		return false;
 	}
-	if (!Array.isArray(sibling.entries)) {
+	// Optional chaining because `null` is valid JSON: it parses without
+	// throwing and then answers no property at all, which is the one shape
+	// that would otherwise reach this line as a raw crash.
+	if (!Array.isArray(sibling?.entries)) {
 		console.error(`sim-golden --against: ${siblingFile} carries no entries array; is it a golden corpus?`);
 		return false;
 	}

@@ -583,11 +583,12 @@ counter value, so the run continues where it left off.
 A counter seq is not a MARK: it is a process-local space, it never writes
 a value into the authoritative marks above, and only an explicit numeric
 seq can raise a resume boundary. It is not entirely inert either, and the
-one place it shows is worth knowing about: publishing to a topic that
-already carries a mark keeps that mark RECENT, so once an app is past
-10,000 marked topics and the bound is evicting, a bare publish influences
-which topic keeps its dedup floor and which loses it. The value never
-moves; only the eviction order does.
+one place it shows is worth knowing about: once an app is past 10,000 marked
+topics and the bound is evicting, publishing to a topic that already carries
+a mark keeps that mark RECENT, so a bare publish influences which topic keeps
+its dedup floor and which loses it. The value never moves; only the eviction
+order does. Below the cap the recency is not even recorded, because nothing
+can be evicted for it to save the topic from.
 
 **What the 10,000-topic bound evicts.** Both per-topic seq maps - the counters
 and the authoritative marks - hold at most 10,000 entries, and a new topic
@@ -622,11 +623,13 @@ its own first eviction:
 One publish therefore WRITES A SEQ into at most one of the two maps, and there
 are only two guards deciding which: an explicit number goes to the marks,
 `{ seq: false }` writes nothing anywhere, and everything else - a bare publish,
-`{}`, `{ seq: true }` - draws the counter. The two maps still overlap, because
-a topic published both ways is in both, and a bare publish to a topic that
-already carries a mark keeps that mark RECENT even though it writes no value
-there. Past the cap that recency is what decides which topic keeps its dedup
-floor, so "writes no seq" is not the same as "does not touch it".
+`{}`, `{ seq: true }` - draws the counter. Not a list of five shapes but two
+tests, which is why a `{ seq: '5' }` that was meant as a cluster seq draws the
+counter rather than being refused.
+
+The maps still overlap: a topic published both ways is in both, and the
+recency touch described above means "writes no seq into a map" is not the same
+as "does not touch it".
 
 An explicit `{ seq: <number> }` must be an INTEGER OF AT LEAST 1. There is no
 upper bound - the frame varint carries any magnitude exactly, so snowflake ids
@@ -909,10 +912,11 @@ always of an identical request: what they require is that a SECOND sighting of
 a path, and two hundred distinct unencoded ones, add no decodes at all.
 
 Every budget that can be stated at scale is. The four exceptions are all one
-shape - a FIRST decode, measured once because a first sighting happens once,
-whether the path is malformed, merely new, or one the cache has evicted and
-must decode again. The file ends with a self-check aimed at work that genuinely
-scales, so the gates cannot pass vacuously.
+shape - a FIRST decode, measured once because a first sighting happens once:
+a malformed path, a fresh one, the fresh one that overflows the cache, and the
+entry that overflow evicted, decoding again on its next sighting. The file ends
+with a self-check aimed at work that genuinely scales, so the gates cannot pass
+vacuously.
 
 Lowering a budget needs no discussion. RAISING one is a design decision - it
 says the adapter now does more I/O per unit of work - so record the reason in
