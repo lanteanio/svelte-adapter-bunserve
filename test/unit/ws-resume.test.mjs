@@ -517,8 +517,8 @@ test('a NaN explicit seq neither erases nor seeds a mark', () => {
 
 test('a counter publish keeps a mixed topic recent without changing its mark', () => {
 	// A topic hot in the counter lane and rare in the explicit one would
-	// otherwise age out of the LRU while it is still busy, losing the resume
-	// floor for exactly the topics most likely to be resumed.
+	// otherwise age out of the bounded map while it is still busy, losing the
+	// resume floor for exactly the topics most likely to be resumed.
 	notePublishedSeq('hot', 7, true);
 	for (let i = 0; i < MAX_SEQ_TOPICS - 1; i++) notePublishedSeq('f:' + i, 1, true);
 	assert.equal(maxAuthoritativeSeq.size, MAX_SEQ_TOPICS, 'full, with hot the least recent');
@@ -529,7 +529,7 @@ test('a counter publish keeps a mixed topic recent without changing its mark', (
 	maxAuthoritativeSeq.clear();
 });
 
-test('LRU eviction cannot pull the ceiling below the pre-window mark', () => {
+test('an eviction cannot pull the ceiling below the pre-window mark', () => {
 	// Eviction is the one thing left that lowers a live mark. If the ceiling
 	// followed it down, an honest report would be rejected and the fallback -
 	// the pre-window mark - would sit ABOVE the value it rejected, dropping
@@ -538,7 +538,7 @@ test('LRU eviction cannot pull the ceiling below the pre-window mark', () => {
 	notePublishedSeq('room', 1000, true);
 	const cap = beginResumeCapture(['room'], ws);
 	captureLive('room', 800, 'REORDERED800');
-	// Push 'room' out of the LRU, then let a later publish re-seed it low.
+	// Push 'room' out of the bounded map, then let a later publish re-seed it low.
 	for (let i = 0; i < MAX_SEQ_TOPICS + 1; i++) notePublishedSeq('f:' + i, 1, true);
 	assert.equal(maxAuthoritativeSeq.has('room'), false, 'evicted mid-window');
 	notePublishedSeq('room', 5, true);
@@ -1268,7 +1268,7 @@ test('publish marks the explicit lane only, under the monotone guard', () => {
 	maxAuthoritativeSeq.clear();
 });
 
-test('maxAuthoritativeSeq is LRU-bounded so unique-topic publishes do not leak', () => {
+test('maxAuthoritativeSeq is bounded so unique-topic publishes do not leak', () => {
 	setServer({ publish: () => 0, subscriberCount: () => 0 });
 	// Far more distinct topics than the cap. A leak would keep every one.
 	for (let i = 0; i < 10_050; i++) {

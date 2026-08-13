@@ -594,15 +594,27 @@ and the authoritative marks - hold at most 10,000 entries, and a new topic
 arriving at a full map evicts one. The policy is second-chance, not LRU: a
 topic published to since the eviction last swept past it is spared and moved
 to the back of the queue, so a quiet topic is what an eviction reaches for.
-One eviction examines at most 32 entries, though, and where those 32 oldest
-entries have ALL been published to recently there is no quiet topic within
-reach and the oldest of them is evicted anyway. An app whose live topic set
-is genuinely larger than the cap therefore has active topics evicted - a
-counter restarts at 1 and a client holding an older seq sees the number go
-backwards; an authoritative mark is lost outright and the next resume on that
-topic dedups nothing and re-delivers its whole held window. Scope the topics
-or publish high-cardinality ones with `{ seq: false }` to stay under the cap;
-the adapter warns once when it starts evicting.
+One eviction examines a bounded window (`SWEEP_LIMIT`, 32 entries today),
+though, and where every entry in that window has been published to recently
+there is no quiet topic within reach and the oldest of them is evicted
+anyway. An app whose live topic set is genuinely larger than the cap
+therefore has ACTIVE topics evicted.
+
+What that costs differs by map, and so does the remedy. Each warns once, on
+its own first eviction:
+
+- A lost COUNTER restarts that topic at 1, so a client holding an older seq
+  for it sees the number go backwards. This map is fed by every publish that
+  does not hand in a number, so publishing high-cardinality topics with
+  `{ seq: false }` keeps them out of it entirely.
+- A lost MARK takes the topic's resume dedup floor with it. A resume opening
+  while the topic is unmarked has no floor to fall back on and re-delivers
+  the whole held window, up to the resume buffer's frame cap - duplicates
+  rather than a gap, but the whole window. A later explicit publish re-seeds
+  the mark low rather than restoring it, which is a floor again but a lower
+  one than the topic had. Only an explicit `{ seq: <number> }` creates a mark,
+  so there is no publish-side opt-out here: scoping the topics that carry
+  explicit seqs is the only lever.
 
 An explicit `{ seq: <number> }` must be an INTEGER OF AT LEAST 1. There is no
 upper bound - the frame varint carries any magnitude exactly, so snowflake ids

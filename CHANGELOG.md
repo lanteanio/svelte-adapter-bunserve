@@ -66,10 +66,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   above a plain set - so once the counter became the default that sat on every
   publish. A topic touched since the last sweep is spared and moved to the
   back of the queue, so it outlives every entry ahead of it and a quiet topic
-  is what an eviction reaches for. One eviction examines at most 32 entries:
-  where those are all in use it evicts the oldest of them, so an app whose
-  live topic set is larger than the cap does have active topics evicted, and
-  their counters restart at 1. What is given up against exact order is
+  is what an eviction reaches for. One eviction examines a bounded window of
+  32 entries: where those are all in use it evicts the oldest of them, so an
+  app whose live topic set is larger than the cap does have ACTIVE topics
+  evicted - a counter restarts at 1, and a mark takes its topic's resume
+  dedup floor with it. Each map now warns once on its own first eviction,
+  naming the harm that map causes. What is given up against exact order is
   precision among topics all touched within the same lap. Measured per bare
   publish, against a 51 ns envelope build: the counter stamp costs 17 ns on a
   small working set and 32 ns with the map at its bound, where keeping exact

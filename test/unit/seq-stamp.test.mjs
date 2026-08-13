@@ -33,6 +33,7 @@ const {
 	SWEEP_LIMIT,
 	evictOne,
 	maxAuthoritativeSeq,
+	notePublishedSeq,
 	noteRecentlyUsed,
 	resetSeqState,
 	setServer,
@@ -169,9 +170,8 @@ test('at the cap, a uniformly hot front evicts an ACTIVE topic and its counter r
 	//
 	// Scanning past the window to avoid this is the unbounded sweep the limit
 	// exists to prevent, and a working set genuinely larger than the cap has no
-	// quiet topic to evict at all. So it is documented rather than fixed - in
-	// the eviction warning, the README and evictOne's own comment - and pinned
-	// here so the documented shape cannot drift away from the implemented one.
+	// quiet topic to evict at all. Both eviction warnings, the README and
+	// evictOne's own comment state this case; this is what holds them to it.
 	try {
 		for (let i = 0; i < MAX_SEQ_TOPICS; i++) stampSeqValue(undefined, `t:${i}`);
 		// Exactly the window, and the OLDEST entries: these are the ones an
@@ -236,6 +236,38 @@ test('an empty queue is not something an eviction can trip over', () => {
 	const { map, recent } = queue([]);
 	evictOne(map, recent);
 	assert.equal(map.size, 0);
+});
+
+test('the sweep window is 32, which is the number the docs state', () => {
+	// The README and the CHANGELOG both quote this figure, and prose cannot
+	// import a constant. Changing SWEEP_LIMIT without changing them would leave
+	// two documents quietly wrong with the whole suite green, so the literal is
+	// pinned here rather than compared against the constant it is measuring.
+	assert.equal(SWEEP_LIMIT, 32);
+});
+
+test('the mark map warns on its own first eviction, and only once', () => {
+	// Each map warns for itself, which is what the README says and what an
+	// operator needs: the counter warning cannot serve here, because a lost
+	// mark costs a resume dedup floor rather than a restarted number, and
+	// { seq: false } is no remedy for a map only an explicit seq can fill.
+	// The latch is module-level and one-shot, so this is the only test in this
+	// file that fills the mark map - anything earlier would spend the warning.
+	const real = console.warn;
+	/** @type {string[]} */
+	const seen = [];
+	console.warn = (/** @type {unknown} */ m) => seen.push(String(m));
+	try {
+		for (let i = 0; i <= MAX_SEQ_TOPICS; i++) notePublishedSeq(`m:${i}`, i + 1, true);
+		assert.equal(seen.length, 1, 'one warning, however many topics arrive');
+		assert.match(seen[0], /explicit seq/, 'names the lane that fills this map');
+		assert.match(seen[0], /resume/, 'and the thing an evicted mark costs');
+		for (let i = 0; i < 50; i++) notePublishedSeq(`more:${i}`, 1, true);
+		assert.equal(seen.length, 1, 'and it does not repeat');
+	} finally {
+		console.warn = real;
+		reset();
+	}
 });
 
 test('one eviction examines a bounded window, however hot the queue is', () => {

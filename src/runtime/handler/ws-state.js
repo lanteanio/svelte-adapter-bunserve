@@ -176,9 +176,26 @@ export function notePublishedSeq(topic, seq, authoritative) {
 	if (!authoritative) return;
 	if (maxAuthoritativeSeq.size >= MAX_SEQ_TOPICS) {
 		evictOne(maxAuthoritativeSeq, maxAuthoritativeSeqRecent);
+		// Its own warning, and its own latch, because this map's harm is not the
+		// counter map's. A lost counter restarts a number; a lost mark takes a
+		// resume dedup floor with it, and the remedy differs too - an explicit
+		// seq is what CREATES a mark here, so there is no publish-side opt-out
+		// to point at.
+		if (!markEvictionWarned) {
+			markEvictionWarned = true;
+			console.warn(
+				`[ws] more than ${MAX_SEQ_TOPICS} topics carry an explicit seq; the oldest resume ` +
+				'dedup floors are being evicted. A topic that has gone quiet goes first, but where ' +
+				'the oldest marks are all still being published to, one of THOSE is evicted. A resume ' +
+				'on an evicted topic dedups nothing and re-delivers its whole held window. Scope the ' +
+				'topics so the working set of explicitly-stamped ones stays under the cap.'
+			);
+		}
 	}
 	maxAuthoritativeSeq.set(topic, seq);
 }
+
+let markEvictionWarned = false;
 
 /**
  * Mark a key as used since the last eviction swept past it.
@@ -238,8 +255,8 @@ export const SWEEP_LIMIT = 32;
  * counter at 1, whenever the oldest stretch of the queue is uniformly hot.
  * Scanning further to avoid it is the unbounded sweep the limit exists to
  * prevent, and at a working set genuinely larger than the cap no policy can
- * evict only quiet topics - there are none. Anything documented for an
- * operator has to say this rather than promise around it.
+ * evict only quiet topics - there are none. Both maps warn once when they
+ * start evicting, and both warnings state this case.
  *
  * That is what makes this CLOCK rather than exact LRU. The requeue is paid
  * only while evicting, which happens only when a NEW topic arrives at a full
