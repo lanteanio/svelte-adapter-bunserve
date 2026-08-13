@@ -114,8 +114,9 @@ export const sharedTopics = new Map();
 /**
  * The highest EXPLICIT (cluster-authoritative) sequence number this server has
  * stamped per topic. ONE seq space: a counter publish - which is every publish
- * that does not hand in a number, the default included - draws from the local
- * per-topic counter, an unrelated space, and never writes a value here.
+ * that neither hands in a number nor opts out with `{ seq: false }`, the
+ * default included - draws from the local per-topic counter, an unrelated
+ * space, and never writes a value here.
  *
  * The resume barrier is the only consumer, and it asks this map a single
  * question - what is the highest seq this server could have issued for the

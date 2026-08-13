@@ -124,6 +124,33 @@ test('an explicit number is taken as given, and never advances the counter', () 
 	}
 });
 
+test('the counter map warns on its own first eviction, and only once', () => {
+	// The twin of the mark map's warning further down. Both are pinned because
+	// the README and the CHANGELOG promise that EACH map warns for itself, and
+	// a promise nothing holds is how the last set of false sentences survived.
+	//
+	// ORDERING CONSTRAINT: both latches are module-private and one-shot, so
+	// this must be the first test here that evicts a counter - the bounded-map
+	// test immediately below would otherwise spend the warning. The isolation
+	// is per PROCESS, not per file: `node --test` runs one process per file
+	// today, and --test-isolation=none would put every file's latches in one.
+	const real = console.warn;
+	/** @type {string[]} */
+	const seen = [];
+	console.warn = (/** @type {unknown} */ m) => seen.push(String(m));
+	try {
+		for (let i = 0; i <= MAX_SEQ_TOPICS; i++) stampSeqValue(undefined, `c:${i}`);
+		assert.equal(seen.length, 1, 'the first eviction warns');
+		assert.match(seen[0], /counter seq/, 'names the lane that fills this map');
+		assert.match(seen[0], /backwards/, 'and what an evicted counter does to a client');
+		for (let i = 0; i < 50; i++) stampSeqValue(undefined, `d:${i}`);
+		assert.equal(seen.length, 1, 'and 50 more evictions add nothing');
+	} finally {
+		console.warn = real;
+		reset();
+	}
+});
+
 test('the counter map is bounded, and a quiet topic is what an eviction reaches for', () => {
 	// The counter is now the DEFAULT, so this map is reached by every publish
 	// and its bound is what keeps an app publishing to client-named topics
@@ -238,12 +265,15 @@ test('an empty queue is not something an eviction can trip over', () => {
 	assert.equal(map.size, 0);
 });
 
-test('the sweep window is 32, which is the number the docs state', () => {
-	// The README and the CHANGELOG both quote this figure, and prose cannot
-	// import a constant. Changing SWEEP_LIMIT without changing them would leave
-	// two documents quietly wrong with the whole suite green, so the literal is
-	// pinned here rather than compared against the constant it is measuring.
+test('the bound and the sweep window are the numbers the docs state', () => {
+	// The README and the CHANGELOG quote both figures, and prose cannot import
+	// a constant. Changing either without changing them would leave those
+	// documents quietly wrong with the whole suite green, so the literals are
+	// pinned here rather than compared against the constants they measure -
+	// every other test in this file uses the imported symbols, which is exactly
+	// why nothing else would notice.
 	assert.equal(SWEEP_LIMIT, 32);
+	assert.equal(MAX_SEQ_TOPICS, 10_000);
 });
 
 test('the mark map warns on its own first eviction, and only once', () => {
@@ -259,11 +289,11 @@ test('the mark map warns on its own first eviction, and only once', () => {
 	console.warn = (/** @type {unknown} */ m) => seen.push(String(m));
 	try {
 		for (let i = 0; i <= MAX_SEQ_TOPICS; i++) notePublishedSeq(`m:${i}`, i + 1, true);
-		assert.equal(seen.length, 1, 'one warning, however many topics arrive');
+		assert.equal(seen.length, 1, 'the first eviction warns');
 		assert.match(seen[0], /explicit seq/, 'names the lane that fills this map');
 		assert.match(seen[0], /resume/, 'and the thing an evicted mark costs');
 		for (let i = 0; i < 50; i++) notePublishedSeq(`more:${i}`, 1, true);
-		assert.equal(seen.length, 1, 'and it does not repeat');
+		assert.equal(seen.length, 1, 'and 50 more evictions add nothing');
 	} finally {
 		console.warn = real;
 		reset();
