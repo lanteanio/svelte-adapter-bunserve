@@ -161,11 +161,11 @@ export async function upgrade(request, { headers }) {
 }
 
 export function open(ws, { platform }) {
-	// Retained on purpose and never released; see LEAK_INJECT. FILLED rather
-	// than merely allocated: a zero-filled typed array is lazily mapped, so an
-	// untouched one costs virtual address space and no resident memory at all -
-	// it would be a leak that no memory gate could see, which makes it useless
-	// for proving the gates work.
+	// Retained on purpose and never released; see LEAK_INJECT. Filled so the
+	// bytes are unambiguously touched on any allocator that maps lazily.
+	// Measured on this platform it makes no difference - filled and unfilled
+	// are byte-identical in rss, heapUsed and external - so this is belt and
+	// braces for a runner that behaves otherwise, not a load-bearing detail.
 	if (LEAK_INJECT > 0) leaked.push(new Uint8Array(LEAK_INJECT).fill(1));
 	// Echo the connection count back so the smoke test can assert the registry
 	// tracks opens.

@@ -9,6 +9,7 @@
 // Run with: npm run test:leak
 
 import { fileURLToPath } from 'node:url';
+import { knob } from './knob.mjs';
 
 const fixtureDir = fileURLToPath(new URL('../fixture/', import.meta.url));
 const suite = (name) => fileURLToPath(new URL(name, import.meta.url));
@@ -17,11 +18,18 @@ const suite = (name) => fileURLToPath(new URL(name, import.meta.url));
 // than fixed: a run given a longer window must not be killed by a timeout that
 // was written for the default one. Two scenarios, plus warmup and cooldown
 // each, plus a wide margin for the build and a slow runner.
-const scenarioMs = Number(process.env.LEAK_WARMUP_MS || 5_000)
-	+ Number(process.env.LEAK_RESETTLE_MS || 8_000)
-	+ Number(process.env.LEAK_DURATION_MS || 60_000)
-	+ Number(process.env.LEAK_COOLDOWN_MS || 3_000);
-const STEP_TIMEOUT_MS = 2 * scenarioMs + 180_000;
+const fixedMs = knob('LEAK_WARMUP_MS', 5_000)
+	+ knob('LEAK_RESETTLE_MS', 8_000)
+	+ knob('LEAK_COOLDOWN_MS', 3_000);
+// Two measured scenarios plus the self-check, each carrying that fixed
+// overhead, plus a wide margin for the build and a slow runner. The
+// self-check's window is its own knob and has to be counted: budgeting for
+// two scenarios when three run is how a documented setting becomes a
+// guaranteed timeout.
+const STEP_TIMEOUT_MS = 3 * fixedMs
+	+ 2 * knob('LEAK_DURATION_MS', 60_000)
+	+ knob('LEAK_SELFCHECK_MS', 30_000)
+	+ 180_000;
 
 const failures = [];
 

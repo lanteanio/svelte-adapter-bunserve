@@ -27,7 +27,16 @@ const RUNTIME_ENV_KEYS = [
 	// Fixture-owned, not runtime-owned, but stripped for the same reason: left
 	// exported in a shell it arms the never-settling shutdown hook in every
 	// fixture server of every suite.
-	'FIXTURE_HANG_SHUTDOWN'
+	'FIXTURE_HANG_SHUTDOWN',
+	// The leak lane's two, stripped for that reason and one worse. Exported,
+	// LEAK_INJECT makes every fixture server retain memory per connection, so
+	// the leak lane reports a defect in the adapter that the harness planted -
+	// and its self-check, which needs an UNinjected control to mean anything,
+	// stops proving what it claims. LEAK_PROBE exported arms an endpoint that
+	// forces a synchronous full collection on request, in every suite's server.
+	// Each is set deliberately by the leak lane, per spawn, and by nothing else.
+	'LEAK_PROBE',
+	'LEAK_INJECT'
 ];
 
 /**
