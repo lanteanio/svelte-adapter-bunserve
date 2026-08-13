@@ -87,7 +87,10 @@ test('an inline value that is another flag is refused too', () => {
 // others are dropped without a word and the run reports a clean comparison
 // against a corpus the caller did not name - so what is refused is the COUNT,
 // and each spelling pair has to prove it. A guard written against the mixed
-// pair alone passes the first of these and fails the other two.
+// pair alone passes the first two of these and fails the last two - and it
+// fails them for the right reason only because of the stderr assertion: a
+// same-spelling pair still exits 1 under that guard, having built the whole
+// corpus and then failed to read a sibling that does not exist.
 for (const [name, args] of [
 	['mixed', ['--against', 'a.json', '--against=b.json']],
 	['mixed, other order', ['--against=b.json', '--against', 'a.json']],
@@ -111,13 +114,24 @@ test('a single --against runs the comparison and names the corpus it read', () =
 	// something other than what was asked for is indistinguishable from a
 	// correct one unless the line says which file it read.
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunserve-sim-cli-'));
-	const sibling = path.join(dir, 'sibling.golden.json');
-	fs.copyFileSync(fileURLToPath(new URL('../dst-goldens/adapter-single.golden.json', import.meta.url)), sibling);
 	try {
+		// Inside the try: a copy that throws - a corpus missing or locked - would
+		// otherwise leave the directory behind, since the cleanup below is what
+		// removes it.
+		const sibling = path.join(dir, 'sibling.golden.json');
+		fs.copyFileSync(fileURLToPath(new URL('../dst-goldens/adapter-single.golden.json', import.meta.url)), sibling);
 		for (const args of [['--against', sibling], [`--against=${sibling}`]]) {
-			const { status, stdout } = run(args);
-			assert.equal(status, 0, `${args.length === 1 ? 'inline' : 'space'} form exits clean`);
+			const { status, stdout, stderr } = run(args);
+			// This test is coupled to the corpus being current, so a drift failure
+			// arrives here as well as in the golden gate. Carrying the child's own
+			// output into the message is what stops that being an exit code with
+			// no explanation attached.
+			assert.equal(status, 0, `${args.length === 1 ? 'inline' : 'space'} form exits clean\n${stderr || stdout}`);
 			assert.match(stdout, /40\/40 sibling fingerprints identical/);
+			// Exact-string rather than path-aware: compareAgainst echoes the
+			// argument as given, so this round-trips byte for byte. A change that
+			// printed a RESOLVED path would still name the corpus and would still
+			// fail here, which is a false red worth recognising rather than a bug.
 			assert.ok(stdout.includes(sibling), 'the line names the corpus it compared against');
 		}
 	} finally {
