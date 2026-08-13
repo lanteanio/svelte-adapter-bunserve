@@ -29,6 +29,7 @@
 		"probe": "bun probe/bun-api-facts.mjs",
 		"test": "node --test \"test/unit/*.test.mjs\"",
 		"test:live": "bun test/live/run.mjs",
+		"test:leak": "bun test/leak/run.mjs",
 		"check:publish": "publint && attw --pack . --profile esm-only",
 		"check:determinism": "node scripts/check-determinism.js",
 		"sim:golden": "node scripts/sim-golden.js",

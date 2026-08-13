@@ -941,6 +941,37 @@ plain clone installs):
 npm run test:live   # builds test/fixture twice and runs the suites in test/live/
 ```
 
+The leak lane asks a question none of the others can: does serving for a while
+make the process grow? It boots the built fixture, drives it at a fixed rate,
+and applies five independent gates - retained memory across the run, the
+footprint's trend, error rate, p95 latency creep, and connections still
+registered after every client has closed.
+
+Two of those deserve their reasoning stated, because the obvious version of
+each is wrong. Retention is measured after forcing the collector until it
+SETTLES: one forced collection is not settled, and comparing single readings
+made a healthy run's growth swing between +7.5% and +67.6%. It counts heap plus
+external, since a typed array lives outside the JS heap and most of what a
+server retains is buffers. The footprint is measured as a least-squares slope
+gated on an r-squared floor, so a runner whose memory merely wanders produces
+no fit and cannot fail the build - and its thresholds are set to catch runaway
+rather than to be precise, because RSS under Bun's allocator climbs toward a
+working-set plateau that looks exactly like a leak over a short window.
+
+It ends with a self-check that arms a deliberate leak in the fixture and
+requires the verdict to fail. A gate never observed failing cannot be told
+apart from one that is unable to.
+
+It has its own CI job and is not part of `npm run test:live`, because it spends
+minutes by design and a gate that slow in the dev loop is one people stop
+running.
+
+```sh
+npm run test:leak                      # two scenarios plus the self-check
+LEAK_SCENARIO=ws npm run test:leak     # one scenario, for investigating a trend
+LEAK_DURATION_MS=240000 npm run test:leak   # a longer window settles a plateau question
+```
+
 The deterministic simulation drives the REAL handler dispatch - the same
 modules a built server runs - over an in-memory Bun.serve double, a virtual
 clock, and a seeded fault engine (`src/sim.js`; every clock, RNG and timer

@@ -116,3 +116,34 @@ jobs:
       # this job is the only thing that proves it.
       - name: Run the live lane
         run: npm run test:live
+
+  leak:
+    name: Standing leak gate (Bun on Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      # Same two installs as the live job, and for the same reason: the fixture
+      # build imports rollup from the adapter's node_modules, and the fixture
+      # resolves the adapter itself through a `file:` dependency.
+      - name: Install the adapter's dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Install the fixture's dependencies
+        working-directory: test/fixture
+        run: npm install --no-audit --no-fund
+
+      # Its own job rather than a step in the live lane: this one spends
+      # minutes by design, because a memory trend needs a window to be fitted
+      # over, and a gate that slow inside the dev loop is a gate people stop
+      # running. It ends with a self-check that arms a deliberate leak and
+      # requires the verdict to fail, so a lane that has quietly stopped being
+      # able to fail reports that rather than passing.
+      - name: Run the leak lane
+        run: npm run test:leak

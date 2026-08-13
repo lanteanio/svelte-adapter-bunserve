@@ -3,6 +3,19 @@
 // test rather than only by unit tests.
 
 /**
+ * A DELIBERATE leak, armed only by the leak harness's self-check.
+ *
+ * A gate that has never been seen to fail is a gate nobody can trust. This
+ * retains `LEAK_INJECT` bytes per connection and never releases them, which is
+ * the plainest leak an app can have, so the harness can prove its verdict
+ * fires on one. Unset - which is every other run, and every real build - the
+ * array is never touched.
+ */
+const LEAK_INJECT = Number(process.env.LEAK_INJECT || 0);
+/** @type {Uint8Array[]} */
+const leaked = [];
+
+/**
  * A STATEFUL wire codec: the payload's first byte is this connection's own
  * frame counter, so the live suite can prove each connection was encoded
  * against its own state. The rest is x/y as big-endian float32. Batch events
@@ -148,6 +161,12 @@ export async function upgrade(request, { headers }) {
 }
 
 export function open(ws, { platform }) {
+	// Retained on purpose and never released; see LEAK_INJECT. FILLED rather
+	// than merely allocated: a zero-filled typed array is lazily mapped, so an
+	// untouched one costs virtual address space and no resident memory at all -
+	// it would be a leak that no memory gate could see, which makes it useless
+	// for proving the gates work.
+	if (LEAK_INJECT > 0) leaked.push(new Uint8Array(LEAK_INJECT).fill(1));
 	// Echo the connection count back so the smoke test can assert the registry
 	// tracks opens.
 	platform.send(ws, '__fixture', 'opened', {
