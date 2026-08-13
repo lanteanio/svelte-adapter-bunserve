@@ -884,15 +884,17 @@ wall-clock assertion cannot gate CI: it fails on a busy runner, gets retried
 until green, and is then ignored.
 
 The two scale differently, and each shape catches what the other cannot. The
-fan-out gate grows the INPUT: "6x the connections must not increase the count
-of X", which is what catches a lost encode-once or a fan-out that quietly
-became a per-connection walk. The HTTP gate repeats the SAME request 200 times
-and requires the count to grow exactly linearly, which is what catches a cost
-that is amortized rather than absent - a disk touch taken every 64th request,
-or a second header build once an entry has been served forty times, hides
-completely inside a short window and is exactly the shape a cache or pool
-regression takes. Every budget in that file is stated at both one call and 200.
-It ends with a self-check pointing the detector at a case that genuinely
+fan-out gate grows the INPUT - connections, or entries in a batch: "6x the
+input must not increase the count of X", which is what catches a lost
+encode-once or a fan-out that quietly became a per-connection walk. The HTTP
+gate holds the input fixed and repeats it 200 times, requiring each budget to
+come out at exactly 200 times its per-response value - and for the decode
+budgets, that value is zero, so repetition must add nothing at all. That is
+what catches a cost which is amortized rather than absent: a disk touch taken
+every 64th request, or a second header build once an entry has been served
+forty times, hides completely inside a short window and is exactly the shape a
+cache or pool regression takes. Every budget in that file is stated at scale
+rather than once, and it ends with a self-check aimed at work that genuinely
 scales, so the gates cannot pass vacuously.
 
 Lowering a budget needs no discussion. RAISING one is a design decision - it

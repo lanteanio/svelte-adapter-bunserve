@@ -335,7 +335,7 @@ test('a HEAD answers from the index alone, on both lanes and on the prerendered 
 	assert.equal(pageHead.body, null, 'a prerendered HEAD carries no body');
 	assert.deepEqual(opened, [], 'and opened nothing');
 	opened.length = 0;
-	assert.deepEqual(costAtScale(() => tryPrerendered('/bigdocs/', '', NO_HEADERS, true)), scaled(per));
+	assert.deepEqual(costAtScale(() => tryPrerendered('/bigdocs/', '', NO_HEADERS, true)), scaled(per), 'under load');
 	assert.deepEqual(opened, [], 'nor under load');
 });
 
@@ -388,16 +388,14 @@ test('a disk-lane range slices the identity file once', async () => {
 	opened.length = 0;
 	/** @type {any} */
 	let head;
-	assert.deepEqual(cost(() => { head = serveStatic(big, RANGE, true); }), { response: 1, headers: 1, bunFile: 0, decode: 0 });
+	// One less Bun.file than the GET above: the length comes from the index.
+	const perHead = { response: 1, headers: 1, bunFile: 0, decode: 0 };
+	assert.deepEqual(cost(() => { head = serveStatic(big, RANGE, true); }), perHead);
 	assert.equal(head.body, null);
 	assert.equal(head.headers.get('content-length'), '10');
 	assert.equal(head.headers.get('content-range'), 'bytes 0-9/4096');
 	assert.deepEqual(opened, []);
-	assert.deepEqual(
-		costAtScale(() => serveStatic(big, RANGE, true)),
-		scaled({ response: 1, headers: 1, bunFile: 0, decode: 0 }),
-		'the HEAD too'
-	);
+	assert.deepEqual(costAtScale(() => serveStatic(big, RANGE, true)), scaled(perHead), 'the HEAD too');
 	assert.deepEqual(opened, [], 'and it opened nothing under load either');
 });
 
