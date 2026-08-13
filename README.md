@@ -889,15 +889,19 @@ The two scale differently, and each shape catches what the other cannot. The
 fan-out gate grows the INPUT - connections, or entries in a batch: "6x the
 input must not increase the count of X", which is what catches a lost
 encode-once or a fan-out that quietly became a per-connection walk. The HTTP
-gate holds the input fixed and repeats it 200 times, requiring each budget to
-come out at exactly 200 times its per-response value - and for the decode
-budgets, that value is zero, so repetition must add nothing at all. That is
-what catches a cost which is amortized rather than absent: a disk touch taken
-every 64th request, or a second header build once an entry has been served
-forty times, hides completely inside a short window and is exactly the shape a
-cache or pool regression takes. Every budget in that file is stated at scale
-rather than once, and it ends with a self-check aimed at work that genuinely
-scales, so the gates cannot pass vacuously.
+gate repeats a request 200 times and requires each counting budget to come out
+at exactly 200 times its per-response value. That is what catches a cost which
+is amortized rather than absent: a disk touch taken every 64th request, or a
+second header build once an entry has been served forty times, hides completely
+inside a short window and is exactly the shape a cache or pool regression
+takes. The decode budgets are the inverse and are the reason the repetition is
+not always of an identical request - what they require is that a second sighting
+of a path, and two hundred distinct unencoded ones, add NO decodes at all.
+
+Every budget that can be stated at scale is, the exception being the pair that
+measures the decode cache's own eviction, which happens once by definition. The
+file ends with a self-check aimed at work that genuinely scales, so the gates
+cannot pass vacuously.
 
 Lowering a budget needs no discussion. RAISING one is a design decision - it
 says the adapter now does more I/O per unit of work - so record the reason in
@@ -934,6 +938,15 @@ parity pin, checked locally with
 `npm run sim:golden -- --against ../svelte-adapter-uws/test/dst-goldens/adapter-single.golden.json`.
 Identical golden traces are the positioning guard: the tier line stays a
 performance statement, never a capability statement.
+
+A change that deliberately moves a fingerprint is blessed with
+`node scripts/sim-golden.js --update`, and the corpus diff is the reviewable
+record of what moved. The corpus records the commit it was blessed from,
+because a seed without one is half a bug report. Blessing from a tree that
+differs from `HEAD` records that commit with a `-dirty` suffix, which is the
+usual outcome and not a problem to fix: it means the fingerprints came from
+that commit's working tree, and the source diff sitting beside the corpus diff
+is the other half.
 
 The publishing surface has its own gate, run in CI on every push:
 

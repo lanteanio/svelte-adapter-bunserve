@@ -24,8 +24,13 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import process from 'node:process';
 import { runSimSwarm, buildSimGoldens, checkSimGoldens } from '../src/sim.js';
+
+// This file's own checkout, so the provenance probe below asks git about THIS
+// tree rather than about whatever directory the script was invoked from.
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 const FAULT_PROFILE = { drop: 0.25, duplicate: 0.15, reorder: 0.5, maxJitterMs: 30 };
 
@@ -44,29 +49,62 @@ const againstPath = againstIdx !== -1 ? process.argv[againstIdx + 1] : null;
  * every time, because nothing exports it - so the corpus kept the seeds and
  * dropped the half a reader needs to check them out.
  *
- * A blessing from a MODIFIED tree does not describe HEAD, and a hash that
- * claims it does is worse than no hash: the reproducer would be run against
- * code that never produced it. Such a run is marked `-dirty`, the same
- * convention `git describe --dirty` uses.
+ * A blessing whose TRACKED tree differs from that commit is marked `-dirty`,
+ * the convention `git describe --dirty` uses. That is the ORDINARY case, not a
+ * failure: re-blessing a corpus in the same change that moved its fingerprints
+ * means the code that produced them is not any commit yet, and `-dirty` says
+ * so - read it as "that commit's working tree", and the corpus diff sitting
+ * beside the source diff is what supplies the rest.
  *
- * The environment still wins where it is set, which is how CI passes the
- * commit it checked out. No git, no repository, no commit: null, exactly as
- * before.
+ * The probe is `git diff HEAD`, which is what "does the tree differ from that
+ * commit" means, and it is why `git status` is the wrong question: untracked
+ * files are not dirt, because they are not what checking that commit out would
+ * have changed. A stray note file next to the checkout must not decide what a
+ * corpus records. The corpus itself is excluded too - it is this script's own
+ * OUTPUT, so a second `--update` would otherwise see its own fresh
+ * `recordedAt` and call the tree dirty on that alone.
+ *
+ * The two probes are separate deliberately. Once HEAD resolves, the sha is
+ * known and worth keeping whatever the diff probe then does; folding them into
+ * one try discarded a good sha on an index lock, which loses the marker
+ * exactly when the tree is busiest. An inconclusive probe (any exit other than
+ * git's "there are differences") records `-dirty`, because the safe reading of
+ * "could not confirm the tree matches" is that it might not.
+ *
+ * GIT_COMMIT overrides all of it - the hook for a job that already knows the
+ * commit it checked out. Nothing in this repo sets it today.
+ *
+ * LIMIT: git is asked about this checkout's own directory, so a source tree
+ * unpacked INSIDE an unrelated repository is answered by that repository.
+ * No git, no repository, or no commit yet: null, exactly as before.
  */
 function resolveGitCommit() {
 	if (process.env.GIT_COMMIT) return process.env.GIT_COMMIT;
+	const opts = {
+		encoding: /** @type {const} */ ('utf8'),
+		stdio: /** @type {const} */ (['ignore', 'pipe', 'ignore']),
+		cwd: REPO_ROOT,
+		timeout: 10_000
+	};
+	let sha;
 	try {
-		const opts = { encoding: /** @type {const} */ ('utf8'), stdio: /** @type {const} */ (['ignore', 'pipe', 'ignore']) };
-		const sha = execFileSync('git', ['rev-parse', 'HEAD'], opts).trim();
-		if (!sha) return null;
-		const modified = execFileSync('git', ['status', '--porcelain'], opts).trim() !== '';
-		return modified ? `${sha}-dirty` : sha;
+		sha = execFileSync('git', ['rev-parse', 'HEAD'], opts).trim();
 	} catch {
 		return null;
 	}
+	if (!sha) return null;
+	try {
+		execFileSync('git', ['diff', '--quiet', 'HEAD', '--', '.', `:(exclude)${CONFIG.file}`], opts);
+		return sha;
+	} catch {
+		return `${sha}-dirty`;
+	}
 }
 
-const gitCommit = resolveGitCommit();
+// Only a blessing records provenance. On the verify path the value reaches no
+// output and no comparison, so resolving it would be two git subprocesses per
+// CI run for a field nothing reads.
+const gitCommit = update ? resolveGitCommit() : (process.env.GIT_COMMIT || null);
 
 /**
  * The sibling-corpus equality check: every seed present in both corpora must

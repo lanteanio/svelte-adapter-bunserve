@@ -35,13 +35,19 @@ test('the committed corpus records which commit blessed it', () => {
 	// A seed plus a commit is the whole bug report this corpus exists to make
 	// possible, and the seeds alone are half of one. The bless used to read an
 	// environment variable nothing exported, so every entry recorded null and
-	// nothing noticed for as long as the corpus existed. A `-dirty` suffix is
-	// legal and honest - it says the blessing tree did not match that commit -
-	// but the committed baseline should not carry one.
+	// nothing noticed for as long as the corpus existed. Nothing reads this
+	// field, which is exactly why it needs a gate rather than a convention.
+	//
+	// A `-dirty` suffix PASSES, and refusing it would be a trap: re-blessing in
+	// the same change that moved the fingerprints is the ordinary way this file
+	// moves, and at that moment the code that produced it is not any commit
+	// yet. What is being pinned is that the provenance is recorded at all.
+	// Either object format, since the shape is git's and not ours.
 	assert.match(
 		corpus.gitCommit ?? '',
-		/^[0-9a-f]{40}$/,
-		'bless with `node scripts/sim-golden.js --update` from a clean tree'
+		/^([0-9a-f]{40}|[0-9a-f]{64})(-dirty)?$/,
+		'no provenance recorded: re-bless with `node scripts/sim-golden.js --update` ' +
+			'inside a git checkout, or set GIT_COMMIT to the commit being blessed'
 	);
 });
 
