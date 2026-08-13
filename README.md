@@ -605,18 +605,23 @@ its own first eviction:
 
 - A lost COUNTER restarts that topic at 1, so a client holding an older seq
   for it sees the number go backwards. This map is fed by every publish that
-  does not opt out with `{ seq: false }`, so publishing high-cardinality
-  topics that way keeps them out of it entirely.
+  neither hands in a number nor opts out with `{ seq: false }`, so publishing
+  high-cardinality topics either of those ways keeps them out of it entirely.
 - A lost MARK takes the topic's resume dedup floor with it. A resume opening
   while the topic is unmarked has no floor to fall back on and re-delivers
   the whole held window, up to the resume buffer's frame cap - duplicates
   rather than a gap, but the whole window. A later explicit publish re-seeds
   the mark at whatever seq it carries: a floor again, and from a monotone
-  authority the damage heals on the next publish to that topic - but a lower
-  floor than the topic had whenever that seq falls below the lost mark, which
-  is what a reordered cluster seq does. Only `{ seq: <number> }` creates a mark,
-  so there is no publish-side opt-out here: scoping the topics that carry
+  authority the damage heals on the next EXPLICIT publish to that topic - a
+  bare one stamps the counter and re-seeds nothing - but a lower floor than
+  the topic had whenever that seq falls below the lost mark, which is what a
+  reordered cluster seq does. Only `{ seq: <number> }` creates a mark, so
+  there is no publish-side opt-out here: scoping the topics that carry
   explicit seqs is the only lever.
+
+The two maps therefore hold different topic sets, and a publish feeds at most
+one of them: a bare or `{ seq: true }` publish feeds the counters, an explicit
+`{ seq: <number> }` feeds the marks, and `{ seq: false }` feeds neither.
 
 An explicit `{ seq: <number> }` must be an INTEGER OF AT LEAST 1. There is no
 upper bound - the frame varint carries any magnitude exactly, so snowflake ids

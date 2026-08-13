@@ -127,7 +127,8 @@ test('an explicit number is taken as given, and never advances the counter', () 
 test('the counter map warns on its own first eviction, and only once', () => {
 	// The twin of the mark map's warning further down. Both are pinned because
 	// the README and the CHANGELOG promise that EACH map warns for itself, and
-	// a promise nothing holds is how the last set of false sentences survived.
+	// a documented promise nothing asserts is one a refactor can delete while
+	// the suite stays green.
 	//
 	// ORDERING CONSTRAINT: both latches are module-private and one-shot, so
 	// this must be the first test here that evicts a counter - the bounded-map

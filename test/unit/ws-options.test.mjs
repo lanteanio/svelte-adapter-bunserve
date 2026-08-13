@@ -19,6 +19,31 @@ test('defaults match svelte-adapter-uws so a ported config behaves the same', ()
 	assert.deepEqual(unknownKeys, []);
 });
 
+test('the bounds the README documents are the bounds an app gets', () => {
+	// The block in README.md that shows every option with its default quotes
+	// these literals, and prose cannot import a constant. Every other test
+	// reads them through normalizeWsOptions or an imported symbol, so changing
+	// one would leave the documented figure wrong with the suite green - which
+	// for a BOUND is worse than a stale sentence: an operator sizing a
+	// deployment against the documented number would be sizing against a
+	// number the server no longer enforces.
+	//
+	// These are not the parity defaults above. This adapter deliberately caps
+	// where the family historically did not, so the numbers are its own.
+	const { options } = normalizeWsOptions(undefined);
+	assert.equal(options.maxSubscriptionsPerConnection, 10_000);
+	assert.equal(options.maxConcurrentSubscribeGates, 64);
+	assert.equal(options.maxConcurrentUnsubscribeHooks, 64);
+	assert.equal(options.maxQueuedUnsubscribeHooks, 1024);
+	assert.equal(options.maxControlEgressBytes, 4 * 1024 * 1024);
+	// The four defaults that decide what an unauthenticated client may reach.
+	// Each is documented as false, and each is a widening if it flips.
+	assert.equal(options.publishToSelf, false);
+	assert.equal(options.allowNonAsciiTopics, false);
+	assert.equal(options.allowSystemTopicSubscribe, false);
+	assert.equal(options.allowUnauthenticatedSubscribe, false);
+});
+
 test('idleTimeout at the Bun ceiling is accepted', () => {
 	// 960 accepted, 961 threw - probe/bun-api-facts.report.md, idle-timeout-cap.
 	const { options } = normalizeWsOptions({ idleTimeout: BUN_IDLE_TIMEOUT_MAX });
