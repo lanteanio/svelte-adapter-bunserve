@@ -65,6 +65,13 @@ const DEFAULTS = {
 	// defaults and each signal's meaning). undefined means "sampler defaults";
 	// the sampler always runs when the WS surface exists, so this only TUNES.
 	pressure: undefined,
+	// Admission control for the upgrade path: concurrent-handshake ceiling,
+	// whole-lifetime connection ceiling, per-tick pacing with a finite queue,
+	// and the deprioritised cursor lane. undefined means every layer is off,
+	// which is the uws default and the backward-compatible one. See
+	// utils/upgrade-admission.js; the block is spelled exactly as uws spells it
+	// so a config carried between the adapters gates the same way in both.
+	upgradeAdmission: undefined,
 	// Build-time rather than transport tuning, and nested HERE rather than at the
 	// top level because that is where svelte-adapter-uws declares them. The two
 	// adapters are drop-in replacements for each other, so a `websocket` block
@@ -93,6 +100,80 @@ function requirePositiveInt(value, key) {
 		);
 	}
 	return /** @type {number} */ (value);
+}
+
+/** Keys the `websocket.upgradeAdmission` block accepts, as uws declares them. */
+const ADMISSION_KEYS = new Set(['maxConcurrent', 'maxConnections', 'perTickBudget', 'maxDeferred', 'cursorLane']);
+
+/**
+ * Validate the `websocket.upgradeAdmission` block.
+ *
+ * REFUSES rather than warns, unlike the pressure block, and the difference is
+ * deliberate: a mistyped pressure threshold falls back to a default that still
+ * protects the server, while a mistyped ceiling here silently leaves the gate
+ * WIDE OPEN - the operator asked for a bound and did not get one. The counters
+ * themselves re-validate the two integer ceilings (see
+ * utils/upgrade-admission.js), so an admission object built by hand elsewhere
+ * is held to the same contract; this is the config-time half, which can name
+ * the option path in its message.
+ *
+ * @param {unknown} value
+ * @returns {{ maxConcurrent?: number, maxConnections?: number, perTickBudget?: number, maxDeferred?: number, cursorLane?: { fraction?: number } }}
+ */
+function requireUpgradeAdmission(value) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+		throw new Error(
+			'adapter option `websocket.upgradeAdmission` must be an object, e.g. ' +
+			'{ maxConcurrent: 1000, maxConnections: 50000, perTickBudget: 64 }.'
+		);
+	}
+	const raw = /** @type {Record<string, unknown>} */ (value);
+	for (const key of Object.keys(raw)) {
+		if (!ADMISSION_KEYS.has(key)) {
+			throw new Error(
+				`unknown adapter option \`websocket.upgradeAdmission.${key}\`; known keys are ` +
+				`${[...ADMISSION_KEYS].join(', ')}.`
+			);
+		}
+	}
+	/** @type {Record<string, unknown>} */
+	const out = {};
+	// Non-negative rather than positive: 0 is the documented spelling for
+	// "disabled", and refusing it would make the off switch an error.
+	for (const key of ['maxConcurrent', 'maxConnections', 'perTickBudget', 'maxDeferred']) {
+		if (raw[key] === undefined) continue;
+		if (!Number.isSafeInteger(raw[key]) || /** @type {number} */ (raw[key]) < 0) {
+			throw new Error(
+				`adapter option \`websocket.upgradeAdmission.${key}\` must be a non-negative safe integer, ` +
+				`got ${JSON.stringify(raw[key])}.`
+			);
+		}
+		out[key] = raw[key];
+	}
+	if (raw.cursorLane !== undefined) {
+		if (raw.cursorLane === null || typeof raw.cursorLane !== 'object' || Array.isArray(raw.cursorLane)) {
+			throw new Error(
+				'adapter option `websocket.upgradeAdmission.cursorLane` must be an object, e.g. { fraction: 0.25 }.'
+			);
+		}
+		const lane = /** @type {Record<string, unknown>} */ (raw.cursorLane);
+		for (const key of Object.keys(lane)) {
+			if (key !== 'fraction') {
+				throw new Error(`unknown adapter option \`websocket.upgradeAdmission.cursorLane.${key}\`; the only key is fraction.`);
+			}
+		}
+		if (lane.fraction !== undefined && (typeof lane.fraction !== 'number' || !(lane.fraction > 0) || lane.fraction > 1)) {
+			throw new Error(
+				'adapter option `websocket.upgradeAdmission.cursorLane.fraction` must be a number greater than 0 and at most 1, ' +
+				`got ${JSON.stringify(lane.fraction)}.`
+			);
+		}
+		// Preserved even when empty: `cursorLane: {}` is what ENABLES the lane at
+		// the default fraction, so dropping an empty object would silently turn
+		// the feature off.
+		out.cursorLane = lane.fraction === undefined ? {} : { fraction: lane.fraction };
+	}
+	return out;
 }
 
 /**
@@ -296,6 +377,9 @@ export function normalizeWsOptions(input) {
 	}
 	if (raw.pressure !== undefined) {
 		options.pressure = requirePressureThresholds(raw.pressure, warnings);
+	}
+	if (raw.upgradeAdmission !== undefined) {
+		options.upgradeAdmission = requireUpgradeAdmission(raw.upgradeAdmission);
 	}
 	if (raw.compressCredentialedResponses !== undefined) {
 		options.compressCredentialedResponses = requireBoolean(

@@ -328,6 +328,15 @@ adapter: bunserve({
 		maxConcurrentUnsubscribeHooks: 64,
 		maxQueuedUnsubscribeHooks: 1024,
 		maxControlEgressBytes: 4 * 1024 * 1024,
+		// Admission control for the upgrade path. Every layer is OFF unless
+		// you set it; omit the block entirely and nothing is gated.
+		upgradeAdmission: {
+			maxConcurrent: 1000,              // handshakes in flight at once
+			maxConnections: 50_000,           // reserved + live, held until close
+			perTickBudget: 64,                // upgrades per event-loop tick
+			maxDeferred: 1024,                // finite queue behind the budget
+			cursorLane: { fraction: 0.25 }    // omit to disable the lane
+		},
 		// Pressure-sampler thresholds; each signal accepts `false` to
 		// disable it. The sampler always runs - this only tunes it.
 		pressure: {
@@ -407,6 +416,32 @@ are different jobs rather than different sizes of the same one:
   marker the budget cannot afford therefore CUTS the connection rather than
   being dropped - a client that reconnects cold-resyncs, which is what the
   marker says.
+
+`upgradeAdmission` is separate from all of those: they bound what one
+established connection may do, and this bounds whether a connection is
+established at all. Every layer is opt-in, and a crossed ceiling answers `503`
+with `retry-after: 1` rather than accepting a socket it cannot serve.
+
+- `maxConcurrent` caps handshakes IN FLIGHT. It is checked before the origin
+  comparison and before your `upgrade` hook, so a connection storm is shed
+  without spending CPU on header parsing or a database round-trip.
+- `maxConnections` caps reserved upgrades PLUS live connections, and the permit
+  is held until the socket closes. That is what makes it different from
+  `maxConcurrent`, which returns its slot the moment the handshake ends -
+  without a lifetime permit, sequential handshakes walk past a live-connection
+  ceiling one at a time.
+- `perTickBudget` caps upgrades per event-loop tick, so 10K handshakes arriving
+  in one I/O batch cannot starve the loop. Work past the budget waits for a
+  later tick rather than being refused, and `maxDeferred` bounds how much may
+  wait - defaulting to 1024 while pacing is on. The queue is deliberately
+  finite: an unbounded one turns a storm into retained closures, which is a leak
+  wearing a throttle's clothing.
+- `cursorLane` reserves a fraction of `maxConcurrent` for a deprioritised
+  cursor-only lane, so a flood of cursor reconnects can never starve ordinary
+  WebSocket admission. Omit it and the lane does not exist.
+
+The block is spelled exactly as `svelte-adapter-uws` spells it, with the same
+defaults, so a config moved between the two adapters gates identically.
 
 Every one of these is PER CONNECTION, which is the honest scope and not the same
 as per client. A peer that reconnects after being cut gets a fresh budget, so

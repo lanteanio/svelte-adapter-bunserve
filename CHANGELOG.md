@@ -79,6 +79,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `websocket.upgradeAdmission`, admission control for the upgrade path, spelled
+  and defaulted exactly as svelte-adapter-uws spells it so a config carried
+  between the two adapters gates the same way. Four independent opt-in layers:
+  `maxConcurrent` bounds handshakes in flight and is checked before the origin
+  comparison and the `upgrade` hook, so a connection storm is shed without
+  spending CPU on it; `maxConnections` bounds reserved upgrades plus live
+  connections with a permit held until close, which is what stops sequential
+  handshakes walking past a live-connection ceiling one at a time;
+  `perTickBudget` bounds upgrades per event-loop tick so one I/O batch cannot
+  starve the loop, with `maxDeferred` (1024 while pacing) bounding the finite
+  queue behind it rather than retaining closures without limit; and
+  `cursorLane` reserves a fraction of `maxConcurrent` for a deprioritised
+  cursor-only lane so cursor reconnects can never starve ordinary admission. A
+  crossed ceiling answers `503` with `retry-after: 1`. Omitting the block leaves
+  every layer off and the upgrade path byte-identical to before.
+
 - The pressure observability surface and LEASE/REQUEST_N flow control,
   matching svelte-adapter-uws: `platform.pressure` (the live 1 Hz
   snapshot - saturation value, reason, publish rate, subscriber ratio,

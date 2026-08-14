@@ -52,6 +52,7 @@
  */
 
 import { wsFacade } from './ws-facade.js';
+import { WS_CONNECTION_PERMIT, upgradeAdmission } from './admission.js';
 import { bumpIn, closeHookRegistered } from './ws-stats.js';
 import { sendControl } from './control-egress.js';
 import { platform, runBatchGate, subscribeWithVerdict } from './platform.js';
@@ -989,6 +990,20 @@ export const websocketHandlers = {
 		// and `connections` would over-report forever.
 		wsConnections.delete(ws);
 		ws._markClosed();
+
+		// Released HERE, beside the deregistration and before the early return
+		// below, because both are the same obligation: this callback is the only
+		// place that runs exactly once per socket. Releasing after the
+		// `!userData` return would leak a permit for every connection that
+		// closed without one, and the ceiling would then ratchet down to zero
+		// over a long-lived process.
+		if (upgradeAdmission !== null) {
+			const carried = ws._rawUserData();
+			if (carried && carried[WS_CONNECTION_PERMIT]) {
+				carried[WS_CONNECTION_PERMIT] = false;
+				upgradeAdmission.releaseConnection();
+			}
+		}
 
 		// Readable throughout this handler: the socket is closed for WRITES, but
 		// userData is not released until `_markDetached()` in the `finally`

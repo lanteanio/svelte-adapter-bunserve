@@ -24,6 +24,7 @@ import { createLogThrottle } from '../utils/log-throttle.js';
 import { processMonotonicNow, randomUuid } from '../runtime.js';
 import { WS_REQUEST_ID_KEY, isDraining } from './ws-state.js';
 import { get_origin, origin, ws_options, ws_path } from './config.js';
+import { WS_CONNECTION_PERMIT, awaitAdmissionSlot, upgradeAdmission } from './admission.js';
 
 /** Upgrade-hook throws, throttled with decay. */
 const upgradeThrewThrottle = createLogThrottle(() => processMonotonicNow());
@@ -183,6 +184,18 @@ function drainingResponse() {
 }
 
 /**
+ * What a shed upgrade gets. A bare 503 with `retry-after`, matching what uws
+ * answers a crossed ceiling with, so a client backs off the same way against
+ * either adapter.
+ */
+function shedResponse() {
+	return new Response('Server busy', {
+		status: 503,
+		headers: { 'retry-after': '1' }
+	});
+}
+
+/**
  * Handle a request that targets the WebSocket endpoint.
  *
  * @param {Request} req
@@ -207,15 +220,62 @@ export function tryUpgrade(req, srv, pathname) {
 			})
 		);
 	}
-	return runUpgrade(req, srv);
+	// BEFORE any per-request work, which is the whole point of the ceilings: a
+	// connection storm is shed without spending CPU on header parsing, the
+	// origin comparison, or the app's hook. Both counters are taken here and
+	// owned by runUpgrade from this line on - it releases the in-flight slot on
+	// every path, and hands the connection permit to the socket only when the
+	// handshake actually completes.
+	//
+	// Unconfigured - the default - takes the original path with no wrapper and
+	// no extra await. That is not just a saved allocation: the wrapper adds a
+	// microtask to every handshake, which reorders the deterministic simulation
+	// and moved five golden fingerprints. A feature that is switched off must be
+	// invisible, and the golden gate is what proves it.
+	if (upgradeAdmission === null) return runUpgrade(req, srv, noop);
+	if (!upgradeAdmission.tryAcquire()) return Promise.resolve(shedResponse());
+	if (!upgradeAdmission.tryAcquireConnection()) {
+		upgradeAdmission.release();
+		return Promise.resolve(shedResponse());
+	}
+	return settleUpgrade(req, srv);
+}
+
+function noop() {}
+
+/**
+ * Owns the two counters `tryUpgrade` took, so no path can leak one.
+ *
+ * The in-flight slot is released however the handshake ends - refused, thrown,
+ * or completed - because it measures the UPGRADE WINDOW, which is over either
+ * way. The connection permit is different: it measures the socket's whole life,
+ * so a completed handshake hands it to the close callback and only a handshake
+ * that never produced a socket releases it here.
+ *
+ * @param {Request} req
+ * @param {import('bun').Server} srv
+ * @returns {Promise<Response | undefined>}
+ */
+async function settleUpgrade(req, srv) {
+	let permitOwnedHere = upgradeAdmission !== null;
+	try {
+		return await runUpgrade(req, srv, () => { permitOwnedHere = false; });
+	} finally {
+		if (upgradeAdmission !== null) {
+			upgradeAdmission.release();
+			if (permitOwnedHere) upgradeAdmission.releaseConnection();
+		}
+	}
 }
 
 /**
  * @param {Request} req
  * @param {import('bun').Server} srv
+ * @param {() => void} onPermitTransferred called once the socket exists and owns
+ *   the connection permit, so the caller stops accounting for it.
  * @returns {Promise<Response | undefined>}
  */
-async function runUpgrade(req, srv) {
+async function runUpgrade(req, srv, onPermitTransferred) {
 	// Cross-site WebSocket hijacking defense, BEFORE the app's hook: the hook
 	// may read cookies and do database work, and a foreign origin should not be
 	// able to make it do either.
@@ -364,6 +424,21 @@ async function runUpgrade(req, srv) {
 	// gets no advisory, no 1012, and a 1006 when stop(true) lands.
 	if (isDraining()) return drainingResponse();
 
+	// Paced LAST, immediately before the socket is taken, so a handshake only
+	// waits for its turn once everything that could refuse it has run. Waiting
+	// first would spend queue depth on upgrades destined for a 403.
+	//
+	// Short-circuited rather than awaiting a resolved promise, for the reason
+	// tryUpgrade skips its wrapper: an await that is always taken costs a
+	// microtask on the unconfigured path and reorders the simulation.
+	if (upgradeAdmission !== null) {
+		if (!await awaitAdmissionSlot()) return shedResponse();
+		// Stamped before the upgrade rather than after: once `srv.upgrade`
+		// returns true the socket may already have been handed to `open`, and a
+		// close arriving before this line would then release nothing.
+		data[WS_CONNECTION_PERMIT] = true;
+	}
+
 	// GUARDED. Bun validates headers itself and throws on anything it dislikes;
 	// an escaping throw here reaches the top-level error handler, which prints a
 	// stack plus source context per request with no throttle at all. The
@@ -380,7 +455,11 @@ async function runUpgrade(req, srv) {
 		}
 		return new Response('WebSocket upgrade failed', { status: 400 });
 	}
-	if (ok) return undefined;
+	if (ok) {
+		// The socket exists and its close callback now owns the permit.
+		onPermitTransferred();
+		return undefined;
+	}
 
 	// Bun refused the handshake (a malformed request that carried the upgrade
 	// header). Nothing has been written yet, so a plain 400 is safe.
