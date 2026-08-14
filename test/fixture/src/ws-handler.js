@@ -10,8 +10,23 @@
  * the plainest leak an app can have, so the harness can prove its verdict
  * fires on one. Unset - which is every other run, and every real build - the
  * array is never touched.
+ *
+ * Refused rather than coerced, because the failure is so misleading: a value
+ * like `64k` becomes NaN, `NaN > 0` is false, nothing is injected, and the lane
+ * then reports that its memory gates could not catch a leak. That accuses the
+ * gates of the bug when the typo was in the arming.
  */
-const LEAK_INJECT = Number(process.env.LEAK_INJECT || 0);
+const LEAK_INJECT = readInjectBytes();
+
+function readInjectBytes() {
+	const raw = process.env.LEAK_INJECT?.trim();
+	if (raw === undefined || raw === '') return 0;
+	const bytes = Number(raw);
+	if (!Number.isFinite(bytes) || bytes < 0) {
+		throw new Error(`LEAK_INJECT=${JSON.stringify(raw)} is not a byte count`);
+	}
+	return bytes;
+}
 /** @type {Uint8Array[]} */
 const leaked = [];
 
@@ -162,10 +177,11 @@ export async function upgrade(request, { headers }) {
 
 export function open(ws, { platform }) {
 	// Retained on purpose and never released; see LEAK_INJECT. Filled so the
-	// bytes are unambiguously touched on any allocator that maps lazily.
-	// Measured on this platform it makes no difference - filled and unfilled
-	// are byte-identical in rss, heapUsed and external - so this is belt and
-	// braces for a runner that behaves otherwise, not a load-bearing detail.
+	// bytes are unambiguously touched on any allocator that maps lazily. On Bun
+	// it made no measurable difference across four isolated trials - the filled
+	// and unfilled readings agreed in rss, heapUsed and external - so this is
+	// belt and braces for a runtime that behaves otherwise, not a load-bearing
+	// detail. The gate itself runs on Linux in CI, where it was not measured.
 	if (LEAK_INJECT > 0) leaked.push(new Uint8Array(LEAK_INJECT).fill(1));
 	// Echo the connection count back so the smoke test can assert the registry
 	// tracks opens.
