@@ -71,10 +71,17 @@ try {
 		headers: { upgrade: 'websocket', connection: 'Upgrade' }
 	});
 	check('a crossed ceiling answers 503', shed.status === 503, `got ${shed.status}`);
-	// Two, matching svelte-adapter-uws. A client that backs off half as long
-	// against one adapter as the other is a difference an operator only finds
-	// under load, which is the worst time to find one.
-	check('and says how long to wait, as uws says it', shed.headers.get('retry-after') === '2', `got ${shed.headers.get('retry-after')}`);
+	// A RANGE, not a value: the base is two, matching svelte-adapter-uws, and
+	// it is jittered over half the base so a refused fleet does not return in
+	// the same second. Asserting the constant would be a test that fails one
+	// run in two - and asserting only that the header exists would not notice
+	// the jitter being dropped, so both ends are checked.
+	const retryAfter = Number(shed.headers.get('retry-after'));
+	check(
+		'and says how long to wait, jittered as uws jitters it',
+		retryAfter >= 2 && retryAfter <= 3,
+		`got ${shed.headers.get('retry-after')}`
+	);
 
 	// THE PART THAT MATTERS. A permit is held for the socket's whole life, so
 	// the ceiling only recovers if `close` actually gives one back. If the

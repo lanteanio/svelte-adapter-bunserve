@@ -21,7 +21,7 @@ import { wsModule } from '../ws-handler-bridge.js';
 import { isUpgradeOriginAllowed } from '../utils/ws-origin.js';
 import { resolveRequestId } from '../utils/request-id.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
-import { processMonotonicNow, randomUuid } from '../runtime.js';
+import { processMonotonicNow, randomFloat, randomUuid } from '../runtime.js';
 import { WS_REQUEST_ID_KEY, isDraining } from './ws-state.js';
 import { get_origin, origin, ws_options, ws_path } from './config.js';
 import { WS_CONNECTION_PERMIT, awaitAdmissionSlot, upgradeAdmission } from './admission.js';
@@ -185,23 +185,39 @@ function drainingResponse() {
 }
 
 /**
+ * The base every refusal backs off from: what svelte-adapter-uws derives from
+ * its holding page's poll interval. This adapter serves no page, so the number
+ * is carried across rather than re-derived - a client that waits half as long
+ * against one adapter as the other is a difference an operator only finds under
+ * load.
+ */
+const RETRY_AFTER_BASE_SECONDS = 2;
+
+/**
  * What a shed upgrade gets: a bare 503 telling the client how long to wait.
  *
- * Two seconds because that is what svelte-adapter-uws answers a crossed ceiling
- * with - it derives the value from its holding page's poll interval, which this
- * adapter does not serve, so the number is carried across rather than
- * re-derived. A client that backs off half as long against one adapter as the
- * other is a difference an operator would only find under load, which is the
- * worst time to find one.
+ * The spread is uws's, arithmetic included, and at the base both adapters use
+ * it currently resolves to the base every time: `floor(rand * 2 * 0.5)` is
+ * `floor(rand * 1)`, which is 0 for every draw below 1. So a refused fleet does
+ * all come back in the same second today, in BOTH adapters - the anti-herd
+ * property the shape suggests is not one either of them delivers, and it would
+ * take a larger base or a wider spread to become real.
+ *
+ * It is written as the expression rather than as the constant 2 anyway: the
+ * value has to track uws's, and hardcoding the answer to today's arithmetic is
+ * how the two silently diverge the moment uws widens either number. Reading the
+ * runtime's RNG seam also keeps a simulated run reproducible.
  *
  * uws answers with a holding page instead when its `waitingRoom` is left on,
  * and that page is the one part of its admission surface not implemented here;
  * `ws-options.js` names the gap when a config asks for it.
  */
 function shedResponse() {
+	const retryAfter = RETRY_AFTER_BASE_SECONDS
+		+ Math.floor(randomFloat() * RETRY_AFTER_BASE_SECONDS * 0.5);
 	return new Response('Server is at upgrade capacity, please retry', {
 		status: 503,
-		headers: { 'retry-after': '2', 'content-type': 'text/plain' }
+		headers: { 'retry-after': String(retryAfter), 'content-type': 'text/plain' }
 	});
 }
 
@@ -248,7 +264,16 @@ export function tryUpgrade(req, srv, pathname) {
 	// while both the main ceiling and the cursor sub-budget have room. The main
 	// lane is never gated by the sub-budget, which is what makes the cursor lane
 	// sheddable without it ever being able to starve real clients.
-	const cursor = isCursorLaneUpgrade(req.headers.get('sec-websocket-protocol'));
+	//
+	// Gated on the lane being CARVED, not merely on the token being offered.
+	// `tryAcquireCursor` refuses whenever `cursorInFlight >= cursorMaxConcurrent`,
+	// and with no lane that ceiling is zero - so `0 >= 0` refuses the first
+	// cursor upgrade and every one after it, on a server with full headroom.
+	// Without this clause the commonest configurations shed every cursor socket
+	// permanently, including the one that asks for the lane but carves it from
+	// an unset `maxConcurrent`.
+	const cursorLaneEnabled = upgradeAdmission.cursorMaxConcurrent > 0;
+	const cursor = cursorLaneEnabled && isCursorLaneUpgrade(req.headers.get('sec-websocket-protocol'));
 	if (cursor) {
 		if (!upgradeAdmission.tryAcquireCursor()) return Promise.resolve(shedResponse());
 	} else if (!upgradeAdmission.tryAcquire()) {
@@ -467,6 +492,14 @@ async function runUpgrade(req, srv, onPermitTransferred) {
 	// microtask on the unconfigured path and reorders the simulation.
 	if (upgradeAdmission !== null) {
 		if (!await awaitAdmissionSlot()) return shedResponse();
+		// RE-CHECKED, for the reason the check above this exists. The pacing
+		// queue parks a handshake across however many turns the budget needs,
+		// and the drain latch is taken synchronously on SIGTERM - so a socket
+		// admitted from the queue lands on a process that has already walked its
+		// live connections and finished draining. It gets no advisory, no 1012,
+		// and a 1006 when stop(true) arrives, which is precisely what the
+		// earlier re-check was added to prevent.
+		if (isDraining()) return drainingResponse();
 		// Stamped before the upgrade rather than after: once `srv.upgrade`
 		// returns true the socket may already have been handed to `open`, and a
 		// close arriving before this line would then release nothing.

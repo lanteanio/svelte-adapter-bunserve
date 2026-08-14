@@ -991,12 +991,12 @@ export const websocketHandlers = {
 		wsConnections.delete(ws);
 		ws._markClosed();
 
-		// Released HERE, beside the deregistration and before the early return
-		// below, because both are the same obligation: this callback is the only
-		// place that runs exactly once per socket. Releasing after the
-		// `!userData` return would leak a permit for every connection that
-		// closed without one, and the ceiling would then ratchet down to zero
-		// over a long-lived process.
+		// Released beside the deregistration because they are the same
+		// obligation, and this callback is the only place that runs exactly once
+		// per socket. The marker is cleared BEFORE the release rather than
+		// after: that is what makes a second close a no-op instead of an
+		// over-release, and `releaseConnection` throws on over-release, which
+		// here would strand the app's close hook.
 		if (upgradeAdmission !== null) {
 			const carried = ws._rawUserData();
 			if (carried && carried[WS_CONNECTION_PERMIT]) {
