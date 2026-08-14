@@ -31,7 +31,7 @@ register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { platform } = await import('../../src/runtime/handler/platform.js');
 const { KNOWN_ADAPTER_OPTIONS } = await import('../../src/adapter-options.js');
-const { KNOWN_WS_OPTION_KEYS } = await import('../../src/runtime/utils/ws-options.js');
+const { KNOWN_WS_OPTION_KEYS, normalizeWsOptions } = await import('../../src/runtime/utils/ws-options.js');
 
 const surface = JSON.parse(
 	readFileSync(new URL('../../probe/uws-surface.json', import.meta.url), 'utf8')
@@ -282,6 +282,77 @@ test('the options uws nests under `websocket` are nested here too, not top-level
 		);
 	}
 });
+
+/**
+ * Keys INSIDE a nested option block, per block. The flat `websocket.*` list
+ * cannot see these: a whole sub-key can be missing while the block's own name
+ * matches on both sides, which is how `upgradeAdmission.waitingRoom` stayed
+ * invisible until it turned a working uws config into a build failure here.
+ *
+ * Only blocks this adapter actually implements are listed. A block recorded in
+ * WS_OPTION_GAPS is missing entirely, and its sub-keys would be noise.
+ */
+const NESTED_GAPS = {
+	upgradeAdmission: {}
+};
+
+/** Sub-keys this adapter accepts that the pinned uws release does not declare. */
+const NESTED_EXTRAS = {
+	upgradeAdmission: {
+		// Not drift: uws grew both after the commit this manifest pins, and this
+		// adapter implements them with uws's own semantics and defaults. The
+		// entries go when the pin moves past them.
+		maxConnections: 'ahead of the pin: uws added it after this commit',
+		maxDeferred: 'ahead of the pin: uws added it after this commit'
+	}
+};
+
+test('nested websocket option blocks match the uws contract, or the difference is recorded', () => {
+	const theirs = surface.nestedWebSocketOptions;
+	assert.ok(theirs && typeof theirs === 'object', 'the manifest records nested option keys');
+
+	for (const block of Object.keys(NESTED_GAPS)) {
+		const declared = theirs[block];
+		assert.ok(Array.isArray(declared), `uws declares nested keys for \`${block}\``);
+		// Read from the live validator rather than a hand-copied list, so this
+		// cannot pass against a set that the adapter does not actually accept.
+		const ours = acceptedNestedKeys(block);
+		assertParity(
+			`websocket.${block}`,
+			ours,
+			declared,
+			NESTED_GAPS[block],
+			NESTED_EXTRAS[block] ?? {}
+		);
+	}
+});
+
+/**
+ * What `normalizeWsOptions` actually accepts inside a block, discovered by
+ * offering each candidate key and seeing whether it warns about being ignored.
+ * Probing the real validator is the point: a list maintained by hand here would
+ * be a second copy of the thing under test.
+ *
+ * @param {string} block
+ * @returns {string[]}
+ */
+function acceptedNestedKeys(block) {
+	const candidates = new Set([
+		...(surface.nestedWebSocketOptions[block] ?? []),
+		'maxConnections', 'maxDeferred'
+	]);
+	const accepted = [];
+	for (const key of candidates) {
+		// Shape-appropriate probe values: a block that must be an object is
+		// REFUSED when handed a number, and that refusal is not the same answer
+		// as "this key is ignored".
+		const probe = surface.nestedWebSocketOptions[`${block}.${key}`] ? {} : 1;
+		const { warnings } = normalizeWsOptions({ [block]: { [key]: probe } });
+		const ignored = warnings.some((w) => w.includes(`${block}.${key}\` is ignored`));
+		if (!ignored) accepted.push(key);
+	}
+	return accepted.sort();
+}
 
 test('the vendored protocol schema is byte-identical to the uws copy at the pin', async () => {
 	// uws is the schema's home; this repo ships a vendored copy so consumers

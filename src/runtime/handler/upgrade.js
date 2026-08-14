@@ -25,6 +25,7 @@ import { processMonotonicNow, randomUuid } from '../runtime.js';
 import { WS_REQUEST_ID_KEY, isDraining } from './ws-state.js';
 import { get_origin, origin, ws_options, ws_path } from './config.js';
 import { WS_CONNECTION_PERMIT, awaitAdmissionSlot, upgradeAdmission } from './admission.js';
+import { isCursorLaneUpgrade } from '../utils/upgrade-admission.js';
 
 /** Upgrade-hook throws, throttled with decay. */
 const upgradeThrewThrottle = createLogThrottle(() => processMonotonicNow());
@@ -184,14 +185,23 @@ function drainingResponse() {
 }
 
 /**
- * What a shed upgrade gets. A bare 503 with `retry-after`, matching what uws
- * answers a crossed ceiling with, so a client backs off the same way against
- * either adapter.
+ * What a shed upgrade gets: a bare 503 telling the client how long to wait.
+ *
+ * Two seconds because that is what svelte-adapter-uws answers a crossed ceiling
+ * with - it derives the value from its holding page's poll interval, which this
+ * adapter does not serve, so the number is carried across rather than
+ * re-derived. A client that backs off half as long against one adapter as the
+ * other is a difference an operator would only find under load, which is the
+ * worst time to find one.
+ *
+ * uws answers with a holding page instead when its `waitingRoom` is left on,
+ * and that page is the one part of its admission surface not implemented here;
+ * `ws-options.js` names the gap when a config asks for it.
  */
 function shedResponse() {
-	return new Response('Server busy', {
+	return new Response('Server is at upgrade capacity, please retry', {
 		status: 503,
-		headers: { 'retry-after': '1' }
+		headers: { 'retry-after': '2', 'content-type': 'text/plain' }
 	});
 }
 
@@ -233,12 +243,35 @@ export function tryUpgrade(req, srv, pathname) {
 	// and moved five golden fingerprints. A feature that is switched off must be
 	// invisible, and the golden gate is what proves it.
 	if (upgradeAdmission === null) return runUpgrade(req, srv, noop);
-	if (!upgradeAdmission.tryAcquire()) return Promise.resolve(shedResponse());
-	if (!upgradeAdmission.tryAcquireConnection()) {
-		upgradeAdmission.release();
+	// Routed by SUBPROTOCOL, exactly as uws routes it: the worker's second
+	// (cursor) socket offers a known token, and its upgrade is admitted only
+	// while both the main ceiling and the cursor sub-budget have room. The main
+	// lane is never gated by the sub-budget, which is what makes the cursor lane
+	// sheddable without it ever being able to starve real clients.
+	const cursor = isCursorLaneUpgrade(req.headers.get('sec-websocket-protocol'));
+	if (cursor) {
+		if (!upgradeAdmission.tryAcquireCursor()) return Promise.resolve(shedResponse());
+	} else if (!upgradeAdmission.tryAcquire()) {
 		return Promise.resolve(shedResponse());
 	}
-	return settleUpgrade(req, srv);
+	if (!upgradeAdmission.tryAcquireConnection()) {
+		releaseLane(cursor);
+		return Promise.resolve(shedResponse());
+	}
+	return settleUpgrade(req, srv, cursor);
+}
+
+/**
+ * Give back whichever in-flight slot was taken. The cursor lane holds one slot
+ * in each of two counters, so releasing the wrong one leaves the sub-budget
+ * permanently spent and the lane refuses every later cursor upgrade.
+ *
+ * @param {boolean} cursor
+ */
+function releaseLane(cursor) {
+	if (upgradeAdmission === null) return;
+	if (cursor) upgradeAdmission.releaseCursorInFlight();
+	else upgradeAdmission.release();
 }
 
 function noop() {}
@@ -254,15 +287,16 @@ function noop() {}
  *
  * @param {Request} req
  * @param {import('bun').Server} srv
+ * @param {boolean} cursor whether the in-flight slot came from the cursor lane
  * @returns {Promise<Response | undefined>}
  */
-async function settleUpgrade(req, srv) {
+async function settleUpgrade(req, srv, cursor) {
 	let permitOwnedHere = upgradeAdmission !== null;
 	try {
 		return await runUpgrade(req, srv, () => { permitOwnedHere = false; });
 	} finally {
 		if (upgradeAdmission !== null) {
-			upgradeAdmission.release();
+			releaseLane(cursor);
 			if (permitOwnedHere) upgradeAdmission.releaseConnection();
 		}
 	}

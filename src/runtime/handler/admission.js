@@ -24,13 +24,30 @@ import { createUpgradeAdmission } from '../utils/upgrade-admission.js';
 export const WS_CONNECTION_PERMIT = Symbol('adapter.connectionPermit');
 
 /**
- * Null when no `websocket.upgradeAdmission` block was configured, which is the
- * default. Every call site checks for null rather than paying for a controller
- * whose every layer is disabled.
+ * Whether a block actually gates anything. A ceiling of zero is the documented
+ * spelling for "disabled", so `{}` and `{ maxConcurrent: 0 }` describe the same
+ * server as omitting the block entirely - and must therefore cost the same.
+ *
+ * The cursor lane is not in this list on purpose: it carves a sub-budget out of
+ * `maxConcurrent` and does nothing without one, so a lane configured alone is
+ * still an ungated server.
+ *
+ * @param {Record<string, any> | undefined} block
+ */
+function gatesAnything(block) {
+	if (!block) return false;
+	return (block.maxConcurrent > 0) || (block.maxConnections > 0) || (block.perTickBudget > 0);
+}
+
+/**
+ * Null when nothing is gated, which is the default and also what a block of
+ * zeroes means. Every call site checks for null rather than paying for a
+ * controller whose every layer is disabled - and the cost is not the allocation
+ * but the await, which reorders the deterministic simulation.
  *
  * @type {ReturnType<typeof createUpgradeAdmission> | null}
  */
-export const upgradeAdmission = ws_options && ws_options.upgradeAdmission
+export const upgradeAdmission = ws_options && gatesAnything(ws_options.upgradeAdmission)
 	? createUpgradeAdmission(ws_options.upgradeAdmission)
 	: null;
 

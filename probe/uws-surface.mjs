@@ -160,6 +160,48 @@ export function interfaceMembers(source, name) {
 	return [...members].sort();
 }
 
+/**
+ * The `KNOWN_NESTED_WEBSOCKET_OPTION_KEYS` map uws declares for its own nested
+ * validator, as `{ 'path.to.block': [key, ...] }`.
+ *
+ * Parsed rather than imported for the reason the rest of this file is: reading
+ * through `git show` pins the manifest to a commit that exists in history,
+ * while importing would take whatever is in someone's working tree.
+ *
+ * @param {string} source uws's `src/index.js` at the pinned commit
+ * @returns {Record<string, string[]>}
+ */
+function nestedOptionKeys(source) {
+	const start = source.indexOf('export const KNOWN_NESTED_WEBSOCKET_OPTION_KEYS');
+	if (start === -1) throw new Error('uws no longer declares KNOWN_NESTED_WEBSOCKET_OPTION_KEYS; the nested parity dimension needs a new source.');
+	const open = source.indexOf('{', start);
+	// Balanced scan rather than a regex: the value is an object of `new Set([...])`
+	// literals, so the first `}` is nowhere near the end.
+	let depth = 0;
+	let end = -1;
+	for (let i = open; i < source.length; i++) {
+		if (source[i] === '{') depth++;
+		else if (source[i] === '}') {
+			depth--;
+			if (depth === 0) { end = i; break; }
+		}
+	}
+	if (end === -1) throw new Error('could not find the end of KNOWN_NESTED_WEBSOCKET_OPTION_KEYS.');
+	const body = source.slice(open, end + 1);
+	/** @type {Record<string, string[]>} */
+	const out = {};
+	// Each entry is `key: new Set([...])` or `'quoted.key': new Set([...])`.
+	const entry = /(?:'([^']+)'|([A-Za-z_$][\w$]*))\s*:\s*new Set\(\[([^\]]*)\]\)/g;
+	let m;
+	while ((m = entry.exec(body)) !== null) {
+		const name = m[1] ?? m[2];
+		const keys = [...m[3].matchAll(/'([^']+)'/g)].map((k) => k[1]).sort();
+		if (keys.length) out[name] = keys;
+	}
+	if (Object.keys(out).length === 0) throw new Error('parsed no nested option blocks; the declaration shape changed.');
+	return out;
+}
+
 const uwsRoot = findUws();
 const ref = process.env.UWS_REF || 'HEAD';
 const commit = execFileSync('git', ['rev-parse', ref], { cwd: uwsRoot, encoding: 'utf8' }).trim();
@@ -183,6 +225,15 @@ const surface = {
 	platform: interfaceMembers(dts, 'Platform'),
 	adapterOptions: interfaceMembers(dts, 'AdapterOptions'),
 	webSocketOptions: interfaceMembers(dts, 'WebSocketOptions'),
+	// The keys INSIDE the nested option blocks, which the flat lists above
+	// cannot see. A whole sub-key can be missing here while the top-level name
+	// matches on both sides - which is exactly how `upgradeAdmission.waitingRoom`
+	// went unnoticed until it turned a working uws config into a build failure.
+	//
+	// Read from index.js rather than the .d.ts because uws already maintains
+	// this as data for its own validator, so recording it costs nothing and
+	// cannot drift from what uws actually accepts.
+	nestedWebSocketOptions: nestedOptionKeys(showAtRef(uwsRoot, commit, 'src/index.js')),
 	exports: Object.keys(pkg.exports ?? {}).sort()
 };
 

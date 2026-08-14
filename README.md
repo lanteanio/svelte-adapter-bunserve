@@ -424,7 +424,10 @@ with `retry-after: 1` rather than accepting a socket it cannot serve.
 
 - `maxConcurrent` caps handshakes IN FLIGHT. It is checked before the origin
   comparison and before your `upgrade` hook, so a connection storm is shed
-  without spending CPU on header parsing or a database round-trip.
+  without paying for the work those do - typically a cookie parse and a
+  database round-trip. Header parsing is NOT saved here: Bun has already
+  parsed them before the adapter is entered, which is a real difference from
+  svelte-adapter-uws, where the ceiling sits ahead of that too.
 - `maxConnections` caps reserved upgrades PLUS live connections, and the permit
   is held until the socket closes. That is what makes it different from
   `maxConcurrent`, which returns its slot the moment the handshake ends -
@@ -440,8 +443,12 @@ with `retry-after: 1` rather than accepting a socket it cannot serve.
   cursor-only lane, so a flood of cursor reconnects can never starve ordinary
   WebSocket admission. Omit it and the lane does not exist.
 
-The block is spelled exactly as `svelte-adapter-uws` spells it, with the same
-defaults, so a config moved between the two adapters gates identically.
+The block is spelled as `svelte-adapter-uws` spells it, with the same defaults
+and the same accepted values, so a config moved between the two adapters gates
+identically. One key is accepted without being honoured: uws serves a holding
+PAGE at a crossed ceiling unless `waitingRoom: false`, and this adapter has no
+holding page - it always answers `503`. A config that asks for one builds and
+runs, and says at build time that the page will not be served.
 
 Every one of these is PER CONNECTION, which is the honest scope and not the same
 as per client. A peer that reconnects after being cut gets a fresh budget, so

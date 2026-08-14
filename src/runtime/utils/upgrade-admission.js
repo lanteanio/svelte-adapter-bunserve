@@ -16,6 +16,33 @@ import { monotonicNow, setImmediateTimer } from '../runtime.js';
 const DEFAULT_MAX_DEFERRED = 1024;
 
 /**
+ * The Sec-WebSocket-Protocol token the cursor-only upgrade lane is keyed on.
+ * The worker's second (cursor) WebSocket sets this subprotocol; the upgrade
+ * handler reads it to route the upgrade through the deprioritised cursor lane.
+ * The token is read only; the server still echoes the negotiated subprotocol
+ * back to the client unchanged.
+ */
+export const CURSOR_LANE_SUBPROTOCOL = 'svelte-realtime-cursor';
+
+/**
+ * `true` when the comma-separated `Sec-WebSocket-Protocol` request header lists
+ * the cursor-lane token. Pure so the token parsing is unit-testable and
+ * isolated from the upgrade hot path. Trims each offered token so the common
+ * `"a, b"` spacing matches.
+ *
+ * @param {string | undefined | null} secProtocol the raw request header value
+ * @returns {boolean}
+ */
+export function isCursorLaneUpgrade(secProtocol) {
+	if (typeof secProtocol !== 'string' || secProtocol.length === 0) return false;
+	const offered = secProtocol.split(',');
+	for (let i = 0; i < offered.length; i++) {
+		if (offered[i].trim() === CURSOR_LANE_SUBPROTOCOL) return true;
+	}
+	return false;
+}
+
+/**
  * Build a self-contained admission controller for WebSocket upgrades.
  *
  * Four independent layers, all opt-in (zero or unset = disabled):

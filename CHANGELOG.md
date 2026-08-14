@@ -91,9 +91,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   starve the loop, with `maxDeferred` (1024 while pacing) bounding the finite
   queue behind it rather than retaining closures without limit; and
   `cursorLane` reserves a fraction of `maxConcurrent` for a deprioritised
-  cursor-only lane so cursor reconnects can never starve ordinary admission. A
-  crossed ceiling answers `503` with `retry-after: 1`. Omitting the block leaves
-  every layer off and the upgrade path byte-identical to before.
+  cursor-only lane, routed on the `svelte-realtime-cursor` subprotocol, so
+  cursor reconnects can never starve ordinary admission. A crossed ceiling
+  answers `503` with `retry-after: 2`, as uws answers it. A block that gates
+  nothing - omitted, empty, or all zeroes - leaves the upgrade path
+  byte-identical to before.
+
+  `waitingRoom` is accepted but not honoured: uws serves a holding page at a
+  crossed ceiling unless the key is `false`, and this adapter has no holding
+  page. Accepting the key keeps a uws config building; a config that asks for
+  the page is told at build time that it will get a `503` instead.
 
 - The pressure observability surface and LEASE/REQUEST_N flow control,
   matching svelte-adapter-uws: `platform.pressure` (the live 1 Hz

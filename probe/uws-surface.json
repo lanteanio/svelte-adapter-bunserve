@@ -91,6 +91,42 @@
 		"upgradeTimeout",
 		"workers"
 	],
+	"nestedWebSocketOptions": {
+		"upgradeAdmission": [
+			"cursorLane",
+			"maxConcurrent",
+			"perTickBudget",
+			"waitingRoom"
+		],
+		"upgradeAdmission.cursorLane": [
+			"fraction"
+		],
+		"upgradeAdmission.waitingRoom": [
+			"admitCheckPath",
+			"path",
+			"pollIntervalMs",
+			"retryAfterSeconds",
+			"template"
+		],
+		"pressure": [
+			"cpuThrottledRatio",
+			"memoryHeapUsedRatio",
+			"psiCpuSome",
+			"psiIoFull",
+			"psiMemoryFull",
+			"publishRatePerSec",
+			"sampleIntervalMs",
+			"subscriberRatio",
+			"topicPublishBytesPerSec",
+			"topicPublishRatePerSec"
+		],
+		"workers": [
+			"compute"
+		],
+		"postureExport": [
+			"path"
+		]
+	},
 	"exports": [
 		".",
 		"./client",

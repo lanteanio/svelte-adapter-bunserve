@@ -103,24 +103,30 @@ function requirePositiveInt(value, key) {
 }
 
 /** Keys the `websocket.upgradeAdmission` block accepts, as uws declares them. */
-const ADMISSION_KEYS = new Set(['maxConcurrent', 'maxConnections', 'perTickBudget', 'maxDeferred', 'cursorLane']);
+const ADMISSION_KEYS = new Set([
+	'maxConcurrent', 'maxConnections', 'perTickBudget', 'maxDeferred', 'cursorLane', 'waitingRoom'
+]);
 
 /**
  * Validate the `websocket.upgradeAdmission` block.
  *
- * REFUSES rather than warns, unlike the pressure block, and the difference is
- * deliberate: a mistyped pressure threshold falls back to a default that still
- * protects the server, while a mistyped ceiling here silently leaves the gate
- * WIDE OPEN - the operator asked for a bound and did not get one. The counters
- * themselves re-validate the two integer ceilings (see
- * utils/upgrade-admission.js), so an admission object built by hand elsewhere
- * is held to the same contract; this is the config-time half, which can name
- * the option path in its message.
+ * WARNS where uws warns and ACCEPTS what uws accepts, which is the whole
+ * constraint: the adapters are drop-in replacements in both directions, so a
+ * block that builds there has to build here. Refusing a value uws merely
+ * clamps would turn a working deployment into a build failure on the way
+ * across, which is a worse outcome than the sloppy value it was refusing.
+ *
+ * So the value ranges are NOT re-litigated here. `createUpgradeAdmission`
+ * enforces exactly what uws enforces - the two integer ceilings - and clamps
+ * the cursor fraction the same way; this pass checks the SHAPE and names keys
+ * that will not be read, which is the failure an operator cannot otherwise
+ * see.
  *
  * @param {unknown} value
+ * @param {string[]} warnings
  * @returns {{ maxConcurrent?: number, maxConnections?: number, perTickBudget?: number, maxDeferred?: number, cursorLane?: { fraction?: number } }}
  */
-function requireUpgradeAdmission(value) {
+function requireUpgradeAdmission(value, warnings) {
 	if (value === null || typeof value !== 'object' || Array.isArray(value)) {
 		throw new Error(
 			'adapter option `websocket.upgradeAdmission` must be an object, e.g. ' +
@@ -130,25 +136,20 @@ function requireUpgradeAdmission(value) {
 	const raw = /** @type {Record<string, unknown>} */ (value);
 	for (const key of Object.keys(raw)) {
 		if (!ADMISSION_KEYS.has(key)) {
-			throw new Error(
-				`unknown adapter option \`websocket.upgradeAdmission.${key}\`; known keys are ` +
-				`${[...ADMISSION_KEYS].join(', ')}.`
+			warnings.push(
+				`unknown adapter option \`websocket.upgradeAdmission.${key}\` is ignored, so the bound it ` +
+				`was meant to set is not applied. Known keys are ${[...ADMISSION_KEYS].join(', ')}.`
 			);
 		}
 	}
 	/** @type {Record<string, unknown>} */
 	const out = {};
-	// Non-negative rather than positive: 0 is the documented spelling for
-	// "disabled", and refusing it would make the off switch an error.
+	// Passed through unexamined, deliberately. createUpgradeAdmission applies
+	// uws's own rules - maxConnections and maxDeferred must be non-negative safe
+	// integers, and nothing else is range-checked - so validating harder here
+	// would refuse configs uws runs.
 	for (const key of ['maxConcurrent', 'maxConnections', 'perTickBudget', 'maxDeferred']) {
-		if (raw[key] === undefined) continue;
-		if (!Number.isSafeInteger(raw[key]) || /** @type {number} */ (raw[key]) < 0) {
-			throw new Error(
-				`adapter option \`websocket.upgradeAdmission.${key}\` must be a non-negative safe integer, ` +
-				`got ${JSON.stringify(raw[key])}.`
-			);
-		}
-		out[key] = raw[key];
+		if (raw[key] !== undefined) out[key] = raw[key];
 	}
 	if (raw.cursorLane !== undefined) {
 		if (raw.cursorLane === null || typeof raw.cursorLane !== 'object' || Array.isArray(raw.cursorLane)) {
@@ -159,19 +160,30 @@ function requireUpgradeAdmission(value) {
 		const lane = /** @type {Record<string, unknown>} */ (raw.cursorLane);
 		for (const key of Object.keys(lane)) {
 			if (key !== 'fraction') {
-				throw new Error(`unknown adapter option \`websocket.upgradeAdmission.cursorLane.${key}\`; the only key is fraction.`);
+				warnings.push(
+					`unknown adapter option \`websocket.upgradeAdmission.cursorLane.${key}\` is ignored; ` +
+					'the only key is fraction.'
+				);
 			}
-		}
-		if (lane.fraction !== undefined && (typeof lane.fraction !== 'number' || !(lane.fraction > 0) || lane.fraction > 1)) {
-			throw new Error(
-				'adapter option `websocket.upgradeAdmission.cursorLane.fraction` must be a number greater than 0 and at most 1, ' +
-				`got ${JSON.stringify(lane.fraction)}.`
-			);
 		}
 		// Preserved even when empty: `cursorLane: {}` is what ENABLES the lane at
 		// the default fraction, so dropping an empty object would silently turn
-		// the feature off.
+		// the feature off. The fraction itself is clamped by the controller, as
+		// uws clamps it, rather than refused.
 		out.cursorLane = lane.fraction === undefined ? {} : { fraction: lane.fraction };
+	}
+	// ACCEPTED AND NAMED, because this adapter has no holding page. uws serves
+	// one by default whenever an admission layer is set, and `false` is its
+	// documented opt-out - so refusing the key outright would fail the build for
+	// the config a careful uws operator writes. A crossed ceiling answers 503
+	// here either way; what an object asks for is a page that does not exist,
+	// and saying so is the difference between a known gap and a silent one.
+	if (raw.waitingRoom !== undefined && raw.waitingRoom !== false) {
+		warnings.push(
+			'adapter option `websocket.upgradeAdmission.waitingRoom` is not implemented by this adapter: ' +
+			'a crossed ceiling answers 503 with retry-after rather than serving a holding page. ' +
+			'svelte-adapter-uws serves one; set it to `false` to state that intent explicitly here.'
+		);
 	}
 	return out;
 }
@@ -379,7 +391,7 @@ export function normalizeWsOptions(input) {
 		options.pressure = requirePressureThresholds(raw.pressure, warnings);
 	}
 	if (raw.upgradeAdmission !== undefined) {
-		options.upgradeAdmission = requireUpgradeAdmission(raw.upgradeAdmission);
+		options.upgradeAdmission = requireUpgradeAdmission(raw.upgradeAdmission, warnings);
 	}
 	if (raw.compressCredentialedResponses !== undefined) {
 		options.compressCredentialedResponses = requireBoolean(

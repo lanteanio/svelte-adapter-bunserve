@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createUpgradeAdmission } from '../../src/runtime/utils/upgrade-admission.js';
+import { createUpgradeAdmission, isCursorLaneUpgrade } from '../../src/runtime/utils/upgrade-admission.js';
 import { normalizeWsOptions } from '../../src/runtime/utils/ws-options.js';
 
 // Admission control for the upgrade path. These pin the CONTRACT rather than
@@ -151,17 +151,148 @@ test('hasCapacity answers without consuming a slot', () => {
 	assert.equal(a.hasCapacity(), false);
 });
 
-test('the deferred observer is fed, and its throw cannot break admission', () => {
-	const a = createUpgradeAdmission({ perTickBudget: 1, maxDeferred: 4 });
+test('the deferred observer is fed the right numbers, in the right order', () => {
+	// Asserting only that it was CALLED leaves the arguments unpinned, and the
+	// arguments are the whole payload: swapping depth for rejectedTotal, or
+	// reporting a constant age, produces a metric that is confidently wrong.
+	const a = createUpgradeAdmission({ perTickBudget: 1, maxDeferred: 1 });
+	/** @type {Array<[number, number, number]>} */
 	const seen = [];
-	a.setDeferredObserver((depth, age, rejected) => seen.push([depth, rejected]));
-	assert.equal(seen.length, 1, 'installing delivers an initial snapshot');
+	a.setDeferredObserver((depth, age, rejected) => seen.push([depth, age, rejected]));
+	assert.deepEqual(seen.at(-1), [0, 0, 0], 'installing delivers an empty snapshot');
+
+	a.admit(() => {});                       // runs, this tick has budget
+	a.admit(() => {});                       // queued
+	assert.deepEqual(seen.at(-1)?.[0], 1, 'depth is first');
+	assert.deepEqual(seen.at(-1)?.[2], 0, 'rejectedTotal is third and still zero');
+
+	a.admit(() => {});                       // refused, queue full
+	assert.deepEqual(seen.at(-1)?.[0], 1, 'depth unchanged by a refusal');
+	assert.deepEqual(seen.at(-1)?.[2], 1, 'and the refusal is counted');
+});
+
+test('the reported age of the oldest deferred callback is real, not a constant', async () => {
+	const a = createUpgradeAdmission({ perTickBudget: 1, maxDeferred: 4 });
+	assert.equal(a.deferredOldestAgeMs, 0, 'nothing queued, no age');
 	a.admit(() => {});
 	a.admit(() => {});
-	assert.ok(seen.length > 1, 'an enqueue notifies');
+	await new Promise((r) => setTimeout(r, 25));
+	// The queue drains on a later tick, so read before that happens is not
+	// guaranteed; what IS guaranteed is that a queued entry ages.
+	if (a.deferredDepth > 0) assert.ok(a.deferredOldestAgeMs > 0, 'a queued entry ages');
+});
+
+test('an observer that throws cannot refuse a connection', () => {
+	const a = createUpgradeAdmission({ perTickBudget: 1, maxDeferred: 4 });
 	a.setDeferredObserver(() => { throw new Error('exporter boom'); });
-	// Observe-only: metrics must never be able to refuse a connection.
-	assert.doesNotThrow(() => a.admit(() => {}));
+	// Observe-only: metrics must never be able to break admission.
+	assert.doesNotThrow(() => { a.admit(() => {}); a.admit(() => {}); });
+});
+
+test('deferred callbacks run FIFO and stay within the tick budget', async () => {
+	// Both properties were unpinned while only one callback was ever deferred:
+	// a LIFO drain and a drain that flushed the whole queue in one tick each
+	// passed. Six admits against a budget of two make the order observable and
+	// the per-tick ceiling enforceable.
+	const a = createUpgradeAdmission({ perTickBudget: 2, maxDeferred: 16 });
+	const ran = [];
+	for (let i = 0; i < 6; i++) a.admit(() => ran.push(i));
+	assert.deepEqual(ran, [0, 1], 'only the budget runs synchronously');
+	await new Promise((r) => setTimeout(r, 60));
+	assert.deepEqual(ran, [0, 1, 2, 3, 4, 5], 'the rest follow in the order they arrived');
+});
+
+test('every accepted callback runs, in order, across a wrapping ring', async () => {
+	// The ring only WRAPS while the queue stays non-empty - `dequeue` resets
+	// head and tail to zero the moment it empties - so a test that lets it drain
+	// between rounds never exercises the wrap at all. Admitting two per turn
+	// against a budget of one keeps it occupied.
+	//
+	// The expectation is derived from what `admit` SAID it accepted, so this
+	// pins the real contract: a callback the queue took must run, exactly once,
+	// in arrival order. A head or tail that fails to wrap reads a hole, the
+	// callback is silently swallowed by drain's guard, and the sequence comes up
+	// short.
+	const a = createUpgradeAdmission({ perTickBudget: 1, maxDeferred: 3 });
+	/** @type {number[]} */
+	const ran = [];
+	/** @type {number[]} */
+	const accepted = [];
+	let n = 0;
+	for (let round = 0; round < 8; round++) {
+		for (let i = 0; i < 2; i++) {
+			const id = n++;
+			if (a.admit(() => ran.push(id)) !== null) accepted.push(id);
+		}
+		await new Promise((r) => setImmediate(r));
+	}
+	await new Promise((r) => setTimeout(r, 60));
+	assert.deepEqual(ran, accepted, 'every accepted callback ran once, in arrival order');
+	assert.ok(accepted.length > 8, `the run has to be long enough to wrap, accepted ${accepted.length}`);
+});
+
+test('a drain turn runs at most the tick budget, not the whole queue', async () => {
+	// The point of pacing. A drain that flushes everything it has in one turn
+	// starves the loop exactly as the unpaced path would, and every end-state
+	// assertion still passes because the same callbacks eventually run.
+	const a = createUpgradeAdmission({ perTickBudget: 2, maxDeferred: 32 });
+	const ran = [];
+	for (let i = 0; i < 8; i++) a.admit(() => ran.push(i));
+	assert.deepEqual(ran, [0, 1], 'this tick spends its budget and no more');
+	// One turn of the loop. The drain was scheduled before this, so it runs
+	// first; anything past the budget having run means the budget is not held.
+	await new Promise((r) => setImmediate(r));
+	assert.ok(ran.length <= 4, `a single drain turn ran ${ran.length}, past the budget of 2`);
+	await new Promise((r) => setTimeout(r, 60));
+	assert.equal(ran.length, 8, 'and the rest still arrive');
+});
+
+test('the age of a queued callback is measured, not reported as zero', async () => {
+	// Read WITHOUT yielding, so no drain can empty the queue underneath the
+	// assertion: the entry is provably still there, which is what makes a
+	// hardcoded zero distinguishable from an empty queue.
+	const a = createUpgradeAdmission({ perTickBudget: 1, maxDeferred: 4 });
+	a.admit(() => {});
+	a.admit(() => {});
+	assert.equal(a.deferredDepth, 1, 'one is queued and nothing has yielded');
+	const spun = Date.now();
+	while (Date.now() - spun < 12) { /* hold the turn so the entry ages */ }
+	assert.ok(a.deferredOldestAgeMs >= 10, `expected a real age, got ${a.deferredOldestAgeMs}`);
+	await new Promise((r) => setTimeout(r, 40));
+});
+
+test('a drain that empties the queue still frees the following tick', async () => {
+	// The drain consumes budget of its own while running callbacks, so after the
+	// queue empties it has to schedule one more empty turn purely to reset the
+	// counter. Without it the budget stays spent forever, and the next upgrade -
+	// arriving on a quiet server, long after the burst - is paced against a tick
+	// that ended minutes ago.
+	const a = createUpgradeAdmission({ perTickBudget: 2, maxDeferred: 8 });
+	for (let i = 0; i < 4; i++) a.admit(() => {});
+	await new Promise((r) => setTimeout(r, 60));
+	assert.equal(a.deferredDepth, 0, 'the queue drained');
+	assert.equal(a.admit(() => {}), true, 'and the next tick runs synchronously again');
+});
+
+test('a tick that spends its budget without queueing still resets on the next turn', async () => {
+	// Without the reset the counter persists, and a quiet request arriving much
+	// later is charged to a tick that ended long ago - so pacing refuses work
+	// for a burst that has already passed.
+	const a = createUpgradeAdmission({ perTickBudget: 2, maxDeferred: 4 });
+	assert.equal(a.admit(() => {}), true);
+	assert.equal(a.admit(() => {}), true, 'budget now spent, but nothing queued');
+	assert.equal(a.deferredDepth, 0);
+	await new Promise((r) => setImmediate(r));
+	await new Promise((r) => setImmediate(r));
+	assert.equal(a.admit(() => {}), true, 'a later tick has its own budget');
+});
+
+test('a fraction above 1 is clamped rather than refused, as uws clamps it', () => {
+	// Drop-in matters more than tidiness here: uws accepts this and clamps, so
+	// refusing it would turn a running uws deployment into a build failure on
+	// the way across.
+	const a = createUpgradeAdmission({ maxConcurrent: 8, cursorLane: { fraction: 5 } });
+	assert.equal(a.cursorMaxConcurrent, 8, 'clamped to the whole ceiling, not 40');
 });
 
 // --- the config surface -----------------------------------------------------
@@ -186,52 +317,103 @@ test('an empty cursorLane survives normalization, because it is what enables the
 	assert.equal(createUpgradeAdmission(options.upgradeAdmission).cursorMaxConcurrent, 2);
 });
 
-test('a bad ceiling is REFUSED at config time, not warned about', () => {
-	// Deliberately unlike the pressure block, which warns and falls back. A
-	// mistyped threshold there still leaves a protective default in place; a
-	// mistyped ceiling here would leave the gate wide open, so the operator who
-	// asked for a bound would silently not have one.
-	assert.throws(
-		() => normalizeWsOptions({ upgradeAdmission: { maxConcurrent: -1 } }),
-		/`websocket\.upgradeAdmission\.maxConcurrent` must be a non-negative safe integer/
-	);
-	assert.throws(
-		() => normalizeWsOptions({ upgradeAdmission: { maxConnections: 1.5 } }),
-		/must be a non-negative safe integer/
-	);
+test('a value uws accepts is accepted here too, rather than failing the build', () => {
+	// THE DROP-IN CONSTRAINT, and the reason this does not simply validate
+	// harder. uws range-checks only the two integer ceilings and clamps the
+	// cursor fraction; every value below runs there. Refusing any of them would
+	// turn a working uws deployment into a build failure on the way across,
+	// which is a worse outcome than the sloppy value being refused.
+	for (const block of [
+		{ maxConcurrent: 1.5 },
+		{ perTickBudget: 2.5 },
+		{ cursorLane: { fraction: 5 } },
+		{ cursorLane: { fraction: 0 } },
+		{ cursorLane: { fraction: -1 } }
+	]) {
+		assert.doesNotThrow(
+			() => normalizeWsOptions({ upgradeAdmission: block }),
+			`uws runs ${JSON.stringify(block)}`
+		);
+	}
+	// The shape is still a shape: a non-object block is a mistake in any adapter.
 	assert.throws(
 		() => normalizeWsOptions({ upgradeAdmission: 5 }),
 		/`websocket\.upgradeAdmission` must be an object/
 	);
 });
 
-test('a misspelled admission key is refused, naming the keys that exist', () => {
-	// A typo in a ceiling is the same failure as a bad value: the bound the
-	// operator asked for is not applied, and nothing says so.
+test('the two ceilings uws range-checks are still range-checked, at the controller', () => {
 	assert.throws(
-		() => normalizeWsOptions({ upgradeAdmission: { maxConcurent: 10 } }),
-		/unknown adapter option `websocket\.upgradeAdmission\.maxConcurent`; known keys are/
+		() => createUpgradeAdmission({ maxConnections: 1.5 }),
+		/maxConnections must be a non-negative safe integer/
 	);
 	assert.throws(
-		() => normalizeWsOptions({ upgradeAdmission: { cursorLane: { frac: 0.5 } } }),
-		/unknown adapter option `websocket\.upgradeAdmission\.cursorLane\.frac`/
+		() => createUpgradeAdmission({ perTickBudget: 1, maxDeferred: -1 }),
+		/maxDeferred must be a non-negative safe integer/
 	);
 });
 
-test('cursorLane.fraction is bounded to (0, 1]', () => {
-	assert.throws(
-		() => normalizeWsOptions({ upgradeAdmission: { cursorLane: { fraction: 0 } } }),
-		/greater than 0 and at most 1/
+test('a misspelled admission key WARNS, naming the keys that exist', () => {
+	// Warned rather than thrown, because uws warns: a typo must be visible
+	// without being a build failure that a carried-over config cannot survive.
+	const { warnings } = normalizeWsOptions({ upgradeAdmission: { maxConcurent: 10 } });
+	assert.ok(
+		warnings.some((w) => /upgradeAdmission\.maxConcurent` is ignored/.test(w)),
+		`expected a warning, got ${JSON.stringify(warnings)}`
 	);
-	assert.throws(
-		() => normalizeWsOptions({ upgradeAdmission: { cursorLane: { fraction: 1.5 } } }),
-		/greater than 0 and at most 1/
+	const lane = normalizeWsOptions({ upgradeAdmission: { cursorLane: { frac: 0.5 } } });
+	assert.ok(lane.warnings.some((w) => /cursorLane\.frac` is ignored/.test(w)));
+});
+
+test('waitingRoom is accepted, and an object asking for the page says so', () => {
+	// uws serves a holding page by default whenever an admission layer is set,
+	// and `false` is its documented opt-out. Refusing the key outright would
+	// fail the build for exactly the config a careful uws operator writes.
+	assert.doesNotThrow(() => normalizeWsOptions({
+		upgradeAdmission: { maxConcurrent: 8, waitingRoom: false }
+	}));
+	const off = normalizeWsOptions({ upgradeAdmission: { maxConcurrent: 8, waitingRoom: false } });
+	assert.equal(off.warnings.filter((w) => /waitingRoom/.test(w)).length, 0, 'false is the honest state here, so it is quiet');
+
+	const asked = normalizeWsOptions({
+		upgradeAdmission: { maxConcurrent: 8, waitingRoom: { path: '/waiting' } }
+	});
+	assert.ok(
+		asked.warnings.some((w) => /waitingRoom` is not implemented/.test(w)),
+		'a page that will not be served must not be accepted in silence'
 	);
-	assert.doesNotThrow(() => normalizeWsOptions({ upgradeAdmission: { cursorLane: { fraction: 1 } } }));
+});
+
+// --- the cursor lane's routing -----------------------------------------------
+
+test('the cursor lane is keyed on the subprotocol token, with spacing tolerated', () => {
+	// The token parsing is what routes an upgrade into the deprioritised lane.
+	// Untested, the lane silently never engages and every cursor socket takes a
+	// main-ceiling slot - which is the failure this lane exists to prevent.
+	assert.equal(isCursorLaneUpgrade('svelte-realtime-cursor'), true);
+	assert.equal(isCursorLaneUpgrade('other, svelte-realtime-cursor'), true, 'common ", " spacing');
+	assert.equal(isCursorLaneUpgrade('other,svelte-realtime-cursor'), true, 'no spacing');
+	assert.equal(isCursorLaneUpgrade('svelte-realtime-cursor, other'), true, 'first of several');
+	assert.equal(isCursorLaneUpgrade('other'), false);
+	assert.equal(isCursorLaneUpgrade('svelte-realtime-cursor-extra'), false, 'not a prefix match');
+	assert.equal(isCursorLaneUpgrade(''), false);
+	assert.equal(isCursorLaneUpgrade(undefined), false);
+	assert.equal(isCursorLaneUpgrade(null), false);
 });
 
 test('zero is the documented off switch and must not be refused', () => {
 	assert.doesNotThrow(() => normalizeWsOptions({
 		upgradeAdmission: { maxConcurrent: 0, maxConnections: 0, perTickBudget: 0, maxDeferred: 0 }
 	}));
+});
+
+test('the cursor lane needs the main ceiling to have room, not just its own', () => {
+	// All-or-nothing. A cursor upgrade admitted while the main ceiling is full
+	// would let the deprioritised lane overshoot the bound it is carved from.
+	const a = createUpgradeAdmission({ maxConcurrent: 2, cursorLane: { fraction: 1 } });
+	assert.equal(a.cursorMaxConcurrent, 2);
+	assert.equal(a.tryAcquire(), true);
+	assert.equal(a.tryAcquire(), true, 'main ceiling now full');
+	assert.equal(a.tryAcquireCursor(), false, 'refused although the sub-budget is untouched');
+	assert.equal(a.cursorInFlight, 0, 'and nothing was consumed by the refusal');
 });

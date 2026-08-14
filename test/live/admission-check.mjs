@@ -71,7 +71,10 @@ try {
 		headers: { upgrade: 'websocket', connection: 'Upgrade' }
 	});
 	check('a crossed ceiling answers 503', shed.status === 503, `got ${shed.status}`);
-	check('and says how long to wait', shed.headers.get('retry-after') === '1', `got ${shed.headers.get('retry-after')}`);
+	// Two, matching svelte-adapter-uws. A client that backs off half as long
+	// against one adapter as the other is a difference an operator only finds
+	// under load, which is the worst time to find one.
+	check('and says how long to wait, as uws says it', shed.headers.get('retry-after') === '2', `got ${shed.headers.get('retry-after')}`);
 
 	// THE PART THAT MATTERS. A permit is held for the socket's whole life, so
 	// the ceiling only recovers if `close` actually gives one back. If the
