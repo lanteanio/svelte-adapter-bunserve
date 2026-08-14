@@ -970,7 +970,12 @@ running.
 npm run test:leak                      # two scenarios plus the self-check
 LEAK_SCENARIO=ws npm run test:leak     # one scenario, for investigating a trend
 LEAK_DURATION_MS=240000 npm run test:leak   # a longer window settles a plateau question
+LEAK_RESETTLE_MS=0 npm run test:leak   # start sampling straight off the baseline collection
 ```
+
+A window that cannot hold at least eight samples at the configured cadence is
+refused before the fixture is built, rather than run and then reported as
+having measured nothing.
 
 The deterministic simulation drives the REAL handler dispatch - the same
 modules a built server runs - over an in-memory Bun.serve double, a virtual
