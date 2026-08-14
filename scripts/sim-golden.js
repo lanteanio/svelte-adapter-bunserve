@@ -64,8 +64,9 @@ const againstInline = process.argv.find((a) => a.startsWith('--against='));
 const againstRequested = againstIdx !== -1 || againstInline !== undefined;
 // Counted, not compared: whichever occurrence this file picks, every other
 // path is dropped in silence, and the run then reports a clean comparison
-// against a corpus the caller did not name. Two of the SAME spelling drop one
-// exactly as a mixed pair does, so the count is the rule.
+// against a corpus the caller did not mean to select - they named two, and an
+// unguessable rule chose one. Two of the SAME spelling drop one exactly as a
+// mixed pair does, so the count is the rule.
 //
 // Which one would have won is not a position: the inline form is preferred
 // wherever it sits, and only within one spelling does the first occurrence

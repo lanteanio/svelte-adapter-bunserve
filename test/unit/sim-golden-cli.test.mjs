@@ -54,7 +54,7 @@ test('--against with no value refuses instead of quietly skipping the comparison
 
 test('--against followed by another flag refuses, and names what it was given', () => {
 	// Otherwise the next flag is read as a filename, which fails only after the
-	// whole corpus has been built.
+	// whole 40-seed swarm has been re-run.
 	//
 	// Deliberately NOT `--update` here, though that is the realistic typo: any
 	// `--xxx` proves the same property, and `--update` is the one value that
@@ -89,8 +89,8 @@ test('an inline value that is another flag is refused too', () => {
 // and each spelling pair has to prove it. A guard written against the mixed
 // pair alone passes the first two of these and fails the last two - and it
 // fails them for the right reason only because of the stderr assertion: a
-// same-spelling pair still exits 1 under that guard, having built the whole
-// corpus and then failed to read a sibling that does not exist.
+// same-spelling pair still exits 1 under that guard, having re-run the whole
+// 40-seed swarm and then failed to read a sibling that does not exist.
 for (const [name, args] of [
 	['mixed', ['--against', 'a.json', '--against=b.json']],
 	['mixed, other order', ['--against=b.json', '--against', 'a.json']],
@@ -128,10 +128,13 @@ test('a single --against runs the comparison and names the corpus it read', () =
 			// no explanation attached.
 			assert.equal(status, 0, `${args.length === 1 ? 'inline' : 'space'} form exits clean\n${stderr || stdout}`);
 			assert.match(stdout, /40\/40 sibling fingerprints identical/);
-			// Exact-string rather than path-aware: compareAgainst echoes the
-			// argument as given, so this round-trips byte for byte. A change that
-			// printed a RESOLVED path would still name the corpus and would still
-			// fail here, which is a false red worth recognising rather than a bug.
+			// Exact-string rather than path-aware, and safe to be: compareAgainst
+			// echoes the argument as given, and the argument here is already
+			// absolute and normalized because mkdtempSync built it - so a change
+			// that printed a RESOLVED path would print these same bytes and this
+			// would still pass. The strict form costs nothing and pins the
+			// property that matters, which is that naming the WRONG corpus must
+			// not read like naming the right one.
 			assert.ok(stdout.includes(sibling), 'the line names the corpus it compared against');
 		}
 	} finally {
