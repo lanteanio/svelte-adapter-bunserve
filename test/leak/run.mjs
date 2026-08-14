@@ -45,14 +45,18 @@ async function run(label, cmd, timeoutMs, opts = {}) {
 	return code === 0;
 }
 
-// Pinned for the reason the live lane pins them: either variable left exported
+// Pinned for the reason the live lane pins them: any one left exported
 // redirects the build, and the gitignored output of an earlier run then stands
-// in for a build this lane never produced.
+// in for a build this lane never produced. WS_ADMISSION matters here more than
+// most - it builds a server with a connection ceiling of two, and this lane
+// churns connections at a fixed rate against what it believes is an ungated
+// one.
 const buildEnv = {
 	...process.env,
 	ADAPTER: 'bunserve',
 	NO_WS: '',
 	STATIC_DOTFILES: '',
+	WS_ADMISSION: '',
 	NODE_ENV: 'production'
 };
 

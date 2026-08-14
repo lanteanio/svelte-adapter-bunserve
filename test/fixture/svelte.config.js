@@ -17,6 +17,7 @@ const which = process.env.ADAPTER || 'bunserve';
 // turn it on.
 const noWs = process.env.NO_WS === '1' || process.env.NO_WS === 'true';
 const dotfiles = process.env.STATIC_DOTFILES === '1' || process.env.STATIC_DOTFILES === 'true';
+const admission = process.env.WS_ADMISSION === '1' || process.env.WS_ADMISSION === 'true';
 
 let adapter;
 if (which === 'bunserve' && dotfiles) {
@@ -30,6 +31,17 @@ if (which === 'bunserve' && dotfiles) {
 	// the same no-handler state as an app that never opted into the realtime
 	// tier, without touching src/ws-handler.js.
 	adapter = bunserve({ out: 'build-no-ws', websocket: { handler: 'src/no-ws-handler.js' } });
+} else if (which === 'bunserve' && admission) {
+	// The admission build for test/live/admission-check.mjs. A ceiling of TWO,
+	// which is the whole point: the default is unlimited, so a gate regression
+	// is invisible unless some build sets a bound low enough for a test to
+	// actually reach. It cannot go in the main build - the leak lane churns
+	// connections at 50 rps against that one, and a ceiling of two would shed
+	// most of them.
+	adapter = bunserve({
+		out: 'build-admission',
+		websocket: { upgradeAdmission: { maxConnections: 2 } }
+	});
 } else if (which === 'bunserve') {
 	// A deliberately small subscription cap so the live smoke tests can prove the
 	// bound actually holds. At the 10,000 default a cap regression is invisible:

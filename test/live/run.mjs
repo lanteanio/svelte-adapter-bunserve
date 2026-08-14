@@ -38,7 +38,7 @@ async function run(label, cmd, opts = {}) {
 	return code === 0;
 }
 
-// Both build-selecting variables are pinned, not just ADAPTER. Either one left
+// Every build-selecting variable is pinned, not just ADAPTER. Any one left
 // exported in the shell silently redirects the build somewhere else and leaves
 // the output the suites assert against untouched - and since those directories
 // are gitignored, a stale one from an earlier run persists indefinitely and the
@@ -51,6 +51,7 @@ const buildEnv = {
 	ADAPTER: 'bunserve',
 	NO_WS: '',
 	STATIC_DOTFILES: '',
+	WS_ADMISSION: '',
 	NODE_ENV: 'production'
 };
 
@@ -83,6 +84,17 @@ const builtNoWs = await run('build fixture (NO_WS)', [process.execPath, 'run', '
 });
 if (builtNoWs) {
 	await run('no-ws-check', [process.execPath, suite('no-ws-check.mjs')]);
+}
+
+// Its own build for the reason the NO_WS one has its own: the ceiling has to be
+// low enough for a test to reach, and a ceiling that low in the main build
+// would shed most of what the other suites and the leak lane open.
+const builtAdmission = await run('build fixture (WS_ADMISSION)', [process.execPath, 'run', 'build'], {
+	cwd: fixtureDir,
+	env: { ...buildEnv, WS_ADMISSION: '1' }
+});
+if (builtAdmission) {
+	await run('admission-check', [process.execPath, suite('admission-check.mjs')]);
 }
 
 if (failures.length) {
