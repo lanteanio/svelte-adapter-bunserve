@@ -351,6 +351,14 @@ async function scenario(name, unit, opts) {
 
 	const warm = await drive(unit, WARMUP_MS, { sample: false });
 	const baselineP95 = quantile(warm.latencies, 0.95);
+	// No cooldown before this one, and the asymmetry with the final reading is
+	// deliberate. The cooldown below exists for the CONNECTIONS gate - a count
+	// only means "the close path leaked" once every client has had time to
+	// finish closing - and only the final reading is compared on that. Settling
+	// itself needs no fixed wait, because settledProbe is adaptive: it keeps
+	// reading until two agree, so a warmup still shedding connections simply
+	// costs it another round. Measured on the ws and self-check scenarios, the
+	// baseline settles in three of its eight rounds.
 	const baseline = await settledProbe();
 
 	// Unsampled: see RESETTLE_MS. Sampling through the post-collection climb
@@ -443,10 +451,10 @@ async function scenario(name, unit, opts) {
 	// or invents one out of it.
 	if (baseline.unsettled || final.unsettled) {
 		const ends = [
-			baseline.unsettled && `baseline (gave up after ${baseline.rounds})`,
-			final.unsettled && `final (gave up after ${final.rounds})`
-		].filter(Boolean).join(' and ');
-		fail('health', `retention never settled: ${ends} forced collections; the retained comparison is noise`);
+			baseline.unsettled && `the baseline gave up after ${baseline.rounds} forced collections`,
+			final.unsettled && `the final reading gave up after ${final.rounds} forced collections`
+		].filter(Boolean).join(', and ');
+		fail('health', `retention never settled: ${ends}; the retained comparison is noise`);
 	}
 	// A warmup that could not run leaves baselineP95 at zero, which silently
 	// disables the p95 gate - so the run reports a clean tail latency it never
