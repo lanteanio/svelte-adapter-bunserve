@@ -476,8 +476,12 @@ function heldSlots(req, cursor) {
 		 * releases it. Called BEFORE the upgrade, not after: `open` is dispatched
 		 * synchronously inside `srv.upgrade`, so by the time that call returns a
 		 * socket may already have opened, closed, and released this permit.
-		 * The hang-up watch comes off in the same breath, because a socket
-		 * closing inside that call also fires this request's abort signal.
+		 * The hang-up watch comes off in the same breath. That is hygiene rather
+		 * than the thing keeping this correct - the permit is already not ours,
+		 * so a late abort could only return the in-flight slot a moment early -
+		 * but a socket closing inside that call DOES fire this request's abort,
+		 * and a listener that can still run during the upgrade is a question
+		 * every future reader would have to answer again.
 		 */
 		handOver() {
 			stopWatching();
@@ -811,8 +815,9 @@ async function runUpgrade(req, srv, held) {
 	try {
 		ok = srv.upgrade(req, responseHeaders ? { data, headers: responseHeaders } : { data });
 	} catch (err) {
-		// The permit was handed over on the way in, so take it back unless a
-		// socket existed long enough to release it itself.
+		// The permit was handed over on the way in, so take it back - the marker
+		// is the arbiter, and on this runtime a throw always beats the socket
+		// into existence, so it is still set.
 		reclaimPermit(data, held);
 		// Uncounted, as uws leaves it uncounted: a handshake the RUNTIME refused
 		// is not one of the reasons its rejection counter carries.
