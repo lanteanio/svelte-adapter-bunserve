@@ -258,7 +258,7 @@ export function tryUpgrade(req, srv, pathname) {
 	// microtask to every handshake, which reorders the deterministic simulation
 	// and moved five golden fingerprints. A feature that is switched off must be
 	// invisible, and the golden gate is what proves it.
-	if (upgradeAdmission === null) return runUpgrade(req, srv, noop);
+	if (upgradeAdmission === null) return runUpgrade(req, srv, null);
 	// Routed by SUBPROTOCOL, exactly as uws routes it: the worker's second
 	// (cursor) socket offers a known token, and its upgrade is admitted only
 	// while both the main ceiling and the cursor sub-budget have room. The main
@@ -299,16 +299,61 @@ function releaseLane(cursor) {
 	else upgradeAdmission.release();
 }
 
-function noop() {}
+/**
+ * The two counters one handshake took, each returnable exactly once.
+ *
+ * Once-only is the whole point: a hang-up and the handshake's own unwind both
+ * end at a release, and `release()` / `releaseCursorInFlight()` are bare
+ * decrements. A slot handed back twice reads as free capacity that does not
+ * exist, so the gate stops gating; a permit handed back twice throws out of the
+ * close callback and strands the app's close hook. uws keeps the same guard
+ * (`inFlightReleased`) for the same reason.
+ *
+ * @param {boolean} cursor whether the in-flight slot came from the cursor lane
+ */
+function heldSlots(cursor) {
+	let lane = true;
+	let permit = true;
+	return {
+		/** `true` while the connection permit is still this handshake's to give. */
+		get hasPermit() { return permit; },
+		/**
+		 * The socket exists and owns the permit from here on, so nothing on this
+		 * side releases it - its close callback does.
+		 */
+		handOver() { permit = false; },
+		/** Give back whatever is still held here. */
+		release() {
+			if (lane) {
+				lane = false;
+				releaseLane(cursor);
+			}
+			if (permit) {
+				permit = false;
+				upgradeAdmission.releaseConnection();
+			}
+		}
+	};
+}
 
 /**
  * Owns the two counters `tryUpgrade` took, so no path can leak one.
  *
  * The in-flight slot is released however the handshake ends - refused, thrown,
- * or completed - because it measures the UPGRADE WINDOW, which is over either
- * way. The connection permit is different: it measures the socket's whole life,
- * so a completed handshake hands it to the close callback and only a handshake
- * that never produced a socket releases it here.
+ * completed, or abandoned - because it measures the UPGRADE WINDOW, which is
+ * over either way. The connection permit is different: it measures the socket's
+ * whole life, so a completed handshake hands it to the close callback and only a
+ * handshake that never produced a socket releases it here.
+ *
+ * A client that hangs up mid-handshake is the case neither of those covers. The
+ * app's `upgrade` hook is the app's: it cannot be cancelled and may await for as
+ * long as it likes, so without a hang-up path both counters stay spent for the
+ * full hook latency after the client has gone - and a fleet of connect-then-drop
+ * clients is precisely the storm the ceiling exists to shed. uws hands both back
+ * from `res.onAborted`; the request's abort signal is that same event here, and
+ * this runtime fires it about ten milliseconds after the socket goes away
+ * (probed). The listener is removed on the way out so a signal that outlives the
+ * handshake cannot reach a closure whose accounting is already finished.
  *
  * @param {Request} req
  * @param {import('bun').Server} srv
@@ -316,25 +361,41 @@ function noop() {}
  * @returns {Promise<Response | undefined>}
  */
 async function settleUpgrade(req, srv, cursor) {
-	let permitOwnedHere = upgradeAdmission !== null;
+	const held = heldSlots(cursor);
+	const onAbort = () => held.release();
+	req.signal.addEventListener('abort', onAbort, { once: true });
 	try {
-		return await runUpgrade(req, srv, () => { permitOwnedHere = false; });
+		return await runUpgrade(req, srv, held);
 	} finally {
-		if (upgradeAdmission !== null) {
-			releaseLane(cursor);
-			if (permitOwnedHere) upgradeAdmission.releaseConnection();
-		}
+		req.signal.removeEventListener('abort', onAbort);
+		held.release();
 	}
+}
+
+/**
+ * What a handshake answers with once its client has gone: the slots went back at
+ * the hang-up, so there is no longer anything to admit it with. Nothing here
+ * reaches a wire - the socket is already gone - but the handler still has to
+ * answer, because answering is what ends the request.
+ *
+ * Deliberately not the shed response: this is a client that left, not a server
+ * that refused, and counting it as capacity pressure would report a storm that
+ * never happened.
+ *
+ * @returns {Response}
+ */
+function abandonedResponse() {
+	return new Response('Client went away', { status: 503 });
 }
 
 /**
  * @param {Request} req
  * @param {import('bun').Server} srv
- * @param {() => void} onPermitTransferred called once the socket exists and owns
- *   the connection permit, so the caller stops accounting for it.
+ * @param {ReturnType<typeof heldSlots> | null} held the counters this handshake
+ *   is holding, or null when nothing is gated.
  * @returns {Promise<Response | undefined>}
  */
-async function runUpgrade(req, srv, onPermitTransferred) {
+async function runUpgrade(req, srv, held) {
 	// Cross-site WebSocket hijacking defense, BEFORE the app's hook: the hook
 	// may read cookies and do database work, and a foreign origin should not be
 	// able to make it do either.
@@ -500,6 +561,16 @@ async function runUpgrade(req, srv, onPermitTransferred) {
 		// and a 1006 when stop(true) arrives, which is precisely what the
 		// earlier re-check was added to prevent.
 		if (isDraining()) return drainingResponse();
+		// The client may have left while the hook ran or while this handshake
+		// waited its turn, in which case the abort listener has already handed
+		// both counters back. Marking the socket as holding a permit that is no
+		// longer held would have its close callback release one nobody took,
+		// which throws where it strands the app's close hook.
+		//
+		// Nothing awaits between here and `srv.upgrade` below, and an abort is
+		// delivered as a task - so the permit cannot be released in the gap, and
+		// this check is what the hand-over below relies on.
+		if (!held.hasPermit) return abandonedResponse();
 		// Stamped before the upgrade rather than after: once `srv.upgrade`
 		// returns true the socket may already have been handed to `open`, and a
 		// close arriving before this line would then release nothing.
@@ -524,7 +595,7 @@ async function runUpgrade(req, srv, onPermitTransferred) {
 	}
 	if (ok) {
 		// The socket exists and its close callback now owns the permit.
-		onPermitTransferred();
+		if (held !== null) held.handOver();
 		return undefined;
 	}
 

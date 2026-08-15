@@ -165,6 +165,14 @@ export function shutdown({ platform }) {
 export async function upgrade(request, { headers }) {
 	await new Promise((resolve) => setTimeout(resolve, 5));
 	const url = new URL(request.url);
+	// A handshake the caller can hold open for as long as it asks for. The
+	// window while this hook awaits is the one where the server is carrying
+	// admission counters on behalf of a client that may already have gone, and
+	// it is unreachable from a browser client - which either completes the
+	// handshake or errors out. Bounded, so a stray value cannot park a fixture
+	// connection for the length of a run.
+	const hold = Math.min(5_000, Number(url.searchParams.get('hold')) || 0);
+	if (hold > 0) await new Promise((resolve) => setTimeout(resolve, hold));
 	if (url.searchParams.get('deny') === '1') {
 		return new Response('nope', { status: 401 });
 	}

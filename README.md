@@ -420,7 +420,7 @@ are different jobs rather than different sizes of the same one:
 `upgradeAdmission` is separate from all of those: they bound what one
 established connection may do, and this bounds whether a connection is
 established at all. Every layer is opt-in, and a crossed ceiling answers `503`
-with `retry-after: 1` rather than accepting a socket it cannot serve.
+with `retry-after: 2` rather than accepting a socket it cannot serve.
 
 - `maxConcurrent` caps handshakes IN FLIGHT. It is checked before the origin
   comparison and before your `upgrade` hook, so a connection storm is shed
@@ -442,6 +442,10 @@ with `retry-after: 1` rather than accepting a socket it cannot serve.
 - `cursorLane` reserves a fraction of `maxConcurrent` for a deprioritised
   cursor-only lane, so a flood of cursor reconnects can never starve ordinary
   WebSocket admission. Omit it and the lane does not exist.
+
+A client that hangs up mid-handshake gives its slot and its permit back at the
+hang-up rather than when your `upgrade` hook finishes, so a storm of
+connect-then-drop clients cannot hold the ceiling closed behind them.
 
 The block is spelled as `svelte-adapter-uws` spells it, with the same defaults
 and the same accepted values, so a config moved between the two adapters gates

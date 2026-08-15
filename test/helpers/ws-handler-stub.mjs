@@ -33,8 +33,17 @@ export let close;
 export let resume;
 
 /**
+ * The handshake hook, which the upgrade path awaits. Unset by default, so
+ * `typeof wsModule.upgrade === 'function'` stays false and every test that does
+ * not install one takes the hookless path exactly as before.
+ *
+ * @type {undefined | ((req: Request, ctx: any) => unknown)}
+ */
+export let upgrade;
+
+/**
  * @param {{ subscribe?: any, subscribeBatch?: any, unsubscribe?: any,
- *   open?: any, message?: any, close?: any, resume?: any }} hooks
+ *   open?: any, message?: any, close?: any, resume?: any, upgrade?: any }} hooks
  */
 export function __setHooks(hooks) {
 	subscribe = hooks.subscribe;
@@ -44,4 +53,5 @@ export function __setHooks(hooks) {
 	message = hooks.message;
 	close = hooks.close;
 	resume = hooks.resume;
+	upgrade = hooks.upgrade;
 }

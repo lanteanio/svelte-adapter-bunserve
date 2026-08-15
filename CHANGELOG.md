@@ -314,6 +314,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A client that opened a WebSocket handshake and hung up while the app's
+  `upgrade` hook was still awaiting kept one `upgradeAdmission` in-flight slot
+  and one connection permit until that hook settled. The hook is the app's - it
+  cannot be cancelled and may take as long as it likes - so a fleet of
+  connect-then-drop clients held the ceiling closed for a full hook latency
+  behind clients that were already gone, which is precisely the storm the
+  ceiling exists to shed. Both counters now come back when the client goes,
+  about ten milliseconds after the socket does. A handshake whose slots have
+  already been returned is answered rather than upgraded, so a socket can never
+  be handed a permit that is no longer held - that would have its close callback
+  release one nobody took, which throws where it strands the app's `close` hook.
+  The default configuration gates nothing and is untouched, wrapper and abort
+  listener alike.
+
 - The liveness and readiness probes answered `GET` but 404'd `HEAD`, because
   both were gated behind a `GET` check that let every other method fall through
   to the SSR catch-all. A load balancer or uptime monitor configured to probe

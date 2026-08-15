@@ -13,6 +13,8 @@
 // ceiling is TWO. The default is unlimited, so a bound this low is the only
 // way a test can actually reach it.
 
+import { connect as tcpConnect } from 'node:net';
+
 import { assertPortFree, buildPath, serverEnv, waitForServer } from './harness.mjs';
 
 const PORT = 8805;
@@ -44,6 +46,32 @@ function closeAndSettle(ws) {
 	});
 }
 
+/**
+ * Start a handshake over a raw socket and leave it in flight, so this suite can
+ * hang up at a moment of its choosing. A WebSocket client cannot express that:
+ * it either completes the handshake or errors, and the window this needs is the
+ * one in between, while the app's upgrade hook is still awaiting.
+ *
+ * @param {string} query
+ */
+function beginHandshake(query) {
+	const sock = tcpConnect(PORT, '127.0.0.1', () => {
+		sock.write(
+			`GET /ws${query} HTTP/1.1\r\n` +
+			`Host: 127.0.0.1:${PORT}\r\n` +
+			'Upgrade: websocket\r\n' +
+			'Connection: Upgrade\r\n' +
+			'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n' +
+			'Sec-WebSocket-Version: 13\r\n' +
+			'\r\n'
+		);
+	});
+	// The point of these sockets is to be destroyed mid-handshake; the resulting
+	// reset is the test, not a failure.
+	sock.on('error', () => {});
+	return sock;
+}
+
 await assertPortFree(PORT);
 
 const proc = Bun.spawn([process.execPath, BUILD], {
@@ -56,6 +84,40 @@ const proc = Bun.spawn([process.execPath, BUILD], {
 const open = [];
 try {
 	await waitForServer(proc, PORT);
+
+	// THE HANG-UP WINDOW, first, while the gate is still empty.
+	//
+	// Two handshakes held inside the app's upgrade hook hold both permits. The
+	// clients then leave without waiting for an answer, and the hook is still
+	// awaiting when they do - which is the window where a permit used to stay
+	// spent. Bounded by hook latency rather than permanent, which is exactly why
+	// no test caught it: everything here reads correct again the moment the hook
+	// returns, so a suite that waits for the handshake to finish sees nothing.
+	const abandoned = [beginHandshake('?hold=1000'), beginHandshake('?hold=1000')];
+	await Bun.sleep(250);
+	const whileHeld = await fetch(`${BASE}/ws`, {
+		headers: { upgrade: 'websocket', connection: 'Upgrade' }
+	});
+	check(
+		'two handshakes inside the hook hold the whole ceiling',
+		whileHeld.status === 503,
+		`got ${whileHeld.status}`
+	);
+
+	for (const sock of abandoned) sock.destroy();
+	// The runtime reports the hang-up on its own turn, about ten milliseconds
+	// after the socket goes (probed); this is that with room to spare.
+	await Bun.sleep(250);
+	let afterHangup = null;
+	try { afterHangup = await connect(); } catch { /* left null, checked below */ }
+	check('a client that hangs up mid-hook gives its permit back', afterHangup !== null);
+	if (afterHangup) await closeAndSettle(afterHangup);
+
+	// Let the abandoned hooks run out before anything else is measured, so their
+	// unwinding cannot land in the middle of a later check. They resolve into a
+	// handshake whose client is long gone, which must produce no socket and
+	// release nothing a second time - the checks below would report either.
+	await Bun.sleep(900);
 
 	// The ceiling is two, so two must be admitted.
 	for (let i = 0; i < 2; i++) {
@@ -71,11 +133,13 @@ try {
 		headers: { upgrade: 'websocket', connection: 'Upgrade' }
 	});
 	check('a crossed ceiling answers 503', shed.status === 503, `got ${shed.status}`);
-	// A RANGE, not a value: the base is two, matching svelte-adapter-uws, and
-	// it is jittered over half the base so a refused fleet does not return in
-	// the same second. Asserting the constant would be a test that fails one
-	// run in two - and asserting only that the header exists would not notice
-	// the jitter being dropped, so both ends are checked.
+	// A RANGE, not a value, because the expression is uws's and the range is
+	// what the two adapters have to agree on. The spread does not actually
+	// widen it today: `base + floor(rand * base * 0.5)` at base 2 is
+	// `floor(rand * 1)`, zero for every draw, so both adapters answer exactly 2
+	// and a refused fleet does return in the same second. Pinning the range
+	// rather than the constant is what keeps this passing when uws widens
+	// either number, which is the moment the two must move together.
 	const retryAfter = Number(shed.headers.get('retry-after'));
 	check(
 		'and says how long to wait, jittered as uws jitters it',
