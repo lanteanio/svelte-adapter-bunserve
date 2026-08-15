@@ -242,11 +242,28 @@ export function createInMemoryApp(opts) {
 			...(connectOpts.headers || {})
 		};
 		const url = SIM_ORIGIN + wsPath + (connectOpts.query ? '?' + connectOpts.query : '');
-		const req = new Request(url, { headers });
+		// Carries a signal so a scenario can model the client that LEAVES
+		// mid-handshake. Without one, `req.signal` never aborts and the
+		// hang-up half of the upgrade path - the admission slots coming back
+		// while the app's hook is still awaiting - is unreachable from here,
+		// which is to say unreachable from the one tool built to explore
+		// orderings.
+		const client = new AbortController();
+		const req = new Request(url, { headers, signal: client.signal });
 		pendingUpgrades.set(req, {
 			clientSide,
 			onUpgraded(raw) {
 				serverWs = raw;
+				// NOT unconditional. `websocketHandlers.open(raw)` runs before
+				// this, inside the upgrade call, exactly as the runtime
+				// dispatches it - so an app hook that closes its socket in
+				// `open` has already driven `onServerClose` by now. Writing
+				// 'open' over that would un-close the connection: the client
+				// would report itself connected while carrying the close code
+				// it was refused with, and every later assertion would be
+				// reasoning about a socket that does not exist. That ordering
+				// is one this simulator exists to explore, not an edge of it.
+				if (openState === 'closed') return;
 				openState = 'open';
 			}
 		});
@@ -308,6 +325,19 @@ export function createInMemoryApp(opts) {
 			close(code = 1000, reason = '') {
 				if (serverWs && openState === 'open') serverWs.close(code, reason);
 				openState = 'closed';
+			},
+			/**
+			 * The client goes away mid-handshake, before there is a socket to
+			 * close: the TCP-level hang-up, which the server learns about
+			 * through the request's abort signal rather than through a close
+			 * frame. This is what a connect-then-drop storm is made of, and the
+			 * only way to reach the upgrade path's hang-up branches from a
+			 * scenario.
+			 */
+			hangUp() {
+				if (openState !== 'connecting') return false;
+				client.abort();
+				return true;
 			},
 			get serverWs() { return serverWs; }
 		};

@@ -390,8 +390,22 @@ export const websocketHandlers = {
 			};
 		}
 
+		// REGISTERED BEFORE THE FIRST THING THAT CAN CLOSE, and the welcome frame
+		// is one: the control-egress budget can refuse it and cut the connection
+		// on the spot. The close handler then runs to completion from inside
+		// this one - deregistering, releasing the connection permit, and
+		// clearing what it needs to - so anything registered after that point
+		// would be registered onto a socket already torn down.
 		wsConnections.add(ws);
 		sendControl(ws, '{"type":"welcome","sessionId":"' + sessionId + '"}');
+		// And the app's `open` is skipped if that happened. The alternative is
+		// what this used to do: announce a connection that no longer exists, to
+		// a hook whose first `ws.getUserData()` throws - which `callHook` then
+		// reports as "the open hook threw; the connection was left open", a
+		// sentence that is wrong twice over. An app is entitled to the ordinary
+		// contract, which is that `open` is only called for a connection it can
+		// still use, and that `close` never precedes it.
+		if (ws._closed) return;
 		callHook('open', () => wsModule.open?.(ws, { platform: wsPlatform }));
 	},
 

@@ -1,6 +1,6 @@
 # Bun server API facts
 
-Generated 2026-08-15T20:11:16.074Z by `probe/bun-api-facts.mjs`.
+Generated 2026-08-15T21:00:15.757Z by `probe/bun-api-facts.mjs`.
 
 - Bun version: **1.3.14** (revision 0d9b296af33f2b851fcbf4df3e9ec89751734ba4)
 - Platform: win32/x64
@@ -193,7 +193,7 @@ Re-run after every Bun upgrade; review any diff before trusting the upgrade.
 - custom upgrade header present on the 101 response
   - true
 - raw 101 status line + headers
-  - HTTP/1.1 101 Switching Protocols | x-probe-upgrade: yes | Upgrade: websocket | Connection: Upgrade | Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo= | Date: Sat, 15 Aug 2026 20:11:11 GMT
+  - HTTP/1.1 101 Switching Protocols | x-probe-upgrade: yes | Upgrade: websocket | Connection: Upgrade | Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo= | Date: Sat, 15 Aug 2026 21:00:10 GMT
 
 ## upgrade-abort
 
@@ -207,6 +207,17 @@ Re-run after every Bun upgrade; review any diff before trusting the upgrade.
   - under 50ms
 - server.upgrade() on a request whose client already left
   - returned false, open handler fired: false
+
+## upgrade-dispatch-order
+
+- order of events around server.upgrade() when `open` closes its socket
+  - before upgrade -> open enters -> abort -> close -> open exits -> upgrade returned true
+- server.upgrade() return value when the socket closed inside `open`
+  - true
+- userData still readable in the close callback
+  - true
+- an `open` handler that throws: does it escape server.upgrade()
+  - escaped: false, upgrade returned true, close handler fired: true
 
 ## header-values
 

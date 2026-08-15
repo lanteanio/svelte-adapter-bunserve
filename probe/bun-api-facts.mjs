@@ -672,6 +672,101 @@ async function probeUpgradeAbort() {
 	}
 }
 
+async function probeUpgradeDispatchOrder() {
+	const section = 'upgrade-dispatch-order';
+	// WHEN the socket callbacks run relative to the upgrade call. The adapter's
+	// permit accounting depends on this and on nothing else: whether `open` is
+	// dispatched inside `server.upgrade()` decides whether a handshake may still
+	// be holding the connection permit when a socket closes and releases it.
+	const order = [];
+	const seen = {};
+	const server = Bun.serve({
+		hostname: HOST, port: 0,
+		fetch(req, srv) {
+			req.signal.addEventListener('abort', () => { order.push('abort'); }, { once: true });
+			order.push('before upgrade');
+			try {
+				seen.returned = srv.upgrade(req, { data: { probe: true } });
+			} catch (err) {
+				seen.threw = String(err).slice(0, 60);
+			}
+			order.push(`upgrade returned ${describeValue(seen.returned)}`);
+			if (seen.returned) return undefined;
+			return new Response('no', { status: 400 });
+		},
+		websocket: {
+			open(ws) {
+				order.push('open enters');
+				// The app hook that turns a socket away: an unauthenticated
+				// session, one socket per user, a full room.
+				ws.close(4001, 'refused in open');
+				order.push('open exits');
+			},
+			message() {},
+			close(ws) {
+				order.push('close');
+				// Whether userData survives into the close callback, which is
+				// where the adapter reads the marker saying who owns the permit.
+				try {
+					seen.dataReadableInClose = ws.data && ws.data.probe === true;
+				} catch {
+					seen.dataReadableInClose = 'threw';
+				}
+			}
+		}
+	});
+	try {
+		const client = new WebSocket(`ws://${HOST}:${server.port}/`);
+		await withTimeout(new Promise((resolve) => {
+			client.addEventListener('close', resolve);
+			client.addEventListener('error', resolve);
+		}), 4000, 'close-in-open client').catch(() => undefined);
+		await sleep(100);
+		record(section, 'order of events around server.upgrade() when `open` closes its socket', order.join(' -> '));
+		record(section, 'server.upgrade() return value when the socket closed inside `open`', describeValue(seen.returned));
+		record(section, 'userData still readable in the close callback', describeValue(seen.dataReadableInClose));
+	} finally {
+		server.stop(true);
+	}
+
+	// An `open` that THROWS, which is the other way an adapter's post-upgrade
+	// bookkeeping can be reached by a callback it did not expect to have run.
+	const thrown = { returned: null, closeFired: false, escaped: false };
+	const server2 = Bun.serve({
+		hostname: HOST, port: 0,
+		fetch(req, srv) {
+			try {
+				thrown.returned = srv.upgrade(req, { data: {} });
+			} catch {
+				thrown.escaped = true;
+			}
+			if (thrown.returned) return undefined;
+			return new Response('no', { status: 400 });
+		},
+		websocket: {
+			open() { throw new Error('the open hook threw'); },
+			message() {},
+			close() { thrown.closeFired = true; }
+		}
+	});
+	try {
+		const client = new WebSocket(`ws://${HOST}:${server2.port}/`);
+		await withTimeout(new Promise((resolve) => {
+			client.addEventListener('close', resolve);
+			client.addEventListener('error', resolve);
+		}), 4000, 'throwing-open client').catch(() => undefined);
+		await sleep(100);
+		record(
+			section,
+			'an `open` handler that throws: does it escape server.upgrade()',
+			`escaped: ${thrown.escaped}, upgrade returned ${describeValue(thrown.returned)}, ` +
+			`close handler fired: ${thrown.closeFired}`
+		);
+	} finally {
+		server2.stop(true);
+	}
+}
+
 async function probeUpgradeHeaderValues() {
 	const section = 'header-values';
 	// Where the runtime draws its own line on a 101 header value, which decides
@@ -915,6 +1010,7 @@ const probes = [
 	probeMessageBufferLifetime,
 	probeUpgradeFlow,
 	probeUpgradeAbort,
+	probeUpgradeDispatchOrder,
 	probeUpgradeHeaderValues,
 	probeSubprotocolSelection,
 	probeRoutesOption,

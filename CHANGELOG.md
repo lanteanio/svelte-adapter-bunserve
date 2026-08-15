@@ -364,6 +364,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the auth endpoint); its `duplicate_header` has no counterpart here at all,
   because repeated request headers are merged before the adapter is entered.
 
+- The `open` hook was called for a connection that had already closed, when the
+  welcome frame did not fit the control-egress budget. `maxControlEgressBytes`
+  below about 60 bytes refuses that frame and cuts the connection with `4429`,
+  and the close callback runs from inside the open callback - so the app's
+  `close` hook ran BEFORE its `open` hook, and `open` then received a socket
+  whose first `getUserData()` threw. That throw was reported as "the open hook
+  threw; the connection was left open", which was wrong twice over. `open` is
+  now called only for a connection the app can still use.
+
 - The liveness and readiness probes answered `GET` but 404'd `HEAD`, because
   both were gated behind a `GET` check that let every other method fall through
   to the SSR catch-all. A load balancer or uptime monitor configured to probe
