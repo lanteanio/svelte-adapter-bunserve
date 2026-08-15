@@ -672,6 +672,54 @@ async function probeUpgradeAbort() {
 	}
 }
 
+async function probeUpgradeHeaderValues() {
+	const section = 'header-values';
+	// Where the runtime draws its own line on a 101 header value, which decides
+	// what the adapter's validator has to catch itself rather than what it can
+	// leave to a throw. Each case gets its own server: a throw here is the
+	// observation, and a shared server would carry one case's socket into the
+	// next.
+	for (const [label, value] of [
+		['printable ASCII', 'plain'],
+		['accented Latin-1 (an ordinary name)', 'José'],
+		['above Latin-1 (an emoji)', '\u{1F600}'],
+		['CR LF (the response-splitting set)', 'a\r\nx-injected: 1'],
+		['NUL', 'a b']
+	]) {
+		const seen = { threw: false, returned: null, open: false };
+		const server = Bun.serve({
+			hostname: HOST, port: 0,
+			fetch(req, srv) {
+				try {
+					seen.returned = srv.upgrade(req, { data: {}, headers: { 'x-probe': value } });
+				} catch {
+					seen.threw = true;
+					return new Response('threw', { status: 500 });
+				}
+				if (seen.returned) return undefined;
+				return new Response('no', { status: 400 });
+			},
+			websocket: { open() { seen.open = true; }, message() {}, close() {} }
+		});
+		try {
+			const client = new WebSocket(`ws://${HOST}:${server.port}/`);
+			await withTimeout(new Promise((resolve) => {
+				client.addEventListener('open', () => { client.close(); });
+				client.addEventListener('close', resolve);
+				client.addEventListener('error', resolve);
+			}), 3000, `header value: ${label}`).catch(() => undefined);
+			await sleep(50);
+			record(
+				section,
+				`server.upgrade() with a header value containing ${label}`,
+				seen.threw ? 'throws' : `upgrades (returned ${describeValue(seen.returned)})`
+			);
+		} finally {
+			server.stop(true);
+		}
+	}
+}
+
 async function probeSubprotocolSelection() {
 	const section = 'subprotocol';
 	const server = Bun.serve({
@@ -867,6 +915,7 @@ const probes = [
 	probeMessageBufferLifetime,
 	probeUpgradeFlow,
 	probeUpgradeAbort,
+	probeUpgradeHeaderValues,
 	probeSubprotocolSelection,
 	probeRoutesOption,
 	probeStopDrain,

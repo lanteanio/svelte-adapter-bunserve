@@ -60,11 +60,19 @@ function invalidHeaderEntry(headers) {
 		const value = headers[name];
 		if (typeof value !== 'string') return `non-string value for ${JSON.stringify(name)}`;
 		// Anything outside printable ASCII. CR/LF/NUL are the response-splitting
-		// set, but the range matters beyond them: Bun rejects every byte >= 0x80
-		// and THROWS out of srv.upgrade when it sees one, so a value as ordinary
-		// as a user's name with an accent used to escape this function, escape
-		// the handler, and land in the unthrottled top-level error logger -
-		// measured at 667 bytes of synchronous stderr per request.
+		// set and the runtime refuses those itself, by throwing out of
+		// srv.upgrade - which is why the guard around that call exists, and why
+		// this check runs first rather than relying on it.
+		//
+		// The range matters beyond them. Where the runtime draws its own line
+		// has MOVED: a value above Latin-1 (an emoji) still throws, but an
+		// accented name does not - it upgrades, and the byte goes on the 101
+		// verbatim (measured, probe/bun-api-facts.report.md, header-values). So
+		// the refusal here is this adapter's own: a header value is bytes on a
+		// wire read by intermediaries that are entitled to assume ASCII, and a
+		// name that survives one hop as UTF-8 and arrives as mojibake at the
+		// next is a worse answer than a refusal the app can see and encode
+		// around.
 		for (let i = 0; i < value.length; i++) {
 			const c = value.charCodeAt(i);
 			if (c < 0x20 || c > 0x7e) {
@@ -172,12 +180,37 @@ function warnReturnedHeaders() {
 }
 
 /**
+ * Count a refused upgrade, unless the client has already gone.
+ *
+ * uws guards its own post-hook refusals the same way (`if (aborted ||
+ * timedOut) return`), and the reason is the one this file gives for not
+ * booking an abandoned handshake as capacity pressure: a connect-then-drop
+ * fleet would otherwise write its own noise into the numbers an operator reads
+ * to decide whether the app is turning people away. The signal is read
+ * directly rather than through the admission ledger, because that ledger only
+ * exists when a ceiling is configured and this has to hold on the default
+ * server too.
+ *
+ * @param {Request} req
+ * @param {string} reason one of `UPGRADE_REJECTION_REASONS`
+ */
+function recordRefusal(req, reason) {
+	if (req.signal.aborted) return;
+	recordUpgradeRejection(reason);
+}
+
+/**
  * 503 with Retry-After, the honest answer for a server that is going away: the
  * client should come back, not treat this as a permanent rejection.
  *
+ * Counted here rather than at its three call sites, so a fourth cannot be
+ * added without one.
+ *
+ * @param {Request} req
  * @returns {Response}
  */
-function drainingResponse() {
+function drainingResponse(req) {
+	recordRefusal(req, 'draining');
 	return new Response('Server draining', {
 		status: 503,
 		headers: { 'retry-after': '1', connection: 'close' }
@@ -464,12 +497,17 @@ function heldSlots(req, cursor) {
  * Give the connection permit back when the upgrade produced no socket.
  *
  * Reads the same marker the close callback reads, which is what makes the two
- * agree across every ordering. The close callback CLEARS it as it releases, so a
- * marker still set means no socket ever owned the permit and this handshake owes
- * it back; a marker already cleared means a socket took it and gave it back
- * inside `srv.upgrade` itself - which is a real ordering, not a theoretical one,
- * because an `open` hook that closes its socket runs to completion before that
- * call returns.
+ * agree without either having to reason about the other's timing. The close
+ * callback CLEARS it as it releases, so a marker still set means no socket ever
+ * owned the permit and this handshake owes it back.
+ *
+ * On this runtime the marker is always still set here: every input that makes
+ * `srv.upgrade` throw throws before a socket exists, and the ordering where one
+ * opens and closes inside the call ends with `true` rather than on either of
+ * these paths. The check is kept anyway because it costs one property read on a
+ * failure path, and because the alternative is an unwritten dependency on which
+ * of those the runtime does - the exact kind of assumption that made the
+ * hand-over wrong in the first place.
  *
  * @param {Record<string, any>} data the userData handed to `srv.upgrade`
  * @param {ReturnType<typeof heldSlots> | null} held
@@ -576,12 +614,12 @@ async function runUpgrade(req, srv, held) {
 	// to the empty string too, so an empty selfOrigin would MATCH those rather
 	// than matching nothing.
 	if (ws_options.allowedOrigins === 'same-origin' && !selfOrigin) {
-		recordUpgradeRejection('bad_origin');
+		recordRefusal(req, 'bad_origin');
 		warnOriginRefused(req.headers.get('origin'), selfOrigin);
 		return new Response('Forbidden origin', { status: 403 });
 	}
 	if (!isUpgradeOriginAllowed(req.headers.get('origin'), selfOrigin, ws_options.allowedOrigins)) {
-		recordUpgradeRejection('bad_origin');
+		recordRefusal(req, 'bad_origin');
 		warnOriginRefused(req.headers.get('origin'), selfOrigin);
 		return new Response('Forbidden origin', { status: 403 });
 	}
@@ -589,7 +627,7 @@ async function runUpgrade(req, srv, held) {
 	// Shutdown has started: refuse rather than hand a client a socket on a
 	// process that is about to exit. Checked before the app hook runs so a
 	// draining server does no needless session work.
-	if (isDraining()) return drainingResponse();
+	if (isDraining()) return drainingResponse(req);
 
 	/** @type {Record<string, any>} */
 	const data = {};
@@ -620,7 +658,7 @@ async function runUpgrade(req, srv, held) {
 			// hook that throws on malformed input (`JSON.parse(cookie)`) turned
 			// one request into ~1KB of synchronous stderr. Measured 50 requests
 			// -> 601 stderr lines before the throttle.
-			recordUpgradeRejection('hook_error');
+			recordRefusal(req, 'hook_error');
 			const { log: logIt, count: n } = upgradeThrewThrottle();
 			if (logIt) {
 				const suffix = n > 1 ? ` (occurrence ${n})` : '';
@@ -630,14 +668,24 @@ async function runUpgrade(req, srv, held) {
 		}
 		// A Response from the hook IS the rejection, verbatim - status, body,
 		// headers. This is why there is no separate upgradeResponse type here.
-		if (result instanceof Response) return result;
+		//
+		// Counted as an auth rejection, which is what it is: the app looked at
+		// this client and said no. It is also the spelling the README leads
+		// with, so leaving it out would have meant the counter read zero on
+		// exactly the servers that reject the most - uws has no equivalent
+		// (its hook cannot return a Response at all), so the label is chosen by
+		// what the refusal MEANS rather than by copying a call site.
+		if (result instanceof Response) {
+			recordRefusal(req, 'auth_rejected');
+			return result;
+		}
 		// `false` REJECTS, matching the family ("Return `false` to reject with
 		// 401"). Tested explicitly because it is not an object: falling through
 		// to the generic userData path would complete the handshake with empty
 		// userData, so a hook whose auth check reads `if (!session) return false`
 		// would admit exactly the connections it means to refuse.
 		if (result === false) {
-			recordUpgradeRejection('auth_rejected');
+			recordRefusal(req, 'auth_rejected');
 			return new Response('Unauthorized', { status: 401 });
 		}
 		if (Object.keys(ctxHeaders).length > 0) {
@@ -656,7 +704,7 @@ async function runUpgrade(req, srv, held) {
 				// equivalent: there the same unusable value throws out of the
 				// response builder the app called, inside the hook. Same cause,
 				// same answer, so the same label.
-				recordUpgradeRejection('hook_error');
+				recordRefusal(req, 'hook_error');
 				const { log: logIt, count: n } = badHeaderThrottle();
 				if (logIt) {
 					const suffix = n > 1 ? ` (occurrence ${n})` : '';
@@ -702,7 +750,7 @@ async function runUpgrade(req, srv, held) {
 	// and this connection is not visible yet. Without this the handshake
 	// completes onto a process that is already past its drain, so the client
 	// gets no advisory, no 1012, and a 1006 when stop(true) lands.
-	if (isDraining()) return drainingResponse();
+	if (isDraining()) return drainingResponse(req);
 
 	// Paced LAST, immediately before the socket is taken, so a handshake only
 	// waits for its turn once everything that could refuse it has run. Waiting
@@ -727,7 +775,7 @@ async function runUpgrade(req, srv, held) {
 		// live connections and finished draining. It gets no advisory, no 1012,
 		// and a 1006 when stop(true) arrives, which is precisely what the
 		// earlier re-check was added to prevent.
-		if (isDraining()) return drainingResponse();
+		if (isDraining()) return drainingResponse(req);
 		// Re-checked after the wait: the client may have left while this
 		// handshake was parked, and the pacing queue can park it across many
 		// turns.
@@ -736,6 +784,12 @@ async function runUpgrade(req, srv, held) {
 		// returns true the socket may already have been handed to `open`, and a
 		// close arriving before this line would then release nothing.
 		data[WS_CONNECTION_PERMIT] = true;
+		// NOTHING MAY AWAIT BETWEEN THESE TWO LINES. An abort delivered in that
+		// gap runs the hang-up release while the marker already says the socket
+		// owns the permit, so the socket's close callback releases it a second
+		// time - and that throw comes out of the close callback, which is the
+		// failure this ordering exists to prevent.
+		//
 		// And handed over before the call, not after it. `srv.upgrade` dispatches
 		// `open` SYNCHRONOUSLY, so an `open` that closes its socket - refusing an
 		// unauthenticated session, enforcing one socket per user, or the control

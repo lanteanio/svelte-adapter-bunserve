@@ -346,14 +346,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Every upgrade refused before open is also counted under the reason that caused
   it, using svelte-adapter-uws's label names so the same event reads as the same
   word on both: `over_capacity`, `cursor_lane`, `connection_capacity`,
-  `deferred_overflow`, `bad_origin`, `auth_rejected`, `hook_error`. That covers
-  refusals no ceiling caused, and the counts are kept whether or not
-  `upgradeAdmission` is configured - counting them on the gate would have
-  published a confident zero for origin refusals on every server that never set
-  one. uws's remaining labels arrive with the features they belong to
-  (`protection`, `upgradeRateLimit`, `upgradeTimeout`, the auth endpoint); its
-  `duplicate_header` has no counterpart here at all, because repeated request
-  headers are merged before the adapter is entered.
+  `deferred_overflow`, `bad_origin`, `auth_rejected`, `hook_error`, plus
+  `draining`. Both spellings of an app-level refusal count as `auth_rejected` -
+  returning `false` and returning a `Response`, the latter being the form this
+  adapter's own docs lead with. `draining` is the one label with no uws
+  counterpart, because uws does not turn upgrades away while shutting down;
+  leaving it out would have made the total quietly wrong during exactly the
+  window an operator is watching a rollout. A refusal is not counted at all once
+  its client has hung up, as uws also declines to count those - a
+  connect-then-drop fleet must not be able to write its own noise into the
+  numbers an operator reads.
+
+  The counts are kept whether or not `upgradeAdmission` is configured. Keeping
+  them on the gate would have published a confident zero for origin refusals on
+  every server that never set a ceiling. uws's remaining labels arrive with the
+  features they belong to (`protection`, `upgradeRateLimit`, `upgradeTimeout`,
+  the auth endpoint); its `duplicate_header` has no counterpart here at all,
+  because repeated request headers are merged before the adapter is entered.
 
 - The liveness and readiness probes answered `GET` but 404'd `HEAD`, because
   both were gated behind a `GET` check that let every other method fall through

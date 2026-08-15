@@ -13,8 +13,12 @@ import { register } from 'node:module';
 // never configured a ceiling - a number that exists and is wrong, which is
 // worse than one that is missing.
 //
-// The reasons here are svelte-adapter-uws's labels for the same three refusals,
-// so the same event reads as the same word on both adapters.
+// The reasons here are svelte-adapter-uws's labels wherever uws has one for the
+// same refusal, so the same event reads as the same word on both adapters. Two
+// do not come from there: a hook returning a Response is an idiom uws's hook
+// cannot express, and it is labelled by what the refusal MEANS rather than by
+// copying a call site; and `draining` has no uws counterpart at all, because
+// uws does not turn upgrades away while shutting down.
 
 globalThis.ENV_PREFIX = '';
 globalThis.WS_PATH = '/ws';
@@ -124,6 +128,43 @@ test('an unusable handshake header from the hook is counted the same way', async
 	}
 });
 
+test('a hook that returns a Response is counted too, which is the documented spelling', async () => {
+	// The README leads with this form and treats `false` as the shorthand, and
+	// the live fixture's own `deny=1` uses it. Counting only `false` would have
+	// meant the counter reading zero on exactly the servers that reject most.
+	__setHooks({ upgrade: () => new Response('nope', { status: 403 }) });
+	try {
+		const before = upgradeRejectionCounts();
+		const res = await quietly(() => tryUpgrade(upgradeRequest('https://allowed.example'), srv, '/ws'));
+		assert.ok(res && res.status === 403, `the hook's own response goes out, got ${res && res.status}`);
+		assert.equal(upgradeRejectionCounts().auth_rejected, before.auth_rejected + 1);
+	} finally {
+		__setHooks({});
+	}
+});
+
+test('a refusal for a client that already left is not counted at all', async () => {
+	// A connect-then-drop fleet against an app with a slow auth hook would
+	// otherwise write its own noise into the numbers an operator reads to decide
+	// whether the app is turning people away. uws guards both of its post-hook
+	// refusals the same way.
+	__setHooks({ upgrade: () => false });
+	try {
+		const gone = new AbortController();
+		gone.abort();
+		const req = new Request('http://127.0.0.1/ws', {
+			headers: { upgrade: 'websocket', connection: 'Upgrade', origin: 'https://allowed.example' },
+			signal: gone.signal
+		});
+		const before = upgradeRejectionCounts();
+		const res = await quietly(() => tryUpgrade(req, srv, '/ws'));
+		assert.ok(res && res.status === 401, 'the refusal still happens');
+		assert.deepEqual(upgradeRejectionCounts(), before, 'but nothing was counted for a client that is gone');
+	} finally {
+		__setHooks({});
+	}
+});
+
 test('an unknown reason counts nowhere, and a snapshot is a copy', () => {
 	const before = upgradeRejectionCounts();
 	// A mistyped label must not invent a counter nobody reads, and inherited
@@ -143,4 +184,22 @@ test('an unknown reason counts nowhere, and a snapshot is a copy', () => {
 	const snapshot = upgradeRejectionCounts();
 	snapshot.bad_origin = 999;
 	assert.notEqual(upgradeRejectionCounts().bad_origin, 999, 'a held copy cannot write back');
+});
+
+test('a refusal because the server is draining is counted as such', async () => {
+	// LAST in the file: `beginDraining()` is a one-way latch, so every test after
+	// it would be testing a shutting-down server.
+	//
+	// The one label with no uws counterpart, because uws does not refuse
+	// upgrades while shutting down. Leaving it uncounted would make the total
+	// quietly wrong during exactly the window - a rolling deploy - when an
+	// operator is watching 503s and needs to tell "going away" from "full".
+	const { beginDraining } = await import('../../src/runtime/handler/ws-state.js');
+	const before = upgradeRejectionCounts();
+	beginDraining();
+	const res = await quietly(() => tryUpgrade(upgradeRequest('https://allowed.example'), srv, '/ws'));
+	assert.ok(res && res.status === 503, `a draining server refuses, got ${res && res.status}`);
+	assert.equal(res.headers.get('retry-after'), '1', 'and says to come back');
+	assert.equal(upgradeRejectionCounts().draining, before.draining + 1);
+	assert.equal(upgradeRejectionCounts().bad_origin, before.bad_origin, 'under its own reason only');
 });

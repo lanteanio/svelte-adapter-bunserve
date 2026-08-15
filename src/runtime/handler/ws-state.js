@@ -523,6 +523,13 @@ export const MAX_SEQ_TOPICS = 10_000;
  *
  * A refusal the RUNTIME makes (a handshake Bun itself rejects) is counted by
  * neither adapter.
+ *
+ * `draining` is the one label with no uws counterpart, because uws has no such
+ * refusal: it does not turn upgrades away while shutting down. Leaving it out
+ * would have made the total quietly wrong during exactly the window an operator
+ * is watching a rollout, so it is carried as a documented extra rather than as
+ * a gap - a dashboard reading by reason sees one more series here, and nothing
+ * it reads means something different.
  */
 export const UPGRADE_REJECTION_REASONS = Object.freeze([
 	'over_capacity',
@@ -531,7 +538,8 @@ export const UPGRADE_REJECTION_REASONS = Object.freeze([
 	'deferred_overflow',
 	'bad_origin',
 	'auth_rejected',
-	'hook_error'
+	'hook_error',
+	'draining'
 ]);
 
 /**
