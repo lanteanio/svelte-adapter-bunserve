@@ -321,7 +321,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connect-then-drop clients held the ceiling closed for a full hook latency
   behind clients that were already gone, which is precisely the storm the
   ceiling exists to shed. Both counters now come back when the client goes,
-  about ten milliseconds after the socket does. A handshake whose slots have
+  within tens of milliseconds of the socket doing so rather than whenever the
+  hook happens to finish. A handshake whose slots have
   already been returned is answered rather than upgraded, so a socket can never
   be handed a permit that is no longer held - that would have its close callback
   release one nobody took, which throws where it strands the app's `close` hook.

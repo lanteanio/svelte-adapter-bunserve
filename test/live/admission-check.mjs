@@ -113,8 +113,9 @@ try {
 	);
 
 	for (const sock of abandoned) sock.destroy();
-	// The runtime reports the hang-up on its own turn, about ten milliseconds
-	// after the socket goes (probed); this is that with room to spare.
+	// The runtime reports the hang-up on its own turn, within tens of
+	// milliseconds of the socket going (probe/bun-api-facts.report.md,
+	// upgrade-abort); this is that with room to spare.
 	await Bun.sleep(250);
 	let afterHangup = null;
 	try { afterHangup = await connect(); } catch { /* left null, checked below */ }

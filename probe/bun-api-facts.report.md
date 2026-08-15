@@ -1,6 +1,6 @@
 # Bun server API facts
 
-Generated 2026-08-01T02:49:00.146Z by `probe/bun-api-facts.mjs`.
+Generated 2026-08-15T15:36:36.874Z by `probe/bun-api-facts.mjs`.
 
 - Bun version: **1.3.14** (revision 0d9b296af33f2b851fcbf4df3e9ec89751734ba4)
 - Platform: win32/x64
@@ -193,7 +193,20 @@ Re-run after every Bun upgrade; review any diff before trusting the upgrade.
 - custom upgrade header present on the 101 response
   - true
 - raw 101 status line + headers
-  - HTTP/1.1 101 Switching Protocols | x-probe-upgrade: yes | Upgrade: websocket | Connection: Upgrade | Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo= | Date: Sat, 01 Aug 2026 02:48:56 GMT
+  - HTTP/1.1 101 Switching Protocols | x-probe-upgrade: yes | Upgrade: websocket | Connection: Upgrade | Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo= | Date: Sat, 15 Aug 2026 15:36:32 GMT
+
+## upgrade-abort
+
+- request.signal on an upgrade request is an AbortSignal
+  - true
+- and is not already aborted when fetch() is entered
+  - true
+- client hangs up 60ms into a 300ms hook: signal.aborted afterwards
+  - true
+- delay from the hang-up to the abort event, bucketed
+  - under 50ms
+- server.upgrade() on a request whose client already left
+  - returned false, open handler fired: false
 
 ## subprotocol
 

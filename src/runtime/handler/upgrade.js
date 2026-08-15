@@ -446,9 +446,11 @@ function heldSlots(cursor) {
  * full hook latency after the client has gone - and a fleet of connect-then-drop
  * clients is precisely the storm the ceiling exists to shed. uws hands both back
  * from `res.onAborted`; the request's abort signal is that same event here, and
- * this runtime fires it about ten milliseconds after the socket goes away
- * (probed). The listener is removed on the way out so a signal that outlives the
- * handshake cannot reach a closure whose accounting is already finished.
+ * this runtime fires it within tens of milliseconds of the socket going away
+ * rather than at the end of the hook, which is the property the release depends
+ * on (`probe/bun-api-facts.report.md`, upgrade-abort). The listener is removed
+ * on the way out so a signal that outlives the handshake cannot reach a closure
+ * whose accounting is already finished.
  *
  * @param {Request} req
  * @param {import('bun').Server} srv

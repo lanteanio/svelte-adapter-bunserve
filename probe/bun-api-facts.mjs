@@ -599,6 +599,79 @@ async function probeUpgradeFlow() {
 	}
 }
 
+async function probeUpgradeAbort() {
+	const section = 'upgrade-abort';
+	const seen = {};
+	const server = Bun.serve({
+		hostname: HOST, port: 0,
+		async fetch(req, srv) {
+			seen.isAbortSignal = req.signal instanceof AbortSignal;
+			seen.abortedAtEntry = req.signal.aborted;
+			const started = Bun.nanoseconds();
+			let firedAfterMs = null;
+			req.signal.addEventListener('abort', () => {
+				firedAfterMs = Math.round((Bun.nanoseconds() - started) / 1e6);
+			}, { once: true });
+			// Stands in for an application upgrade hook, which may await freely.
+			// The client hangs up partway through it.
+			await sleep(300);
+			seen.firedAfterMs = firedAfterMs;
+			seen.abortedAfterHook = req.signal.aborted;
+			seen.upgradeReturned = srv.upgrade(req, { data: {} });
+			if (seen.upgradeReturned) return undefined;
+			return new Response('not upgraded', { status: 400 });
+		},
+		websocket: { message() {}, open() { seen.openFired = true; } }
+	});
+	try {
+		const socket = await Bun.connect({
+			hostname: HOST, port: server.port,
+			socket: {
+				open(s) {
+					s.write(
+						`GET / HTTP/1.1\r\nHost: ${HOST}:${server.port}\r\n` +
+						'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
+						'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n' +
+						'Sec-WebSocket-Version: 13\r\n\r\n'
+					);
+				},
+				data() {},
+				error() {}
+			}
+		});
+		await sleep(60);
+		socket.end();
+		await sleep(400);
+		record(section, 'request.signal on an upgrade request is an AbortSignal', seen.isAbortSignal);
+		record(section, 'and is not already aborted when fetch() is entered', seen.abortedAtEntry === false);
+		record(
+			section,
+			'client hangs up 60ms into a 300ms hook: signal.aborted afterwards',
+			seen.abortedAfterHook
+		);
+		// A bucket rather than the reading, because the raw number differs on
+		// every run and this file is committed so that a CHANGE in behavior shows
+		// up as a diff. What the adapter depends on is that the event arrives
+		// promptly rather than at the end of the hook, so that is what is
+		// recorded: a delay that grew to the hook's own length would move it.
+		const delay = seen.firedAfterMs === null ? null : seen.firedAfterMs - 60;
+		record(
+			section,
+			'delay from the hang-up to the abort event, bucketed',
+			delay === null
+				? 'never fired'
+				: delay < 50 ? 'under 50ms' : delay < 200 ? 'under 200ms' : `${delay}ms`
+		);
+		record(
+			section,
+			'server.upgrade() on a request whose client already left',
+			`returned ${describeValue(seen.upgradeReturned)}, open handler fired: ${seen.openFired === true}`
+		);
+	} finally {
+		server.stop(true);
+	}
+}
+
 async function probeSubprotocolSelection() {
 	const section = 'subprotocol';
 	const server = Bun.serve({
@@ -793,6 +866,7 @@ const probes = [
 	probeMaxPayloadEnforcement,
 	probeMessageBufferLifetime,
 	probeUpgradeFlow,
+	probeUpgradeAbort,
 	probeSubprotocolSelection,
 	probeRoutesOption,
 	probeStopDrain,

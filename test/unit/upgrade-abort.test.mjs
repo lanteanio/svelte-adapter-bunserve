@@ -10,8 +10,9 @@ import { register } from 'node:module';
 // what makes it easy to miss: a storm of connect-then-drop clients pins
 // `maxConcurrent` for a full hook latency, and that storm is the exact thing the
 // ceiling exists to shed. uws returns both counters from `res.onAborted`; the
-// equivalent here is the request's abort signal, which this runtime fires about
-// ten milliseconds after the socket goes away (probed).
+// equivalent here is the request's abort signal, which this runtime fires within
+// tens of milliseconds of the socket going away rather than at the end of the
+// hook (`probe/bun-api-facts.report.md`, upgrade-abort).
 //
 // Every assertion below is about the state of the gate WHILE the hooks are still
 // parked. Anything measured after they settle would pass with no fix at all.
