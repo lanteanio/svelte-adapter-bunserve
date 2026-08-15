@@ -448,6 +448,32 @@ export function isDraining() {
 }
 
 /**
+ * Count one refused upgrade under the reason that refused it.
+ *
+ * An unrecognised reason is ignored rather than counted or thrown on: a
+ * mistyped label must not invent a counter nobody reads, and a refusal path is
+ * the last place that should be able to throw.
+ *
+ * @param {string} reason one of `UPGRADE_REJECTION_REASONS`
+ */
+export function recordUpgradeRejection(reason) {
+	if (!(reason in wsCounters.upgradeRejectedByReason)) return;
+	wsCounters.upgradeRejectedByReason[reason]++;
+	wsCounters.upgradeRejectedTotal++;
+}
+
+/**
+ * The refusal counts as they stand, keyed by reason. A copy, so a caller that
+ * holds one is reading the moment it asked about rather than an object that
+ * moves underneath it.
+ *
+ * @returns {Record<string, number>}
+ */
+export function upgradeRejectionCounts() {
+	return { ...wsCounters.upgradeRejectedByReason };
+}
+
+/**
  * Un-latch the drain flag (simulation/test harness only). Production never
  * un-drains - the process exits - but a sim runs many seeds in one process,
  * and a drain-lane scenario would otherwise leave every later seed's upgrades
@@ -479,6 +505,51 @@ export const MAX_SUBSCRIPTIONS_PER_CONNECTION =
  * evict it.
  */
 export const MAX_SEQ_TOPICS = 10_000;
+
+/**
+ * Why a WebSocket upgrade was refused before it opened.
+ *
+ * svelte-adapter-uws's label set for `upgrade_rejected_total{reason}`, narrowed
+ * to the refusals this adapter can actually perform, so a refusal reads as the
+ * same word on both and a dashboard built against one is not quietly wrong
+ * against the other. What uws has and this list does not:
+ *
+ * - `siege`, `ip_rate_limit`, `auth_timeout` and `auth_rate_limit` belong to
+ *   `protection`, `upgradeRateLimit`, `upgradeTimeout` and the auth endpoint -
+ *   all recorded parity gaps. Each label arrives with the feature.
+ * - `duplicate_header` is unreachable on this transport rather than unported:
+ *   repeated request headers are merged before the adapter is entered, so there
+ *   is no ambiguity here to refuse.
+ *
+ * A refusal the RUNTIME makes (a handshake Bun itself rejects) is counted by
+ * neither adapter.
+ */
+export const UPGRADE_REJECTION_REASONS = Object.freeze([
+	'over_capacity',
+	'cursor_lane',
+	'connection_capacity',
+	'deferred_overflow',
+	'bad_origin',
+	'auth_rejected',
+	'hook_error'
+]);
+
+/**
+ * A counts-by-reason bag with every reason present and zero.
+ *
+ * Null-prototype so a reason can never collide with an inherited key, and
+ * seeded so a read before the first refusal reports zeroes rather than an
+ * object that grows a key at a time - a consumer should not have to tell
+ * "no refusals yet" from "that reason does not exist".
+ *
+ * @returns {Record<string, number>}
+ */
+function seedRejectionCounts() {
+	/** @type {Record<string, number>} */
+	const counts = Object.create(null);
+	for (const reason of UPGRADE_REJECTION_REASONS) counts[reason] = 0;
+	return counts;
+}
 
 export const wsCounters = {
 	/**
@@ -578,7 +649,23 @@ export const wsCounters = {
 	 */
 	metricsSampleHook: null,
 	/** @type {(() => void) | null} */
-	postureExportHook: null
+	postureExportHook: null,
+
+	/**
+	 * WebSocket upgrades refused before open, by reason, and their total.
+	 *
+	 * Here rather than on the admission controller, which is the obvious home
+	 * and the wrong one: that controller does not exist unless
+	 * `websocket.upgradeAdmission` is configured, and most of these refusals
+	 * have nothing to do with admission. An origin refusal on a server with no
+	 * ceiling would have been counted nowhere, and the exporter that closes the
+	 * metrics parity gap would have published zeroes for it - the silent kind of
+	 * divergence, where the number exists and is wrong.
+	 *
+	 * @type {Record<string, number>}
+	 */
+	upgradeRejectedByReason: seedRejectionCounts(),
+	upgradeRejectedTotal: 0
 };
 
 /**

@@ -22,7 +22,7 @@ import { isUpgradeOriginAllowed } from '../utils/ws-origin.js';
 import { resolveRequestId } from '../utils/request-id.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
 import { processMonotonicNow, randomFloat, randomUuid } from '../runtime.js';
-import { WS_REQUEST_ID_KEY, isDraining } from './ws-state.js';
+import { WS_REQUEST_ID_KEY, isDraining, recordUpgradeRejection } from './ws-state.js';
 import { get_origin, origin, ws_options, ws_path } from './config.js';
 import { WS_CONNECTION_PERMIT, awaitAdmissionSlot, upgradeAdmission } from './admission.js';
 import { isCursorLaneUpgrade } from '../utils/upgrade-admission.js';
@@ -294,12 +294,12 @@ function shedDetail(gate, reason) {
  * @returns {Response}
  */
 function shed(reason) {
+	recordUpgradeRejection(reason);
 	// Unreachable with no controller, every call site being inside a null check
 	// already - but a capacity refusal must never be the thing that throws, so
-	// the counters are read through a guard rather than an assumption.
+	// the numbers in the line are read through a guard rather than an assumption.
 	const gate = upgradeAdmission;
 	if (gate === null) return shedResponse();
-	gate.recordRejection(reason);
 	const { log: logIt, count: n } = shedThrottles[reason]();
 	if (logIt) {
 		const { state, knob } = shedDetail(gate, reason);
@@ -394,8 +394,15 @@ function releaseLane(cursor) {
 	else upgradeAdmission.release();
 }
 
+/** The sibling of `releaseLane` for the whole-lifetime permit. */
+function releasePermit() {
+	if (upgradeAdmission === null) return;
+	upgradeAdmission.releaseConnection();
+}
+
 /**
- * The two counters one handshake took, each returnable exactly once.
+ * The two counters one handshake took, each returnable exactly once, plus the
+ * hang-up watch that can return them early.
  *
  * Once-only is the whole point: a hang-up and the handshake's own unwind both
  * end at a release, and `release()` / `releaseCursorInFlight()` are bare
@@ -404,31 +411,74 @@ function releaseLane(cursor) {
  * close callback and strands the app's close hook. uws keeps the same guard
  * (`inFlightReleased`) for the same reason.
  *
+ * @param {Request} req
  * @param {boolean} cursor whether the in-flight slot came from the cursor lane
  */
-function heldSlots(cursor) {
+function heldSlots(req, cursor) {
 	let lane = true;
 	let permit = true;
+	const onAbort = () => giveBack();
+	req.signal.addEventListener('abort', onAbort, { once: true });
+
+	function giveBack() {
+		if (lane) {
+			lane = false;
+			releaseLane(cursor);
+		}
+		if (permit) {
+			permit = false;
+			releasePermit();
+		}
+	}
+
+	function stopWatching() {
+		req.signal.removeEventListener('abort', onAbort);
+	}
+
 	return {
 		/** `true` while the connection permit is still this handshake's to give. */
 		get hasPermit() { return permit; },
 		/**
-		 * The socket exists and owns the permit from here on, so nothing on this
-		 * side releases it - its close callback does.
+		 * The permit is the socket's from here on - only its close callback
+		 * releases it. Called BEFORE the upgrade, not after: `open` is dispatched
+		 * synchronously inside `srv.upgrade`, so by the time that call returns a
+		 * socket may already have opened, closed, and released this permit.
+		 * The hang-up watch comes off in the same breath, because a socket
+		 * closing inside that call also fires this request's abort signal.
 		 */
-		handOver() { permit = false; },
-		/** Give back whatever is still held here. */
-		release() {
-			if (lane) {
-				lane = false;
-				releaseLane(cursor);
-			}
-			if (permit) {
-				permit = false;
-				upgradeAdmission.releaseConnection();
-			}
+		handOver() {
+			stopWatching();
+			permit = false;
+		},
+		/** Take the permit back when no socket took it after all. */
+		reclaim() { permit = true; },
+		/** Stop watching and give back whatever is still held here. */
+		settle() {
+			stopWatching();
+			giveBack();
 		}
 	};
+}
+
+/**
+ * Give the connection permit back when the upgrade produced no socket.
+ *
+ * Reads the same marker the close callback reads, which is what makes the two
+ * agree across every ordering. The close callback CLEARS it as it releases, so a
+ * marker still set means no socket ever owned the permit and this handshake owes
+ * it back; a marker already cleared means a socket took it and gave it back
+ * inside `srv.upgrade` itself - which is a real ordering, not a theoretical one,
+ * because an `open` hook that closes its socket runs to completion before that
+ * call returns.
+ *
+ * @param {Record<string, any>} data the userData handed to `srv.upgrade`
+ * @param {ReturnType<typeof heldSlots> | null} held
+ */
+function reclaimPermit(data, held) {
+	if (held === null) return;
+	if (data[WS_CONNECTION_PERMIT] !== true) return;
+	data[WS_CONNECTION_PERMIT] = false;
+	held.reclaim();
 }
 
 /**
@@ -448,9 +498,14 @@ function heldSlots(cursor) {
  * from `res.onAborted`; the request's abort signal is that same event here, and
  * this runtime fires it within tens of milliseconds of the socket going away
  * rather than at the end of the hook, which is the property the release depends
- * on (`probe/bun-api-facts.report.md`, upgrade-abort). The listener is removed
- * on the way out so a signal that outlives the handshake cannot reach a closure
- * whose accounting is already finished.
+ * on (`probe/bun-api-facts.report.md`, upgrade-abort).
+ *
+ * What this deliberately gives up, exactly as uws gives it up: while a hung-up
+ * handshake's hook keeps running, it is running OUTSIDE the ceiling. So
+ * `maxConcurrent` bounds handshakes in flight, not app hooks in flight, and a
+ * connect-then-drop fleet can hold more hooks open than the ceiling's number.
+ * Holding the slots instead would mean a storm of clients that have already left
+ * keeps out the clients that are still there, which is the worse trade.
  *
  * @param {Request} req
  * @param {import('bun').Server} srv
@@ -458,14 +513,11 @@ function heldSlots(cursor) {
  * @returns {Promise<Response | undefined>}
  */
 async function settleUpgrade(req, srv, cursor) {
-	const held = heldSlots(cursor);
-	const onAbort = () => held.release();
-	req.signal.addEventListener('abort', onAbort, { once: true });
+	const held = heldSlots(req, cursor);
 	try {
 		return await runUpgrade(req, srv, held);
 	} finally {
-		req.signal.removeEventListener('abort', onAbort);
-		held.release();
+		held.settle();
 	}
 }
 
@@ -524,10 +576,12 @@ async function runUpgrade(req, srv, held) {
 	// to the empty string too, so an empty selfOrigin would MATCH those rather
 	// than matching nothing.
 	if (ws_options.allowedOrigins === 'same-origin' && !selfOrigin) {
+		recordUpgradeRejection('bad_origin');
 		warnOriginRefused(req.headers.get('origin'), selfOrigin);
 		return new Response('Forbidden origin', { status: 403 });
 	}
 	if (!isUpgradeOriginAllowed(req.headers.get('origin'), selfOrigin, ws_options.allowedOrigins)) {
+		recordUpgradeRejection('bad_origin');
 		warnOriginRefused(req.headers.get('origin'), selfOrigin);
 		return new Response('Forbidden origin', { status: 403 });
 	}
@@ -566,6 +620,7 @@ async function runUpgrade(req, srv, held) {
 			// hook that throws on malformed input (`JSON.parse(cookie)`) turned
 			// one request into ~1KB of synchronous stderr. Measured 50 requests
 			// -> 601 stderr lines before the throttle.
+			recordUpgradeRejection('hook_error');
 			const { log: logIt, count: n } = upgradeThrewThrottle();
 			if (logIt) {
 				const suffix = n > 1 ? ` (occurrence ${n})` : '';
@@ -581,7 +636,10 @@ async function runUpgrade(req, srv, held) {
 		// to the generic userData path would complete the handshake with empty
 		// userData, so a hook whose auth check reads `if (!session) return false`
 		// would admit exactly the connections it means to refuse.
-		if (result === false) return new Response('Unauthorized', { status: 401 });
+		if (result === false) {
+			recordUpgradeRejection('auth_rejected');
+			return new Response('Unauthorized', { status: 401 });
+		}
 		if (Object.keys(ctxHeaders).length > 0) {
 			// VALIDATED before it reaches the 101. Moving the channel out of
 			// band stopped an attacker NAMING a header; it did nothing about an
@@ -594,6 +652,11 @@ async function runUpgrade(req, srv, held) {
 				// Throttled: reachable per request whenever the app echoes a
 				// client-controlled value into a header, which is the exact
 				// shape this check exists for.
+				// Counted as a hook error, which is where uws counts its own
+				// equivalent: there the same unusable value throws out of the
+				// response builder the app called, inside the hook. Same cause,
+				// same answer, so the same label.
+				recordUpgradeRejection('hook_error');
 				const { log: logIt, count: n } = badHeaderThrottle();
 				if (logIt) {
 					const suffix = n > 1 ? ` (occurrence ${n})` : '';
@@ -649,6 +712,13 @@ async function runUpgrade(req, srv, held) {
 	// tryUpgrade skips its wrapper: an await that is always taken costs a
 	// microtask on the unconfigured path and reorders the simulation.
 	if (upgradeAdmission !== null) {
+		// BEFORE the pacing wait, not after it. A handshake whose client has
+		// already gone cannot be completed, so spending a per-tick slot or a
+		// queue entry on it takes that place from a client who is still there -
+		// the connect-then-drop storm would simply move from the ceiling to the
+		// queue. Refusing it here also keeps it out of the shed counters, where
+		// it would report capacity pressure that never happened.
+		if (!held.hasPermit) return abandonedResponse();
 		if (!await awaitAdmissionSlot()) return shed('deferred_overflow');
 		// RE-CHECKED, for the reason the check above this exists. The pacing
 		// queue parks a handshake across however many turns the budget needs,
@@ -658,20 +728,24 @@ async function runUpgrade(req, srv, held) {
 		// and a 1006 when stop(true) arrives, which is precisely what the
 		// earlier re-check was added to prevent.
 		if (isDraining()) return drainingResponse();
-		// The client may have left while the hook ran or while this handshake
-		// waited its turn, in which case the abort listener has already handed
-		// both counters back. Marking the socket as holding a permit that is no
-		// longer held would have its close callback release one nobody took,
-		// which throws where it strands the app's close hook.
-		//
-		// Nothing awaits between here and `srv.upgrade` below, and an abort is
-		// delivered as a task - so the permit cannot be released in the gap, and
-		// this check is what the hand-over below relies on.
+		// Re-checked after the wait: the client may have left while this
+		// handshake was parked, and the pacing queue can park it across many
+		// turns.
 		if (!held.hasPermit) return abandonedResponse();
 		// Stamped before the upgrade rather than after: once `srv.upgrade`
 		// returns true the socket may already have been handed to `open`, and a
 		// close arriving before this line would then release nothing.
 		data[WS_CONNECTION_PERMIT] = true;
+		// And handed over before the call, not after it. `srv.upgrade` dispatches
+		// `open` SYNCHRONOUSLY, so an `open` that closes its socket - refusing an
+		// unauthenticated session, enforcing one socket per user, or the control
+		// -egress guard cutting the connection - runs the close callback, and
+		// with it the permit release, before this call returns. Holding the
+		// permit across the call means that release and this frame's own both
+		// count, which throws inside the close callback and strands every
+		// teardown behind it. Measured ordering: open, abort, close, then the
+		// return (`probe/bun-api-facts.report.md`, upgrade-abort).
+		held.handOver();
 	}
 
 	// GUARDED. Bun validates headers itself and throws on anything it dislikes;
@@ -683,6 +757,11 @@ async function runUpgrade(req, srv, held) {
 	try {
 		ok = srv.upgrade(req, responseHeaders ? { data, headers: responseHeaders } : { data });
 	} catch (err) {
+		// The permit was handed over on the way in, so take it back unless a
+		// socket existed long enough to release it itself.
+		reclaimPermit(data, held);
+		// Uncounted, as uws leaves it uncounted: a handshake the RUNTIME refused
+		// is not one of the reasons its rejection counter carries.
 		const { log: logIt, count: n } = upgradeThrewThrottle();
 		if (logIt) {
 			const suffix = n > 1 ? ` (occurrence ${n})` : '';
@@ -690,13 +769,10 @@ async function runUpgrade(req, srv, held) {
 		}
 		return new Response('WebSocket upgrade failed', { status: 400 });
 	}
-	if (ok) {
-		// The socket exists and its close callback now owns the permit.
-		if (held !== null) held.handOver();
-		return undefined;
-	}
+	if (ok) return undefined;
 
 	// Bun refused the handshake (a malformed request that carried the upgrade
 	// header). Nothing has been written yet, so a plain 400 is safe.
+	reclaimPermit(data, held);
 	return new Response('WebSocket upgrade failed', { status: 400 });
 }

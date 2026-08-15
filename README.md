@@ -459,6 +459,13 @@ PAGE at a crossed ceiling unless `waitingRoom: false`, and this adapter has no
 holding page - it always answers `503`. A config that asks for one builds and
 runs, and says at build time that the page will not be served.
 
+Two smaller differences in what a refusal looks like, both of them uws's to
+settle: uws omits `retry-after` on a cursor-lane refusal and on every refusal
+once the holding page is off, where this adapter always sends it; and uws
+reports refusals through its metrics registry rather than the log, so a runbook
+built on these lines has no counterpart there until `websocket.metrics` is
+supported here.
+
 Every one of these is PER CONNECTION, which is the honest scope and not the same
 as per client. A peer that reconnects after being cut gets a fresh budget, so
 none of them bounds an attacker who can open sockets in a loop; nothing here

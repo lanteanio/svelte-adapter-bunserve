@@ -322,7 +322,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behind clients that were already gone, which is precisely the storm the
   ceiling exists to shed. Both counters now come back when the client goes,
   within tens of milliseconds of the socket doing so rather than whenever the
-  hook happens to finish. A handshake whose slots have
+  hook happens to finish, and a handshake whose client left is answered without
+  spending a pacing turn a live client could have used. A handshake whose slots
+  have
   already been returned is answered rather than upgraded, so a socket can never
   be handed a permit that is no longer held - that would have its close callback
   release one nobody took, which throws where it strands the app's `close` hook.
@@ -332,14 +334,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A shed WebSocket upgrade was completely unobservable: no counter, no log line,
   nothing an operator could reach. A server refusing exactly as configured was
   indistinguishable from a broken one, and the quickest thing that made it stop
-  was removing the ceiling. Each refusal is now counted under the reason that
-  caused it - `over_capacity`, `cursor_lane`, `connection_capacity`,
-  `deferred_overflow`, which is svelte-adapter-uws's label set verbatim - and
-  says so once, naming what filled up, how full it was, and which key widens it.
-  Throttled with decay and per reason, so a lane that is refusing constantly
-  cannot silence the first refusal from a different ceiling, and a sustained
-  storm costs a handful of lines rather than one per refusal. Nothing about the
-  client is logged: a refusal is a statement about this server's capacity.
+  was removing the ceiling. A shed now says once what filled up, how full it was,
+  and which key widens it. Throttled with decay and per reason, so a lane that is
+  refusing constantly cannot silence the first refusal from a different ceiling,
+  and a sustained storm costs a handful of lines rather than one per refusal.
+  Nothing about the client is logged: a refusal is a statement about this
+  server's capacity. svelte-adapter-uws reports the same refusals through its
+  metrics registry, which is a recorded parity gap here, so the line is what an
+  operator has until that lands.
+
+  Every upgrade refused before open is also counted under the reason that caused
+  it, using svelte-adapter-uws's label names so the same event reads as the same
+  word on both: `over_capacity`, `cursor_lane`, `connection_capacity`,
+  `deferred_overflow`, `bad_origin`, `auth_rejected`, `hook_error`. That covers
+  refusals no ceiling caused, and the counts are kept whether or not
+  `upgradeAdmission` is configured - counting them on the gate would have
+  published a confident zero for origin refusals on every server that never set
+  one. uws's remaining labels arrive with the features they belong to
+  (`protection`, `upgradeRateLimit`, `upgradeTimeout`, the auth endpoint); its
+  `duplicate_header` has no counterpart here at all, because repeated request
+  headers are merged before the adapter is entered.
 
 - The liveness and readiness probes answered `GET` but 404'd `HEAD`, because
   both were gated behind a `GET` check that let every other method fall through

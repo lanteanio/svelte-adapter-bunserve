@@ -135,6 +135,13 @@ function resetSimState() {
 	wsCounters.activePosture = null;
 	wsCounters.metricsSampleHook = null;
 	wsCounters.postureExportHook = null;
+	// Refusal counts are cross-seed state like every counter above: a scenario
+	// that drives a refused upgrade would otherwise carry its tally into the next
+	// seed's run.
+	wsCounters.upgradeRejectedTotal = 0;
+	for (const reason of Object.keys(wsCounters.upgradeRejectedByReason)) {
+		wsCounters.upgradeRejectedByReason[reason] = 0;
+	}
 	topicPublishStats.clear();
 	lastPublishWarnAt.clear();
 	pressureListeners.clear();

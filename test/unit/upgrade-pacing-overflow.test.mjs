@@ -26,6 +26,8 @@ register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { tryUpgrade } = await import('../../src/runtime/handler/upgrade.js');
 const { upgradeAdmission } = await import('../../src/runtime/handler/admission.js');
+const { upgradeRejectionCounts, wsCounters } = await import('../../src/runtime/handler/ws-state.js');
+const { __setHooks } = await import('../helpers/ws-handler-stub.mjs');
 
 /** A server that accepts every upgrade and remembers how many it took. */
 function fakeServer() {
@@ -39,6 +41,14 @@ function fakeServer() {
 function upgradeRequest() {
 	return new Request('http://127.0.0.1/ws', {
 		headers: { upgrade: 'websocket', connection: 'Upgrade' }
+	});
+}
+
+/** The same handshake, with a client that can hang up on it. */
+function upgradeRequestWith(signal) {
+	return new Request('http://127.0.0.1/ws', {
+		headers: { upgrade: 'websocket', connection: 'Upgrade' },
+		signal
 	});
 }
 
@@ -69,8 +79,8 @@ test('a handshake with nowhere to wait is shed, counted, and named', async () =>
 		console.warn = real;
 	}
 
-	assert.equal(upgradeAdmission.rejectedByReason.deferred_overflow, 1, 'counted by reason');
-	assert.equal(upgradeAdmission.rejectedTotal, 1, 'and in the total');
+	assert.equal(upgradeRejectionCounts().deferred_overflow, 1, 'counted by reason');
+	assert.equal(wsCounters.upgradeRejectedTotal, 1, 'and in the total');
 	// Both counters, as uws keeps both: the reason-labelled one alongside the
 	// dedicated overflow counter, so a queue that is dropping work is visible
 	// without having to read the reason breakdown.
@@ -80,4 +90,43 @@ test('a handshake with nowhere to wait is shed, counted, and named', async () =>
 	assert.match(warnings[0], /pacing queue/, 'naming what refused it');
 	assert.match(warnings[0], /perTickBudget/, 'and the knob that widens it');
 	assert.equal(srv.taken, 1, 'only the admitted handshake reached the server');
+});
+
+test('a handshake whose client left spends no pacing budget on its way out', async () => {
+	// The budget is the scarce thing this fixture has, so a dead handshake that
+	// takes a turn takes it FROM a live one - the connect-then-drop storm just
+	// moves from the ceiling to the queue. Both handshakes park in the app hook,
+	// one client leaves, and both resume in the same tick: the live one must get
+	// the turn, and the dead one must not be counted as capacity pressure on its
+	// way out.
+	const srv = fakeServer();
+	const parked = [];
+	__setHooks({ upgrade: () => new Promise((resolve) => parked.push(resolve)) });
+	const refusedBefore = wsCounters.upgradeRejectedTotal;
+	// One macrotask first, so the drain has reset the budget the test above
+	// spent. Microtask drains do not run it, and a stale count would make this
+	// pass or fail on what a NEIGHBOUR did.
+	await new Promise((resolve) => setImmediate(resolve));
+
+	const gone = new AbortController();
+	const dead = tryUpgrade(upgradeRequestWith(gone.signal), srv, '/ws');
+	const live = tryUpgrade(upgradeRequestWith(new AbortController().signal), srv, '/ws');
+	for (let i = 0; i < 10; i++) await Promise.resolve();
+	assert.equal(parked.length, 2, 'both are inside the hook, ahead of the pacing wait');
+
+	gone.abort();
+	// Released together, so both continuations run in one tick and compete for
+	// the same single-slot budget.
+	for (const resolve of parked.splice(0)) resolve({});
+
+	const deadRes = await dead;
+	assert.ok(deadRes && deadRes.status === 503, 'the abandoned handshake is answered');
+	assert.equal(deadRes.headers.get('retry-after'), null, 'as abandoned, not as shed');
+	assert.equal(await live, undefined, 'and the live handshake got the tick it needed');
+	assert.equal(
+		wsCounters.upgradeRejectedTotal,
+		refusedBefore,
+		'a client that left is not a refusal anyone should act on'
+	);
+	__setHooks({});
 });

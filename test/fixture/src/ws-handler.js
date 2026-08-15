@@ -173,6 +173,13 @@ export async function upgrade(request, { headers }) {
 	// connection for the length of a run.
 	const hold = Math.min(5_000, Number(url.searchParams.get('hold')) || 0);
 	if (hold > 0) await new Promise((resolve) => setTimeout(resolve, hold));
+	// An app that turns a socket away from inside `open` - an unauthenticated
+	// session, one socket per user, a full room. The close runs synchronously
+	// inside the runtime's own upgrade call, which is where the adapter's permit
+	// accounting has to already have handed the permit over.
+	if (url.searchParams.get('closeOnOpen') === '1') {
+		return { closeOnOpen: true };
+	}
 	if (url.searchParams.get('deny') === '1') {
 		return new Response('nope', { status: 401 });
 	}
@@ -184,6 +191,14 @@ export async function upgrade(request, { headers }) {
 }
 
 export function open(ws, { platform }) {
+	// Turned away here, synchronously, before anything else happens on this
+	// connection. This is the shape the adapter's permit hand-over has to
+	// survive: the close callback runs inside the runtime's upgrade call, so a
+	// handshake still holding the permit at that moment releases it twice.
+	if (ws.getUserData().closeOnOpen) {
+		ws.end(4003, 'refused by the app');
+		return;
+	}
 	// Retained on purpose and never released; see LEAK_INJECT. Filled so the
 	// bytes are unambiguously touched on any allocator that maps lazily. On Bun
 	// it made no measurable difference across four isolated trials - the filled

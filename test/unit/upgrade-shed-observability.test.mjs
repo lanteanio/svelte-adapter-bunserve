@@ -30,6 +30,7 @@ register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { tryUpgrade } = await import('../../src/runtime/handler/upgrade.js');
 const { upgradeAdmission } = await import('../../src/runtime/handler/admission.js');
+const { upgradeRejectionCounts, wsCounters } = await import('../../src/runtime/handler/ws-state.js');
 const { CURSOR_LANE_SUBPROTOCOL } = await import('../../src/runtime/utils/upgrade-admission.js');
 const { __setHooks } = await import('../helpers/ws-handler-stub.mjs');
 
@@ -85,11 +86,32 @@ async function capturingWarnings(fn) {
 	}
 }
 
+/**
+ * Admit until the permit pool is full, and hand back how many got in. The
+ * refusal that ends the loop is a shed like any other, so it runs inside a
+ * capture - otherwise every run of the suite prints capacity warnings that
+ * belong to the setup rather than to anything under test.
+ *
+ * @param {{ upgrade: () => boolean }} srv
+ */
+async function fillPermits(srv) {
+	let admitted = 0;
+	await capturingWarnings(async () => {
+		for (;;) {
+			const res = await tryUpgrade(upgradeRequest(), srv, '/ws');
+			if (res !== undefined) return;
+			admitted++;
+			assert.ok(admitted <= upgradeAdmission.maxConnections, 'the ceiling must bind eventually');
+		}
+	});
+	return admitted;
+}
+
 test('the controller is live for this fixture, so the checks below can fail', () => {
 	assert.notEqual(upgradeAdmission, null, 'admission is configured');
 	assert.equal(upgradeAdmission.maxConcurrent, 4);
 	assert.equal(upgradeAdmission.cursorMaxConcurrent, 1, 'a lane of one, carved from four');
-	assert.equal(upgradeAdmission.rejectedTotal, 0, 'nothing has been refused yet');
+	assert.equal(wsCounters.upgradeRejectedTotal, 0, 'nothing has been refused yet');
 });
 
 test('a shed at the concurrent-upgrade ceiling is counted and named', async () => {
@@ -100,16 +122,16 @@ test('a shed at the concurrent-upgrade ceiling is counted and named', async () =
 	await settle();
 	assert.equal(upgradeAdmission.inFlight, 4, 'the main lane is full');
 
-	const before = upgradeAdmission.rejectedByReason;
+	const before = upgradeRejectionCounts();
 	const { result, warnings } = await capturingWarnings(
 		() => tryUpgrade(upgradeRequest(), srv, '/ws')
 	);
 	assert.ok(result && result.status === 503, 'the fifth handshake is shed');
 
-	const after = upgradeAdmission.rejectedByReason;
+	const after = upgradeRejectionCounts();
 	assert.equal(after.over_capacity, before.over_capacity + 1, 'counted under its own reason');
 	assert.equal(after.cursor_lane, before.cursor_lane, 'and under no other');
-	assert.equal(upgradeAdmission.rejectedTotal, 1, 'and in the total');
+	assert.equal(wsCounters.upgradeRejectedTotal, 1, 'and in the total');
 
 	assert.equal(warnings.length, 1, 'and said out loud, once');
 	assert.match(warnings[0], /concurrent-upgrade ceiling/, 'naming which ceiling refused it');
@@ -132,13 +154,13 @@ test('a shed on the cursor sub-budget names the lane, not the main ceiling', asy
 	assert.equal(upgradeAdmission.cursorInFlight, 1, 'the lane is full');
 	assert.equal(upgradeAdmission.inFlight, 1, 'while the main lane has room to spare');
 
-	const before = upgradeAdmission.rejectedByReason;
+	const before = upgradeRejectionCounts();
 	const { result, warnings } = await capturingWarnings(
 		() => tryUpgrade(upgradeRequest({ cursor: true }), srv, '/ws')
 	);
 	assert.ok(result && result.status === 503, 'the second cursor handshake is shed');
 
-	const after = upgradeAdmission.rejectedByReason;
+	const after = upgradeRejectionCounts();
 	assert.equal(after.cursor_lane, before.cursor_lane + 1, 'counted as a lane refusal');
 	assert.equal(after.over_capacity, before.over_capacity, 'not as main-lane pressure');
 
@@ -150,6 +172,41 @@ test('a shed on the cursor sub-budget names the lane, not the main ceiling', asy
 
 	releaseHooks();
 	await held;
+
+	// AND THE LANE EMPTIES. A cursor handshake holds a slot in each of two
+	// counters, so a completed one that gives back the main slot instead of the
+	// cursor slot leaves the sub-budget permanently spent - a lane of one that
+	// refuses every cursor socket after the first, on an idle server, which is
+	// the exact defect this file's neighbour was written for. The shed above
+	// cannot see it: a full lane looks the same either way.
+	assert.equal(upgradeAdmission.cursorInFlight, 0, 'the completed cursor upgrade freed its lane slot');
+	const again = await tryUpgrade(upgradeRequest({ cursor: true }), srv, '/ws');
+	assert.equal(again, undefined, 'so the next cursor handshake is admitted, not shed');
+	assert.equal(upgradeAdmission.cursorInFlight, 0, 'and that one freed its slot too');
+});
+
+test('a cursor handshake refused by the connection ceiling still frees its lane slot', async () => {
+	// The refusal path takes the lane slot before it asks for a permit, so it
+	// has to hand back the CURSOR slot when the permit is denied. Handing back
+	// the main one instead leaks the sub-budget one refusal at a time, which
+	// again ends with a lane that refuses everything.
+	const srv = fakeServer();
+	releaseHooks();
+	// Fill the permit pool, so the next handshake is refused for want of a
+	// permit rather than for want of a lane.
+	await fillPermits(srv);
+	assert.equal(upgradeAdmission.cursorInFlight, 0, 'the lane starts empty');
+
+	const before = upgradeRejectionCounts();
+	const refused = await tryUpgrade(upgradeRequest({ cursor: true }), srv, '/ws');
+	assert.ok(refused && refused.status === 503, 'the cursor handshake is refused');
+	assert.equal(
+		upgradeRejectionCounts().connection_capacity,
+		before.connection_capacity + 1,
+		'for want of a permit, not for want of a lane'
+	);
+	assert.equal(upgradeAdmission.cursorInFlight, 0, 'and its lane slot went back');
+	assert.equal(upgradeAdmission.inFlight, 0, 'along with the main-lane slot it shares');
 });
 
 test('a shed at the connection ceiling names that ceiling', async () => {
@@ -159,29 +216,22 @@ test('a shed at the connection ceiling names that ceiling', async () => {
 	// cannot be what refuses.
 	const srv = fakeServer();
 	releaseHooks();
-	let admitted = 0;
-	for (;;) {
-		const res = await tryUpgrade(upgradeRequest(), srv, '/ws');
-		if (res !== undefined) break;
-		admitted++;
-		assert.ok(admitted <= upgradeAdmission.maxConnections, 'the ceiling must bind eventually');
-	}
+	await fillPermits(srv);
 	assert.equal(upgradeAdmission.connectionPermits, upgradeAdmission.maxConnections, 'the pool is full');
 	assert.equal(upgradeAdmission.inFlight, 0, 'and nothing is in flight, so the lane is not what refused');
 
-	const before = upgradeAdmission.rejectedByReason;
+	const before = upgradeRejectionCounts();
 	const { result, warnings } = await capturingWarnings(
 		() => tryUpgrade(upgradeRequest(), srv, '/ws')
 	);
 	assert.ok(result && result.status === 503);
 
-	const after = upgradeAdmission.rejectedByReason;
+	const after = upgradeRejectionCounts();
 	assert.equal(after.connection_capacity, before.connection_capacity + 1);
 	assert.equal(after.over_capacity, before.over_capacity, 'an empty lane is not over capacity');
 
-	assert.ok(warnings.length >= 1);
-	const line = warnings[warnings.length - 1];
-	assert.match(line, /connection ceiling/, 'naming the ceiling');
-	assert.match(line, /6 of 6/, 'with both sides of the comparison');
-	assert.match(line, /maxConnections/, 'and the knob that raises it');
+	assert.equal(warnings.length, 1, 'said once');
+	assert.match(warnings[0], /connection ceiling/, 'naming the ceiling');
+	assert.match(warnings[0], /6 of 6/, 'with both sides of the comparison');
+	assert.match(warnings[0], /maxConnections/, 'and the knob that raises it');
 });

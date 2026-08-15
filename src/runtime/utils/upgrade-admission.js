@@ -25,23 +25,6 @@ const DEFAULT_MAX_DEFERRED = 1024;
 export const CURSOR_LANE_SUBPROTOCOL = 'svelte-realtime-cursor';
 
 /**
- * Why an upgrade was refused for want of capacity.
- *
- * uws's label set, verbatim: these are the values its rejection counter carries,
- * so the same refusal reads as the same word on both adapters and a dashboard
- * built against one is not silently wrong against the other. The exporter that
- * publishes them is a recorded parity gap here; the counters exist so that when
- * it lands it has something true to read, and so an operator reading a log line
- * today and a metric tomorrow sees one vocabulary.
- */
-export const UPGRADE_REJECTION_REASONS = Object.freeze([
-	'over_capacity',
-	'cursor_lane',
-	'connection_capacity',
-	'deferred_overflow'
-]);
-
-/**
  * `true` when the comma-separated `Sec-WebSocket-Protocol` request header lists
  * the cursor-lane token. Pure so the token parsing is unit-testable and
  * isolated from the upgrade hot path. Trims each offered token so the common
@@ -132,13 +115,6 @@ export function createUpgradeAdmission(opts) {
 	let deferredTail = 0;
 	let deferredDepth = 0;
 	let deferredRejectedTotal = 0;
-	// Null-prototype so a reason can never collide with an inherited key, and
-	// seeded with every reason so a breakdown read before the first refusal
-	// reports zeroes rather than an object that grows a key at a time.
-	/** @type {Record<string, number>} */
-	const rejectedByReason = Object.create(null);
-	for (const reason of UPGRADE_REJECTION_REASONS) rejectedByReason[reason] = 0;
-	let rejectedTotal = 0;
 	/** @type {null | ((depth: number, oldestAgeMs: number, rejectedTotal: number) => void)} */
 	let deferredObserver = null;
 	let drainScheduled = false;
@@ -260,30 +236,6 @@ export function createUpgradeAdmission(opts) {
 		get deferredOldestAgeMs() { return oldestDeferredAgeMs(); },
 		/** Callbacks refused because the finite pacing queue was full. */
 		get deferredRejectedTotal() { return deferredRejectedTotal; },
-		/**
-		 * Count one refused upgrade under the reason that refused it.
-		 *
-		 * The controller counts rather than the caller, because the counters
-		 * have to outlive whichever call site produced them - the same numbers
-		 * are what a metrics exporter reads. An unrecognised reason is ignored:
-		 * a mistyped label must not invent a counter nobody reads, and must
-		 * never be able to turn a shed into a throw on the refusal path.
-		 *
-		 * @param {string} reason one of `UPGRADE_REJECTION_REASONS`
-		 */
-		recordRejection(reason) {
-			if (!(reason in rejectedByReason)) return;
-			rejectedByReason[reason]++;
-			rejectedTotal++;
-		},
-		/** Upgrades refused for want of capacity, whatever the reason. */
-		get rejectedTotal() { return rejectedTotal; },
-		/**
-		 * A snapshot of the refusal counts, keyed by reason. A copy, so a reader
-		 * that holds it is reading the moment it asked about rather than a live
-		 * object that moves under it.
-		 */
-		get rejectedByReason() { return { ...rejectedByReason }; },
 		/**
 		 * Install the internal metrics observer. It receives an initial snapshot
 		 * and every later enqueue, overflow, and drain transition.

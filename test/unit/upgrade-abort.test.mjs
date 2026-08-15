@@ -33,6 +33,7 @@ register('../helpers/ws-handler-loader.mjs', import.meta.url);
 const { tryUpgrade } = await import('../../src/runtime/handler/upgrade.js');
 const { upgradeAdmission } = await import('../../src/runtime/handler/admission.js');
 const { __setHooks } = await import('../helpers/ws-handler-stub.mjs');
+const { wsCounters } = await import('../../src/runtime/handler/ws-state.js');
 
 /** A server that accepts every upgrade and remembers how many it took. */
 function fakeServer() {
@@ -79,6 +80,7 @@ test('the controller is live for this fixture, so the checks below can fail', ()
 
 test('a client that hangs up mid-hook gives both counters back before the hook settles', async () => {
 	const srv = fakeServer();
+	const refusedBefore = wsCounters.upgradeRejectedTotal;
 	const first = new AbortController();
 	const second = new AbortController();
 
@@ -116,6 +118,17 @@ test('a client that hangs up mid-hook gives both counters back before the hook s
 	const abandonedB = await b;
 	assert.ok(abandonedA && abandonedA.status === 503, 'an abandoned handshake is answered, not upgraded');
 	assert.ok(abandonedB && abandonedB.status === 503);
+	// NOT a shed, though it shares the status. A client that left is not
+	// capacity pressure, so it carries no retry-after and moves no counter -
+	// otherwise a fleet of connect-then-drop clients would report a storm the
+	// server never had, in the very numbers an operator would reach for to
+	// decide whether the ceiling is too low.
+	assert.equal(abandonedA.headers.get('retry-after'), null, 'nothing to come back for');
+	assert.equal(
+		wsCounters.upgradeRejectedTotal,
+		refusedBefore + 1,
+		'only the genuine shed was counted'
+	);
 	assert.equal(srv.taken, 1, 'and the runtime was never asked to take a socket for a client that left');
 
 	// No slot is released twice: `release()` and `releaseConnection()` are bare

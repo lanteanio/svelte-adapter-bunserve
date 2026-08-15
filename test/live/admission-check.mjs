@@ -47,6 +47,28 @@ function closeAndSettle(ws) {
 }
 
 /**
+ * Open a socket and resolve with how it ended, for the cases where the server
+ * is expected to close it rather than serve it.
+ *
+ * @param {string} query
+ * @returns {Promise<{ code: number, wasClean: boolean }>}
+ */
+function connectAndWait(query) {
+	return new Promise((resolve) => {
+		const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws${query}`);
+		const timer = setTimeout(() => resolve({ code: 0, wasClean: false }), 5_000);
+		ws.addEventListener('close', (e) => {
+			clearTimeout(timer);
+			resolve({ code: e.code, wasClean: e.wasClean });
+		});
+		ws.addEventListener('error', () => {
+			clearTimeout(timer);
+			resolve({ code: -1, wasClean: false });
+		});
+	});
+}
+
+/**
  * Start a handshake over a raw socket and leave it in flight, so this suite can
  * hang up at a moment of its choosing. A WebSocket client cannot express that:
  * it either completes the handshake or errors, and the window this needs is the
@@ -101,7 +123,11 @@ try {
 	// spent. Bounded by hook latency rather than permanent, which is exactly why
 	// no test caught it: everything here reads correct again the moment the hook
 	// returns, so a suite that waits for the handshake to finish sees nothing.
-	const abandoned = [beginHandshake('?hold=1000'), beginHandshake('?hold=1000')];
+	// A LONG hold on purpose. The hook releases these permits by itself when it
+	// returns, so the margin between the probe below and that moment is the
+	// margin by which this check tests the fix rather than the clock: at a 1s
+	// hold it was under half a second, which a loaded box can eat.
+	const abandoned = [beginHandshake('?hold=4000'), beginHandshake('?hold=4000')];
 	await Bun.sleep(250);
 	const whileHeld = await fetch(`${BASE}/ws`, {
 		headers: { upgrade: 'websocket', connection: 'Upgrade' }
@@ -126,7 +152,35 @@ try {
 	// unwinding cannot land in the middle of a later check. They resolve into a
 	// handshake whose client is long gone, which must produce no socket and
 	// release nothing a second time - the checks below would report either.
-	await Bun.sleep(900);
+	await Bun.sleep(3900);
+
+	// AN `open` HOOK THAT CLOSES ITS SOCKET, which the runtime runs
+	// synchronously inside its own upgrade call - so the close callback, and
+	// with it the permit release, happens before that call has returned. A
+	// handshake that still believes it owns the permit at that point releases it
+	// twice, and the second release throws from inside the close callback, where
+	// it strands the app's close hook and takes the process with it. Three
+	// clients in a row, because the first would look fine either way: it is the
+	// second that finds a ceiling ratcheted down by the first.
+	for (let i = 0; i < 3; i++) {
+		const refused = await connectAndWait('?closeOnOpen=1');
+		check(
+			`an app that closes the socket in \`open\` leaves the server serving (${i + 1}/3)`,
+			refused.code === 4003,
+			`got code ${refused.code}, clean=${refused.wasClean}`
+		);
+	}
+	// And the process is still there. Guarded rather than bare: the failure this
+	// is watching for KILLS the server, so an unguarded fetch would throw
+	// ConnectionRefused out of the suite and report a crash instead of a failed
+	// check - and every check after it would never run.
+	let healthy = 0;
+	try {
+		healthy = (await fetch(`${BASE}/healthz`)).status;
+	} catch (err) {
+		healthy = `unreachable (${err.code || err.message})`;
+	}
+	check('and the server is still serving afterwards', healthy === 200, `got ${healthy}`);
 
 	// The ceiling is two, so two must be admitted.
 	for (let i = 0; i < 2; i++) {
