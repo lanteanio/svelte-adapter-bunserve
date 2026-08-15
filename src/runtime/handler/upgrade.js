@@ -222,6 +222,98 @@ function shedResponse() {
 }
 
 /**
+ * Sheds, throttled with decay - one schedule per reason, so a lane that is
+ * refusing constantly cannot silence the first refusal from a different ceiling.
+ * Four fixed categories, so this cannot grow with traffic.
+ */
+const shedThrottles = {
+	over_capacity: createLogThrottle(() => processMonotonicNow()),
+	cursor_lane: createLogThrottle(() => processMonotonicNow()),
+	connection_capacity: createLogThrottle(() => processMonotonicNow()),
+	deferred_overflow: createLogThrottle(() => processMonotonicNow())
+};
+
+/**
+ * Which ceiling refused this upgrade, in an operator's terms: what filled up,
+ * how full it is, and which option widens it. Both sides of the comparison are
+ * named for the reason the origin refusal names both of its own - "full" without
+ * the numbers cannot tell a ceiling that is one short from one set to zero.
+ *
+ * Read at refusal time, so the numbers are the ones that did the refusing.
+ *
+ * @param {NonNullable<typeof upgradeAdmission>} gate
+ * @param {string} reason
+ * @returns {{ state: string, knob: string }}
+ */
+function shedDetail(gate, reason) {
+	switch (reason) {
+		case 'cursor_lane':
+			return {
+				// The main lane's headroom is part of the diagnostic: a cursor
+				// refusal while the main lane is nearly empty is the sub-budget
+				// doing its job, and raising maxConcurrent would not move it.
+				state: `the cursor lane is full (${gate.cursorInFlight} of ${gate.cursorMaxConcurrent} ` +
+					`in flight, main lane ${gate.inFlight} of ${gate.maxConcurrent})`,
+				knob: 'websocket.upgradeAdmission.cursorLane.fraction'
+			};
+		case 'connection_capacity':
+			return {
+				state: `the connection ceiling is full (${gate.connectionPermits} of ` +
+					`${gate.maxConnections} reserved or live)`,
+				knob: 'websocket.upgradeAdmission.maxConnections'
+			};
+		case 'deferred_overflow':
+			return {
+				state: `the pacing queue is full (${gate.deferredDepth} of ${gate.maxDeferred} waiting)`,
+				knob: 'websocket.upgradeAdmission.perTickBudget or .maxDeferred'
+			};
+		default:
+			return {
+				state: `the concurrent-upgrade ceiling is full (${gate.inFlight} of ` +
+					`${gate.maxConcurrent} in flight)`,
+				knob: 'websocket.upgradeAdmission.maxConcurrent'
+			};
+	}
+}
+
+/**
+ * Refuse an upgrade for want of capacity: count it, say so, and answer.
+ *
+ * A silent shed is the failure mode this file already names on the origin
+ * refusal - the page loads, the socket gets a 503, and the server logs nothing,
+ * so a ceiling doing precisely what it was configured to do is indistinguishable
+ * from an outage, and the fastest thing that "fixes" it is to turn the ceiling
+ * off. The counters are what an exporter reads; the line is what an operator
+ * reads today. Neither says anything about the client - no address, no origin,
+ * no headers - because a refusal is about this server's capacity.
+ *
+ * Every capacity refusal goes through here, which is what keeps a later one from
+ * being added without its counter.
+ *
+ * @param {'over_capacity' | 'cursor_lane' | 'connection_capacity' | 'deferred_overflow'} reason
+ * @returns {Response}
+ */
+function shed(reason) {
+	// Unreachable with no controller, every call site being inside a null check
+	// already - but a capacity refusal must never be the thing that throws, so
+	// the counters are read through a guard rather than an assumption.
+	const gate = upgradeAdmission;
+	if (gate === null) return shedResponse();
+	gate.recordRejection(reason);
+	const { log: logIt, count: n } = shedThrottles[reason]();
+	if (logIt) {
+		const { state, knob } = shedDetail(gate, reason);
+		const suffix = n > 1 ? ` (occurrence ${n})` : '';
+		console.warn(
+			`[ws] shed a WebSocket upgrade${suffix}: ${state}.\n` +
+			`  The client was told to retry. This is the ceiling working; raise ${knob}\n` +
+			'  only if a healthy server is refusing steady-state traffic rather than shedding a burst.'
+		);
+	}
+	return shedResponse();
+}
+
+/**
  * Handle a request that targets the WebSocket endpoint.
  *
  * @param {Request} req
@@ -275,13 +367,16 @@ export function tryUpgrade(req, srv, pathname) {
 	const cursorLaneEnabled = upgradeAdmission.cursorMaxConcurrent > 0;
 	const cursor = cursorLaneEnabled && isCursorLaneUpgrade(req.headers.get('sec-websocket-protocol'));
 	if (cursor) {
-		if (!upgradeAdmission.tryAcquireCursor()) return Promise.resolve(shedResponse());
+		// Every cursor refusal is reported as a lane refusal, including one the
+		// main ceiling caused, because that is the label uws gives it - and a
+		// cursor socket that cannot connect is a cursor-lane symptom either way.
+		if (!upgradeAdmission.tryAcquireCursor()) return Promise.resolve(shed('cursor_lane'));
 	} else if (!upgradeAdmission.tryAcquire()) {
-		return Promise.resolve(shedResponse());
+		return Promise.resolve(shed('over_capacity'));
 	}
 	if (!upgradeAdmission.tryAcquireConnection()) {
 		releaseLane(cursor);
-		return Promise.resolve(shedResponse());
+		return Promise.resolve(shed('connection_capacity'));
 	}
 	return settleUpgrade(req, srv, cursor);
 }
@@ -552,7 +647,7 @@ async function runUpgrade(req, srv, held) {
 	// tryUpgrade skips its wrapper: an await that is always taken costs a
 	// microtask on the unconfigured path and reorders the simulation.
 	if (upgradeAdmission !== null) {
-		if (!await awaitAdmissionSlot()) return shedResponse();
+		if (!await awaitAdmissionSlot()) return shed('deferred_overflow');
 		// RE-CHECKED, for the reason the check above this exists. The pacing
 		// queue parks a handshake across however many turns the budget needs,
 		// and the drain latch is taken synchronously on SIGTERM - so a socket

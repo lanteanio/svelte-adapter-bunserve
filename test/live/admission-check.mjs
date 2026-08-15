@@ -80,6 +80,14 @@ const proc = Bun.spawn([process.execPath, BUILD], {
 	stderr: 'pipe'
 });
 
+// Collected as it arrives rather than read at the end: the checks below assert
+// that a shed upgrade SAYS SO, and the stream ends when the process does.
+let serverErr = '';
+const errCollected = (async () => {
+	const decoder = new TextDecoder();
+	for await (const chunk of proc.stderr) serverErr += decoder.decode(chunk, { stream: true });
+})().catch(() => { /* the pipe closing with the process is the normal ending */ });
+
 /** @type {WebSocket[]} */
 const open = [];
 try {
@@ -189,6 +197,30 @@ try {
 	try { proc.kill(); } catch { /* already gone */ }
 	await proc.exited;
 }
+
+await errCollected;
+
+// A shed upgrade that says nothing is the operational trap this adapter already
+// names on the origin refusal: the page loads, the socket gets a 503, and the
+// server logs nothing - so a ceiling working as configured looks like an outage,
+// and the fastest thing that makes it stop is to turn the ceiling off. Asserted
+// against the real process's stderr, because a counter nobody can reach is not
+// observability.
+check(
+	'a shed upgrade says so on the server',
+	serverErr.includes('[ws] shed a WebSocket upgrade'),
+	serverErr ? serverErr.slice(0, 300) : '(nothing on stderr)'
+);
+check(
+	'and names the ceiling that refused it, with both sides of the comparison',
+	/connection ceiling is full \(2 of 2 reserved or live\)/.test(serverErr),
+	serverErr ? serverErr.slice(0, 300) : '(nothing on stderr)'
+);
+check(
+	'and the knob that raises it',
+	serverErr.includes('websocket.upgradeAdmission.maxConnections'),
+	serverErr ? serverErr.slice(0, 300) : '(nothing on stderr)'
+);
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed) {

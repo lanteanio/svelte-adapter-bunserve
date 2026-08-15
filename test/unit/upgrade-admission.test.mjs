@@ -1,7 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createUpgradeAdmission, isCursorLaneUpgrade } from '../../src/runtime/utils/upgrade-admission.js';
+import {
+	UPGRADE_REJECTION_REASONS,
+	createUpgradeAdmission,
+	isCursorLaneUpgrade
+} from '../../src/runtime/utils/upgrade-admission.js';
 import { normalizeWsOptions } from '../../src/runtime/utils/ws-options.js';
 
 // Admission control for the upgrade path. These pin the CONTRACT rather than
@@ -416,4 +420,42 @@ test('the cursor lane needs the main ceiling to have room, not just its own', ()
 	assert.equal(a.tryAcquire(), true, 'main ceiling now full');
 	assert.equal(a.tryAcquireCursor(), false, 'refused although the sub-budget is untouched');
 	assert.equal(a.cursorInFlight, 0, 'and nothing was consumed by the refusal');
+});
+
+test('refusals are counted per reason, and an unknown reason counts nowhere', () => {
+	const a = createUpgradeAdmission({ maxConcurrent: 1 });
+	// Seeded rather than grown a key at a time: a breakdown read before the
+	// first refusal has to report zeroes, not an empty object a consumer then
+	// has to treat as a special case.
+	assert.deepEqual(
+		a.rejectedByReason,
+		{ over_capacity: 0, cursor_lane: 0, connection_capacity: 0, deferred_overflow: 0 }
+	);
+	assert.equal(a.rejectedTotal, 0);
+
+	for (const reason of UPGRADE_REJECTION_REASONS) a.recordRejection(reason);
+	assert.equal(a.rejectedTotal, UPGRADE_REJECTION_REASONS.length);
+	assert.deepEqual(
+		a.rejectedByReason,
+		{ over_capacity: 1, cursor_lane: 1, connection_capacity: 1, deferred_overflow: 1 }
+	);
+
+	// A mistyped label must not invent a counter nobody reads, and inherited
+	// keys are not labels: without a null-prototype bag, 'constructor' would
+	// pass the membership check and then increment a function.
+	a.recordRejection('nonsense');
+	a.recordRejection('constructor');
+	a.recordRejection('__proto__');
+	assert.equal(a.rejectedTotal, UPGRADE_REJECTION_REASONS.length, 'the total did not move');
+	assert.deepEqual(
+		a.rejectedByReason,
+		{ over_capacity: 1, cursor_lane: 1, connection_capacity: 1, deferred_overflow: 1 }
+	);
+
+	// A snapshot is a copy: a caller holding one is reading the moment it
+	// asked about, and mutating it cannot reach the controller's own counts.
+	const snapshot = a.rejectedByReason;
+	snapshot.over_capacity = 99;
+	a.recordRejection('over_capacity');
+	assert.equal(a.rejectedByReason.over_capacity, 2);
 });

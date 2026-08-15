@@ -328,6 +328,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The default configuration gates nothing and is untouched, wrapper and abort
   listener alike.
 
+- A shed WebSocket upgrade was completely unobservable: no counter, no log line,
+  nothing an operator could reach. A server refusing exactly as configured was
+  indistinguishable from a broken one, and the quickest thing that made it stop
+  was removing the ceiling. Each refusal is now counted under the reason that
+  caused it - `over_capacity`, `cursor_lane`, `connection_capacity`,
+  `deferred_overflow`, which is svelte-adapter-uws's label set verbatim - and
+  says so once, naming what filled up, how full it was, and which key widens it.
+  Throttled with decay and per reason, so a lane that is refusing constantly
+  cannot silence the first refusal from a different ceiling, and a sustained
+  storm costs a handful of lines rather than one per refusal. Nothing about the
+  client is logged: a refusal is a statement about this server's capacity.
+
 - The liveness and readiness probes answered `GET` but 404'd `HEAD`, because
   both were gated behind a `GET` check that let every other method fall through
   to the SSR catch-all. A load balancer or uptime monitor configured to probe

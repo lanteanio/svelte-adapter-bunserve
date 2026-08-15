@@ -443,9 +443,14 @@ with `retry-after: 2` rather than accepting a socket it cannot serve.
   cursor-only lane, so a flood of cursor reconnects can never starve ordinary
   WebSocket admission. Omit it and the lane does not exist.
 
-A client that hangs up mid-handshake gives its slot and its permit back at the
-hang-up rather than when your `upgrade` hook finishes, so a storm of
-connect-then-drop clients cannot hold the ceiling closed behind them.
+A shed upgrade is not silent. The server says which ceiling refused it, how full
+that ceiling was, and which key widens it, throttled so a sustained storm costs a
+handful of lines rather than one per refusal. Silence there is the trap: from the
+client side a gate doing exactly what it was configured to do is
+indistinguishable from an outage, and the quickest thing that makes it stop is
+removing the ceiling. A client that hangs up mid-handshake gives its slot and its
+permit back at the hang-up rather than when your `upgrade` hook finishes, so a
+storm of connect-then-drop clients cannot hold the ceiling closed behind them.
 
 The block is spelled as `svelte-adapter-uws` spells it, with the same defaults
 and the same accepted values, so a config moved between the two adapters gates
