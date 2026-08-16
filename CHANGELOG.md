@@ -147,6 +147,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CI also gains the pinned-Bun probe job (a Bun upgrade that breaks an
   observed behavior fails loudly) and the determinism seam scan.
 
+- The simulator models what the runtime does when a socket closes: the request
+  it was upgraded from ends, and it ends BEFORE the close callback runs. That
+  matters for a socket the app closes from inside `open`, which is dispatched
+  synchronously inside `server.upgrade()` - modelling the close without the
+  abort left a handshake's hang-up watch armed while its own socket tore down,
+  so the interleaving that releases an admission permit twice could not occur
+  under simulation at all.
+
 - An injectable runtime seam (`src/runtime/runtime.js`): every clock, RNG and
   timer read in the served runtime goes through named helpers over one
   swappable environment - identical in shape to svelte-adapter-uws's seam -

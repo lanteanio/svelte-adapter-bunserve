@@ -71,8 +71,10 @@ export function createInMemoryApp(opts) {
 	/**
 	 * @param {any} data - the userData object srv.upgrade was handed
 	 * @param {{ deliver: Function, onServerClose: Function }} clientSide
+	 * @param {() => void} endRequest - abort the signal of the request this
+	 *   socket was upgraded from; see the call in `close()`
 	 */
-	function makeRawWs(data, clientSide) {
+	function makeRawWs(data, clientSide, endRequest) {
 		/** @type {Set<string>} native membership (the stand-in for Bun's topic tree) */
 		const topics = new Set();
 		const id = connSeq++;
@@ -125,6 +127,25 @@ export function createInMemoryApp(opts) {
 				if (raw.readyState !== 1) return;
 				raw.readyState = 3;
 				connections.delete(raw);
+				// THE SOCKET GOING AWAY ENDS ITS REQUEST, and it does so BEFORE the
+				// close callback runs. Measured on Bun for the case that matters -
+				// an app closing its socket from inside `open`, which is dispatched
+				// synchronously inside `srv.upgrade`:
+				//
+				//   before upgrade -> open enters -> abort -> close -> open exits
+				//
+				// (probe/bun-api-facts.report.md, upgrade-dispatch-order). Without
+				// this the simulator models the close and silently drops the abort,
+				// so a handshake that is still holding its counters when its own
+				// socket closes never learns of it - which is one half of the exact
+				// ordering the upgrade path is built around, and the half that
+				// produces a DOUBLE release rather than a leak.
+				//
+				// Ordinarily nothing is listening by now: a handshake that completed
+				// takes its abort listener off as it hands the permit over. That is
+				// the point - the only run in which this is observable at all is one
+				// where the socket closed while its handshake was still in flight.
+				endRequest();
 				websocketHandlers.close(raw, code, String(reason));
 				clientSide.onServerClose(code, String(reason));
 			},
@@ -151,7 +172,7 @@ export function createInMemoryApp(opts) {
 	 * tryUpgrade is async (the app's upgrade hook may await), so several
 	 * connects can be in flight at once; the Request object is the correlation
 	 * key between connect() and the srv.upgrade() call the dispatch makes.
-	 * @type {WeakMap<Request, { clientSide: any, onUpgraded: (raw: any) => void }>}
+	 * @type {WeakMap<Request, { clientSide: any, onUpgraded: (raw: any) => void, endRequest: () => void }>}
 	 */
 	const pendingUpgrades = new WeakMap();
 
@@ -189,7 +210,7 @@ export function createInMemoryApp(opts) {
 			if (!pending) return false;
 			pendingUpgrades.delete(req);
 			const data = opts2 && opts2.data && typeof opts2.data === 'object' ? opts2.data : {};
-			const raw = makeRawWs(data, pending.clientSide);
+			const raw = makeRawWs(data, pending.clientSide, pending.endRequest);
 			connections.add(raw);
 			websocketHandlers.open(raw);
 			pending.onUpgraded(raw);
@@ -252,6 +273,11 @@ export function createInMemoryApp(opts) {
 		const req = new Request(url, { headers, signal: client.signal });
 		pendingUpgrades.set(req, {
 			clientSide,
+			// The same controller `hangUp()` uses, because on a real server they are
+			// the same event: the client's connection ended. It reaches the server
+			// as an abort whether the client walked away mid-handshake or the server
+			// itself closed the socket it had just been given.
+			endRequest: () => client.abort(),
 			onUpgraded(raw) {
 				serverWs = raw;
 				// NOT unconditional. `websocketHandlers.open(raw)` runs before
@@ -339,6 +365,14 @@ export function createInMemoryApp(opts) {
 				client.abort();
 				return true;
 			},
+			/**
+			 * Whether this client's REQUEST has ended, which is a different
+			 * question from whether the connection is closed. The server learns of
+			 * it as an abort, and it is what every hang-up branch in the upgrade
+			 * path keys on - including the one that fires when the server closes
+			 * the socket it was just given, from inside `open`.
+			 */
+			get requestEnded() { return client.signal.aborted; },
 			get serverWs() { return serverWs; }
 		};
 		return facade;

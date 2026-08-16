@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+// Dependency-free and reads no global, so it is safe to import before the
+// server options below are installed.
+import { normalizeWsOptions } from '../../src/runtime/utils/ws-options.js';
 
 // THE SIMULATOR, DRIVEN THROUGH THE TWO ORDERINGS IT COULD NOT SEE.
 //
@@ -20,13 +23,17 @@ import assert from 'node:assert/strict';
 
 globalThis.ENV_PREFIX = '';
 globalThis.WS_PATH = '/ws';
-globalThis.WS_OPTIONS = {
+// NORMALIZED, because a raw object is not a server. The keys below are the ones
+// these tests are about; a built server also carries the subscription cap, the
+// control-egress budget and the gate concurrency, and a handler reading those
+// and finding `undefined` is not the handler a deployment runs.
+globalThis.WS_OPTIONS = normalizeWsOptions({
 	allowedOrigins: 'any',
 	path: '/ws',
 	handler: 'src/ws-handler.js',
 	allowUnauthenticatedSubscribe: true,
 	upgradeAdmission: { maxConcurrent: 2, maxConnections: 2 }
-};
+}).options;
 
 // Imported for its side effects as much as its exports: it registers the sim
 // loader and installs the seeded environment seam that the handler graph reads.
@@ -90,6 +97,57 @@ test('a socket closed inside the open hook is reported closed, not open', async 
 	} finally {
 		__setSimHooks({});
 	}
+});
+
+test('closing the socket inside `open` ends its request, which is how the runtime behaves', async () => {
+	// THE HALF THE SIMULATOR USED TO DROP. On Bun the socket going away ends the
+	// request it was upgraded from, and it does so BEFORE the close callback:
+	//
+	//   before upgrade -> open enters -> abort -> close -> open exits
+	//
+	// (probe/bun-api-facts.report.md, upgrade-dispatch-order). Modelling the
+	// close without the abort left the handshake's hang-up watch armed while its
+	// own socket tore down - so the interleaving that releases the permit TWICE
+	// could not occur here, and the corpus could not fail on it. It is the
+	// double release that is fatal: `releaseConnection` throws, and that throw
+	// leaves through the close callback.
+	__setSimHooks({
+		open: (ws) => { ws.end(4001, 'refused by the app'); }
+	});
+	try {
+		const sim = newApp();
+		const client = sim.connect();
+		await settle();
+
+		assert.equal(client.requestEnded, true, 'the request ended with the socket');
+		assert.equal(client.state, 'closed');
+		// And the accounting survived it: one release, not two. An over-release
+		// throws rather than miscounting, so a passing assertion here is also the
+		// statement that nothing threw.
+		assert.equal(upgradeAdmission.connectionPermits, 0);
+		assert.equal(upgradeAdmission.inFlight, 0);
+	} finally {
+		__setSimHooks({});
+	}
+});
+
+test('a connection that stays open has not ended its request', async () => {
+	// The other side of the rule, so the abort models a socket ENDING rather
+	// than a socket existing. Without this, wiring that fired on every upgrade
+	// would pass the test above and make every later hang-up branch unreachable
+	// for the opposite reason.
+	const sim = newApp();
+	const client = sim.connect();
+	await settle();
+
+	assert.equal(client.state, 'open');
+	assert.equal(client.requestEnded, false);
+	assert.equal(upgradeAdmission.connectionPermits, 1, 'and it is holding its permit');
+
+	client.close(1000, 'done');
+	await settle();
+	assert.equal(client.requestEnded, true, 'ending it later ends the request too');
+	assert.equal(upgradeAdmission.connectionPermits, 0, 'and returns the permit exactly once');
 });
 
 test('a client that hangs up mid-hook gives the ceiling back inside the sim too', async () => {
