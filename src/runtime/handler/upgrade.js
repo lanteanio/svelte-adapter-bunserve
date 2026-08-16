@@ -21,9 +21,9 @@ import { wsModule } from '../ws-handler-bridge.js';
 import { isUpgradeOriginAllowed } from '../utils/ws-origin.js';
 import { resolveRequestId } from '../utils/request-id.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
-import { processMonotonicNow, randomFloat, randomUuid } from '../runtime.js';
+import { clearTimer, processMonotonicNow, randomFloat, randomUuid, setTimer } from '../runtime.js';
 import { WS_REQUEST_ID_KEY, isDraining, recordUpgradeRejection } from './ws-state.js';
-import { get_origin, origin, ws_options, ws_path } from './config.js';
+import { get_origin, origin, upgrade_timeout_ms, ws_options, ws_path } from './config.js';
 import { WS_CONNECTION_PERMIT, awaitAdmissionSlot, upgradeAdmission } from './admission.js';
 import { isCursorLaneUpgrade } from '../utils/upgrade-admission.js';
 
@@ -252,6 +252,91 @@ function shedResponse() {
 		status: 503,
 		headers: { 'retry-after': String(retryAfter), 'content-type': 'text/plain' }
 	});
+}
+
+/**
+ * What a hook that ran out of time resolves to.
+ *
+ * A Symbol rather than a value, because every ordinary shape the hook can
+ * return is already meaningful here: an object is userData, `false` and a
+ * `Response` are rejections, and `undefined` is "no userData". There is no
+ * spare value left to mean "this never answered", and a hook cannot fabricate
+ * this one.
+ */
+const HOOK_TIMED_OUT = Symbol('adapter.upgradeTimeout');
+
+/** Hook timeouts, throttled with decay. */
+const upgradeTimedOutThrottle = createLogThrottle(() => processMonotonicNow());
+
+/**
+ * Wait for the app's `upgrade` hook, giving up after `websocket.upgradeTimeout`.
+ *
+ * The timeout bounds the HOOK rather than the handshake, which is what makes it
+ * worth having: a hook that awaits a database, an identity provider or a lock
+ * is the part that can hang, and while it hangs the handshake is holding an
+ * in-flight slot and a connection permit that no other client can use. Without
+ * a bound, one unreachable dependency turns the whole upgrade ceiling into a
+ * queue of handshakes that will never finish.
+ *
+ * A hook that answered WITHOUT a promise cannot time out, so it never arms a
+ * timer - the common path stays exactly as cheap as it was. The timer is
+ * cleared the moment the hook settles, either way: an armed timer per pending
+ * handshake, left to expire on its own, is a retained callback per upgrade and
+ * enough of them to matter on a server doing thousands.
+ *
+ * A hook that resolves LATE resolves into nothing. Its value is dropped and a
+ * late rejection is swallowed here rather than escaping as an unhandled one,
+ * because by then this handshake has already been answered.
+ *
+ * @param {any} pending whatever the hook returned
+ * @returns {any} the hook's value, or `HOOK_TIMED_OUT`
+ */
+function awaitUpgradeHook(pending) {
+	if (upgrade_timeout_ms <= 0) return pending;
+	if (pending === null || typeof pending !== 'object' || typeof pending.then !== 'function') {
+		return pending;
+	}
+	return new Promise((resolve, reject) => {
+		const timer = setTimer(() => resolve(HOOK_TIMED_OUT), upgrade_timeout_ms);
+		pending.then(
+			(value) => { clearTimer(timer); resolve(value); },
+			(err) => { clearTimer(timer); reject(err); }
+		);
+	});
+}
+
+/**
+ * What a timed-out handshake gets. The status is uws's, and so is the absence
+ * of a `retry-after`: nothing here says the app's hook will answer any faster
+ * in two seconds than it did in ten, so this is not a capacity refusal wearing
+ * a different number.
+ */
+function timedOutResponse() {
+	return new Response('Upgrade timed out', {
+		status: 504,
+		headers: { 'content-type': 'text/plain' }
+	});
+}
+
+/**
+ * Say that the app's `upgrade` hook did not answer in time.
+ *
+ * Worth a line, unlike the shed refusals: a crossed ceiling is the server
+ * working as configured, while this is a dependency the hook is waiting on that
+ * is not answering - and the symptom without it is sockets that 504 for no
+ * stated reason. Throttled with decay, because whatever the hook is waiting for
+ * is usually not answering for anyone.
+ */
+function warnUpgradeTimedOut() {
+	const { log: logIt, count: n } = upgradeTimedOutThrottle();
+	if (!logIt) return;
+	const suffix = n > 1 ? ` (occurrence ${n})` : '';
+	console.warn(
+		`[ws] the upgrade hook did not answer within ${upgrade_timeout_ms / 1000}s${suffix}; ` +
+		'the handshake was refused with 504 and its admission slots were returned. ' +
+		'Something the hook awaits is not responding. Raise `websocket.upgradeTimeout`, ' +
+		'or set it to 0 to wait indefinitely.'
+	);
 }
 
 /**
@@ -655,7 +740,9 @@ async function runUpgrade(req, srv, held) {
 		const ctxHeaders = {};
 		let result;
 		try {
-			result = await wsModule.upgrade(req, { platform, headers: ctxHeaders });
+			// The hook is CALLED inside the try, so a synchronous throw still takes
+			// the hook-error path below rather than escaping the handshake.
+			result = await awaitUpgradeHook(wsModule.upgrade(req, { platform, headers: ctxHeaders }));
 		} catch (err) {
 			// Throttled like every other hook-error site. This one is the
 			// CHEAPEST to drive - plain HTTP, no socket, no Origin needed - so a
@@ -669,6 +756,14 @@ async function runUpgrade(req, srv, held) {
 				console.error(`WebSocket upgrade error${suffix}:`, err);
 			}
 			return new Response('Internal Server Error', { status: 500 });
+		}
+		// Checked BEFORE every shape the hook could have returned. A hook that
+		// eventually produces a Response, or userData, has still not produced it
+		// in time, and reading a late answer here would answer the client twice.
+		if (result === HOOK_TIMED_OUT) {
+			recordRefusal(req, 'auth_timeout');
+			warnUpgradeTimedOut();
+			return timedOutResponse();
 		}
 		// A Response from the hook IS the rejection, verbatim - status, body,
 		// headers. This is why there is no separate upgradeResponse type here.

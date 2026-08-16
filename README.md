@@ -328,6 +328,7 @@ adapter: bunserve({
 		maxConcurrentUnsubscribeHooks: 64,
 		maxQueuedUnsubscribeHooks: 1024,
 		maxControlEgressBytes: 4 * 1024 * 1024,
+		upgradeTimeout: 10,                 // seconds the `upgrade` hook may take; 0 waits forever
 		// Admission control for the upgrade path. Every layer is OFF unless
 		// you set it; omit the block entirely and nothing is gated.
 		upgradeAdmission: {
@@ -416,6 +417,17 @@ are different jobs rather than different sizes of the same one:
   marker the budget cannot afford therefore CUTS the connection rather than
   being dropped - a client that reconnects cold-resyncs, which is what the
   marker says.
+
+`upgradeTimeout` bounds the one part of a handshake that can hang: your
+`upgrade` hook. It awaits a database, an identity provider or a lock, and while
+it waits the handshake is holding an admission slot and a connection permit no
+other client can have - so one unreachable dependency turns the ceiling below
+into a queue of handshakes that never finish. A hook that outruns the bound is
+refused with `504 Gateway Timeout`, its counters are returned, and a value it
+produces afterwards is discarded rather than upgrading a client that has already
+been told no. Ten seconds by default, in seconds because that is the unit
+svelte-adapter-uws declares it in; `0` waits indefinitely. A hook that answers
+without a promise never arms a timer at all.
 
 `upgradeAdmission` is separate from all of those: they bound what one
 established connection may do, and this bounds whether a connection is

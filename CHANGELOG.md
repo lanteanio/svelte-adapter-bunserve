@@ -102,6 +102,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   page. Accepting the key keeps a uws config building; a config that asks for
   the page is told at build time that it will get a `503` instead.
 
+- `websocket.upgradeTimeout`, in seconds, bounding how long the app's `upgrade`
+  hook may take before the handshake is refused with `504 Gateway Timeout`.
+  Spelled and defaulted as svelte-adapter-uws spells it, **including the default
+  of 10 seconds** - so an app whose hook legitimately takes longer than that now
+  gets a 504 where it previously waited indefinitely, and should set the bound it
+  wants or `0` to keep waiting. The hook is the part of a handshake that can
+  hang: it awaits a database, an identity provider or a lock, and while it waits
+  the handshake holds an admission slot and a connection permit that no other
+  client can have, so one unreachable dependency would otherwise turn the whole
+  upgrade ceiling into a queue of handshakes that never finish. A timed-out
+  handshake returns both counters, is counted as
+  `upgrade_rejected_total{reason: "auth_timeout"}`, and says so once per throttle
+  window - a crossed ceiling is the server working as configured, but this is a
+  dependency that is not answering, and the symptom without a line is sockets
+  that 504 for no stated reason. A hook that resolves afterwards resolves into
+  nothing: its value is discarded rather than upgrading a client that has already
+  been refused, and a late rejection is swallowed rather than escaping as an
+  unhandled one. A hook that answers WITHOUT a promise arms no timer at all, so
+  the common path is unchanged.
+
 - The pressure observability surface and LEASE/REQUEST_N flow control,
   matching svelte-adapter-uws: `platform.pressure` (the live 1 Hz
   snapshot - saturation value, reason, publish rate, subscriber ratio,

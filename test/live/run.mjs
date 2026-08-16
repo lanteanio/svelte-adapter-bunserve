@@ -52,6 +52,7 @@ const buildEnv = {
 	NO_WS: '',
 	STATIC_DOTFILES: '',
 	WS_ADMISSION: '',
+	WS_UPGRADE_TIMEOUT: '',
 	NODE_ENV: 'production'
 };
 
@@ -95,6 +96,19 @@ const builtAdmission = await run('build fixture (WS_ADMISSION)', [process.execPa
 });
 if (builtAdmission) {
 	await run('admission-check', [process.execPath, suite('admission-check.mjs')]);
+}
+
+// Its own build again, and for the same shape of reason: the admission suite
+// above hangs a handshake open for four seconds deliberately, so a bound short
+// enough for a test to reach would answer that handshake before it could be
+// abandoned. The bound only fires on a REAL clock, which is the whole reason
+// this is a live suite - the unit lane drives it on a virtual one.
+const builtUpgradeTimeout = await run('build fixture (WS_UPGRADE_TIMEOUT)', [process.execPath, 'run', 'build'], {
+	cwd: fixtureDir,
+	env: { ...buildEnv, WS_UPGRADE_TIMEOUT: '1' }
+});
+if (builtUpgradeTimeout) {
+	await run('upgrade-timeout-check', [process.execPath, suite('upgrade-timeout-check.mjs')]);
 }
 
 if (failures.length) {

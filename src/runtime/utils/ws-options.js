@@ -65,6 +65,13 @@ const DEFAULTS = {
 	// defaults and each signal's meaning). undefined means "sampler defaults";
 	// the sampler always runs when the WS surface exists, so this only TUNES.
 	pressure: undefined,
+	// How long the app's `upgrade` hook may take, in seconds, before the
+	// handshake is refused with a 504. Seconds and a default of 10 because that
+	// is what uws declares; `0` disables it. It bounds the HOOK, not the
+	// handshake: a hook that awaits a database or an identity provider is the
+	// thing that hangs, and a hung handshake holds an admission slot and a
+	// connection permit the whole time it waits.
+	upgradeTimeout: 10,
 	// Admission control for the upgrade path: concurrent-handshake ceiling,
 	// whole-lifetime connection ceiling, per-tick pacing with a finite queue,
 	// and the deprioritised cursor lane. undefined means every layer is off,
@@ -349,6 +356,26 @@ export function normalizeWsOptions(input) {
 	}
 	if (raw.maxBackpressure !== undefined) {
 		options.maxBackpressure = requirePositiveInt(raw.maxBackpressure, 'maxBackpressure');
+	}
+	if (raw.upgradeTimeout !== undefined) {
+		const seconds = raw.upgradeTimeout;
+		// Any finite non-negative NUMBER, not an integer. uws guards this one as
+		// a protective number rather than an integer, so `upgradeTimeout: 0.5` is
+		// a valid config there - and a config that builds on one adapter and
+		// throws on the other is the exact failure this parity exists to remove.
+		// The bound is protective, so a non-number cannot fall back to the
+		// default: every comparison against one is false, which would disable the
+		// timeout rather than restore it.
+		if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) {
+			throw new Error(
+				'adapter option `websocket.upgradeTimeout` must be a non-negative, finite number of ' +
+				`seconds, got ${JSON.stringify(seconds)}. Use 0 to disable the timeout deliberately; ` +
+				'anything unrecognized would disable it silently, because a comparison against a ' +
+				'non-number is false. If the value comes from the environment, convert it explicitly ' +
+				'(e.g. Number(process.env.WS_UPGRADE_TIMEOUT)).'
+			);
+		}
+		options.upgradeTimeout = seconds;
 	}
 	if (raw.idleTimeout !== undefined) {
 		const idle = raw.idleTimeout;

@@ -105,7 +105,6 @@ const WS_OPTION_GAPS = {
 	authorizeWireSubscribe: 'wire-subscribe authorization',
 	upgradeRateLimit: 'admission control',
 	upgradeRateLimitWindow: 'admission control',
-	upgradeTimeout: 'admission control',
 	consistencyAuditIntervalMs: 'background audits',
 	resourceGrowthAuditIntervalMs: 'background audits',
 	stateHashIntervalMs: 'background audits',

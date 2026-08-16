@@ -46,6 +46,21 @@ export const allow_system_topic_subscribe = ws_options?.allowSystemTopicSubscrib
  */
 export const allow_unauthenticated_subscribe = ws_options?.allowUnauthenticatedSubscribe === true;
 
+/**
+ * How long the app's `upgrade` hook may take before the handshake is refused,
+ * in MILLISECONDS - the option is declared in seconds, because that is the unit
+ * uws declares it in, and the runtime wants the other one.
+ *
+ * Resolved once here rather than read per upgrade: this sits on the handshake
+ * path, and the value cannot change for the life of the process. `0` disables
+ * the timeout, and so does any value the normalizer did not produce - a server
+ * built before the option existed has no key here at all.
+ */
+export const upgrade_timeout_ms = typeof ws_options?.upgradeTimeout === 'number'
+	&& Number.isFinite(ws_options.upgradeTimeout) && ws_options.upgradeTimeout > 0
+	? ws_options.upgradeTimeout * 1000
+	: 0;
+
 export const ssl_cert = env('SSL_CERT', '');
 
 export const ssl_key = env('SSL_KEY', '');

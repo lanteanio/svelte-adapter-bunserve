@@ -92,6 +92,15 @@ const CORPORA = {
 			path: '/ws',
 			handler: 'src/ws-handler.js',
 			allowUnauthenticatedSubscribe: true,
+			// OFF, and it has to be. A virtual clock does not wait out a timeout,
+			// it JUMPS to it: with any bound armed, the scheduler's next move from
+			// a parked handshake is to advance time to the moment it expires. Every
+			// hook this workload parks would then be answered by the timeout before
+			// anything else could happen to it - so the client leaving mid-handshake,
+			// which is half of what this corpus exists for, would become unreachable
+			// rather than merely rarer. The bound is about wall-clock time, so it is
+			// covered where wall-clock time is real: the unit lane and the live lane.
+			upgradeTimeout: 0,
 			// All four layers, configured together because that is the only way
 			// their INTERACTIONS are pinned: the cursor lane carves its sub-budget
 			// out of `maxConcurrent`, pacing parks a handshake across ticks while

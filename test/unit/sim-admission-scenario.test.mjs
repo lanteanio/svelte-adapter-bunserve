@@ -28,6 +28,10 @@ globalThis.WS_OPTIONS = normalizeWsOptions({
 	path: '/ws',
 	handler: 'src/ws-handler.js',
 	allowUnauthenticatedSubscribe: true,
+	// The corpus server's own setting, and for its reason: a virtual clock jumps
+	// to a timeout rather than waiting it out, so any bound armed here would
+	// answer every parked handshake before a client could leave inside one.
+	upgradeTimeout: 0,
 	upgradeAdmission: {
 		maxConcurrent: 4,
 		maxConnections: 5,

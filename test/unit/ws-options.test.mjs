@@ -46,6 +46,44 @@ test('the bounds the README documents are the bounds an app gets', () => {
 	assert.equal(options.publishToSelf, false);
 });
 
+test('upgradeTimeout defaults to the ten seconds uws defaults to', () => {
+	// A carried config that names no timeout has to get the same bound on both
+	// adapters, or the same hung dependency 504s on one and hangs on the other.
+	const { options } = normalizeWsOptions(undefined);
+	assert.equal(options.upgradeTimeout, 10);
+});
+
+test('upgradeTimeout accepts a fractional number of seconds, as uws does', () => {
+	// uws guards this one as a protective NUMBER rather than an integer, so
+	// `0.5` is a valid config there. Refusing it here would fail a build that
+	// succeeds on the sibling, which is the exact difference this parity exists
+	// to remove.
+	assert.equal(normalizeWsOptions({ upgradeTimeout: 0.5 }).options.upgradeTimeout, 0.5);
+	assert.equal(normalizeWsOptions({ upgradeTimeout: 30 }).options.upgradeTimeout, 30);
+});
+
+test('upgradeTimeout of 0 disables the bound and is not an error', () => {
+	// The documented spelling for "wait indefinitely". It has to be reachable
+	// deliberately, because the alternative an app reaches for otherwise is a
+	// very large number, which is a different thing.
+	assert.equal(normalizeWsOptions({ upgradeTimeout: 0 }).options.upgradeTimeout, 0);
+});
+
+test('an unusable upgradeTimeout fails the build rather than disabling itself', () => {
+	// The failure this refusal exists for: the runtime compares against this
+	// bound, every comparison against a non-number is false, and so a value the
+	// normalizer waved through would turn the timeout OFF while the config says
+	// it is on. A string is the realistic way to get here - an unconverted
+	// environment variable.
+	for (const bad of ['10', null, {}, [], NaN, Infinity, -1, -0.5, true]) {
+		assert.throws(
+			() => normalizeWsOptions({ upgradeTimeout: bad }),
+			/upgradeTimeout.*non-negative, finite number/s,
+			`refuses ${JSON.stringify(bad) ?? String(bad)}`
+		);
+	}
+});
+
 test('idleTimeout at the Bun ceiling is accepted', () => {
 	// 960 accepted, 961 threw - probe/bun-api-facts.report.md, idle-timeout-cap.
 	const { options } = normalizeWsOptions({ idleTimeout: BUN_IDLE_TIMEOUT_MAX });

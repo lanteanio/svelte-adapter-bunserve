@@ -18,6 +18,7 @@ const which = process.env.ADAPTER || 'bunserve';
 const noWs = process.env.NO_WS === '1' || process.env.NO_WS === 'true';
 const dotfiles = process.env.STATIC_DOTFILES === '1' || process.env.STATIC_DOTFILES === 'true';
 const admission = process.env.WS_ADMISSION === '1' || process.env.WS_ADMISSION === 'true';
+const upgradeTimeout = process.env.WS_UPGRADE_TIMEOUT === '1' || process.env.WS_UPGRADE_TIMEOUT === 'true';
 
 let adapter;
 if (which === 'bunserve' && dotfiles) {
@@ -41,6 +42,19 @@ if (which === 'bunserve' && dotfiles) {
 	adapter = bunserve({
 		out: 'build-admission',
 		websocket: { upgradeAdmission: { maxConnections: 2 } }
+	});
+} else if (which === 'bunserve' && upgradeTimeout) {
+	// The build for test/live/upgrade-timeout-check.mjs. Its own, because the
+	// admission build's suite hangs a handshake open for four seconds on
+	// purpose, and any bound short enough to be reached by a test would answer
+	// that handshake before it could be abandoned.
+	//
+	// A ceiling as well as a bound: what a timeout has to GIVE BACK is the half
+	// worth proving over a real socket, and there is nothing to give back on a
+	// server with no ceiling.
+	adapter = bunserve({
+		out: 'build-upgrade-timeout',
+		websocket: { upgradeTimeout: 0.3, upgradeAdmission: { maxConnections: 2 } }
 	});
 } else if (which === 'bunserve') {
 	// A deliberately small subscription cap so the live smoke tests can prove the
