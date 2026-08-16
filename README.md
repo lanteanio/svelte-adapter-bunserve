@@ -1056,9 +1056,10 @@ Identical golden traces are the positioning guard: the tier line stays a
 performance statement, never a capability statement. Nothing adapter-specific
 belongs in that corpus, which is why there is a second one.
 
-`adapter-admission` runs a server with an `upgradeAdmission` ceiling, an app
-that refuses sockets from inside its `open` hook, and clients that leave while
-the app's `upgrade` hook still has them. Each corpus names the server it runs
+`adapter-admission` runs a server with all four `upgradeAdmission` layers
+configured at once, an app that refuses sockets from inside its `open` hook, and
+clients that leave while the app's `upgrade` hook still has them. Every refusal
+reason the ceiling can give is given by some seed. Each corpus names the server it runs
 against, and that server is built once when the runtime is imported - so one
 process verifies one corpus, and `npm run sim:golden` is two invocations rather
 than a loop. Select one with `--corpus <name>`; an unrecognised name is refused

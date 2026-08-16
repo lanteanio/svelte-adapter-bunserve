@@ -157,9 +157,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A second committed golden corpus
   (`test/dst-goldens/adapter-admission.golden.json`, forty seeds) that drives a
-  server with an `upgradeAdmission` ceiling, an app that refuses sockets from
-  inside its `open` hook, and clients that leave while the app's `upgrade` hook
-  still has them. Those are the orderings the upgrade path is built around, and
+  server with all four `upgradeAdmission` layers configured at once, an app that
+  refuses sockets from inside its `open` hook, and clients that leave while the
+  app's `upgrade` hook still has them. Every refusal reason the ceiling can give
+  is given by some seed - the concurrent-upgrade ceiling, the live-connection
+  ceiling, the cursor sub-budget and the finite pacing queue - and the layers are
+  configured together because that is the only way their interactions are pinned:
+  the cursor lane carves its sub-budget out of `maxConcurrent`, and pacing parks
+  a handshake across ticks while it is already holding a permit, which is a
+  window a client can leave in. Those are the orderings the upgrade path is
+  built around, and
   a refused socket runs its close callback - permit release included - before
   `server.upgrade()` has returned, so the accounting is at its most delicate
   exactly where nothing else exercised it. Clients arrive in two waves, so a
@@ -174,9 +181,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A steady-state hypothesis over the upgrade ceiling: when a run settles, the
   permits it holds must be exactly the sockets that are open, nothing may still
-  be in flight, and the pacing queue must be empty. A permit that outlives its
-  handshake narrows the ceiling for every later client and is otherwise silent
-  until the server stops admitting anyone.
+  be in flight, the cursor sub-budget must be back, and the pacing queue must be
+  empty. A permit that outlives its handshake narrows the ceiling for every later
+  client and is otherwise silent until the server stops admitting anyone. The
+  cursor sub-budget is read separately rather than trusted to move with the
+  shared in-flight counter, because the two are kept in step by hand: released
+  down the main lane's path, the shared counter settles at zero while the cursor
+  lane stays permanently full and refuses every later cursor socket.
 
 - An injectable runtime seam (`src/runtime/runtime.js`): every clock, RNG and
   timer read in the served runtime goes through named helpers over one

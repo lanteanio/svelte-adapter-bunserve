@@ -28,14 +28,21 @@ globalThis.WS_OPTIONS = normalizeWsOptions({
 	path: '/ws',
 	handler: 'src/ws-handler.js',
 	allowUnauthenticatedSubscribe: true,
-	upgradeAdmission: { maxConcurrent: 3, maxConnections: 5 }
+	upgradeAdmission: {
+		maxConcurrent: 4,
+		maxConnections: 5,
+		perTickBudget: 1,
+		maxDeferred: 2,
+		cursorLane: { fraction: 0.5 }
+	}
 }).options;
 
 const { runSim, SIM_SCENARIOS } = await import('../../src/sim.js');
 const { wsCounters } = await import('../../src/runtime/handler/ws-state.js');
+const { upgradeAdmission } = await import('../../src/runtime/handler/admission.js');
 
 /** The corpus's own swarm knobs for this workload. */
-const BASE = { clients: 8, topics: ['room', 'cursor'] };
+const BASE = { clients: 12, topics: ['room', 'cursor'] };
 
 /**
  * Run one seed of the committed workload and report what became of every client
@@ -121,18 +128,39 @@ test('the committed workload drives all three orderings, and every client reache
 	assert.ok(open > 0, `and connections still succeed (saw ${open})`);
 });
 
-test('both ceilings answer refusals, which is what the second wave is for', async () => {
-	// The two ceilings are checked in order, so a workload that arrives in one
-	// burst gets every refusal from whichever is lower and the other is never
-	// reached. Losing that is invisible in a fingerprint - the corpus would stay
-	// green over a workload half of it had stopped exercising.
+test('every refusal reason the ceiling can give is given by some seed', async () => {
+	// The four layers refuse for four different reasons, and they are checked in
+	// order - so a workload arriving in one burst gets every refusal from
+	// whichever layer answers first and the rest are never reached. Losing one is
+	// invisible in a fingerprint: the corpus would stay green over a workload
+	// that had quietly stopped exercising a whole layer.
+	//
+	// `draining` is not here and cannot be: it is a one-way latch on the process,
+	// so a scenario that reached it would end every later seed's server too.
 	const seen = new Set();
 	for (const seed of ['1', '2', '3', '4', '5', '6', '7', '8']) {
 		const { reasons } = await runSeed(seed);
 		for (const [reason, n] of Object.entries(reasons)) if (n > 0) seen.add(reason);
 	}
-	assert.ok(seen.has('over_capacity'), `the concurrent-upgrade ceiling refuses some handshake (saw ${[...seen]})`);
-	assert.ok(seen.has('connection_capacity'), `the live-connection ceiling refuses some handshake (saw ${[...seen]})`);
+	for (const reason of ['over_capacity', 'connection_capacity', 'cursor_lane', 'deferred_overflow']) {
+		assert.ok(seen.has(reason), `${reason} is reached (saw ${[...seen].sort()})`);
+	}
+});
+
+test('the pacing queue actually holds callbacks, rather than always running them straight through', async () => {
+	// `perTickBudget` only does anything once a tick's budget is spent, and the
+	// depth is back to zero by quiescence - which is what the steady-state
+	// hypothesis requires - so nothing in the corpus can show that the queue was
+	// ever used. Without this, the pacing layer could stop deferring entirely and
+	// every gate would still pass.
+	let peak = 0;
+	upgradeAdmission.setDeferredObserver((depth) => { if (depth > peak) peak = depth; });
+	try {
+		for (const seed of ['1', '2', '3', '4']) await runSeed(seed);
+	} finally {
+		upgradeAdmission.setDeferredObserver(null);
+	}
+	assert.ok(peak > 1, `the queue held more than one deferred upgrade (peak ${peak})`);
 });
 
 test('a client that left is not counted as a refusal', async () => {

@@ -254,11 +254,18 @@ export function checkStarvation(clients, publishLog, faults) {
  * ceiling must account for exactly the sockets that are actually open, and for
  * nothing else.
  *
- * Three readings, in the order they answer "did the accounting come back":
+ * Four readings, in the order they answer "did the accounting come back":
  *
  * - `inFlight` is zero. Every handshake has finished, one way or another. A
  *   handshake still counted in flight at quiescence is one whose slot was taken
  *   and never given back, and the slot is what a later client is refused for.
+ * - `cursorInFlight` is zero. Read SEPARATELY rather than trusted to move with
+ *   the counter above it, because the two are kept in step by hand: a cursor
+ *   upgrade takes one slot from each, and only `releaseCursorInFlight()` gives
+ *   both back. A release down the main lane's path returns the shared counter
+ *   and leaves the sub-budget spent, so `inFlight` settles at zero while the
+ *   cursor lane is permanently full and refuses every later cursor socket -
+ *   which is a failure the reading above cannot see, and one this lane has had.
  * - `connectionPermits` equals the number of open connections. A permit is
  *   acquired before the upgrade and held until the socket's close callback, so
  *   at rest the two are the same number by definition. They come apart when a
@@ -279,7 +286,7 @@ export function checkStarvation(clients, publishLog, faults) {
  * the upgrade and close paths, which never travel that channel, so a dropped or
  * reordered frame cannot legitimately unbalance this.
  *
- * @param {{ maxConnections?: number, inFlight?: number, connectionPermits?: number, deferredDepth?: number, openConnections?: number } | null | undefined} admission
+ * @param {{ maxConnections?: number, inFlight?: number, cursorInFlight?: number, connectionPermits?: number, deferredDepth?: number, openConnections?: number } | null | undefined} admission
  *   the controller's end-of-run reading, or null/undefined on an ungated server
  * @returns {SteadyStateViolation}
  */
@@ -290,6 +297,12 @@ export function checkAdmissionSettled(admission) {
 		return {
 			category: 'steady.admission-unsettled',
 			context: { reading: 'inFlight', value: admission.inFlight, openConnections: open }
+		};
+	}
+	if (admission.cursorInFlight) {
+		return {
+			category: 'steady.admission-unsettled',
+			context: { reading: 'cursorInFlight', value: admission.cursorInFlight, openConnections: open }
 		};
 	}
 	if ((admission.maxConnections || 0) > 0 && (admission.connectionPermits || 0) !== open) {

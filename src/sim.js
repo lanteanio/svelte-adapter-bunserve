@@ -16,6 +16,7 @@
 
 import { register } from 'node:module';
 import { normalizeWsOptions } from './runtime/utils/ws-options.js';
+import { CURSOR_LANE_SUBPROTOCOL } from './runtime/utils/upgrade-admission.js';
 import {
 	createScheduler, createSeededRng, createFaultEngine, DEFAULT_SEED, FIXED_EPOCH
 } from './runtime/sim-core.js';
@@ -268,6 +269,7 @@ function admissionReading(app) {
 	return {
 		maxConnections: upgradeAdmission.maxConnections,
 		inFlight: upgradeAdmission.inFlight,
+		cursorInFlight: upgradeAdmission.cursorInFlight,
 		connectionPermits: upgradeAdmission.connectionPermits,
 		deferredDepth: upgradeAdmission.deferredDepth,
 		openConnections: app._connections.size
@@ -337,9 +339,18 @@ async function admissionScenario(api, opts) {
 
 	/** @type {string[]} */
 	const modes = [];
+	/** @type {boolean[]} */
+	const cursorLane = [];
 	for (let i = 0; i < opts.clients; i++) {
 		const draw = api.rng.float();
 		modes.push(draw < 0.3 ? 'refuse' : draw < 0.65 ? 'park' : 'plain');
+		// The worker's SECOND socket, routed through the deprioritised lane by its
+		// subprotocol. It matters that these are mixed in with ordinary upgrades
+		// rather than run apart: the lane carves its sub-budget out of the main
+		// ceiling and holds a slot in both counters, so the two are only kept in
+		// step by releasing down the right path - and a release down the wrong one
+		// leaves the sub-budget spent while the main counter looks settled.
+		cursorLane.push(api.rng.float() < 0.35);
 	}
 
 	/** @type {any[]} */
@@ -357,7 +368,12 @@ async function admissionScenario(api, opts) {
 	// in-flight slots, which is the state where the other one answers.
 	const half = Math.ceil(opts.clients / 2);
 	for (const [from, to] of [[0, half], [half, opts.clients]]) {
-		for (let i = from; i < to; i++) conns[i] = api.connect({ query: 'mode=' + modes[i] });
+		for (let i = from; i < to; i++) {
+			conns[i] = api.connect({
+				query: 'mode=' + modes[i],
+				headers: cursorLane[i] ? { 'sec-websocket-protocol': CURSOR_LANE_SUBPROTOCOL } : undefined
+			});
+		}
 		await api.advance();
 
 		// The clients that go away mid-handshake. Only the parked ones can: the

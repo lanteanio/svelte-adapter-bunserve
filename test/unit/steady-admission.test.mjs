@@ -39,6 +39,27 @@ test('a handshake still in flight at quiescence is a violation', () => {
 	assert.equal(v.context.value, 1);
 });
 
+test('a cursor slot still held is a violation the shared counter cannot show', () => {
+	// The lane holds one slot in each of two counters and only
+	// `releaseCursorInFlight()` gives both back. Release it down the main lane's
+	// path and the shared counter settles at zero while the sub-budget stays
+	// spent - so the whole cursor lane refuses every later socket, on a server
+	// that reads as idle. Reading `inFlight` alone would call this settled.
+	const v = checkAdmissionSettled({ maxConnections: 5, inFlight: 0, cursorInFlight: 1, connectionPermits: 2, deferredDepth: 0, openConnections: 2 });
+	assert.equal(v.category, 'steady.admission-unsettled');
+	assert.equal(v.context.reading, 'cursorInFlight');
+	assert.equal(v.context.value, 1);
+});
+
+test('a server with no cursor lane reads zero and settles', () => {
+	// The sub-budget is zero unless the lane is configured, so the reading must
+	// not fire on every gated server that does not use one.
+	assert.equal(
+		checkAdmissionSettled({ maxConnections: 5, inFlight: 0, cursorInFlight: 0, connectionPermits: 1, deferredDepth: 0, openConnections: 1 }),
+		null
+	);
+});
+
 test('a permit held by no socket is a violation', () => {
 	// The leak: a refused or abandoned handshake that kept its permit. The
 	// ceiling narrows by one for the rest of the process, and nothing says so.

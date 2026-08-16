@@ -81,17 +81,29 @@ const CORPORA = {
 		// A server with a ceiling, because the accounting this corpus exists to
 		// pin does not exist without one - `upgradeAdmission` is null on a default
 		// server, and every permit call is a no-op. The bounds are small on
-		// purpose: against eight clients arriving in two waves they are crossed
+		// purpose: against twelve clients arriving in two waves they are crossed
 		// often enough that refusals are part of the ordinary trajectory rather
-		// than a rare seed, and BOTH of them answer some of those refusals - the
-		// concurrent-upgrade ceiling during a wave, the live-connection ceiling
-		// once the previous wave's survivors are holding permits.
+		// than a rare seed, and EVERY refusal reason the ceiling can give is given
+		// by some seed - the concurrent-upgrade ceiling during a wave, the
+		// live-connection ceiling once the previous wave's survivors are holding
+		// permits, the cursor sub-budget, and the finite pacing queue.
 		wsOptions: {
 			allowedOrigins: 'any',
 			path: '/ws',
 			handler: 'src/ws-handler.js',
 			allowUnauthenticatedSubscribe: true,
-			upgradeAdmission: { maxConcurrent: 3, maxConnections: 5 }
+			// All four layers, configured together because that is the only way
+			// their INTERACTIONS are pinned: the cursor lane carves its sub-budget
+			// out of `maxConcurrent`, pacing parks a handshake across ticks while
+			// it is already holding a permit, and a client can leave during that
+			// park. A corpus per layer would exercise each one and none of those.
+			upgradeAdmission: {
+				maxConcurrent: 4,
+				maxConnections: 5,
+				perTickBudget: 1,
+				maxDeferred: 2,
+				cursorLane: { fraction: 0.5 }
+			}
 		},
 		swarm: {
 			count: 40,
@@ -99,7 +111,7 @@ const CORPORA = {
 			faultMode: 'random',
 			faultProbability: 0.25,
 			faultProfile: FAULT_PROFILE,
-			base: { clients: 8, topics: ['room', 'cursor'] }
+			base: { clients: 12, topics: ['room', 'cursor'] }
 		}
 	}
 };
