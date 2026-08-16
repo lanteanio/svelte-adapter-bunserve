@@ -46,6 +46,42 @@ test('the bounds the README documents are the bounds an app gets', () => {
 	assert.equal(options.publishToSelf, false);
 });
 
+test('the upgrade rate limit defaults to the uws figures', () => {
+	const { options } = normalizeWsOptions(undefined);
+	assert.equal(options.upgradeRateLimit, 10);
+	assert.equal(options.upgradeRateLimitWindow, 10);
+});
+
+test('a rate limit of 0 disables the limiter and is not an error', () => {
+	assert.equal(normalizeWsOptions({ upgradeRateLimit: 0 }).options.upgradeRateLimit, 0);
+});
+
+test('a rate-limit WINDOW of 0 is refused, and says why it is not the way to disable', () => {
+	// The two zeroes mean opposite things, which is the trap. Zero LIMIT
+	// disables the limiter; zero WINDOW breaks it - every request then looks
+	// like a fresh window, the estimate evaluates to NaN, and `NaN >= limit` is
+	// false, so everything is admitted while the config says a limit is on.
+	assert.throws(
+		() => normalizeWsOptions({ upgradeRateLimitWindow: 0 }),
+		/upgradeRateLimitWindow.*greater than 0.*does not disable the limiter, it breaks it/s
+	);
+});
+
+test('an unusable rate limit fails the build rather than disabling itself', () => {
+	for (const bad of ['10', null, {}, NaN, Infinity, -1, true]) {
+		assert.throws(
+			() => normalizeWsOptions({ upgradeRateLimit: bad }),
+			/upgradeRateLimit.*finite number/s,
+			`refuses ${JSON.stringify(bad) ?? String(bad)}`
+		);
+		assert.throws(
+			() => normalizeWsOptions({ upgradeRateLimitWindow: bad }),
+			/upgradeRateLimitWindow/s,
+			`refuses window ${JSON.stringify(bad) ?? String(bad)}`
+		);
+	}
+});
+
 test('upgradeTimeout defaults to the ten seconds uws defaults to', () => {
 	// A carried config that names no timeout has to get the same bound on both
 	// adapters, or the same hung dependency 504s on one and hangs on the other.

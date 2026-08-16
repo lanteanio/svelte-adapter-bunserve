@@ -65,6 +65,13 @@ const DEFAULTS = {
 	// defaults and each signal's meaning). undefined means "sampler defaults";
 	// the sampler always runs when the WS surface exists, so this only TUNES.
 	pressure: undefined,
+	// Upgrades one client address may make per window, and how long that window
+	// is in seconds. Both uws's numbers. `upgradeRateLimit: 0` disables the
+	// limiter; the WINDOW refuses zero, because a zero window does not disable
+	// anything - it makes every request look like a fresh window, which admits
+	// everything (see the validator).
+	upgradeRateLimit: 10,
+	upgradeRateLimitWindow: 10,
 	// How long the app's `upgrade` hook may take, in seconds, before the
 	// handshake is refused with a 504. Seconds and a default of 10 because that
 	// is what uws declares; `0` disables it. It bounds the HOOK, not the
@@ -107,6 +114,38 @@ function requirePositiveInt(value, key) {
 		);
 	}
 	return /** @type {number} */ (value);
+}
+
+/**
+ * A bound that PROTECTS a resource: any finite number at or above the floor.
+ *
+ * Not an integer check, because uws guards these as protective numbers and a
+ * config valid there has to build here. Not a silent fallback either: the
+ * runtime compares against these, every comparison against a non-number is
+ * false, and so a value waved through would turn the bound OFF while the config
+ * says it is on. A string is the realistic way to get here - an unconverted
+ * environment variable.
+ *
+ * @param {unknown} value
+ * @param {string} key
+ * @param {{ allowZero?: boolean, zeroMeans?: string }} [opts]
+ * @returns {number}
+ */
+function requireProtectiveNumber(value, key, { allowZero = true, zeroMeans = '' } = {}) {
+	const floor = allowZero ? 0 : Number.MIN_VALUE;
+	if (typeof value === 'number' && Number.isFinite(value) && value >= floor) {
+		return value;
+	}
+	if (!allowZero && value === 0) {
+		throw new Error(`adapter option \`websocket.${key}\` must be greater than 0. ${zeroMeans}`);
+	}
+	throw new Error(
+		`adapter option \`websocket.${key}\` must be a finite number >= ${allowZero ? 0 : 'greater than 0'}, ` +
+		`got ${JSON.stringify(value)}. This option bounds a resource, and every comparison against a ` +
+		'non-number is false - so an unrecognized value would disable the bound entirely rather than ' +
+		'fall back to the default. If the value comes from the environment, convert it explicitly ' +
+		`(e.g. Number(process.env.WS_${key.toUpperCase()})).`
+	);
 }
 
 /** Keys the `websocket.upgradeAdmission` block accepts, as uws declares them. */
@@ -356,6 +395,32 @@ export function normalizeWsOptions(input) {
 	}
 	if (raw.maxBackpressure !== undefined) {
 		options.maxBackpressure = requirePositiveInt(raw.maxBackpressure, 'maxBackpressure');
+	}
+	if (raw.upgradeRateLimit !== undefined) {
+		options.upgradeRateLimit = requireProtectiveNumber(
+			raw.upgradeRateLimit,
+			'upgradeRateLimit',
+			{ allowZero: true }
+		);
+	}
+	if (raw.upgradeRateLimitWindow !== undefined) {
+		// The WINDOW refuses zero where the limit accepts it, and the two zeroes
+		// mean opposite things. Setting the LIMIT to zero disables the limiter;
+		// setting the WINDOW to zero breaks it - every request then looks like a
+		// fresh window, the sliding estimate divides by zero and evaluates to
+		// NaN, and `NaN >= limit` is false, so everything is admitted while the
+		// config says a limit is in force.
+		options.upgradeRateLimitWindow = requireProtectiveNumber(
+			raw.upgradeRateLimitWindow,
+			'upgradeRateLimitWindow',
+			{
+				allowZero: false,
+				zeroMeans: 'A zero WINDOW does not disable the limiter, it breaks it: every request ' +
+					'then looks like a fresh window, the estimate evaluates to NaN, and NaN >= limit ' +
+					'is false - so everything is admitted. Set `upgradeRateLimit` itself to 0 to ' +
+					'disable the limit deliberately.'
+			}
+		);
 	}
 	if (raw.upgradeTimeout !== undefined) {
 		const seconds = raw.upgradeTimeout;

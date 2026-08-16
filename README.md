@@ -328,6 +328,8 @@ adapter: bunserve({
 		maxConcurrentUnsubscribeHooks: 64,
 		maxQueuedUnsubscribeHooks: 1024,
 		maxControlEgressBytes: 4 * 1024 * 1024,
+		upgradeRateLimit: 10,               // upgrades per client address per window; 0 disables
+		upgradeRateLimitWindow: 10,         // that window, in seconds
 		upgradeTimeout: 10,                 // seconds the `upgrade` hook may take; 0 waits forever
 		// Admission control for the upgrade path. Every layer is OFF unless
 		// you set it; omit the block entirely and nothing is gated.
@@ -417,6 +419,36 @@ are different jobs rather than different sizes of the same one:
   marker the budget cannot afford therefore CUTS the connection rather than
   being dropped - a client that reconnects cold-resyncs, which is what the
   marker says.
+
+`upgradeRateLimit` meters upgrades PER CLIENT ADDRESS - ten per ten seconds by
+default, `0` to disable - on a sliding window, so a client cannot double its
+rate by placing requests either side of a boundary. It is checked before the
+Origin comparison and before your `upgrade` hook, because the Origin gate bounds
+no rate at all (a non-browser client sends whatever Origin it likes) and the
+hook is the expensive part. Over the limit is `429` with a `retry-after` naming
+the window.
+
+Two things decide whether it means what it says:
+
+- **What counts as one client.** The key is the socket peer unless
+  `ADDRESS_HEADER` is set. Behind a reverse proxy, an L4 load balancer, or
+  docker's `userland-proxy`, every client arrives as the gateway address and
+  this per-client limit is really one GLOBAL cap - the symptom is intermittent
+  `429`s on `/ws` under trivial traffic. Set `ADDRESS_HEADER=x-forwarded-for`
+  (with `XFF_DEPTH`, and `TRUSTED_PROXIES` so the claim is only honoured from
+  your own proxies), or set the limit to `0` if you throttle upstream. The
+  server says so once, on the first refusal that looks like this.
+- **IPv6 is keyed on its /64**, not the full address, because a /64 is the
+  smallest block a host is routinely given - keying the whole address would let
+  one attacker source every request from a fresh one and never share a bucket
+  with itself. A 6to4 site is keyed on its /48. Clients behind one /64 (an
+  office, a campus, a VPN egress) therefore share a bucket. IPv4, IPv4-mapped
+  addresses, NAT64, Teredo and link-local keep their full value, because their
+  /64 is shared by clients with nothing to do with each other.
+
+A load test from a single machine will be rate-limited, which is the limiter
+working. Point it at `upgradeRateLimit: 0`, or give the generator real
+addresses.
 
 `upgradeTimeout` bounds the one part of a handshake that can hang: your
 `upgrade` hook. It awaits a database, an identity provider or a lock, and while

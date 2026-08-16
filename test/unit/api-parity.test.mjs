@@ -103,8 +103,6 @@ const WS_OPTION_GAPS = {
 	authPathRateLimitWindow: 'auth endpoint',
 	authPathRequireOrigin: 'auth endpoint',
 	authorizeWireSubscribe: 'wire-subscribe authorization',
-	upgradeRateLimit: 'admission control',
-	upgradeRateLimitWindow: 'admission control',
 	consistencyAuditIntervalMs: 'background audits',
 	resourceGrowthAuditIntervalMs: 'background audits',
 	stateHashIntervalMs: 'background audits',

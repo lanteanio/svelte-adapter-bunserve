@@ -366,6 +366,22 @@ export function createSlidingWindowLimiter({
 			// during a flood vastly outnumber sweeps, so the cursor still rotates
 			// for all but the first sample after each one.
 			evictCursor = null;
+		},
+
+		/**
+		 * Drop every tracked identity and release the cursor.
+		 *
+		 * For the simulator alone, and for the reason the admission controller
+		 * has one: production builds this once per process, while the sim runs a
+		 * whole corpus of servers in one - so without it a seed would inherit the
+		 * windows of every seed before it, and a fingerprint would depend on the
+		 * order its seed was run in. `sweep` is not a substitute: it retires what
+		 * is IDLE, and the entries a previous run left behind are, by its clock,
+		 * brand new.
+		 */
+		_resetForSim() {
+			map.clear();
+			evictCursor = null;
 		}
 	};
 }

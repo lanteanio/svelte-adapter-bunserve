@@ -23,8 +23,16 @@ import { resolveRequestId } from '../utils/request-id.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
 import { clearTimer, processMonotonicNow, randomFloat, randomUuid, setTimer } from '../runtime.js';
 import { WS_REQUEST_ID_KEY, isDraining, recordUpgradeRejection } from './ws-state.js';
-import { get_origin, origin, upgrade_timeout_ms, ws_options, ws_path } from './config.js';
+import { address_header, get_origin, origin, upgrade_timeout_ms, ws_options, ws_path } from './config.js';
 import { WS_CONNECTION_PERMIT, awaitAdmissionSlot, upgradeAdmission } from './admission.js';
+import {
+	addressScope,
+	rateLimitAddress,
+	upgradeRateLimitExceeded,
+	upgradeRateLimiter,
+	upgradeRateLimitPerWindow,
+	upgradeRateLimitWindowSeconds
+} from './rate-limit.js';
 import { isCursorLaneUpgrade } from '../utils/upgrade-admission.js';
 
 /** Upgrade-hook throws, throttled with decay. */
@@ -252,6 +260,56 @@ function shedResponse() {
 		status: 503,
 		headers: { 'retry-after': String(retryAfter), 'content-type': 'text/plain' }
 	});
+}
+
+/**
+ * What a client over its per-address limit gets. `429`, and a `retry-after`
+ * naming the window it has to wait out - which is the honest number here,
+ * unlike a shed upgrade's, because the limiter knows exactly when the
+ * allowance comes back rather than guessing at when capacity will.
+ */
+function rateLimitedResponse() {
+	return new Response('Too many upgrade requests', {
+		status: 429,
+		headers: {
+			'retry-after': String(Math.max(1, Math.ceil(upgradeRateLimitWindowSeconds))),
+			'content-type': 'text/plain'
+		}
+	});
+}
+
+let warnedRateLimitProxyCollapse = false;
+/**
+ * Say once that this server may be metering every client as one.
+ *
+ * The signature is a refusal keyed on a loopback or private address while no
+ * `ADDRESS_HEADER` is configured, which is what an address-rewriting proxy in
+ * front of the server looks like from here: every client arrives as the
+ * gateway, they all share one bucket, and the per-address limit is really a
+ * single global cap. The symptom is intermittent 429s on `/ws` under trivial
+ * traffic, which is otherwise very hard to attribute.
+ *
+ * One-shot rather than throttled: it describes the deployment, not the request,
+ * and a server directly facing the internet sees real client addresses here and
+ * never reaches it.
+ *
+ * @param {string} address the address the refusal was keyed on
+ */
+function warnRateLimitProxyCollapse(address) {
+	if (warnedRateLimitProxyCollapse || address_header) return;
+	const scope = addressScope(address);
+	if (scope !== 'loopback' && scope !== 'private') return;
+	warnedRateLimitProxyCollapse = true;
+	console.warn(
+		`[ws] refused a WebSocket upgrade (429) keyed on a ${scope} client address (${address}) ` +
+		'while ADDRESS_HEADER is unset. If this server runs behind a reverse proxy, a load\n' +
+		'  balancer, or docker\'s userland-proxy, every client arrives as the same address and the\n' +
+		`  per-address \`websocket.upgradeRateLimit\` (${upgradeRateLimitPerWindow} per ` +
+		`${upgradeRateLimitWindowSeconds}s) is really one GLOBAL cap. Restore real client addresses\n` +
+		'  with ADDRESS_HEADER=x-forwarded-for (plus XFF_DEPTH for the trusted hop count) and\n' +
+		'  TRUSTED_PROXIES, or set docker `userland-proxy: false`, or set\n' +
+		'  websocket.upgradeRateLimit: 0 if you throttle upstream.'
+	);
 }
 
 /**
@@ -672,6 +730,25 @@ function abandonedResponse() {
  * @returns {Promise<Response | undefined>}
  */
 async function runUpgrade(req, srv, held) {
+	// METERED FIRST, ahead of the origin comparison below. That comparison
+	// normalizes two origins and may reconstruct one from request headers; this
+	// folds a key and reads a map. A flood should be turned away by the cheaper
+	// of the two, and it is the order uws refuses in.
+	//
+	// The Origin gate is not a rate bound in any case: a non-browser client
+	// sends whatever Origin it likes, so without this the app's `upgrade` hook -
+	// typically a cookie parse and a database round trip - is reachable at raw
+	// server capacity from one address.
+	if (upgradeRateLimiter !== null) {
+		const peer = srv.requestIP(req);
+		const address = rateLimitAddress(req, peer ? peer.address : '');
+		if (upgradeRateLimitExceeded(address)) {
+			recordRefusal(req, 'ip_rate_limit');
+			warnRateLimitProxyCollapse(address);
+			return rateLimitedResponse();
+		}
+	}
+
 	// Cross-site WebSocket hijacking defense, BEFORE the app's hook: the hook
 	// may read cookies and do database work, and a foreign origin should not be
 	// able to make it do either.

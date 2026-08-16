@@ -102,6 +102,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   page. Accepting the key keeps a uws config building; a config that asks for
   the page is told at build time that it will get a `503` instead.
 
+- `websocket.upgradeRateLimit` and `websocket.upgradeRateLimitWindow`, a
+  per-client-address sliding-window limit on WebSocket upgrades. Ten per ten
+  seconds by default, as svelte-adapter-uws defaults them, so **a server that
+  sets neither is now metered where it previously was not** - set
+  `upgradeRateLimit: 0` to keep the old behaviour, and note that a load test
+  from one machine is a single client by this measure. Over the limit is `429`
+  with a `retry-after` naming the window. It is checked before the Origin
+  comparison and before the app's `upgrade` hook: the Origin gate bounds no rate
+  (a non-browser client sends whatever Origin it likes), so without this the
+  hook - typically a cookie parse and a database round trip - is reachable at
+  raw server capacity from a single address.
+
+  The identity is the socket peer unless `ADDRESS_HEADER` is set, in which case
+  the header is honoured only from a peer inside `TRUSTED_PROXIES`. Behind an
+  address-rewriting proxy with no header configured every client arrives as the
+  gateway and the per-client limit is really one global cap; the server says so
+  once, on the first refusal keyed on a loopback or private address. Unlike the
+  SSR resolver, a missing or unusable header falls back to the socket peer
+  rather than throwing - a bucket key is not `getClientAddress`, and a proxy
+  dropping a header would otherwise turn every upgrade into a 500.
+
+  IPv6 is keyed on its /64 allocation prefix (6to4 on its /48), because keying
+  the full address lets one attacker source every request from a fresh one and
+  never share a bucket with itself. IPv4, IPv4-mapped, NAT64, Teredo,
+  link-local, scoped, malformed and opaque values keep their full value, since
+  their /64 is shared by unrelated clients. The window is measured on the
+  MONOTONIC clock, so a wall-clock step cannot retire or extend one.
+
+  Refusals are counted as `upgrade_rejected_total{reason: "ip_rate_limit"}`.
+
 - `websocket.upgradeTimeout`, in seconds, bounding how long the app's `upgrade`
   hook may take before the handshake is refused with `504 Gateway Timeout`.
   Spelled and defaulted as svelte-adapter-uws spells it, **including the default

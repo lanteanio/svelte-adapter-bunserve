@@ -172,9 +172,12 @@ export function createInMemoryApp(opts) {
 	 * tryUpgrade is async (the app's upgrade hook may await), so several
 	 * connects can be in flight at once; the Request object is the correlation
 	 * key between connect() and the srv.upgrade() call the dispatch makes.
-	 * @type {WeakMap<Request, { clientSide: any, onUpgraded: (raw: any) => void, endRequest: () => void }>}
+	 * @type {WeakMap<Request, { clientSide: any, onUpgraded: (raw: any) => void, endRequest: () => void, address: string }>}
 	 */
 	const pendingUpgrades = new WeakMap();
+
+	/** How many clients have connected, for the per-client address below. */
+	let connectSeq = 0;
 
 	// - The Bun server double ----------------------------------------------------
 
@@ -216,8 +219,23 @@ export function createInMemoryApp(opts) {
 			pending.onUpgraded(raw);
 			return true;
 		},
-		requestIP() {
-			return { address: '127.0.0.1' };
+		/**
+		 * A DISTINCT address per simulated client, not one shared by all of them.
+		 *
+		 * An in-memory transport has no addressing, so the obvious stand-in is a
+		 * single constant - and that quietly makes every client in a run the same
+		 * client to anything that meters by address. The upgrade rate limiter
+		 * does, so a scenario opening a dozen connections would find most of them
+		 * refused for a reason that belongs to the double rather than to the
+		 * system under test. Distinct addresses model what the scenario means:
+		 * separate clients.
+		 *
+		 * Derived from the connect sequence, so it is deterministic and a replay
+		 * assigns the same address to the same client.
+		 */
+		requestIP(req) {
+			const pending = pendingUpgrades.get(req);
+			return { address: pending ? pending.address : '10.0.0.0' };
 		},
 		stop() { /* the sim tears down through close(), never through Bun.serve */ }
 	};
@@ -271,8 +289,14 @@ export function createInMemoryApp(opts) {
 		// orderings.
 		const client = new AbortController();
 		const req = new Request(url, { headers, signal: client.signal });
+		// One address per client. Kept off the loopback and private ranges an
+		// advisory keys on, so a simulated refusal never reads as a
+		// misconfigured proxy.
+		const n = connectSeq++;
+		const address = `198.18.${(n >> 8) & 0xff}.${n & 0xff}`;
 		pendingUpgrades.set(req, {
 			clientSide,
+			address,
 			// The same controller `hangUp()` uses, because on a real server they are
 			// the same event: the client's connection ended. It reaches the server
 			// as an abort whether the client walked away mid-handshake or the server

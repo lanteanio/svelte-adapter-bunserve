@@ -53,6 +53,7 @@ const buildEnv = {
 	STATIC_DOTFILES: '',
 	WS_ADMISSION: '',
 	WS_UPGRADE_TIMEOUT: '',
+	WS_RATE_LIMIT: '',
 	NODE_ENV: 'production'
 };
 
@@ -109,6 +110,18 @@ const builtUpgradeTimeout = await run('build fixture (WS_UPGRADE_TIMEOUT)', [pro
 });
 if (builtUpgradeTimeout) {
 	await run('upgrade-timeout-check', [process.execPath, suite('upgrade-timeout-check.mjs')]);
+}
+
+// Its own build for a blunter reason than the others: the limiter is OFF in the
+// main build, because every suite there - and the leak lane at 50 rps for
+// minutes - drives it from this one address, which is exactly the traffic a
+// per-address limit exists to refuse.
+const builtRateLimit = await run('build fixture (WS_RATE_LIMIT)', [process.execPath, 'run', 'build'], {
+	cwd: fixtureDir,
+	env: { ...buildEnv, WS_RATE_LIMIT: '1' }
+});
+if (builtRateLimit) {
+	await run('upgrade-rate-limit-check', [process.execPath, suite('upgrade-rate-limit-check.mjs')]);
 }
 
 if (failures.length) {

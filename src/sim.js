@@ -77,6 +77,7 @@ const {
 	wsCounters
 } = await import('./runtime/handler/ws-state.js');
 const { upgradeAdmission } = await import('./runtime/handler/admission.js');
+const { upgradeRateLimiter } = await import('./runtime/handler/rate-limit.js');
 const { _resetWireCodecRegistry } = await import('./runtime/handler/codec-registry.js');
 const { _resetSharedWireIds } = await import('./runtime/utils/shared-wire-id.js');
 const { stopPressureSampling } = await import('./runtime/handler/pressure-metrics.js');
@@ -124,6 +125,10 @@ function resetSimState() {
 	// back is checked as a steady-state hypothesis BEFORE this reset, at the end
 	// of each run, so clearing it here hides nothing.
 	if (upgradeAdmission !== null) upgradeAdmission._resetForSim();
+	// The upgrade rate limiter, for exactly the same reason: it is built once per
+	// process and meters by client address, so a seed would otherwise start
+	// against windows every earlier seed had already spent.
+	if (upgradeRateLimiter !== null) upgradeRateLimiter._resetForSim();
 	wsCounters.closedWsAborts = 0;
 	wsCounters.droppedReleaseRecords = 0;
 	wsCounters.publishCount = 0;

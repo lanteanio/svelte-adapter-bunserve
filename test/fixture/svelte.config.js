@@ -19,6 +19,7 @@ const noWs = process.env.NO_WS === '1' || process.env.NO_WS === 'true';
 const dotfiles = process.env.STATIC_DOTFILES === '1' || process.env.STATIC_DOTFILES === 'true';
 const admission = process.env.WS_ADMISSION === '1' || process.env.WS_ADMISSION === 'true';
 const upgradeTimeout = process.env.WS_UPGRADE_TIMEOUT === '1' || process.env.WS_UPGRADE_TIMEOUT === 'true';
+const rateLimit = process.env.WS_RATE_LIMIT === '1' || process.env.WS_RATE_LIMIT === 'true';
 
 let adapter;
 if (which === 'bunserve' && dotfiles) {
@@ -43,6 +44,15 @@ if (which === 'bunserve' && dotfiles) {
 		out: 'build-admission',
 		websocket: { upgradeAdmission: { maxConnections: 2 } }
 	});
+} else if (which === 'bunserve' && rateLimit) {
+	// The build for test/live/upgrade-rate-limit-check.mjs. Three per ten
+	// seconds, low enough for a test to reach without waiting - the default of
+	// ten would need eleven handshakes to prove anything, and the main build has
+	// the limiter off because every other suite drives it from one address.
+	adapter = bunserve({
+		out: 'build-rate-limit',
+		websocket: { upgradeRateLimit: 3, upgradeRateLimitWindow: 10 }
+	});
 } else if (which === 'bunserve' && upgradeTimeout) {
 	// The build for test/live/upgrade-timeout-check.mjs. Its own, because the
 	// admission build's suite hangs a handshake open for four seconds on
@@ -63,6 +73,16 @@ if (which === 'bunserve' && dotfiles) {
 	adapter = bunserve({
 		out: 'build',
 		websocket: {
+			// OFF. Every suite and the leak lane drive this build from one
+			// address - the leak lane at 50 rps for minutes - which is precisely
+			// the traffic shape the per-address limit exists to refuse. Left at
+			// its default the lane measures the limiter instead of memory: 240 of
+			// 250 warmup requests refused, a 98% error rate, and a verdict that
+			// cannot vouch for anything. A test harness on one machine is one
+			// client by this measure, which is a real property worth knowing
+			// rather than a quirk of the fixture. The limit gets its own build
+			// (WS_RATE_LIMIT) where it is the subject.
+			upgradeRateLimit: 0,
 			maxSubscriptionsPerConnection: 20,
 			// A NON-DEFAULT pressure block, so the live suite proves the whole
 			// round trip - normalize, serialize into the build, read back at

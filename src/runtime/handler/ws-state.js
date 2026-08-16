@@ -514,9 +514,9 @@ export const MAX_SEQ_TOPICS = 10_000;
  * same word on both and a dashboard built against one is not quietly wrong
  * against the other. What uws has and this list does not:
  *
- * - `siege`, `ip_rate_limit` and `auth_rate_limit` belong to `protection`,
- *   `upgradeRateLimit` and the auth endpoint - all recorded parity gaps. Each
- *   label arrives with the feature, which is how `auth_timeout` got here.
+ * - `siege` and `auth_rate_limit` belong to `protection` and the auth endpoint -
+ *   both recorded parity gaps. Each label arrives with the feature, which is how
+ *   `auth_timeout` and `ip_rate_limit` got here.
  * - `duplicate_header` is unreachable on this transport rather than unported:
  *   repeated request headers are merged before the adapter is entered, so there
  *   is no ambiguity here to refuse.
@@ -537,6 +537,7 @@ export const UPGRADE_REJECTION_REASONS = Object.freeze([
 	'connection_capacity',
 	'deferred_overflow',
 	'bad_origin',
+	'ip_rate_limit',
 	'auth_rejected',
 	'auth_timeout',
 	'hook_error',
