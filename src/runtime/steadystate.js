@@ -23,6 +23,7 @@
 //   steady.no-quiescence         - the run did not drain (leftover refed work)
 //   steady.delivery-nonmonotonic - a client saw a per-topic seq regress
 //   steady.starvation            - a publish-time subscriber never got a frame
+//   steady.admission-unsettled   - the upgrade ceiling did not match the sockets it gated
 // plus topic.zero-subscribers (reused from invariants.js on the terminal snapshot).
 
 import { checkTopicsHaveSubscribers } from './invariants.js';
@@ -38,7 +39,8 @@ import { checkTopicsHaveSubscribers } from './invariants.js';
  *   terminal?: { topicCounts?: Record<string, number> },
  *   publishLog?: PublishLogEntry[],
  *   clients?: DeliveredClient[],
- *   faults?: FaultClasses
+ *   faults?: FaultClasses,
+ *   admission?: { maxConnections?: number, inFlight?: number, connectionPermits?: number, deferredDepth?: number, openConnections?: number } | null
  * }} SteadyStateTrajectory
  * @typedef {{ category: string, context: unknown } | null} SteadyStateViolation
  */
@@ -248,6 +250,64 @@ export function checkStarvation(clients, publishLog, faults) {
 }
 
 /**
+ * Admission-settlement hypothesis: when the run reaches quiescence, the upgrade
+ * ceiling must account for exactly the sockets that are actually open, and for
+ * nothing else.
+ *
+ * Three readings, in the order they answer "did the accounting come back":
+ *
+ * - `inFlight` is zero. Every handshake has finished, one way or another. A
+ *   handshake still counted in flight at quiescence is one whose slot was taken
+ *   and never given back, and the slot is what a later client is refused for.
+ * - `connectionPermits` equals the number of open connections. A permit is
+ *   acquired before the upgrade and held until the socket's close callback, so
+ *   at rest the two are the same number by definition. They come apart when a
+ *   handshake that never produced a socket kept its permit - the client that
+ *   hung up mid-handshake, the socket the app closed inside `open` - which is
+ *   exactly the accounting the ceiling is made of. Only meaningful when the
+ *   live-connection ceiling is configured at all; with `maxConnections` at zero
+ *   the permit calls are no-ops and the count stays flat at zero by design.
+ * - `deferredDepth` is zero. A callback still retained by the pacing queue is an
+ *   upgrade that was never run and never refused.
+ *
+ * The opposite failure - a permit released twice - cannot be caught by reading
+ * counters here, because `releaseConnection` throws on over-release and that
+ * throw leaves through whatever called it. It surfaces as an uncaught error
+ * rather than as a violation, which is louder, not quieter.
+ *
+ * No fault guard. The fault engine gates FRAMES; the permit lifecycle runs on
+ * the upgrade and close paths, which never travel that channel, so a dropped or
+ * reordered frame cannot legitimately unbalance this.
+ *
+ * @param {{ maxConnections?: number, inFlight?: number, connectionPermits?: number, deferredDepth?: number, openConnections?: number } | null | undefined} admission
+ *   the controller's end-of-run reading, or null/undefined on an ungated server
+ * @returns {SteadyStateViolation}
+ */
+export function checkAdmissionSettled(admission) {
+	if (!admission) return null;
+	const open = admission.openConnections || 0;
+	if (admission.inFlight) {
+		return {
+			category: 'steady.admission-unsettled',
+			context: { reading: 'inFlight', value: admission.inFlight, openConnections: open }
+		};
+	}
+	if ((admission.maxConnections || 0) > 0 && (admission.connectionPermits || 0) !== open) {
+		return {
+			category: 'steady.admission-unsettled',
+			context: { reading: 'connectionPermits', value: admission.connectionPermits || 0, openConnections: open }
+		};
+	}
+	if (admission.deferredDepth) {
+		return {
+			category: 'steady.admission-unsettled',
+			context: { reading: 'deferredDepth', value: admission.deferredDepth, openConnections: open }
+		};
+	}
+	return null;
+}
+
+/**
  * Run every steady-state hypothesis against one recorded trajectory and collect
  * the violations (one per hypothesis at most, since each returns its first).
  * Pure: no de-dup, no clock, no side effect - the runner owns de-dup and folds
@@ -271,5 +331,6 @@ export function runSteadyState(trajectory) {
 	add(checkTopicsHaveSubscribers(t.terminal || {}));
 	add(checkDeliveryMonotonic(t.clients, t.faults));
 	add(checkStarvation(t.clients, t.publishLog, t.faults));
+	add(checkAdmissionSettled(t.admission));
 	return out;
 }

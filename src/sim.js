@@ -75,6 +75,7 @@ const {
 	wsConnections,
 	wsCounters
 } = await import('./runtime/handler/ws-state.js');
+const { upgradeAdmission } = await import('./runtime/handler/admission.js');
 const { _resetWireCodecRegistry } = await import('./runtime/handler/codec-registry.js');
 const { _resetSharedWireIds } = await import('./runtime/utils/shared-wire-id.js');
 const { stopPressureSampling } = await import('./runtime/handler/pressure-metrics.js');
@@ -114,6 +115,14 @@ function resetSimState() {
 	stopPressureSampling();
 	_resetWireCodecRegistry();
 	_resetSharedWireIds();
+	// The upgrade ceiling, on the servers that have one. It is built once per
+	// PROCESS from the options, and the sim runs a corpus of servers in one
+	// process, so a seed that ended holding a permit would otherwise narrow the
+	// ceiling every later seed runs against - and a fingerprint that depends on
+	// which seeds ran first is not a fingerprint. Whether the accounting came
+	// back is checked as a steady-state hypothesis BEFORE this reset, at the end
+	// of each run, so clearing it here hides nothing.
+	if (upgradeAdmission !== null) upgradeAdmission._resetForSim();
 	wsCounters.closedWsAborts = 0;
 	wsCounters.droppedReleaseRecords = 0;
 	wsCounters.publishCount = 0;
@@ -248,6 +257,24 @@ function snapshot(app) {
 }
 
 /**
+ * The upgrade ceiling's end-of-run reading, or null on a server that has none.
+ * Paired with the live socket count, because the hypothesis this feeds is about
+ * the two AGREEING rather than about either number alone.
+ *
+ * @param {ReturnType<typeof createInMemoryApp>} app
+ */
+function admissionReading(app) {
+	if (upgradeAdmission === null) return null;
+	return {
+		maxConnections: upgradeAdmission.maxConnections,
+		inFlight: upgradeAdmission.inFlight,
+		connectionPermits: upgradeAdmission.connectionPermits,
+		deferredDepth: upgradeAdmission.deferredDepth,
+		openConnections: app._connections.size
+	};
+}
+
+/**
  * The default scenario when a caller passes none: connect N clients, subscribe
  * each to every topic, then publish a few events per topic, advancing the
  * clock between phases so frames flow. Identical steps to the uws sim's
@@ -263,6 +290,122 @@ async function defaultScenario(api, opts) {
 	for (const t of opts.topics) for (let n = 0; n < 3; n++) api.publish(t, 'tick', { n });
 	await api.advance();
 }
+
+/**
+ * The admission scenario: a gated server, an app that refuses some sockets from
+ * inside `open`, and clients that leave while the app's `upgrade` hook still has
+ * them.
+ *
+ * These are the two orderings the whole upgrade path is built around, and until
+ * this scenario existed no COMMITTED run drove either one - the coverage was
+ * unit-level, so the corpus, which is the oracle that does not depend on the
+ * code under test, could not fail on them. The defect they produce is not
+ * subtle: a permit released twice throws out of the close callback and strands
+ * every teardown behind it.
+ *
+ * The hooks are installed here rather than handed in as `handler` because their
+ * state has to be PER RUN. The swarm hands every seed the same config object, so
+ * a map of parked resolvers living on it would carry one seed's unfinished
+ * handshakes into the next seed's server - cross-seed contamination of exactly
+ * the kind resetSimState exists to prevent, and invisible because it would look
+ * like a scenario that simply behaved differently later in the corpus.
+ *
+ * Each client's role is drawn from the run's seeded stream, so the seeds spread
+ * across the interleavings rather than all replaying one shape.
+ */
+async function admissionScenario(api, opts) {
+	/** @type {Array<() => void>} resolvers for the handshakes parked in the app hook */
+	const parked = [];
+	__setSimHooks({
+		upgrade(req) {
+			const mode = new URL(req.url).searchParams.get('mode') || 'plain';
+			// An app hook that AWAITS - a session lookup, a token check, a rate
+			// limiter - is what holds a handshake open long enough for its client
+			// to leave inside it. Without one the abort branch is unreachable,
+			// because nothing is ever pending when the abort arrives.
+			if (mode === 'park') return new Promise((resolve) => parked.push(() => resolve({ mode })));
+			return { mode };
+		},
+		open(ws) {
+			// `open` is dispatched INSIDE `srv.upgrade`, so this close runs its
+			// close callback - and the permit release with it - before the upgrade
+			// call returns. Ordinary apps reach it: refusing an unauthenticated
+			// session, holding one socket per user, a full room.
+			if (ws.getUserData().mode === 'refuse') ws.end(4003, 'refused by the app');
+		}
+	});
+
+	/** @type {string[]} */
+	const modes = [];
+	for (let i = 0; i < opts.clients; i++) {
+		const draw = api.rng.float();
+		modes.push(draw < 0.3 ? 'refuse' : draw < 0.65 ? 'park' : 'plain');
+	}
+
+	/** @type {any[]} */
+	const conns = [];
+	// TWO WAVES, not one burst, and the second wave is the point. A single burst
+	// only ever shows the ceiling REFUSING: every handshake is in flight before
+	// any permit has come back, so no client is ever admitted because an earlier
+	// one released. That is precisely the property a leak destroys - a leaked
+	// permit costs nothing until the next client needs it - so a workload that
+	// never re-uses a permit cannot fail on one.
+	//
+	// It also makes both refusal reasons reachable. The two ceilings are checked
+	// in order, so in one burst whichever is lower answers every refusal; by the
+	// second wave the survivors of the first are holding permits without holding
+	// in-flight slots, which is the state where the other one answers.
+	const half = Math.ceil(opts.clients / 2);
+	for (const [from, to] of [[0, half], [half, opts.clients]]) {
+		for (let i = from; i < to; i++) conns[i] = api.connect({ query: 'mode=' + modes[i] });
+		await api.advance();
+
+		// The clients that go away mid-handshake. Only the parked ones can: the
+		// rest have already been answered by now, and `hangUp()` says so by
+		// returning false, which is what keeps this from silently modelling
+		// nothing.
+		for (let i = from; i < to; i++) {
+			if (modes[i] === 'park' && api.rng.float() < 0.5) conns[i].hangUp();
+		}
+		await api.advance();
+
+		// Whatever is still parked is answered, so the wave can settle. Including
+		// the handshakes whose client has already gone: the hook does not know
+		// that, and the upgrade path has to be the one that notices.
+		for (const release of parked.splice(0)) release();
+		await api.advance();
+	}
+
+	for (let i = 0; i < conns.length; i++) {
+		if (conns[i].state !== 'open') continue;
+		for (const t of opts.topics) conns[i].subscribe(t);
+	}
+	await api.advance();
+	// The survivors still carry traffic. A ceiling that refused the right clients
+	// but broke the ones it admitted would pass every count and fail here.
+	for (const t of opts.topics) for (let n = 0; n < 3; n++) api.publish(t, 'tick', { n });
+	await api.advance();
+}
+
+/**
+ * The scenarios a committed corpus can be blessed against, by NAME.
+ *
+ * The name is what the corpus file records, because the scenario itself is a
+ * function and a function does not survive JSON: a corpus that recorded its
+ * workload as `{}` would be re-verified against whatever workload the runner
+ * happened to be holding, and the fingerprints would disagree for a reason the
+ * report could not name. With the name recorded, that mismatch is reported as
+ * one.
+ *
+ * A scenario supplies its own `handler` hooks where it needs them, so an entry
+ * is the whole workload rather than half of one.
+ *
+ * @type {Record<string, { scenario: (api: any, opts: { clients: number, topics: string[] }) => void | Promise<void> }>}
+ */
+export const SIM_SCENARIOS = {
+	default: { scenario: defaultScenario },
+	admission: { scenario: admissionScenario }
+};
 
 /**
  * Run one simulation. Single-process only - the cluster path joins when the
@@ -380,7 +523,12 @@ export async function runSim(config = {}) {
 			terminal: finalState,
 			publishLog,
 			clients: deliveredPairs,
-			faults: faultClasses(config.faults)
+			faults: faultClasses(config.faults),
+			// Read here, before `server.close()` below tears the connections down:
+			// at quiescence the permits and the live sockets must be the same
+			// number, and after teardown they are trivially both zero, which is
+			// the reading that would prove nothing.
+			admission: admissionReading(app)
 		})) recordViolation(v);
 
 		await server.close();
@@ -488,6 +636,7 @@ function runFailed(result) {
  *   faultProbability?: number,
  *   checkRatio?: number,
  *   gitCommit?: string,
+ *   scenarioName?: string,
  *   onResult?: (run: any, index: number) => void
  * }} [config]
  * @returns {Promise<{ summary: any, runs: any[] }>}
@@ -557,6 +706,10 @@ export async function runSimSwarm(config = {}) {
 		firstFailingSeed: failingSeeds.length ? failingSeeds[0] : null,
 		failingSeeds,
 		faultMode,
+		// Which named workload produced these fingerprints. Carried so the corpus
+		// can record it and a later run can be told it is comparing against a
+		// different one; null when the caller ran an unnamed scenario of its own.
+		scenarioName: config.scenarioName ?? null,
 		faulted: runs.filter((r) => r.faulted).length,
 		determinismChecks,
 		determinismFailures,
@@ -630,6 +783,16 @@ export function checkSimGoldens(golden, swarmResult, opts = {}) {
 	const aFaultMode = swarmResult.summary ? swarmResult.summary.faultMode : undefined;
 	if (gFaultMode !== undefined && gFaultMode !== null && aFaultMode !== undefined && gFaultMode !== aFaultMode) {
 		configMismatch = "fault mode differs: corpus recorded '" + gFaultMode + "', run used '" + aFaultMode +
+			"' - fingerprints are not comparable; regenerate the corpus or fix the runner config";
+	}
+	// The workload, on the same rule as the fault mode above. Without this a
+	// corpus checked against the wrong scenario reports drift on every seed, which
+	// reads as forty regressions in the code rather than as one wrong runner
+	// config - and the two call for opposite responses.
+	const gScenario = golden.swarm ? golden.swarm.scenario : undefined;
+	const aScenario = swarmResult.summary ? swarmResult.summary.scenarioName : undefined;
+	if (configMismatch === null && gScenario !== undefined && gScenario !== null && aScenario !== undefined && aScenario !== null && gScenario !== aScenario) {
+		configMismatch = "scenario differs: corpus recorded '" + gScenario + "', run used '" + aScenario +
 			"' - fingerprints are not comparable; regenerate the corpus or fix the runner config";
 	}
 

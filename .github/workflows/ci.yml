@@ -30,13 +30,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      # Re-runs the committed corpus seeds under the corpus config and fails
-      # on any fingerprint drift. The corpus entries are fingerprint-identical
-      # to svelte-adapter-uws's adapter-single corpus at the parity pin
-      # (verified locally via `npm run sim:golden -- --against <uws corpus>`,
+      # Re-runs every committed corpus's seeds under the config it was blessed
+      # with, and fails on any fingerprint drift. `adapter-single`'s entries are
+      # fingerprint-identical to svelte-adapter-uws's corpus of the same name at
+      # the parity pin (verified locally via
+      # `node scripts/sim-golden.js --corpus adapter-single --against <uws corpus>`,
       # the same local-ritual shape as probe:uws); this job holds THIS repo to
-      # that blessed baseline on every push.
-      - name: Verify the golden corpus
+      # that blessed baseline on every push. `adapter-admission` has no sibling
+      # to compare against - it drives this adapter's upgrade ceiling, an app
+      # that refuses sockets from inside `open`, and clients that leave
+      # mid-handshake.
+      - name: Verify the golden corpora
         run: npm run sim:golden
 
   bun-matrix:

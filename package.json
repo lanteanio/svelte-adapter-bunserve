@@ -32,7 +32,7 @@
 		"test:leak": "bun test/leak/run.mjs",
 		"check:publish": "publint && attw --pack . --profile esm-only",
 		"check:determinism": "node scripts/check-determinism.js",
-		"sim:golden": "node scripts/sim-golden.js",
+		"sim:golden": "node scripts/sim-golden.js --corpus adapter-single && node scripts/sim-golden.js --corpus adapter-admission",
 		"probe:uws": "node probe/uws-surface.mjs"
 	},
 	"dependencies": {

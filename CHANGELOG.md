@@ -155,6 +155,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so the interleaving that releases an admission permit twice could not occur
   under simulation at all.
 
+- A second committed golden corpus
+  (`test/dst-goldens/adapter-admission.golden.json`, forty seeds) that drives a
+  server with an `upgradeAdmission` ceiling, an app that refuses sockets from
+  inside its `open` hook, and clients that leave while the app's `upgrade` hook
+  still has them. Those are the orderings the upgrade path is built around, and
+  a refused socket runs its close callback - permit release included - before
+  `server.upgrade()` has returned, so the accounting is at its most delicate
+  exactly where nothing else exercised it. Clients arrive in two waves, so a
+  permit given back by the first wave is what admits someone in the second:
+  a leaked permit costs nothing until the next client needs it, and a workload
+  that never re-uses one cannot fail on it. `npm run sim:golden` runs both
+  corpora; a corpus names the server and the workload it was blessed under, and
+  a run against a different one is refused rather than reported as drift.
+  `adapter-single` is untouched, so it stays fingerprint-identical to
+  svelte-adapter-uws's corpus - an adapter-specific workload gets its own file
+  rather than diluting the cross-adapter one.
+
+- A steady-state hypothesis over the upgrade ceiling: when a run settles, the
+  permits it holds must be exactly the sockets that are open, nothing may still
+  be in flight, and the pacing queue must be empty. A permit that outlives its
+  handshake narrows the ceiling for every later client and is otherwise silent
+  until the server stops admitting anyone.
+
 - An injectable runtime seam (`src/runtime/runtime.js`): every clock, RNG and
   timer read in the served runtime goes through named helpers over one
   swappable environment - identical in shape to svelte-adapter-uws's seam -

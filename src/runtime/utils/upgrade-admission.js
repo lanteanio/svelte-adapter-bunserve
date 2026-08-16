@@ -302,6 +302,39 @@ export function createUpgradeAdmission(opts) {
 			notifyDeferredObserver();
 			scheduleDrain();
 			return false;
+		},
+		/**
+		 * Drop every counter and queued callback back to the state a freshly
+		 * built controller is in.
+		 *
+		 * Exists for the simulator alone, and only because the two disagree about
+		 * how many servers a process runs. Production is one server per process,
+		 * so this controller is built once and lives as long as the process; the
+		 * sim runs a whole corpus of servers in one process, and the controller it
+		 * drives is a module singleton reached through `ws_options` at import, so
+		 * without this each seed would inherit the previous seed's ceiling. That
+		 * makes a fingerprint depend on the ORDER its seed was run in, which is
+		 * the one property a golden corpus cannot have.
+		 *
+		 * The deferred observer is deliberately not cleared: it is an installed
+		 * collaborator rather than run state, and a reset that silently
+		 * disconnected metrics would be a surprise in the one direction that is
+		 * hard to notice.
+		 */
+		_resetForSim() {
+			inFlight = 0;
+			cursorInFlight = 0;
+			connectionPermits = 0;
+			perTickCount = 0;
+			deferred.length = 0;
+			deferredHead = 0;
+			deferredTail = 0;
+			deferredDepth = 0;
+			deferredRejectedTotal = 0;
+			// Cleared so the next run can schedule its own drain. Any drain still
+			// scheduled from the previous run is holding a timer on that run's
+			// scheduler, which is torn down with it, so nothing is left to cancel.
+			drainScheduled = false;
 		}
 	};
 }

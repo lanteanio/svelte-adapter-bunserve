@@ -92,8 +92,8 @@ Prototype phase. The build order:
 5. Backpressure/flow-control parity (done: the pressure sampler,
    `platform.pressure`/`onPressure`/`onPublishRate`, and the lease window
    lane), and the conformance gate against the family's deterministic
-   simulation goldens (done: `npm run sim:golden`, fingerprint-identical to
-   the sibling's corpus at the pin).
+   simulation goldens (done: `npm run sim:golden`, whose cross-adapter corpus
+   is fingerprint-identical to the sibling's at the pin).
 
 Single-process at launch; a multi-process mode is planned.
 
@@ -1040,13 +1040,29 @@ modules a built server runs - over an in-memory Bun.serve double, a virtual
 clock, and a seeded fault engine (`src/sim.js`; every clock, RNG and timer
 read in the runtime goes through `src/runtime/runtime.js`, enforced by
 `npm run check:determinism`). A seed reproduces its interleaving bit-for-bit,
-and the committed golden corpus (`test/dst-goldens/`, verified in CI by
-`npm run sim:golden`) pins forty seeds' structural fingerprints - which are
-fingerprint-identical to svelte-adapter-uws's own committed corpus at the
-parity pin, checked locally with
-`npm run sim:golden -- --against ../svelte-adapter-uws/test/dst-goldens/adapter-single.golden.json`.
+and the committed golden corpora (`test/dst-goldens/`, verified in CI by
+`npm run sim:golden`) pin forty seeds' structural fingerprints each.
+
+`adapter-single` is the cross-adapter corpus: its fingerprints are identical to
+svelte-adapter-uws's own committed corpus at the parity pin, checked locally
+with
+
+```
+node scripts/sim-golden.js --corpus adapter-single \
+  --against ../svelte-adapter-uws/test/dst-goldens/adapter-single.golden.json
+```
+
 Identical golden traces are the positioning guard: the tier line stays a
-performance statement, never a capability statement.
+performance statement, never a capability statement. Nothing adapter-specific
+belongs in that corpus, which is why there is a second one.
+
+`adapter-admission` runs a server with an `upgradeAdmission` ceiling, an app
+that refuses sockets from inside its `open` hook, and clients that leave while
+the app's `upgrade` hook still has them. Each corpus names the server it runs
+against, and that server is built once when the runtime is imported - so one
+process verifies one corpus, and `npm run sim:golden` is two invocations rather
+than a loop. Select one with `--corpus <name>`; an unrecognised name is refused
+rather than defaulted.
 
 A change that deliberately moves a fingerprint is blessed with
 `node scripts/sim-golden.js --update`, and the corpus diff is the reviewable
