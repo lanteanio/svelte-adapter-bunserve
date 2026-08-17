@@ -134,6 +134,23 @@ export async function upgrade(request, { platform, headers }) {
 	return { userId: session.userId };
 }
 
+// Optional HTTP preflight, mounted at `websocket.authPath` (default
+// `/__ws/auth`) ONLY when this hook is exported. The family client store POSTs
+// here before opening a socket when `connect({ auth: true })` is used.
+//
+// It exists so a session cookie can be refreshed on an ordinary response: a
+// Set-Cookie on the 101 upgrade response is silently dropped by Cloudflare
+// Tunnel and other strict edge proxies, so a refresh that rides on the
+// handshake works in development and vanishes in production.
+//
+// Return nothing for 204, `false` for 401, or a Response to use verbatim.
+// Cookies set here are merged onto whichever of those you return.
+export async function authenticate(request, { cookies, platform, getClientAddress }) {
+	const session = await refresh(cookies.get('sid'));
+	if (!session) return false;
+	cookies.set('sid', session.token, { path: '/', maxAge: 3600 });
+}
+
 // Once per process. `init` runs after the listener is up (a throw here is NOT
 // swallowed - boot failure should be loud). `shutdown` runs at graceful stop
 // BEFORE the sockets are drained, so it can still reach connected clients.
@@ -183,6 +200,27 @@ that object is therefore attacker-settable - a crafted token claim could put an
 arbitrary `Set-Cookie` on the 101 response. The context channel cannot be named
 by client data. A returned `headers` key is ordinary userData, and the
 adapter warns once if it sees one.
+
+**The auth preflight is guarded against CSRF by default.** It accepts session
+cookies and runs your credential check, so a page on any origin could otherwise
+drive it with the visitor's cookie riding along on a credentialed `fetch`. The
+request is accepted when it carries `x-requested-with: XMLHttpRequest` (a
+cross-origin browser cannot set a custom header without a CORS preflight, and
+this endpoint approves none), or `sec-fetch-site: same-origin` (browsers stamp
+it and script cannot forge it), or an `Origin` your `allowedOrigins` allows. The
+family client stamps the first, so browser traffic is unaffected. A **missing**
+`Origin` is refused here, where the upgrade door allows it - that door has your
+`upgrade` hook behind it to authenticate a non-browser client, and this endpoint
+IS the authentication. Native clients that send none of the three are what
+`authPathRequireOrigin: false` is for.
+
+**The hooks take `(request, context)` here, where svelte-adapter-uws takes a
+single event object.** Bun hands `fetch` a real `Request` that outlives an
+await, so passing it straight through is the honest shape rather than copying
+one field at a time into a synthetic event. A `hooks.ws` module moving between
+the two adapters needs its `upgrade` and `authenticate` signatures adjusted;
+everything the context carries (`platform`, `cookies`, `getClientAddress`) is
+the same information under the same names.
 
 **`subscribe` is called with the per-connection `platform`**, the same one every
 other hook receives, so `platform.requestId` correlates across the whole
@@ -311,6 +349,8 @@ adapter: bunserve({
 	websocket: {
 		path: '/ws',                        // default
 		handler: 'src/ws-handler.js',       // default
+		authPath: '/__ws/auth',             // the auth preflight POST; must differ from `path`
+		authPathRequireOrigin: true,        // CSRF guard on it; false accepts native clients
 		compressCredentialedResponses: false,
 		maxPayloadLength: 1024 * 1024,      // default 1 MB
 		idleTimeout: 120,                   // seconds; Bun REFUSES anything above 960

@@ -79,6 +79,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The auth preflight endpoint, with `websocket.authPath` (default
+  `/__ws/auth`) and `websocket.authPathRequireOrigin` (default `true`). Export
+  an `authenticate` hook from your WebSocket handler and the adapter mounts a
+  `POST` endpoint there; export nothing and there is no endpoint, so the path
+  falls through to ordinary routing exactly as before. The family client store
+  posts to it before opening a socket when `connect({ auth: true })` is used.
+
+  It exists because a `Set-Cookie` on the `101` upgrade response is silently
+  dropped by Cloudflare Tunnel and other strict edge proxies - a session
+  refresh that rides on the handshake therefore works in development and
+  disappears in production with no error anywhere. Moving it to an ordinary
+  HTTP response is what every proxy understands. The hook is handed the real
+  `Request` plus `{ platform, cookies, getClientAddress }`: return nothing for
+  `204`, `false` for `401`, or a `Response` to use verbatim, with anything set
+  through `cookies` merged onto whichever of the three you return. A wrong verb
+  is answered `405` rather than falling through to the SSR catch-all, which
+  would render the app shell at a URL that is not a page. A throwing hook is
+  `500`, logged once per throttle window.
+
+  `authPathRequireOrigin` is the CSRF guard, on by default: the endpoint runs
+  app credential code against session cookies, so a page on any origin could
+  otherwise drive it with a credentialed `fetch` and the visitor's cookie
+  riding along. A request is accepted when it carries `x-requested-with:
+  XMLHttpRequest`, or `sec-fetch-site: same-origin`, or an `Origin` that
+  `allowedOrigins` allows - the first of which the family client always sends,
+  so browser traffic is unaffected. A **missing** `Origin` is refused here
+  where the upgrade door allows it: that door has the app's `upgrade` hook
+  behind it to authenticate a non-browser client, and this endpoint is itself
+  the authentication. Set it to `false` for native clients that send none of
+  the three.
+
+  `authPath` must be absolute and must differ from `websocket.path` and from
+  the probe routes; each collision fails the build, because the WebSocket lane
+  and the probes are matched first and the preflight would simply never be
+  reached.
+
 - `websocket.upgradeAdmission`, admission control for the upgrade path, spelled
   and defaulted exactly as svelte-adapter-uws spells it so a config carried
   between the two adapters gates the same way. Four independent opt-in layers:

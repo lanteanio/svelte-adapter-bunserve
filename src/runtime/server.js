@@ -6,8 +6,9 @@ import { cacheDir, clientDir, prerenderedDir, serveStatic, tryPrerendered } from
 import { handleSSR } from './handler/ssr.js';
 import { requestDone, isDraining } from './handler/lifecycle.js';
 import { response400, response500 } from './handler/http-helpers.js';
-import { is_tls, ssl_cert, ssl_key, body_size_limit, idle_timeout, ws_options, ws_path } from './handler/config.js';
+import { auth_path, is_tls, ssl_cert, ssl_key, body_size_limit, idle_timeout, ws_options, ws_path } from './handler/config.js';
 import { tryUpgrade } from './handler/upgrade.js';
+import { authEndpointMounted, tryAuthEndpoint } from './handler/auth.js';
 import { websocketHandlers } from './handler/ws.js';
 import { setServer } from './handler/ws-state.js';
 import { startPressureSampling } from './handler/pressure-metrics.js';
@@ -90,6 +91,16 @@ function fetchHandler(req, srv) {
 	const upgraded = tryUpgrade(req, srv, pathname);
 	if (upgraded !== null) return upgraded;
 
+	// === AUTH PREFLIGHT ===
+	// Alongside the upgrade lane and ahead of static and SSR, for the same
+	// reason: it is one exact string compare against an adapter-owned path, and
+	// the SSR catch-all would otherwise render the app shell at a URL that is not
+	// a page. Returns null when the request is not for this endpoint - which
+	// includes every request on a server whose handler exports no `authenticate`,
+	// since nothing is mounted there at all.
+	const authenticated = tryAuthEndpoint(req, srv, pathname);
+	if (authenticated !== null) return authenticated;
+
 	// === STATIC FILE FAST PATH ===
 	// Minimum work: 1 Map lookup, no decode, no full URL handling.
 	const staticFile = staticCache.get(pathname);
@@ -160,5 +171,9 @@ export function start(host, port) {
 		`Listening on ${is_tls ? 'https' : 'http'}://${host}:${bunServer.port} (ready in ${(processMonotonicNow() - _t_boot).toFixed(0)}ms)`
 	);
 	if (ws_options) console.log(`WebSocket endpoint registered at ${ws_path}`);
+	// Only when it exists: an app with no `authenticate` hook has no endpoint
+	// here, and a line naming one would send an operator looking for a route that
+	// answers nothing.
+	if (authEndpointMounted()) console.log(`WebSocket auth endpoint registered at ${auth_path}`);
 	return bunServer;
 }

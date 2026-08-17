@@ -42,8 +42,18 @@ export let resume;
 export let upgrade;
 
 /**
+ * The auth preflight hook. Unset by default for the reason `upgrade` is: the
+ * endpoint is mounted only when the app exports one, so a test that installs
+ * nothing sees a server with no auth endpoint at all.
+ *
+ * @type {undefined | ((req: Request, ctx: any) => unknown)}
+ */
+export let authenticate;
+
+/**
  * @param {{ subscribe?: any, subscribeBatch?: any, unsubscribe?: any,
- *   open?: any, message?: any, close?: any, resume?: any, upgrade?: any }} hooks
+ *   open?: any, message?: any, close?: any, resume?: any, upgrade?: any,
+ *   authenticate?: any }} hooks
  */
 export function __setHooks(hooks) {
 	subscribe = hooks.subscribe;
@@ -54,4 +64,5 @@ export function __setHooks(hooks) {
 	close = hooks.close;
 	resume = hooks.resume;
 	upgrade = hooks.upgrade;
+	authenticate = hooks.authenticate;
 }

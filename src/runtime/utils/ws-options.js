@@ -95,6 +95,16 @@ const DEFAULTS = {
 	// about the one it does.
 	handler: 'src/ws-handler.js',
 	path: '/ws',
+	// Where the auth preflight POST is served, when the handler exports an
+	// `authenticate` hook. uws's path, because the family client store is the
+	// thing that calls it and it has one address for both adapters. The `__`
+	// prefix is what makes it obviously not a page; Cloudflare Access is the
+	// documented reason an app would move it.
+	authPath: '/__ws/auth',
+	// Whether that endpoint requires evidence the request came from a page this
+	// server trusts (CSRF defense). On by default, and off is how a native client
+	// that sends none of those headers is accepted.
+	authPathRequireOrigin: true,
 	// Also uws-nested: whether a Vary-on-credentials response may be compressed.
 	compressCredentialedResponses: false
 };
@@ -508,6 +518,30 @@ export function normalizeWsOptions(input) {
 			);
 		}
 		options.path = raw.path;
+	}
+	if (raw.authPath !== undefined) {
+		if (typeof raw.authPath !== 'string' || raw.authPath[0] !== '/') {
+			throw new Error(
+				"adapter option `websocket.authPath` must be an absolute path string starting with '/' " +
+				`(e.g. '/__ws/auth') - got ${JSON.stringify(raw.authPath)}.`
+			);
+		}
+		options.authPath = raw.authPath;
+	}
+	// Checked against the RESOLVED pair, so it fires whether the collision was
+	// written out or arrived by moving only one of the two onto the other's
+	// default. The upgrade lane is matched first, so an auth path equal to it
+	// would never be reached and an app would see its preflight answered with a
+	// 426 - a failure with nothing in it that names this option.
+	if (options.authPath === options.path) {
+		throw new Error(
+			`adapter option \`websocket.authPath\` ('${options.authPath}') must differ from ` +
+			`\`websocket.path\` ('${options.path}'). The WebSocket endpoint is matched first, so the ` +
+			'auth preflight would never be reached.'
+		);
+	}
+	if (raw.authPathRequireOrigin !== undefined) {
+		options.authPathRequireOrigin = requireBoolean(raw.authPathRequireOrigin, 'authPathRequireOrigin');
 	}
 	if (raw.maxSubscriptionsPerConnection !== undefined) {
 		options.maxSubscriptionsPerConnection = requirePositiveInt(

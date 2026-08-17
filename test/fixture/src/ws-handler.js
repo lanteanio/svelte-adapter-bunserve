@@ -190,6 +190,36 @@ export async function upgrade(request, { headers }) {
 	return { user: url.searchParams.get('user') || 'anon' };
 }
 
+/**
+ * The auth preflight, exercised by test/live/auth-endpoint-check.mjs.
+ *
+ * Every branch a real hook has: refresh a cookie and answer implicitly, refuse,
+ * answer with a Response of its own, or throw. Which one it takes is chosen by
+ * the query string, so one build covers all of them.
+ */
+export async function authenticate(request, { cookies, platform, getClientAddress }) {
+	const url = new URL(request.url);
+	const mode = url.searchParams.get('mode') || 'ok';
+	if (mode === 'throw') throw new Error('the app hook exploded');
+	if (mode === 'deny') {
+		// A refusal that still clears the stale session, which is what a real one
+		// does and what the adapter has to let through on a 401.
+		cookies.delete('fixture_session', { path: '/' });
+		return false;
+	}
+	if (mode === 'response') {
+		cookies.set('fixture_session', 'from-jar', { path: '/' });
+		return new Response(JSON.stringify({ requestId: platform.requestId, address: getClientAddress() }), {
+			status: 200,
+			headers: { 'content-type': 'application/json' }
+		});
+	}
+	// The ordinary path: a refreshed session cookie on an ordinary HTTP
+	// response, which is the entire reason this endpoint exists.
+	cookies.set('fixture_session', 'refreshed', { path: '/', maxAge: 600 });
+	return undefined;
+}
+
 export function open(ws, { platform }) {
 	// Turned away here, synchronously, before anything else happens on this
 	// connection. This is the shape the adapter's permit hand-over has to

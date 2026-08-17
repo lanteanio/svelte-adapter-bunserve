@@ -17,6 +17,7 @@
 /** @type {any} */ export let close;
 /** @type {any} */ export let drain;
 /** @type {any} */ export let upgrade;
+/** @type {any} */ export let authenticate;
 /** @type {any} */ export let resume;
 /** @type {any} */ export let init;
 /** @type {any} */ export let shutdown;
@@ -37,6 +38,11 @@ export function __setSimHooks(hooks = {}) {
 	close = hooks.close;
 	drain = hooks.drain;
 	upgrade = hooks.upgrade;
+	// Never reached by a sim scenario - the auth endpoint is plain HTTP and the
+	// in-memory transport carries no HTTP requests - but reset with the rest, so
+	// a unit test that assembles the sim graph and installs one cannot leave it
+	// mounted for the next.
+	authenticate = hooks.authenticate;
 	resume = hooks.resume;
 	init = hooks.init;
 	shutdown = hooks.shutdown;

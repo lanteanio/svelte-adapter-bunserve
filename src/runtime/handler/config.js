@@ -17,6 +17,14 @@ export const ws_options = WS_OPTIONS;
 /** The path the WebSocket endpoint answers on. */
 export const ws_path = WS_PATH;
 
+/**
+ * The path the auth preflight endpoint answers on, when the app exports an
+ * `authenticate` hook to serve there. Read from the normalized options rather
+ * than from a build constant of its own: unlike `ws_path`, nothing needs it
+ * before the options exist.
+ */
+export const auth_path = ws_options?.authPath ?? '/__ws/auth';
+
 /** True when a compressor is configured, so publish/send can deflate by default. */
 export const ws_compression_on = Boolean(ws_options && ws_options.compression);
 

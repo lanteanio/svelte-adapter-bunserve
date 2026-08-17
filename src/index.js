@@ -64,12 +64,23 @@ export default function (opts = {}) {
 	// intent - see the WS_OPTIONS decision below.
 	const wsTransportConfigured =
 		websocket !== undefined &&
-		Object.keys(websocket).some((key) => key !== 'handler' && key !== 'path');
+		Object.keys(websocket).some((key) => key !== 'handler' && key !== 'path' && key !== 'authPath');
 
 	if (websocketPath === healthCheckPath || websocketPath === readinessCheckPath) {
 		throw new Error(
 			`adapter option \`websocket.path\` ('${websocketPath}') collides with a probe route. ` +
 			'The probe routes are matched first, so the WebSocket endpoint would never be reached.'
+		);
+	}
+
+	// The same collision, and the same reason: the probes are matched first, so
+	// an auth preflight sharing a probe's path would be answered with the probe's
+	// 200 and the sign-in would fail with nothing naming the cause.
+	const websocketAuthPath = wsResult.options.authPath;
+	if (websocketAuthPath === healthCheckPath || websocketAuthPath === readinessCheckPath) {
+		throw new Error(
+			`adapter option \`websocket.authPath\` ('${websocketAuthPath}') collides with a probe route. ` +
+			'The probe routes are matched first, so the auth preflight endpoint would never be reached.'
 		);
 	}
 
