@@ -517,6 +517,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **BREAKING (bucket identity)** A rate-limit key no longer carries a port.
+  `1.2.3.4:5678` and `[::ffff:1.2.3.4]:5678` keyed as written, so behind any
+  proxy that reports the peer SOCKET rather than the peer host - Azure App
+  Service does, and so does nginx configured with `$remote_addr:$remote_port` -
+  every request from one client landed in a fresh bucket and `upgradeRateLimit`
+  and `websocket.authPathRateLimit` could not refuse anything. Nothing about
+  the door said so: the map churned, the entry cap absorbed it, and the
+  refusal counters stayed at zero, which reads exactly like traffic under the
+  limit. The address is now recovered and the port dropped wherever the value
+  is recognised as an address carrying one, including on every path that
+  deliberately declines to fold the address itself. A value that is NOT
+  recognised is still never trimmed, so an opaque `ADDRESS_HEADER` string keeps
+  every byte. Deployments where the client address arrives without a port are
+  unaffected, and clients that were metered separately still are.
+
 - `XFF_DEPTH` is validated at boot and a value that cannot select a hop refuses
   to start the process. A non-numeric or non-positive value parsed to `NaN` or
   `0`, both of which slipped past the "chain shorter than the configured depth"

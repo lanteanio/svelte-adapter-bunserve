@@ -112,8 +112,57 @@ test('garbage after a bracketed literal is refused rather than ignored', () => {
 	assert.notEqual(key('[2001:db8:1:2::1]:65536'), victim);
 });
 
-test('IPv4 with a port is left alone', () => {
+test('one IPv4 client keys the same however its port arrives', () => {
+	// THE PROPERTY, stated the way it fails. A proxy that reports the peer socket
+	// rather than the peer host (Azure App Service does; nginx configured with
+	// `$remote_addr:$remote_port` does) writes a different value on every
+	// connection, so a key that kept the port would be a fresh bucket per request
+	// and the limiter could never refuse anything. Asserting only that two
+	// DIFFERENT addresses stay apart passes with the port kept, which is how this
+	// went unnoticed.
+	assert.equal(key('203.0.113.7:5678'), key('203.0.113.7:5679'));
+	assert.equal(key('203.0.113.7:5678'), key('203.0.113.7'));
+	assert.equal(key('203.0.113.7:5678'), '203.0.113.7');
+});
+
+test('two IPv4 clients stay apart whether or not they carry ports', () => {
 	assert.notEqual(key('203.0.113.7:5678'), key('203.0.113.8:5678'));
+	assert.notEqual(key('203.0.113.7:5678'), key('203.0.113.8'));
+});
+
+test('an unfolded IPv6 address keys the same however its port arrives', () => {
+	// Every address the folding rules deliberately keep whole reaches the same
+	// trap by the same route: the value it falls back to must not carry the port
+	// either. IPv4-mapped is the one a dual-stack listener produces for ordinary
+	// IPv4 clients, so it is the one a real deployment meets.
+	assert.equal(key('[::ffff:203.0.113.7]:5678'), key('[::ffff:203.0.113.7]:5679'));
+	assert.equal(key('[::ffff:203.0.113.7]:5678'), key('::ffff:203.0.113.7'));
+	assert.equal(key('[fe80::1]:5678'), key('fe80::1'));
+	assert.equal(key('[64:ff9b::203.0.113.9]:5678'), key('64:ff9b::203.0.113.9'));
+	assert.equal(key('[2001:0:53aa:64c:1c:2b0f:3f57:fefd]:5678'), key('2001:0:53aa:64c:1c:2b0f:3f57:fefd'));
+	assert.equal(key('[2001:db8:::1]:5678'), key('2001:db8:::1'));
+	assert.equal(key('[fe80::1%eth0]:5678'), key('fe80::1%eth0'));
+	// ...and clients that were distinct before still are.
+	assert.notEqual(key('[::ffff:203.0.113.7]:5678'), key('[::ffff:203.0.113.8]:5678'));
+	assert.notEqual(key('[fe80::1]:5678'), key('[fe80::2]:5678'));
+});
+
+test('a value that only looks like IPv4 with a port keeps every byte', () => {
+	// Trimming something that is not an address could hand it a key a real client
+	// meters under.
+	assert.equal(key('203.0.113.7:99999'), '203.0.113.7:99999');
+	assert.equal(key('203.0.113.999:80'), '203.0.113.999:80');
+	assert.equal(key('203.0.113.7:'), '203.0.113.7:');
+	assert.equal(key('203.0.113.7:80x'), '203.0.113.7:80x');
+});
+
+test('a bracketed value that is not an address keeps its brackets', () => {
+	// With ADDRESS_HEADER set the value need not be an address, and `[user-42]`
+	// and `user-42` are two client-supplied strings rather than two spellings of
+	// one client.
+	assert.equal(key('[user-42]'), '[user-42]');
+	assert.notEqual(key('[user-42]'), key('user-42'));
+	assert.equal(key('[203.0.113.7]:5678'), '203.0.113.7');
 });
 
 test('an opaque header value is left alone', () => {

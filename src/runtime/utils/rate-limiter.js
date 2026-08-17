@@ -69,6 +69,59 @@ function expandIpv6(host) {
 }
 
 /**
+ * Whether `host[start, end)` is a dotted-quad IPv4 address, every octet in
+ * range.
+ *
+ * Scanned rather than split-and-matched: this is on the per-request key path,
+ * and the split version allocates five strings and runs four regexes to answer
+ * a question one pass over the characters answers with none.
+ *
+ * @param {string} host
+ * @param {number} start
+ * @param {number} end
+ * @returns {boolean}
+ */
+function isIpv4(host, start, end) {
+	let octets = 0;
+	let digits = 0;
+	let value = 0;
+	for (let i = start; i < end; i++) {
+		const c = host.charCodeAt(i);
+		if (c === 46) {
+			if (digits === 0 || octets === 3) return false;
+			octets++;
+			digits = 0;
+			value = 0;
+			continue;
+		}
+		if (c < 48 || c > 57) return false;
+		if (++digits > 3) return false;
+		value = value * 10 + (c - 48);
+		if (value > 255) return false;
+	}
+	return octets === 3 && digits > 0;
+}
+
+/**
+ * Whether `host[start, ...]` is a decimal port number in range.
+ *
+ * @param {string} host
+ * @param {number} start
+ * @returns {boolean}
+ */
+function isPort(host, start) {
+	const end = host.length;
+	if (start >= end || end - start > 5) return false;
+	let value = 0;
+	for (let i = start; i < end; i++) {
+		const c = host.charCodeAt(i);
+		if (c < 48 || c > 57) return false;
+		value = value * 10 + (c - 48);
+	}
+	return value <= 65535;
+}
+
+/**
  * The bucket one client gets.
  *
  * IPv6 is keyed on its allocation PREFIX, not the full address. A /64 is the
@@ -99,6 +152,13 @@ function expandIpv6(host) {
  * nothing here should have to be revisited because a runtime changed how it
  * spells an address, and this adapter's probe does not record which it emits.
  *
+ * A PORT IS NEVER PART OF THE KEY, on any of these paths. Several runtimes and
+ * proxies report the peer socket rather than the peer host - `1.2.3.4:5678`,
+ * `[::ffff:1.2.3.4]:5678` - and the port is different on every connection, so a
+ * key carrying one identifies a connection where it has to identify a client.
+ * The address is recovered and the port dropped whenever the value is recognised
+ * as an address with one; an unrecognised value is never trimmed.
+ *
  * Merging distinct clients into one bucket is a far worse error than failing to
  * merge one client's addresses, so every uncertain case declines to fold.
  *
@@ -126,18 +186,35 @@ export function rateLimitKey(clientIp, maxKeyLen) {
  */
 function foldToPrefix(value) {
 	let host = value;
+	let bracketed = false;
 
 	// A bracketed literal, with or without a port: [2001:db8::1]:443
 	if (host.charCodeAt(0) === 91) {
 		const end = host.indexOf(']');
 		if (end === -1) return value;
-		const suffix = host.slice(end + 1);
-		if (suffix !== '') {
-			if (!/^:\d{1,5}$/.test(suffix) || Number(suffix.slice(1)) > 65535) return value;
+		if (end + 1 !== host.length) {
+			if (host.charCodeAt(end + 1) !== 58 || !isPort(host, end + 2)) return value;
 		}
 		host = host.slice(1, end);
+		bracketed = true;
 	}
-	if (host.indexOf(':') === -1) return value; // IPv4, or an opaque header value
+
+	// WHAT AN UNFOLDED ADDRESS FALLS BACK TO. Every path below that declines to
+	// fold returns this rather than the value as it arrived, because the port and
+	// the brackets are not part of the client's identity - they are which socket
+	// this one request came in on. Returning them would give a proxy that reports
+	// the peer as `host:port` a fresh bucket per connection, and the limiter would
+	// never refuse anything: the failure the folding rules exist to prevent,
+	// reached by the addresses those same rules deliberately keep whole.
+	//
+	// It is the recognised spelling that is dropped, never an unrecognised one. A
+	// bracketed value holding something that is not an address keeps its brackets:
+	// with `ADDRESS_HEADER` set that is a client-supplied string, and two
+	// spellings of one string are not two spellings of one client.
+	const firstColon = host.indexOf(':');
+	const declined = bracketed && (firstColon !== -1 || isIpv4(host, 0, host.length)) ? host : value;
+
+	if (firstColon === -1) return declined; // IPv4, or an opaque header value
 
 	// Fast path for the zero-prefixed forms. An IPv4 client on a dual-stack
 	// listener can arrive fully expanded
@@ -145,20 +222,38 @@ function foldToPrefix(value) {
 	// below refuses to fold anyway - recognising it here skips a full parse
 	// whose result is thrown away.
 	if (host.charCodeAt(0) === 48 || host.charCodeAt(0) === 58) {
-		if (/^(0{1,4}:){4}|^::/.test(host)) return value;
+		if (/^(0{1,4}:){4}|^::/.test(host)) return declined;
 	}
 
 	const pct = host.indexOf('%');
-	if (pct !== -1) return value; // scoped, not a global literal
+	if (pct !== -1) return declined; // scoped, not a global literal
 	host = host.toLowerCase();
 
-	// `1.2.3.4:5678` has a colon but is IPv4 with a port, not IPv6.
-	if (/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(host)) return value;
+	// `1.2.3.4:5678` has a colon but is IPv4 with a port, not IPv6. The port is
+	// DROPPED and the address kept: this is the shape a proxy writes when it
+	// reports the peer socket rather than the peer host, and it is the one that
+	// changes on every connection.
+	//
+	// Both halves are validated before anything is dropped, for the reason the
+	// bracketed literal validates its own port: trimming a value that is not an
+	// address could land it on a key a real client meters under. An
+	// out-of-range octet or port keeps the whole value instead.
+	// The shape test is a dot before the first colon, which no IPv6 spelling has:
+	// an embedded IPv4 tail (`64:ff9b::1.2.3.4`) puts its dots after one, and the
+	// `::ffff:` forms left above. That keeps the parse off every IPv6 key rather
+	// than running it and discarding the answer.
+	const firstDot = host.indexOf('.');
+	if (firstDot !== -1 && firstDot < firstColon) {
+		if (isIpv4(host, 0, firstColon) && isPort(host, firstColon + 1)) {
+			return host.slice(0, firstColon);
+		}
+		return declined;
+	}
 
 	const groups = expandIpv6(host);
-	if (groups === null) return value;
+	if (groups === null) return declined;
 	// A zero /64 is not a routing prefix anyone is allocated - see above.
-	if (groups[0] === '0' && groups[1] === '0' && groups[2] === '0' && groups[3] === '0') return value;
+	if (groups[0] === '0' && groups[1] === '0' && groups[2] === '0' && groups[3] === '0') return declined;
 
 	// Prefixes where the /64 is SHARED BY UNRELATED CLIENTS, so folding merges
 	// people who have nothing to do with each other. The same failure the
@@ -172,10 +267,10 @@ function foldToPrefix(value) {
 	// - Link-local (`fe80::/10`): one /64 for an entire LAN.
 	//
 	// The address is kept whole instead.
-	if (groups[0] === '64' && groups[1] === 'ff9b') return value;
-	if (groups[0] === '2001' && groups[1] === '0') return value;
+	if (groups[0] === '64' && groups[1] === 'ff9b') return declined;
+	if (groups[0] === '2001' && groups[1] === '0') return declined;
 	const first = parseInt(groups[0], 16);
-	if ((first & 0xffc0) === 0xfe80) return value;
+	if ((first & 0xffc0) === 0xfe80) return declined;
 
 	// 6to4 gives one site `2002:V4ADDR::/48`. Folding only the ordinary /64
 	// would leave that site 65,536 independently metered subnet buckets.

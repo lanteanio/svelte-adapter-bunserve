@@ -558,7 +558,10 @@ Two things decide whether it means what it says:
   with itself. A 6to4 site is keyed on its /48. Clients behind one /64 (an
   office, a campus, a VPN egress) therefore share a bucket. IPv4, IPv4-mapped
   addresses, NAT64, Teredo and link-local keep their full value, because their
-  /64 is shared by clients with nothing to do with each other.
+  /64 is shared by clients with nothing to do with each other. A port is never
+  part of the key: a proxy that reports the peer socket rather than the peer
+  host (`1.2.3.4:5678`) writes a different value per connection, and metering
+  that would meter connections rather than clients.
 
 A load test from a single machine will be rate-limited, which is the limiter
 working. Point it at `upgradeRateLimit: 0`, or give the generator real
