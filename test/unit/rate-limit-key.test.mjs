@@ -140,8 +140,8 @@ test('an unfolded IPv6 address keys the same however its port arrives', () => {
 	assert.equal(key('[fe80::1]:5678'), key('fe80::1'));
 	assert.equal(key('[64:ff9b::203.0.113.9]:5678'), key('64:ff9b::203.0.113.9'));
 	assert.equal(key('[2001:0:53aa:64c:1c:2b0f:3f57:fefd]:5678'), key('2001:0:53aa:64c:1c:2b0f:3f57:fefd'));
-	assert.equal(key('[2001:db8:::1]:5678'), key('2001:db8:::1'));
 	assert.equal(key('[fe80::1%eth0]:5678'), key('fe80::1%eth0'));
+	assert.equal(key('[203.0.113.7]:5678'), '203.0.113.7');
 	// ...and clients that were distinct before still are.
 	assert.notEqual(key('[::ffff:203.0.113.7]:5678'), key('[::ffff:203.0.113.8]:5678'));
 	assert.notEqual(key('[fe80::1]:5678'), key('[fe80::2]:5678'));
@@ -156,13 +156,25 @@ test('a value that only looks like IPv4 with a port keeps every byte', () => {
 	assert.equal(key('203.0.113.7:80x'), '203.0.113.7:80x');
 });
 
-test('a bracketed value that is not an address keeps its brackets', () => {
-	// With ADDRESS_HEADER set the value need not be an address, and `[user-42]`
-	// and `user-42` are two client-supplied strings rather than two spellings of
-	// one client.
-	assert.equal(key('[user-42]'), '[user-42]');
-	assert.notEqual(key('[user-42]'), key('user-42'));
-	assert.equal(key('[203.0.113.7]:5678'), '203.0.113.7');
+test('a bracketed value that is not an address keeps every byte', () => {
+	// Brackets mean an IP literal, so a bracketed ADDRESS may lose them and its
+	// port. Anything else is a client-supplied string, and unwrapping it would
+	// merge two identities - the error this module calls far worse than failing
+	// to merge one client's spellings.
+	//
+	// A COLON IS NOT ENOUGH to make it an address, which is the whole point: the
+	// opaque values below all carry one, and an unwrap rule keyed on the colon
+	// would put every one of them in its unbracketed twin's bucket.
+	for (const opaque of ['[user-42]', '[a:b:c]', '[user:42]', '[api.example.com:8080]']) {
+		assert.equal(key(opaque), opaque, `${opaque} keeps its brackets`);
+		assert.notEqual(key(opaque), key(opaque.slice(1, -1)), `${opaque} is not its own contents`);
+	}
+	// Malformed IPv6 is not an address either, so it keeps its port too. That
+	// costs a fresh bucket per connection for a value no proxy writes, which is
+	// the lesser of the two failures - and the parse says so rather than the
+	// shape.
+	assert.equal(key('[2001:db8:::1]:5678'), '[2001:db8:::1]:5678');
+	assert.notEqual(key('[2001:db8:::1]:5678'), key('2001:db8:::1'));
 });
 
 test('an opaque header value is left alone', () => {
@@ -202,6 +214,28 @@ test('a flood sourced from fresh addresses in one /64 is metered as one client',
 	}
 	assert.equal(admitted, 10);
 	assert.equal(l.map.size, 1);
+});
+
+test('a flood from one address on rotating ports is metered as one client', () => {
+	// THE OUTAGE, at the level it happened. The key assertions above prove the
+	// fold; this proves the DOOR - one bucket, ten admissions, everything after
+	// refused. Without it the fold could be right while the limiter still let a
+	// port-rotating client through, and nothing here would say so.
+	const l = limiter();
+	let admitted = 0;
+	for (let i = 0; i < 100; i++) {
+		if (!l.exceeded(`203.0.113.7:${40000 + i}`, 1000)) admitted++;
+	}
+	assert.equal(admitted, 10, 'the allowance is spent once, not once per port');
+	assert.equal(l.map.size, 1, 'and one bucket was created, not a hundred');
+	// The bracketed IPv4-mapped spelling a dual-stack listener can produce.
+	const m = limiter();
+	let mapped = 0;
+	for (let i = 0; i < 100; i++) {
+		if (!m.exceeded(`[::ffff:203.0.113.7]:${40000 + i}`, 1000)) mapped++;
+	}
+	assert.equal(mapped, 10);
+	assert.equal(m.map.size, 1);
 });
 
 test('one /64 cannot spend another /64 allowance', () => {

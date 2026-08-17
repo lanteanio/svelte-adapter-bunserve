@@ -539,31 +539,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **BREAKING (bucket identity)** A rate-limit key no longer carries a port.
-  `1.2.3.4:5678` and `[::ffff:1.2.3.4]:5678` keyed as written, so behind any
-  proxy that reports the peer SOCKET rather than the peer host - Azure App
-  Service does, and so does nginx configured with `$remote_addr:$remote_port` -
-  every request from one client landed in a fresh bucket and `upgradeRateLimit`
-  and `websocket.authPathRateLimit` could not refuse anything. Nothing about
-  the door said so: the map churned, the entry cap absorbed it, and the
-  refusal counters stayed at zero, which reads exactly like traffic under the
-  limit. The address is now recovered and the port dropped wherever the value
-  is recognised as an address carrying one, including on every path that
-  deliberately declines to fold the address itself. A value that is NOT
-  recognised is still never trimmed, so an opaque `ADDRESS_HEADER` string keeps
-  every byte. Deployments where the client address arrives without a port are
-  unaffected, and clients that were metered separately still are.
+  `1.2.3.4:5678` and `[::ffff:1.2.3.4]:5678` keyed as written, so an
+  `ADDRESS_HEADER` whose proxy reports the peer SOCKET rather than the peer host
+  - Azure App Service does, and so does nginx configured with
+  `$remote_addr:$remote_port` - put every request from one client in a fresh
+  bucket, and `upgradeRateLimit` and `websocket.authPathRateLimit` could not
+  refuse anything. Nothing about the door said so: the map churned, the entry
+  cap absorbed it, and the refusal counters stayed at zero, which reads exactly
+  like traffic under the limit. (The socket peer this adapter resolves without
+  a header never carries a port, so a deployment that sets no `ADDRESS_HEADER`
+  was never affected.) The address is now recovered and the port dropped
+  wherever the value is RECOGNISED as an address carrying one, including on
+  every path that deliberately declines to fold the address itself. A value the
+  address parsers do not recognise is never trimmed, port and brackets
+  included, so an opaque `ADDRESS_HEADER` string keeps every byte and two
+  spellings of one such string stay two identities. Clients that were metered
+  separately still are.
 
-- `XFF_DEPTH` is validated at boot and a value that cannot select a hop refuses
-  to start the process. A non-numeric or non-positive value parsed to `NaN` or
+- `XFF_DEPTH` is validated at boot: with `ADDRESS_HEADER` set, a value that
+  cannot select a hop refuses to start the process, and without one it is named
+  in a warning instead. A non-numeric or non-positive value parsed to `NaN` or
   `0`, both of which slipped past the "chain shorter than the configured depth"
   check in each of the two places that read a forwarded chain, and the read that
   followed threw on `undefined`. The result was a 500 with a stack for every SSR
   request and - since metering by client address resolves an address before
   anything has authenticated - for every WebSocket handshake as well, on a
-  server that had started and reported itself healthy. `ADDRESS_HEADER`
-  deployments are the only ones that ever read the value; the default is `1` and
-  is unaffected. svelte-adapter-uws refuses the same values at boot with the
-  same message.
+  server that had started and reported itself healthy. It must be plain decimal
+  digits: `2.9`, `3junk` and `1e3` were each accepted as a depth nobody wrote
+  (2, 3 and 1). The default is `1` and is unaffected, and a server with no
+  `ADDRESS_HEADER` reads the value nowhere, so it will not refuse to start over
+  one - svelte-adapter-uws refuses that case too, which is the one place these
+  two deliberately differ, and only ever by accepting more.
 
 - A client that opened a WebSocket handshake and hung up while the app's
   `upgrade` hook was still awaiting kept one `upgradeAdmission` in-flight slot

@@ -80,21 +80,46 @@ export const origin = parse_origin(env('ORIGIN', undefined));
 
 export const xff_depth = parseInt(env('XFF_DEPTH', '1'), 10);
 
-// REFUSED AT BOOT, because neither reader can survive it at request time.
+export const address_header = env('ADDRESS_HEADER', '').toLowerCase();
+
+// A DEPTH THAT CANNOT SELECT A HOP, refused where it would be read and named
+// where it would not.
+//
 // `parseInt` gives `NaN` for a non-numeric value and `0` for `0`, and the guard
 // both readers share - `xff_depth > addresses.length` - is false for both, so
 // each falls through to `addresses[addresses.length - xff_depth]`, which is
 // `undefined`, and `.trim()` throws. On the SSR path that is a 500 per request;
 // on the upgrade path it is a 500 per HANDSHAKE, because metering by client
-// address made this run before anything has authenticated. A value that cannot
-// select a hop cannot serve traffic, so the process does not start with one.
-if (!Number.isInteger(xff_depth) || xff_depth < 1) {
-	throw new Error(
-		`Invalid ${ENV_PREFIX + 'XFF_DEPTH'}: '${env('XFF_DEPTH', '1')}'. Must be a positive integer.`
-	);
+// address runs before anything has authenticated.
+//
+// GATED ON `ADDRESS_HEADER`, because that is the only thing that makes the value
+// reachable: both readers return the socket peer before touching it otherwise.
+// Refusing regardless would stop a server booting over a variable it will never
+// read - `XFF_DEPTH=` with an empty value is one `ENV XFF_DEPTH=` in a
+// Dockerfile or one `value: ""` in a manifest away - and a process that will not
+// start is a worse answer than a warning for a setting that does nothing here.
+// The sibling refuses it unconditionally; that difference is deliberate and only
+// ever ACCEPTS more, so a config that builds there still builds here.
+//
+// The RAW string is validated, and as PLAIN DECIMAL DIGITS rather than through a
+// number parse. `parseInt` truncates, so any test applied to its answer is true
+// of values the operator never wrote: `2.9` becomes 2, `3junk` becomes 3, and
+// `1e3` becomes 1 - the last one a thousand-fold difference, silently, under a
+// message promising a positive integer. Digits are the only spelling for which
+// the value validated and the value used are the same number.
+{
+	const raw = env('XFF_DEPTH', '1').trim();
+	if (!/^[0-9]+$/.test(raw) || Number(raw) < 1) {
+		const message =
+			`Invalid ${ENV_PREFIX + 'XFF_DEPTH'}: '${env('XFF_DEPTH', '1')}'. Must be a positive integer.`;
+		if (address_header) throw new Error(message);
+		console.warn(
+			`[adapter] ${message} It is ignored on this server, because ${ENV_PREFIX + 'ADDRESS_HEADER'} ` +
+			'is not set and nothing reads a forwarded chain - but it would refuse to start the moment ' +
+			'one is configured.'
+		);
+	}
 }
-
-export const address_header = env('ADDRESS_HEADER', '').toLowerCase();
 
 export const protocol_header = env('PROTOCOL_HEADER', '').toLowerCase();
 

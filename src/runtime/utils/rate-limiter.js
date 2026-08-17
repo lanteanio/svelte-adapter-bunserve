@@ -122,6 +122,28 @@ function isPort(host, start) {
 }
 
 /**
+ * Whether a bracketed host the fold never got to parse is an IPv6 literal.
+ *
+ * Brackets mean an IP literal by RFC 3986, so a bracketed ADDRESS may safely
+ * lose them and its port, while a bracketed anything-else is a client-supplied
+ * string that must keep every byte - `[a:b:c]` sharing a bucket with `a:b:c`
+ * merges two identities, which this module calls the far worse error.
+ *
+ * Called only from the two fast paths that decline BEFORE the main parse runs,
+ * and only for a bracketed value. Every other decline happens after
+ * `expandIpv6` has already answered, so it costs nothing there, and an
+ * unbracketed value never reaches this at all.
+ *
+ * @param {string} host bracket-free, possibly zone-qualified, any case
+ * @returns {boolean}
+ */
+function isIpv6Literal(host) {
+	const pct = host.indexOf('%');
+	const bare = pct === -1 ? host : host.slice(0, pct);
+	return expandIpv6(bare.toLowerCase()) !== null;
+}
+
+/**
  * The bucket one client gets.
  *
  * IPv6 is keyed on its allocation PREFIX, not the full address. A /64 is the
@@ -202,37 +224,55 @@ function foldToPrefix(value) {
 	// WHAT AN UNFOLDED ADDRESS FALLS BACK TO. Every path below that declines to
 	// fold returns this rather than the value as it arrived, because the port and
 	// the brackets are not part of the client's identity - they are which socket
-	// this one request came in on. Returning them would give a proxy that reports
-	// the peer as `host:port` a fresh bucket per connection, and the limiter would
+	// this one request came in on. Returning them would give an `ADDRESS_HEADER`
+	// written as `host:port` a fresh bucket per connection, and the limiter would
 	// never refuse anything: the failure the folding rules exist to prevent,
 	// reached by the addresses those same rules deliberately keep whole.
 	//
-	// It is the recognised spelling that is dropped, never an unrecognised one. A
-	// bracketed value holding something that is not an address keeps its brackets:
-	// with `ADDRESS_HEADER` set that is a client-supplied string, and two
-	// spellings of one string are not two spellings of one client.
-	const firstColon = host.indexOf(':');
-	const declined = bracketed && (firstColon !== -1 || isIpv4(host, 0, host.length)) ? host : value;
-
-	if (firstColon === -1) return declined; // IPv4, or an opaque header value
+	// THE TEST IS WHETHER THE BRACKETS HELD AN ADDRESS, not whether they held
+	// something with a colon in it. `[a:b:c]` and `a:b:c` are two client-supplied
+	// strings, and merging them merges two identities - the error this module
+	// calls far worse than failing to merge one client's spellings. So a value
+	// the address parsers do not recognise keeps every byte it arrived with,
+	// including a port it may be carrying: a fresh bucket per connection for a
+	// malformed bracketed value is the lesser of the two failures, and no proxy
+	// writes one.
+	//
+	// The test is applied WHERE THE ANSWER IS ALREADY KNOWN wherever possible.
+	// Every decline below the main parse has one for free; only the two fast
+	// paths that return before it ask, and only for a bracketed value. An
+	// unbracketed value - which is every socket peer this runtime resolves, since
+	// Bun reports the address without brackets or port - pays one boolean.
+	if (host.indexOf(':') === -1) {
+		// IPv4, or an opaque header value.
+		return bracketed && isIpv4(host, 0, host.length) ? host : value;
+	}
 
 	// Fast path for the zero-prefixed forms. An IPv4 client on a dual-stack
 	// listener can arrive fully expanded
 	// (`0000:0000:0000:0000:0000:ffff:7f00:0001`), which the zero-prefix rule
 	// below refuses to fold anyway - recognising it here skips a full parse
 	// whose result is thrown away.
-	if (host.charCodeAt(0) === 48 || host.charCodeAt(0) === 58) {
-		if (/^(0{1,4}:){4}|^::/.test(host)) return declined;
+	//
+	// SKIPPED WHEN BRACKETED, because there the parse is not thrown away: the
+	// brackets may only come off a value that is an address, and this shortcut
+	// returns before anything has established that. Falling through costs a
+	// bracketed value one parse and saves it a second one, and the zero-/64 rule
+	// below refuses exactly what this regex matches, so nothing about the
+	// decision changes.
+	if (!bracketed && (host.charCodeAt(0) === 48 || host.charCodeAt(0) === 58)) {
+		if (/^(0{1,4}:){4}|^::/.test(host)) return value;
 	}
 
 	const pct = host.indexOf('%');
-	if (pct !== -1) return declined; // scoped, not a global literal
+	// Scoped, not a global literal.
+	if (pct !== -1) return bracketed && isIpv6Literal(host) ? host : value;
 	host = host.toLowerCase();
 
 	// `1.2.3.4:5678` has a colon but is IPv4 with a port, not IPv6. The port is
-	// DROPPED and the address kept: this is the shape a proxy writes when it
-	// reports the peer socket rather than the peer host, and it is the one that
-	// changes on every connection.
+	// DROPPED and the address kept: this is the shape an `ADDRESS_HEADER` carries
+	// when the proxy writes the peer SOCKET rather than the peer host, and it is
+	// the one that changes on every connection.
 	//
 	// Both halves are validated before anything is dropped, for the reason the
 	// bracketed literal validates its own port: trimming a value that is not an
@@ -242,16 +282,26 @@ function foldToPrefix(value) {
 	// an embedded IPv4 tail (`64:ff9b::1.2.3.4`) puts its dots after one, and the
 	// `::ffff:` forms left above. That keeps the parse off every IPv6 key rather
 	// than running it and discarding the answer.
+	//
+	// Both indices are taken AFTER the lowercase above, so neither can be a
+	// position in a string that no longer exists: `toLowerCase` is not
+	// length-preserving in general, and an index carried across it is a bug
+	// waiting for the character that demonstrates it.
+	const firstColon = host.indexOf(':');
 	const firstDot = host.indexOf('.');
 	if (firstDot !== -1 && firstDot < firstColon) {
 		if (isIpv4(host, 0, firstColon) && isPort(host, firstColon + 1)) {
 			return host.slice(0, firstColon);
 		}
-		return declined;
+		return value;
 	}
 
 	const groups = expandIpv6(host);
-	if (groups === null) return declined;
+	// Not an address at all, so a bracketed one keeps its brackets and its port.
+	if (groups === null) return value;
+	// Past the parse the value IS an address, so every decline below may drop the
+	// brackets and the port with no second parse to pay for it.
+	const declined = bracketed ? host : value;
 	// A zero /64 is not a routing prefix anyone is allocated - see above.
 	if (groups[0] === '0' && groups[1] === '0' && groups[2] === '0' && groups[3] === '0') return declined;
 
