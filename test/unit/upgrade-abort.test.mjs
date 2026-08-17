@@ -152,3 +152,29 @@ test('a handshake that is never abandoned still upgrades, and returns only its i
 	assert.equal(upgradeAdmission.inFlight, 0, 'the upgrade window is over, so the slot went back');
 	assert.equal(upgradeAdmission.connectionPermits, before + 1, 'the permit went to the socket');
 });
+
+test('a handshake the RUNTIME refuses gives its permit straight back', async () => {
+	// The other refusal in this lane, and the one no simulated run can produce:
+	// the in-memory double takes every socket it is offered, so the branch where
+	// `server.upgrade` answers false - a malformed handshake, or a request the
+	// runtime has already seen end - is reachable only from a server double that
+	// says no. Nothing has been written at that point, so the client gets a plain
+	// 400; the permit was handed over on the way in, and if it is not taken back
+	// the ceiling shrinks by one for every such handshake, permanently.
+	// From a clean ledger: the tests above leave live sockets holding permits,
+	// and this one needs the ceiling to have room, or the shed would answer first
+	// and prove nothing about the branch below it.
+	upgradeAdmission._resetForSim();
+	const srv = { taken: 0, upgrade() { srv.taken++; return false; } };
+	const before = upgradeAdmission.connectionPermits;
+	const inFlightBefore = upgradeAdmission.inFlight;
+	const settled = tryUpgrade(upgradeRequest(new AbortController().signal), srv, '/ws');
+	await settle();
+	releaseHooks();
+	const refused = await settled;
+	assert.ok(refused && refused.status === 400, `the client is answered, got ${refused && refused.status}`);
+	assert.equal(srv.taken, 1, 'the runtime was asked, and declined');
+	assert.equal(upgradeAdmission.connectionPermits, before, 'the permit came back');
+	assert.equal(upgradeAdmission.inFlight, inFlightBefore, 'and so did the in-flight slot');
+	assert.equal(upgradeAdmission.overReleaseTotal, 0, 'exactly once, not twice');
+});
