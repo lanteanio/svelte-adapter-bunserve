@@ -2,20 +2,20 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { register } from 'node:module';
 
-// THE METERED DOOR, DRIVEN THROUGH THE REAL UPGRADE PATH.
+// THE METERED DOOR ON ITS SOCKET-PEER BRANCH.
 //
-// Every other test of the limiter either calls the key folder directly or hands
-// the limiter an address a test invented. This one goes the whole way: a client
-// connects, `server.requestIP` answers, the upgrade path resolves an address
-// from it, folds a key, and meters. That is the only place the three can be
-// caught disagreeing - a fold that returns a different key per connection meters
-// nothing, and a limiter that refuses nothing looks exactly like traffic under
-// the limit from every counter the suite reads.
+// `upgrade-rate-limit.test.mjs` already drives this door end to end, and does it
+// the way a deployment behind a proxy does: ADDRESS_HEADER configured, each
+// client naming itself in the header. That leaves one branch of
+// `resolveRateLimitAddress` with no workload behind it - the DEFAULT one, where
+// no header is configured and the key is whatever `server.requestIP` answered.
+// It is the branch every zero-config deployment takes.
 //
-// The simulator could not reach a refusal at all before: it hands every client a
-// fresh address, which is the right default for a workload about connections and
-// makes the address door unreachable. A connection may now say which client it
-// comes from.
+// What that buys beyond the key folder's own tests is the join: `requestIP`, the
+// resolver, the fold and the limiter agreeing about who one client is. A fold
+// that returns a different key per connection meters nothing, and a door that
+// refuses nothing looks exactly like traffic under the limit from every counter
+// the suite reads.
 
 globalThis.ENV_PREFIX = '';
 globalThis.WS_PATH = '/ws';
@@ -79,27 +79,6 @@ test('one client past its allowance is refused, through the whole path', async (
 	assert.equal(clients[2].state, 'rejected', 'the third is over the limit');
 	assert.equal(clients[2].rejection.status, '429', 'and told so');
 	assert.equal(clients[3].state, 'rejected', 'and so is everything after it');
-});
-
-test('a client whose port changes per connection is still one client', async () => {
-	// The shape a proxy writes when it reports the peer SOCKET rather than the
-	// peer host, which several do. A key that kept the port would put every
-	// connection in a fresh bucket, and this door would refuse nothing while
-	// every counter read exactly like traffic under the limit.
-	const app = newApp();
-	const clients = await connectAll(app, 4, (i) => `198.18.7.7:${40000 + i}`);
-	assert.equal(clients[0].state, 'open');
-	assert.equal(clients[1].state, 'open');
-	assert.equal(clients[2].state, 'rejected', 'the port is not part of who this client is');
-	assert.equal(clients[2].rejection.status, '429');
-});
-
-test('the same holds for the bracketed IPv6 spelling of one client', async () => {
-	const app = newApp();
-	const clients = await connectAll(app, 4, (i) => `[::ffff:198.18.7.7]:${40000 + i}`);
-	assert.equal(clients[0].state, 'open');
-	assert.equal(clients[1].state, 'open');
-	assert.equal(clients[2].state, 'rejected');
 });
 
 test('separate clients keep separate allowances', async () => {

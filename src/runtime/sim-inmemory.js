@@ -294,12 +294,12 @@ export function createInMemoryApp(opts) {
 		// misconfigured proxy.
 		//
 		// OVERRIDABLE, because "every client is a different client" is the right
-		// default and the wrong one for anything that meters by address: with a
-		// fresh address per connect, no workload can reach a rate-limit refusal at
-		// all, and the door's whole behaviour - the bucket key, the window, the
-		// advisory - has no oracle here. A caller that passes an address is saying
-		// these connections come from one client, which is what a NAT'd office, a
-		// mobile carrier, or an attacker looks like.
+		// default and the wrong one for anything that meters by address: a
+		// workload about the metered door needs several connections to BE one
+		// client, which is what a NAT'd office, a mobile carrier or an attacker
+		// looks like. `upgrade-rate-limit.test.mjs` gets there by configuring
+		// ADDRESS_HEADER and letting each client name itself in a header; this is
+		// the same choice for the socket-peer branch, which no header can reach.
 		const n = connectSeq++;
 		const address = typeof connectOpts.address === 'string'
 			? connectOpts.address

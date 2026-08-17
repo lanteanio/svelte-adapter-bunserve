@@ -323,10 +323,14 @@ function awaitUpgradeHook(pending) {
 	return new Promise((resolve, reject) => {
 		const timer = setTimer(() => resolve(HOOK_TIMED_OUT), upgrade_timeout_ms);
 		// ATTACHED INSIDE A TRY, because `pending` is the app's value and `then`
-		// is the app's code: a thenable whose `then` throws (a getter, a Proxy, a
-		// half-built promise-like) would otherwise escape with the timer still
-		// armed, holding it for the whole timeout on a handshake that has already
-		// been answered. The throw is the hook's failure and is reported as one.
+		// is the app's code: a thenable whose `then` throws when CALLED would
+		// otherwise escape with the timer still armed, holding it for the whole
+		// timeout on a handshake that has already been answered. (A throwing `then`
+		// GETTER never reaches here - the shape test above reads the property, and
+		// that throw leaves through the caller's own catch.)
+		//
+		// The clear is the whole point. A throw inside a Promise executor already
+		// rejects the promise, so the rejection was never at risk; the timer was.
 		try {
 			pending.then(
 				(value) => { clearTimer(timer); resolve(value); },

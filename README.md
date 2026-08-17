@@ -222,8 +222,8 @@ budget is separate from `upgradeRateLimit`'s and deliberately higher: every
 reconnect that preflights also upgrades, so matching them 1:1 would make this
 door the binding constraint on both. The identity is resolved exactly as the
 upgrade limiter resolves it, with the same caveat behind an address-rewriting
-proxy - and the server says so once, on the first refusal keyed on a loopback or
-private address. Refusals are counted as
+proxy - and the server says so once per door and per cause, on the first
+refusal that looks like one. Refusals are counted as
 `upgrade_rejected_total{reason: "auth_rate_limit"}`.
 
 **The hooks take `(request, context)` here, where svelte-adapter-uws takes a

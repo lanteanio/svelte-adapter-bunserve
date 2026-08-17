@@ -688,8 +688,11 @@ export const wsCounters = {
 	 * count alone cannot tell a server turning away one client in a thousand
 	 * from one turning away every second client.
 	 *
-	 * Monotonic and never reset, unlike the live connection count, which is what
-	 * makes it a rate rather than a level.
+	 * Monotonic for the life of a server, unlike the live connection count, which
+	 * is what makes it a rate rather than a level. The simulator clears it
+	 * between seeds along with the refusals, because there a "life" is one run
+	 * and a counter carried across them makes a hypothesis depend on how many
+	 * seeds preceded it.
 	 */
 	upgradeAdmittedTotal: 0,
 

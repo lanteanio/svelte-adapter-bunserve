@@ -67,23 +67,27 @@ test('a rate-limit WINDOW of 0 is refused, and says why it is not the way to dis
 	);
 });
 
-test('a sub-millisecond window is refused for the same reason zero is', () => {
-	// The gap the zero refusal left. `0.0001` is arithmetically greater than
-	// zero and operationally identical to it: the window retires before the next
-	// request arrives, so nothing is ever counted and every request is admitted
-	// while the config says a limit is in force - the outcome the message above
-	// promises to prevent.
+test('a window below the family floor is refused, as the sibling refuses it', () => {
+	// The gap the zero refusal left: `0.5` is arithmetically greater than zero
+	// and builds here while failing the build on svelte-adapter-uws, whose floor
+	// for a protective number that does not allow zero is 1. A config valid on
+	// one adapter and refused by the other is the failure the parity work exists
+	// to remove - and a window under a second is not a rate in any case, it is a
+	// burst cap on whatever fraction of a second the requests land in.
 	for (const key of ['upgradeRateLimitWindow', 'authPathRateLimitWindow']) {
-		for (const tiny of [0.0001, 1e-9, Number.MIN_VALUE]) {
+		for (const tiny of [0.5, 0.0001, 1e-9, Number.MIN_VALUE]) {
 			assert.throws(
 				() => normalizeWsOptions({ [key]: tiny }),
-				/must be at least 0\.001.*retires before the next request arrives/s,
+				/must be at least 1.*not a rate/s,
 				`refuses ${key} ${tiny}`
 			);
 		}
-		// And a millisecond itself builds, so the floor is a floor and not a
-		// minimum anyone has to guess at.
-		assert.equal(normalizeWsOptions({ [key]: 0.001 }).options[key], 0.001);
+		// And a second itself builds, so the floor is a floor and not a minimum
+		// anyone has to guess at.
+		assert.equal(normalizeWsOptions({ [key]: 1 }).options[key], 1);
+		// Fractions ABOVE it are still accepted: the floor is the family's, not a
+		// switch to integers.
+		assert.equal(normalizeWsOptions({ [key]: 2.5 }).options[key], 2.5);
 	}
 });
 
@@ -93,7 +97,7 @@ test('the refusal for an unusable value reads as a range, not as a phrase', () =
 	// never converted to a number.
 	assert.throws(
 		() => normalizeWsOptions({ upgradeRateLimitWindow: '10' }),
-		/must be a finite number >= 0\.001, got "10"/
+		/must be a finite number >= 1, got "10"/
 	);
 	assert.throws(
 		() => normalizeWsOptions({ upgradeRateLimit: '10' }),
@@ -122,8 +126,11 @@ test('`metrics` is accepted, named, and not loaded', () => {
 	// instrumented and is not - so the difference is said out loud at build time
 	// rather than discovered from a dashboard of zeroes.
 	const { options, warnings, unknownKeys } = normalizeWsOptions({ metrics: './src/lib/metrics.js' });
-	assert.equal(options.metrics, './src/lib/metrics.js');
 	assert.deepEqual(unknownKeys, [], 'not an unknown key - it is a known one with different semantics');
+	// And nothing is kept. A stored value is a key that becomes honoured the day
+	// some module reads it, with the warning still firing and the parity list
+	// still calling it a gap.
+	assert.equal(options.metrics, undefined);
 	assert.equal(warnings.length, 1);
 	assert.match(warnings[0], /does not load it/);
 	assert.match(warnings[0], /platform\.metrics/);

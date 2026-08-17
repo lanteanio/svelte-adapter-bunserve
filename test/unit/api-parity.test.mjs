@@ -271,12 +271,16 @@ test('an accepted-but-inert key is recorded as a gap, and says so at build time'
 		);
 	}
 	// The one that exists today, driven through the real validator: a valid value
-	// builds, and the build says what the adapter does instead.
-	const { warnings } = normalizeWsOptions({ metrics: './src/lib/metrics.js' });
+	// builds, the build says what the adapter does instead, and NOTHING IS KEPT.
+	// The third check is the one the other two cannot make - a stored value is a
+	// key that becomes honoured the moment some module reads it, with the warning
+	// still firing and both lists still calling it a gap.
+	const { options, warnings } = normalizeWsOptions({ metrics: './src/lib/metrics.js' });
 	assert.ok(
 		warnings.some((w) => w.includes('`websocket.metrics`') && w.includes('does not load it')),
 		'the build says the module is not loaded'
 	);
+	assert.equal(options.metrics, undefined, 'and keeps nothing for a later reader to honour');
 });
 
 test('export subpaths match the uws contract, or the difference is recorded', () => {

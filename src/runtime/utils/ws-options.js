@@ -209,16 +209,24 @@ function requireProtectiveNumber(
 }
 
 /**
- * The shortest rate-limit window that is one, in SECONDS.
+ * The shortest rate-limit window, in SECONDS.
  *
- * A window is an elapsed-time measurement against a millisecond clock, so
- * anything below a millisecond retires before the next request can arrive: every
- * request opens a fresh window, `curr` is always zero when it is compared, and
- * the door admits everything while the config says a limit is in force. That is
- * the outcome the zero-window refusal exists to prevent, reached by a value the
- * zero-window refusal accepts.
+ * ONE SECOND, because that is the family's floor: svelte-adapter-uws refuses
+ * anything below 1 for every protective number that does not allow zero, so a
+ * smaller value here would build on one adapter and fail the build on the other
+ * - the failure the whole parity effort exists to remove. It is also the
+ * smallest window that means anything as a rate: below it the limit stops being
+ * "N per window" and becomes a burst cap on whatever fraction of a second the
+ * requests happen to land in.
+ *
+ * Zero is refused separately and for a different reason: it makes the sliding
+ * estimate divide by zero, and `NaN >= limit` is false, so the door admits
+ * everything while the config says a limit is in force. That arithmetic does
+ * NOT carry over to small non-zero values - the clock this runs on is
+ * fractional, so a half-millisecond window counts and refuses exactly as
+ * configured. It is simply not a window anyone means.
  */
-const MIN_RATE_LIMIT_WINDOW = 0.001;
+const MIN_RATE_LIMIT_WINDOW = 1;
 
 /** Keys the `websocket.upgradeAdmission` block accepts, as uws declares them. */
 const ADMISSION_KEYS = new Set([
@@ -492,9 +500,9 @@ export function normalizeWsOptions(input) {
 					'is false - so everything is admitted. Set `upgradeRateLimit` itself to 0 to ' +
 					'disable the limit deliberately.',
 				min: MIN_RATE_LIMIT_WINDOW,
-				minMeans: 'The window is measured in seconds against a millisecond clock, so a shorter ' +
-					'one retires before the next request arrives: nothing is ever counted and every ' +
-					'request is admitted, which is the same outcome a zero window has. Set ' +
+				minMeans: 'A window shorter than a second is not a rate - it is a burst cap on whatever ' +
+					'fraction of a second the requests land in - and svelte-adapter-uws refuses it, so ' +
+					'a config carried between the two adapters would build here and fail there. Set ' +
 					'`upgradeRateLimit` itself to 0 to disable the limit deliberately.'
 			}
 		);
@@ -522,9 +530,9 @@ export function normalizeWsOptions(input) {
 					'is false - so everything is admitted. Set `authPathRateLimit` itself to 0 to ' +
 					'disable the limit deliberately.',
 				min: MIN_RATE_LIMIT_WINDOW,
-				minMeans: 'The window is measured in seconds against a millisecond clock, so a shorter ' +
-					'one retires before the next request arrives: nothing is ever counted and every ' +
-					'request is admitted, which is the same outcome a zero window has. Set ' +
+				minMeans: 'A window shorter than a second is not a rate - it is a burst cap on whatever ' +
+					'fraction of a second the requests land in - and svelte-adapter-uws refuses it, so ' +
+					'a config carried between the two adapters would build here and fail there. Set ' +
 					'`authPathRateLimit` itself to 0 to disable the limit deliberately.'
 			}
 		);
@@ -625,7 +633,12 @@ export function normalizeWsOptions(input) {
 				`metrics registry (e.g. './src/lib/metrics.js') - got ${JSON.stringify(raw.metrics)}.`
 			);
 		}
-		options.metrics = raw.metrics;
+		// NOT STORED. The type check above is worth doing wherever the value was
+		// going to be read, but keeping the value would leave one `ws_options.metrics`
+		// read between here and a build that honours the option - at which point
+		// the key would be honoured, the warning would still fire, and the parity
+		// list would still call it a gap. An inert key that holds nothing cannot
+		// become live by accident.
 		// ACCEPTED AND NAMED, exactly as `upgradeAdmission.waitingRoom` is, and for
 		// a sharper reason: honouring it would produce a server that LOOKS
 		// instrumented and is not. On this runtime a module imported by both a

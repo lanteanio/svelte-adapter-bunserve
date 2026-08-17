@@ -260,10 +260,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   link-local, scoped, malformed and opaque values keep their full value, since
   their /64 is shared by unrelated clients. The window is measured on the
   MONOTONIC clock, so a wall-clock step cannot retire or extend one, and it must
-  be at least a millisecond: a shorter one retires before the next request
-  arrives, so nothing is ever counted and everything is admitted while the
-  config says a limit is in force. The build refuses it and says so, as it
-  already refused a window of zero for the same reason.
+  be at least a second - svelte-adapter-uws's floor, so a config carried between
+  the two adapters cannot build on one and fail the build on the other. A window
+  of zero is refused separately and for a different reason: it makes the sliding
+  estimate `NaN`, and `NaN >= limit` is false, so the door would admit
+  everything while the config said a limit was in force.
 
   Refusals are counted as `upgrade_rejected_total{reason: "ip_rate_limit"}`.
 

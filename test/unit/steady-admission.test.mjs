@@ -126,12 +126,24 @@ test('a callback still retained by the pacing queue is a violation', () => {
 	assert.equal(v.context.value, 2);
 });
 
-test('the in-flight reading is reported first when several are wrong', () => {
+test('the in-flight reading is reported first among the level readings', () => {
 	// One violation per hypothesis, so which one it names decides what a reader
-	// investigates. In-flight is the earliest link in the chain: a handshake that
-	// never finished is the likeliest reason the permits are wrong too.
+	// investigates. In-flight is the earliest link in that chain: a handshake
+	// that never finished is the likeliest reason the permits are wrong too.
 	const v = checkAdmissionSettled({ maxConnections: 5, inFlight: 2, connectionPermits: 9, deferredDepth: 4, openConnections: 0 });
 	assert.equal(v.context.reading, 'inFlight');
+});
+
+test('but an over-release outranks all of them', () => {
+	// It is the only reading that says the LEDGER is wrong rather than that some
+	// level has not come back, and the levels beside it may look settled
+	// precisely because the extra release rebalanced them - so a reader sent to
+	// investigate an in-flight slot would be chasing a symptom.
+	const v = checkAdmissionSettled({
+		maxConnections: 5, inFlight: 2, connectionPermits: 9, deferredDepth: 4,
+		overReleaseTotal: 1, openConnections: 0
+	});
+	assert.equal(v.context.reading, 'overReleaseTotal');
 });
 
 test('a missing reading is absence, not zero', () => {

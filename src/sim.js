@@ -405,27 +405,19 @@ async function admissionScenario(api, opts) {
 		// The clients that go away mid-handshake. Only a client still IN one can:
 		// a park-mode client whose handshake the ceiling already refused was
 		// answered before its hook ever ran, and asking it to hang up is asking
-		// for nothing. Which is why the state is read rather than the mode.
+		// for nothing. Which is why the state is read rather than the mode - and
+		// reading it here rather than relying on `hangUp`'s own guard is what
+		// makes the intent legible at the call site.
 		//
-		// AND THE ANSWER IS CHECKED, because a return value nobody reads is not a
-		// guard. `hangUp` refuses anything that is not mid-handshake, so a false
-		// here means the facade's own two notions of "still connecting" have come
-		// apart - and the failure that would otherwise follow is silent: every
-		// hang-up becomes a no-op, the mid-handshake abort ordering leaves the
-		// workload, and every fingerprint still matches, because a workload that
-		// stopped happening was never in one. The aggregate - that some client
-		// does leave mid-handshake, across seeds - is asserted in
-		// test/unit/sim-admission-scenario.test.mjs.
+		// THE PROPERTY THIS WORKLOAD OWES - that some client does leave
+		// mid-handshake - cannot be checked here, and a throw pretending to check
+		// it would be dead code: the facade has one notion of "connecting" and
+		// `hangUp` reads the same variable this line does. It is asserted across
+		// seeds instead, in test/unit/sim-admission-scenario.test.mjs, which is
+		// where a change that answered parked handshakes earlier would surface.
 		for (let i = from; i < to; i++) {
 			if (modes[i] !== 'park' || api.rng.float() >= 0.5) continue;
-			if (conns[i].state !== 'connecting') continue;
-			if (!conns[i].hangUp()) {
-				throw new Error(
-					`sim scenario: client ${i} reports state 'connecting' but refused to hang up, so this ` +
-					'run models no mid-handshake abort for it. The client facade and the upgrade path ' +
-					'disagree about whether the handshake is still open.'
-				);
-			}
+			if (conns[i].state === 'connecting') conns[i].hangUp();
 		}
 		await api.advance();
 

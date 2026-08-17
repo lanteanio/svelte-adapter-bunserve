@@ -77,6 +77,42 @@ test('a client is admitted up to its limit and refused past it', async () => {
 	assert.equal(wsCounters.upgradeRejectedByReason.ip_rate_limit, 1, 'counted by reason');
 });
 
+test('a client whose header carries a rotating port is still one client', async () => {
+	// THE SHAPE THAT MADE THIS DOOR REFUSE NOTHING. Several proxies write the
+	// peer SOCKET rather than the peer host into the forwarded header - Azure App
+	// Service does, and so does nginx configured with
+	// `$remote_addr:$remote_port` - so the value differs on every connection. A
+	// key that kept the port put each one in a fresh bucket, and the door
+	// admitted everything while its counters read exactly like traffic under the
+	// limit.
+	//
+	// Driven through the HEADER because that is the only way this shape reaches
+	// the adapter: the socket peer it resolves without one never carries a port.
+	const app = newApp();
+	const opened = [];
+	for (let i = 0; i < 3; i++) {
+		opened.push(app.connect(from(`198.51.100.4:${40000 + i}`)));
+		await settle();
+	}
+	assert.deepEqual(opened.map((c) => c.state), ['open', 'open', 'open']);
+
+	const refused = app.connect(from('198.51.100.4:40003'));
+	await settle();
+	assert.equal(refused.state, 'rejected', 'the port is not part of who this client is');
+	assert.equal(refused.rejection.status, '429');
+
+	// And the bracketed IPv4-mapped spelling a dual-stack proxy can write.
+	const mapped = [];
+	for (let i = 0; i < 3; i++) {
+		mapped.push(app.connect(from(`[::ffff:198.51.100.9]:${40000 + i}`)));
+		await settle();
+	}
+	assert.deepEqual(mapped.map((c) => c.state), ['open', 'open', 'open']);
+	const mappedRefused = app.connect(from('[::ffff:198.51.100.9]:40003'));
+	await settle();
+	assert.equal(mappedRefused.state, 'rejected');
+});
+
 test('one address spending its allowance does not spend another\'s', async () => {
 	// The property that makes it a per-client limit rather than a global cap.
 	const app = newApp();

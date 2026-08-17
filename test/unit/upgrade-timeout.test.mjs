@@ -190,6 +190,11 @@ test('a thenable whose `then` throws is refused, and leaves no timer armed', asy
 			scheduler.now() - startedAt < 5000,
 			`no timer was left armed (advanced ${scheduler.now() - startedAt}ms)`
 		);
+		// And the handshake gave back what it held, like every other refusal in
+		// this file - a leak here would pass on the timer assertion alone.
+		assert.equal(upgradeAdmission.inFlight, 0, 'the in-flight slot came back');
+		assert.equal(upgradeAdmission.connectionPermits, 0, 'and the permit');
+		assert.equal(upgradeAdmission.overReleaseTotal, 0, 'exactly once');
 	} finally {
 		__setSimHooks({});
 	}
