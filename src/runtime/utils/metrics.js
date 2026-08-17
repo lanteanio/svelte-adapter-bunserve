@@ -446,6 +446,28 @@ export function createMetricRegistry(options = {}) {
 		},
 
 		/**
+		 * Retract a family so the next document omits it entirely.
+		 *
+		 * The counterpart to a projection that can stop being measurable. A gauge
+		 * whose source has gone away cannot be answered with a zero (that is a
+		 * measurement, and a false one) and cannot be left at its last value
+		 * either - a frozen reading published as current is the worse of the two,
+		 * because it looks alive. Retracting is the third answer: the family
+		 * disappears until something measures it again, which is what a scraper
+		 * reads as "this instance no longer reports this".
+		 *
+		 * Registration-state only, so re-registering later is a fresh family. Not
+		 * for app instruments: an app that stops writing to a counter still wants
+		 * its last total.
+		 *
+		 * @param {string} name
+		 * @returns {boolean} whether a family was there to retract
+		 */
+		retract(name) {
+			return families.delete(name);
+		},
+
+		/**
 		 * The whole document, in Prometheus text exposition format.
 		 *
 		 * MANIFEST ORDER FIRST, so two scrapes of an unchanged server are

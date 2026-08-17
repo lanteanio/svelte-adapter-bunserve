@@ -24,7 +24,7 @@ import { createMetricRegistry } from '../utils/metrics.js';
 import { PRESSURE_REASON_CODES } from '../observability-manifest.js';
 import { pressureSnapshot, wsConnections, wsCounters } from './ws-state.js';
 import { upgradeAdmission } from './admission.js';
-import { rateMapEvictions } from './rate-limit.js';
+import { authRateLimiter, rateMapEvictions, upgradeRateLimiter } from './rate-limit.js';
 
 /**
  * The one registry. Created eagerly rather than on first use: an app registers
@@ -34,17 +34,17 @@ import { rateMapEvictions } from './rate-limit.js';
  */
 export const metricsRegistry = createMetricRegistry();
 
-/** Gauges are held once rather than re-registered per scrape. */
+/**
+ * Gauges held once rather than re-registered per scrape.
+ *
+ * Only the ones the runtime can answer at any instant, from state it maintains
+ * continuously. Everything the SAMPLER produces is optional below instead: those
+ * have no value at all until its first tick, and a family registered here
+ * renders a zero from the first scrape whether anything set it or not.
+ */
 const gauges = {
 	connections: metricsRegistry.gauge('ws_connections'),
-	subscriptions: metricsRegistry.gauge('ws_subscriptions'),
-	backpressureMaxBytes: metricsRegistry.gauge('ws_backpressure_max_bytes'),
-	backpressureConnections: metricsRegistry.gauge('ws_backpressure_connections'),
-	saturation: metricsRegistry.gauge('pressure_saturation'),
-	reason: metricsRegistry.gauge('pressure_reason'),
-	sampleTimestamp: metricsRegistry.gauge('pressure_sample_timestamp_seconds'),
-	residentBytes: metricsRegistry.gauge('resident_memory_bytes'),
-	heapUsedRatio: metricsRegistry.gauge('heap_used_ratio')
+	subscriptions: metricsRegistry.gauge('ws_subscriptions')
 };
 
 /**
@@ -67,6 +67,23 @@ function setOptional(name, value) {
 	let gauge = optionalGauges.get(name);
 	if (gauge === undefined) optionalGauges.set(name, (gauge = metricsRegistry.gauge(name)));
 	gauge.set(value);
+}
+
+/**
+ * Withdraw an optional gauge whose source has stopped answering.
+ *
+ * Skipping the `set` is not enough, and that is the whole reason this exists: a
+ * gauge registered by an earlier scrape keeps rendering its LAST value, so a
+ * kernel file that read fine at boot and fails now publishes the boot reading as
+ * current. `/proc/pressure/*` returning null is a transient failure as often as
+ * a permanent one - a container losing the mount, a read racing a cgroup move -
+ * and a frozen number is worse than a missing one, because a dashboard cannot
+ * tell it from a live reading and an alert on it never fires.
+ *
+ * @param {string} name
+ */
+function clearOptional(name) {
+	if (optionalGauges.delete(name)) metricsRegistry.retract(name);
 }
 
 /**
@@ -94,8 +111,17 @@ export function projectMetrics() {
 		undefined,
 		wsCounters.upgradeRejectedByReason.deferred_overflow ?? 0
 	);
-	metricsRegistry.projectCounter('upgrade_rate_map_evicted_total', { door: 'upgrade' }, rateMapEvictions.upgrade);
-	metricsRegistry.projectCounter('upgrade_rate_map_evicted_total', { door: 'auth' }, rateMapEvictions.auth);
+	// One series per door that HAS a limiter. A door with none keeps no map to
+	// evict from, so its zero is not "nothing was evicted" but "nothing is being
+	// counted" - the same distinction the admission gauges below make, and the
+	// one that decides whether a flat line on a dashboard means healthy or
+	// unconfigured.
+	if (upgradeRateLimiter !== null) {
+		metricsRegistry.projectCounter('upgrade_rate_map_evicted_total', { door: 'upgrade' }, rateMapEvictions.upgrade);
+	}
+	if (authRateLimiter !== null) {
+		metricsRegistry.projectCounter('upgrade_rate_map_evicted_total', { door: 'auth' }, rateMapEvictions.auth);
+	}
 
 	// Only where a ceiling exists. Without one there is no in-flight ledger to
 	// read, and a zero here would say "no upgrades in flight" on a server that
@@ -116,18 +142,30 @@ export function projectMetrics() {
 	gauges.subscriptions.set(wsCounters.totalSubscriptions);
 	metricsRegistry.projectCounter('ws_publishes_total', undefined, wsCounters.publishCount);
 	metricsRegistry.projectCounter('ws_closed_socket_aborts_total', undefined, wsCounters.closedWsAborts);
-	gauges.backpressureMaxBytes.set(pressureSnapshot.maxBufferedBytes);
-	gauges.backpressureConnections.set(pressureSnapshot.backpressuredConnections);
 
 	// - Pressure ---------------------------------------------------------------
-	gauges.saturation.set(pressureSnapshot.value);
-	gauges.reason.set(PRESSURE_REASON_CODES[pressureSnapshot.reason] ?? 0);
-	// Seconds, not milliseconds, because the name says seconds. The sampler
-	// records wall-clock ms; a scrape that read them as seconds would date every
-	// sample to 1970 and every freshness alert would fire forever.
-	gauges.sampleTimestamp.set(wsCounters.lastSampleWallMs / 1000);
-	gauges.residentBytes.set(wsCounters.lastResidentBytes);
-	gauges.heapUsedRatio.set(wsCounters.lastHeapUsedRatio);
+	//
+	// EVERY reading below the guard comes from the pressure sampler, and until
+	// its first tick there is no reading - only the zeroed fields it will later
+	// fill. Published anyway, a scrape in that window says the process holds no
+	// memory, has no saturation, and was last sampled in 1970: three numbers that
+	// read as measurements, one of which breaks every freshness alert written
+	// against it. Absent until measured, which is the rule the manifest states
+	// and the optional gauges beside them already follow. The window is one
+	// `sampleIntervalMs` after boot, which is exactly when an orchestrator's
+	// first scrape lands.
+	if (wsCounters.lastSampleWallMs > 0) {
+		setOptional('ws_backpressure_max_bytes', pressureSnapshot.maxBufferedBytes);
+		setOptional('ws_backpressure_connections', pressureSnapshot.backpressuredConnections);
+		setOptional('pressure_saturation', pressureSnapshot.value);
+		setOptional('pressure_reason', PRESSURE_REASON_CODES[pressureSnapshot.reason] ?? 0);
+		// Seconds, not milliseconds, because the name says seconds. The sampler
+		// records wall-clock ms; a scrape that read them as seconds would date
+		// every sample to 1970 and every freshness alert would fire forever.
+		setOptional('pressure_sample_timestamp_seconds', wsCounters.lastSampleWallMs / 1000);
+		setOptional('resident_memory_bytes', wsCounters.lastResidentBytes);
+		setOptional('heap_used_ratio', wsCounters.lastHeapUsedRatio);
+	}
 	for (const [key, count] of wsCounters.pressureReasonTransitions) {
 		const arrow = key.indexOf('>');
 		metricsRegistry.projectCounter(
@@ -138,15 +176,24 @@ export function projectMetrics() {
 	}
 
 	// Kernel readings, absent off-Linux and absent until the first sample that
-	// could read them.
+	// could read them - and absent AGAIN the moment one stops reading. A null
+	// here is not only "this platform never had them": the sampler returns null
+	// for a transient read failure too, and a gauge left registered from an
+	// earlier scrape would answer with the reading from before the failure, as
+	// though it were current. See clearOptional.
 	const psi = pressureSnapshot.psi;
 	if (psi !== null && typeof psi === 'object') {
 		setOptional('psi_cpu_some_avg10', psi.cpuSome10);
 		setOptional('psi_memory_full_avg10', psi.memoryFull10);
 		setOptional('psi_io_full_avg10', psi.ioFull10);
+	} else {
+		clearOptional('psi_cpu_some_avg10');
+		clearOptional('psi_memory_full_avg10');
+		clearOptional('psi_io_full_avg10');
 	}
 	const cpu = pressureSnapshot.cpuThrottle;
 	if (cpu !== null && typeof cpu === 'object') setOptional('cpu_throttled_ratio', cpu.throttledRatio);
+	else clearOptional('cpu_throttled_ratio');
 }
 
 /**

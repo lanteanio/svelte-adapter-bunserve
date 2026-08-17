@@ -84,7 +84,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configure. Serve it from an ordinary route - `return new
   Response(await platform.metricsSnapshot())` - and register your own
   instruments on `platform.metrics`, where they land in the same document after
-  the adapter's own families. Every instance means every instance: a build with
+  the adapter's own families. A signal this instance has not measured is ABSENT
+  from the document rather than published as a zero, and that holds over time,
+  not only at boot: the sampler-derived gauges appear at its first tick, and the
+  kernel readings disappear again if `/proc/pressure` stops answering, so a
+  frozen number is never served as a current one. Every instance means every
+  instance: a build with
   no WebSocket handler carries both members too, so an app whose only use for
   this adapter's observability is a scrape route does not need a realtime tier
   to have one.

@@ -37,6 +37,31 @@ function family(text, name) {
 	return text.split('\n').filter((l) => l.startsWith(name + '{') || l.startsWith(name + ' '));
 }
 
+// DECLARED FIRST, and it has to be: `lastSampleWallMs` only ever goes from zero
+// to a time, so the window this describes exists once per process and any test
+// that sets it closes the window for every test after it.
+test('nothing the sampler produces is published before its first tick', async () => {
+	// A zero here is not a reading. It says the process holds no memory, has no
+	// saturation, and was last sampled in 1970 - and an orchestrator's first
+	// scrape lands inside exactly this window.
+	assert.equal(wsCounters.lastSampleWallMs, 0, 'no sample has been taken yet');
+	const text = await metricsSnapshot();
+	for (const name of [
+		'pressure_sample_timestamp_seconds',
+		'resident_memory_bytes',
+		'heap_used_ratio',
+		'pressure_saturation',
+		'pressure_reason',
+		'ws_backpressure_max_bytes',
+		'ws_backpressure_connections'
+	]) {
+		assert.equal(family(text, name).length, 0, `${name} is absent until something measures it`);
+	}
+	// What the runtime knows continuously is published from the first scrape.
+	assert.notEqual(value(text, 'ws_connections'), undefined);
+	assert.notEqual(value(text, 'ws_subscriptions'), undefined);
+});
+
 test('the refusal bag is published under every reason, zeroes included', async () => {
 	// A dashboard should show "no origin refusals" as a flat zero line rather
 	// than as a gap, which reads like a missing exporter.
@@ -84,6 +109,10 @@ test('a later scrape reflects the newer value, not the sum of the two', async ()
 test('the pressure reason is the severity code the sibling uses', async () => {
 	// A gauge cannot carry a string, and a dashboard that thresholds on this
 	// number has to mean the same thing on both adapters.
+	//
+	// The sample stamp opens the window the test above closes: from here on this
+	// file describes a server whose sampler has ticked at least once.
+	wsCounters.lastSampleWallMs = 1_700_000_000_000;
 	pressureSnapshot.reason = 'MEMORY';
 	assert.equal(value(await metricsSnapshot(), 'pressure_reason'), '6');
 	pressureSnapshot.reason = 'SUBSCRIBERS';
@@ -153,6 +182,41 @@ test('and present once a reading exists', async () => {
 	assert.equal(value(text, 'cpu_throttled_ratio'), '0.4');
 	pressureSnapshot.psi = null;
 	pressureSnapshot.cpuThrottle = null;
+});
+
+test('and absent again when the kernel stops answering', async () => {
+	// The order matters, and it is the point: a reading existed a moment ago.
+	// `/proc/pressure/*` returns null for a TRANSIENT failure as readily as a
+	// permanent one - a container losing the mount, a read racing a cgroup move -
+	// and a gauge left registered would republish the pre-failure number as
+	// current, which no dashboard can tell from a live one and no alert on the
+	// value can fire on.
+	pressureSnapshot.psi = { cpuSome10: 12.5, memoryFull10: 0, ioFull10: 3 };
+	pressureSnapshot.cpuThrottle = { throttledRatio: 0.4, nrThrottledDelta: 2 };
+	assert.equal(value(await metricsSnapshot(), 'psi_cpu_some_avg10'), '12.5');
+	pressureSnapshot.psi = null;
+	pressureSnapshot.cpuThrottle = null;
+	const text = await metricsSnapshot();
+	assert.doesNotMatch(text, /psi_cpu_some_avg10/);
+	assert.doesNotMatch(text, /psi_memory_full_avg10/);
+	assert.doesNotMatch(text, /psi_io_full_avg10/);
+	assert.doesNotMatch(text, /cpu_throttled_ratio/);
+	// And measurable again without a restart.
+	pressureSnapshot.psi = { cpuSome10: 7, memoryFull10: 1, ioFull10: 2 };
+	assert.equal(value(await metricsSnapshot(), 'psi_cpu_some_avg10'), '7');
+	pressureSnapshot.psi = null;
+	await metricsSnapshot();
+});
+
+test('the eviction counter names every door that meters', async () => {
+	// Both doors take the defaults here, so both keep a map, and both publish a
+	// zero from the first scrape - the flat line that says "no evictions" rather
+	// than a gap that reads like a missing exporter. The other half of the rule -
+	// a door with no limiter naming no series - is its own file, because the
+	// limiters are built once from module-level config.
+	const text = await metricsSnapshot();
+	assert.equal(value(text, 'upgrade_rate_map_evicted_total{door="upgrade"}'), '0');
+	assert.equal(value(text, 'upgrade_rate_map_evicted_total{door="auth"}'), '0');
 });
 
 // - the platform surface ------------------------------------------------------
