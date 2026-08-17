@@ -67,6 +67,40 @@ test('a rate-limit WINDOW of 0 is refused, and says why it is not the way to dis
 	);
 });
 
+test('a sub-millisecond window is refused for the same reason zero is', () => {
+	// The gap the zero refusal left. `0.0001` is arithmetically greater than
+	// zero and operationally identical to it: the window retires before the next
+	// request arrives, so nothing is ever counted and every request is admitted
+	// while the config says a limit is in force - the outcome the message above
+	// promises to prevent.
+	for (const key of ['upgradeRateLimitWindow', 'authPathRateLimitWindow']) {
+		for (const tiny of [0.0001, 1e-9, Number.MIN_VALUE]) {
+			assert.throws(
+				() => normalizeWsOptions({ [key]: tiny }),
+				/must be at least 0\.001.*retires before the next request arrives/s,
+				`refuses ${key} ${tiny}`
+			);
+		}
+		// And a millisecond itself builds, so the floor is a floor and not a
+		// minimum anyone has to guess at.
+		assert.equal(normalizeWsOptions({ [key]: 0.001 }).options[key], 0.001);
+	}
+});
+
+test('the refusal for an unusable value reads as a range, not as a phrase', () => {
+	// It said "must be a finite number >= greater than 0". This is the line an
+	// operator sees on the realistic failure - an environment variable that was
+	// never converted to a number.
+	assert.throws(
+		() => normalizeWsOptions({ upgradeRateLimitWindow: '10' }),
+		/must be a finite number >= 0\.001, got "10"/
+	);
+	assert.throws(
+		() => normalizeWsOptions({ upgradeRateLimit: '10' }),
+		/must be a finite number >= 0, got "10"/
+	);
+});
+
 test('an unusable rate limit fails the build rather than disabling itself', () => {
 	for (const bad of ['10', null, {}, NaN, Infinity, -1, true]) {
 		assert.throws(

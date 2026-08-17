@@ -149,27 +149,60 @@ function requirePositiveInt(value, key) {
  * says it is on. A string is the realistic way to get here - an unconverted
  * environment variable.
  *
+ * `min` is the smallest MEANINGFUL non-zero value, where a bound has one. Any
+ * positive number is accepted by default, which is right for a count and wrong
+ * for a duration: a knob whose unit is seconds has values that are arithmetically
+ * positive and operationally the same as off, and "greater than zero" lets every
+ * one of them through.
+ *
  * @param {unknown} value
  * @param {string} key
- * @param {{ allowZero?: boolean, zeroMeans?: string }} [opts]
+ * @param {{ allowZero?: boolean, zeroMeans?: string, min?: number, minMeans?: string }} [opts]
  * @returns {number}
  */
-function requireProtectiveNumber(value, key, { allowZero = true, zeroMeans = '' } = {}) {
-	const floor = allowZero ? 0 : Number.MIN_VALUE;
-	if (typeof value === 'number' && Number.isFinite(value) && value >= floor) {
-		return value;
+function requireProtectiveNumber(
+	value,
+	key,
+	{ allowZero = true, zeroMeans = '', min = Number.MIN_VALUE, minMeans = '' } = {}
+) {
+	if (typeof value === 'number' && Number.isFinite(value)) {
+		if (value === 0) {
+			if (allowZero) return value;
+			throw new Error(`adapter option \`websocket.${key}\` must be greater than 0. ${zeroMeans}`);
+		}
+		if (value >= min) return value;
+		if (value > 0) {
+			throw new Error(
+				`adapter option \`websocket.${key}\` must be at least ${min}, got ${JSON.stringify(value)}. ` +
+				minMeans
+			);
+		}
 	}
-	if (!allowZero && value === 0) {
-		throw new Error(`adapter option \`websocket.${key}\` must be greater than 0. ${zeroMeans}`);
-	}
+	// The bound reads as a range rather than as a comparison against a phrase:
+	// spelled `>= ${allowZero ? 0 : 'greater than 0'}` this said "must be a
+	// finite number >= greater than 0", which is the line an operator sees on
+	// the realistic failure - an environment variable that was never converted.
+	const bound = allowZero ? '>= 0' : min > Number.MIN_VALUE ? `>= ${min}` : '> 0';
 	throw new Error(
-		`adapter option \`websocket.${key}\` must be a finite number >= ${allowZero ? 0 : 'greater than 0'}, ` +
+		`adapter option \`websocket.${key}\` must be a finite number ${bound}, ` +
 		`got ${JSON.stringify(value)}. This option bounds a resource, and every comparison against a ` +
 		'non-number is false - so an unrecognized value would disable the bound entirely rather than ' +
 		'fall back to the default. If the value comes from the environment, convert it explicitly ' +
 		`(e.g. Number(process.env.WS_${key.toUpperCase()})).`
 	);
 }
+
+/**
+ * The shortest rate-limit window that is one, in SECONDS.
+ *
+ * A window is an elapsed-time measurement against a millisecond clock, so
+ * anything below a millisecond retires before the next request can arrive: every
+ * request opens a fresh window, `curr` is always zero when it is compared, and
+ * the door admits everything while the config says a limit is in force. That is
+ * the outcome the zero-window refusal exists to prevent, reached by a value the
+ * zero-window refusal accepts.
+ */
+const MIN_RATE_LIMIT_WINDOW = 0.001;
 
 /** Keys the `websocket.upgradeAdmission` block accepts, as uws declares them. */
 const ADMISSION_KEYS = new Set([
@@ -441,7 +474,12 @@ export function normalizeWsOptions(input) {
 				zeroMeans: 'A zero WINDOW does not disable the limiter, it breaks it: every request ' +
 					'then looks like a fresh window, the estimate evaluates to NaN, and NaN >= limit ' +
 					'is false - so everything is admitted. Set `upgradeRateLimit` itself to 0 to ' +
-					'disable the limit deliberately.'
+					'disable the limit deliberately.',
+				min: MIN_RATE_LIMIT_WINDOW,
+				minMeans: 'The window is measured in seconds against a millisecond clock, so a shorter ' +
+					'one retires before the next request arrives: nothing is ever counted and every ' +
+					'request is admitted, which is the same outcome a zero window has. Set ' +
+					'`upgradeRateLimit` itself to 0 to disable the limit deliberately.'
 			}
 		);
 	}
@@ -466,7 +504,12 @@ export function normalizeWsOptions(input) {
 				zeroMeans: 'A zero WINDOW does not disable the limiter, it breaks it: every request ' +
 					'then looks like a fresh window, the estimate evaluates to NaN, and NaN >= limit ' +
 					'is false - so everything is admitted. Set `authPathRateLimit` itself to 0 to ' +
-					'disable the limit deliberately.'
+					'disable the limit deliberately.',
+				min: MIN_RATE_LIMIT_WINDOW,
+				minMeans: 'The window is measured in seconds against a millisecond clock, so a shorter ' +
+					'one retires before the next request arrives: nothing is ever counted and every ' +
+					'request is admitted, which is the same outcome a zero window has. Set ' +
+					'`authPathRateLimit` itself to 0 to disable the limit deliberately.'
 			}
 		);
 	}

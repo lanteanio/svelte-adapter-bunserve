@@ -170,6 +170,31 @@ test('a hook that answers WITHOUT a promise arms no timer at all', async () => {
 	}
 });
 
+test('a thenable whose `then` throws is refused, and leaves no timer armed', async () => {
+	// `pending.then` is the APP'S code - a getter, a Proxy, a half-built
+	// promise-like - and it runs after the timer is armed. Escaping there used to
+	// leave the timer holding a callback for the whole bound on a handshake that
+	// had already been answered. The handshake is refused as a hook error either
+	// way; what this pins is that the run drains without waiting the bound out.
+	__setSimHooks({
+		upgrade: () => ({ then() { throw new TypeError('not really a promise'); } })
+	});
+	try {
+		const { app, scheduler } = newApp();
+		const client = app.connect();
+		await settle();
+		assert.notEqual(client.state, 'open', 'the handshake was refused');
+		const startedAt = scheduler.now();
+		await scheduler.run({ maxSteps: 100 });
+		assert.ok(
+			scheduler.now() - startedAt < 5000,
+			`no timer was left armed (advanced ${scheduler.now() - startedAt}ms)`
+		);
+	} finally {
+		__setSimHooks({});
+	}
+});
+
 test('a hook that answers LATE answers nothing, and its rejection escapes nowhere', async () => {
 	// The handshake has already been answered by the time this resolves. The
 	// value must be dropped rather than upgrading a client that was told 504,

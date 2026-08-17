@@ -32,7 +32,16 @@ import { authRateLimiter, rateMapEvictions, upgradeRateLimiter } from './rate-li
  * a lazily created registry would hand that app a different object than the one
  * the projection later writes into.
  */
-export const metricsRegistry = createMetricRegistry();
+export const metricsRegistry = createMetricRegistry({
+	// The projection runs on ANY serialize, not only through metricsSnapshot().
+	// `platform.metrics` is a documented member and the registry it hands back is
+	// this one, so an app that renders it directly - `platform.metrics.serialize()`
+	// in a route, or a library given the registry - would otherwise get a
+	// document whose adapter families are whatever the last scrape left, or
+	// missing entirely on a server nothing has scraped. The hook is what makes
+	// there be one way for the document to be built.
+	beforeSerialize: () => projectMetrics()
+});
 
 /**
  * Gauges held once rather than re-registered per scrape.
@@ -209,6 +218,7 @@ export function projectMetrics() {
  * @returns {Promise<string>}
  */
 export function metricsSnapshot() {
-	projectMetrics();
+	// `serialize()` projects through the registry's own hook, so there is no
+	// projection here to keep in step with it.
 	return Promise.resolve(metricsRegistry.serialize());
 }

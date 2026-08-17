@@ -248,6 +248,18 @@ test('a build with no realtime tier serves the same two members', async () => {
 	assert.equal(platform.metricsSnapshot, httpPlatform.metricsSnapshot);
 });
 
+test('serializing the registry directly projects too', async () => {
+	// `platform.metrics` is documented, and the registry it hands back is this
+	// one - so an app that renders it in a route, or a library handed the
+	// registry, must not get a document whose adapter families are whatever the
+	// last scrape left. The counter below moves with nothing scraping in
+	// between.
+	wsCounters.publishCount = 4242;
+	const direct = platform.metrics.serialize();
+	assert.equal(value(direct, 'ws_publishes_total'), '4242');
+	assert.equal(direct, await platform.metricsSnapshot());
+});
+
 test('the snapshot is a promise resolving to text, never null', async () => {
 	// The sibling can answer null (no registry configured) and its collection is
 	// a round trip that can fail; here there is one process and the answer is in

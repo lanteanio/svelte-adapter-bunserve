@@ -483,9 +483,10 @@ export function createMetricRegistry(options = {}) {
 		 */
 		serialize() {
 			// The projection runs FIRST when one is installed, so a caller that
-			// serializes the registry directly - the member this adapter documents on
-			//  - gets the same document  returns
-			// rather than one whose adapter families are stale or missing.
+			// serializes the registry directly - `platform.metrics` is a documented
+			// member and this is the registry it hands back - gets the same document
+			// the adapter's own snapshot returns, rather than one whose adapter
+			// families are whatever the last scrape left behind.
 			if (typeof options.beforeSerialize === 'function') options.beforeSerialize();
 			/** @type {string[]} */
 			const out = [];
