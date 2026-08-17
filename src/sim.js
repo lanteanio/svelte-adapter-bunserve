@@ -77,7 +77,7 @@ const {
 	wsCounters
 } = await import('./runtime/handler/ws-state.js');
 const { upgradeAdmission } = await import('./runtime/handler/admission.js');
-const { upgradeRateLimiter } = await import('./runtime/handler/rate-limit.js');
+const { upgradeRateLimiter, authRateLimiter } = await import('./runtime/handler/rate-limit.js');
 const { _resetWireCodecRegistry } = await import('./runtime/handler/codec-registry.js');
 const { _resetSharedWireIds } = await import('./runtime/utils/shared-wire-id.js');
 const { stopPressureSampling } = await import('./runtime/handler/pressure-metrics.js');
@@ -129,6 +129,11 @@ function resetSimState() {
 	// process and meters by client address, so a seed would otherwise start
 	// against windows every earlier seed had already spent.
 	if (upgradeRateLimiter !== null) upgradeRateLimiter._resetForSim();
+	// The auth door's limiter is unreachable from a scenario - the in-memory
+	// transport carries no HTTP requests - but it is the same kind of singleton,
+	// and a unit test that assembles this graph and drives that door would
+	// otherwise leave its windows spent for the next.
+	if (authRateLimiter !== null) authRateLimiter._resetForSim();
 	wsCounters.closedWsAborts = 0;
 	wsCounters.droppedReleaseRecords = 0;
 	wsCounters.publishCount = 0;

@@ -98,8 +98,6 @@ const ADAPTER_OPTION_EXTRAS = {
 const WS_OPTION_GAPS = {
 	adminPath: 'admin endpoint',
 	adminAuthAcknowledged: 'admin endpoint',
-	authPathRateLimit: 'auth endpoint rate limit',
-	authPathRateLimitWindow: 'auth endpoint rate limit',
 	authorizeWireSubscribe: 'wire-subscribe authorization',
 	consistencyAuditIntervalMs: 'background audits',
 	resourceGrowthAuditIntervalMs: 'background audits',

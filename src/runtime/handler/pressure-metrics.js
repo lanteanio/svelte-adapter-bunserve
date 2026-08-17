@@ -12,7 +12,7 @@ import { foldConnectionBackpressure, BACKPRESSURE_SAMPLE_CAP, BACKPRESSURE_SAMPL
 import { DEFAULT_GRANT, leaseGrantSize, samplePressureValue } from '../utils/lease.js';
 import { now, setIntervalTimer, clearIntervalTimer } from '../runtime.js';
 import { createOsPressureSampler } from '../utils/os-pressure.js';
-import { sweepUpgradeRateLimit } from './rate-limit.js';
+import { sweepRateLimits } from './rate-limit.js';
 import { PRESSURE_INTERVAL_MAX_MS, PRESSURE_INTERVAL_MIN_MS } from '../utils/ws-options.js';
 import {
 	lastPublishWarnAt,
@@ -282,7 +282,7 @@ function samplePressure(thresholds) {
 	// the process already wakes on this schedule, and a second interval for work
 	// this cheap is a second thing to start, stop and reason about at shutdown.
 	// A server with no limiter configured does nothing here.
-	sweepUpgradeRateLimit();
+	sweepRateLimits();
 }
 
 /**

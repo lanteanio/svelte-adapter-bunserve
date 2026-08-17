@@ -214,6 +214,18 @@ family client stamps the first, so browser traffic is unaffected. A **missing**
 IS the authentication. Native clients that send none of the three are what
 `authPathRequireOrigin: false` is for.
 
+**The preflight is metered per client address**, at `authPathRateLimit` (30) per
+`authPathRateLimitWindow` (10) seconds, so a credential check against a database
+cannot be driven at raw server capacity from one address. Over the limit is
+`429` with a `retry-after` naming the window, and the hook is never called. The
+budget is separate from `upgradeRateLimit`'s and deliberately higher: every
+reconnect that preflights also upgrades, so matching them 1:1 would make this
+door the binding constraint on both. The identity is resolved exactly as the
+upgrade limiter resolves it, with the same caveat behind an address-rewriting
+proxy - and the server says so once, on the first refusal keyed on a loopback or
+private address. Refusals are counted as
+`upgrade_rejected_total{reason: "auth_rate_limit"}`.
+
 **The hooks take `(request, context)` here, where svelte-adapter-uws takes a
 single event object.** Bun hands `fetch` a real `Request` that outlives an
 await, so passing it straight through is the honest shape rather than copying
@@ -351,6 +363,8 @@ adapter: bunserve({
 		handler: 'src/ws-handler.js',       // default
 		authPath: '/__ws/auth',             // the auth preflight POST; must differ from `path`
 		authPathRequireOrigin: true,        // CSRF guard on it; false accepts native clients
+		authPathRateLimit: 30,              // preflights per client address per window; 0 disables
+		authPathRateLimitWindow: 10,        // that window, in seconds
 		compressCredentialedResponses: false,
 		maxPayloadLength: 1024 * 1024,      // default 1 MB
 		idleTimeout: 120,                   // seconds; Bun REFUSES anything above 960

@@ -123,6 +123,11 @@ const builtRateLimit = await run('build fixture (WS_RATE_LIMIT)', [process.execP
 });
 if (builtRateLimit) {
 	await run('upgrade-rate-limit-check', [process.execPath, suite('upgrade-rate-limit-check.mjs')]);
+	// The same build's other metered door. Its own suite rather than more checks
+	// in that one: the proxy-collapse advisory is one-shot per PROCESS, so
+	// whichever door refuses first is the one that can be read from stderr, and
+	// two doors in one server would leave the second's advisory unprovable.
+	await run('auth-rate-limit-check', [process.execPath, suite('auth-rate-limit-check.mjs')]);
 }
 
 if (failures.length) {

@@ -27,7 +27,15 @@ import { createLogThrottle } from '../utils/log-throttle.js';
 import { processMonotonicNow, randomUuid } from '../runtime.js';
 import { response413, response500 } from './http-helpers.js';
 import { auth_path, get_origin, origin, ws_options } from './config.js';
-import { rateLimitAddress } from './rate-limit.js';
+import {
+	authRateLimiter,
+	authRateLimitExceeded,
+	authRateLimitWindowSeconds,
+	rateLimitAddress,
+	warnRateLimitProxyCollapse,
+	AUTH_DOOR
+} from './rate-limit.js';
+import { recordUpgradeRejection } from './ws-state.js';
 
 /**
  * Whether this server serves the endpoint at all.
@@ -87,6 +95,23 @@ function forbiddenOrigin() {
 	return new Response('Origin not allowed', {
 		status: 403,
 		headers: { 'content-type': 'text/plain' }
+	});
+}
+
+/**
+ * What a client over its per-address preflight limit gets. `429`, and a
+ * `retry-after` naming the window it has to wait out - the honest number here,
+ * because the limiter knows exactly when the allowance comes back.
+ *
+ * @returns {Response}
+ */
+function rateLimitedResponse() {
+	return new Response('Too many authentication requests', {
+		status: 429,
+		headers: {
+			'retry-after': String(Math.max(1, Math.ceil(authRateLimitWindowSeconds))),
+			'content-type': 'text/plain'
+		}
 	});
 }
 
@@ -157,6 +182,22 @@ export function tryAuthEndpoint(req, srv, pathname) {
 		if (!isAuthOriginAccepted(req.headers, selfOrigin, ws_options.allowedOrigins)) {
 			warnAuthOriginRefused(req.headers.get('origin'));
 			return forbiddenOrigin();
+		}
+	}
+
+	// METERED AFTER the origin check, which is the opposite order to the upgrade
+	// door's and deliberate on both. There the origin comparison may reconstruct
+	// an origin from headers, so the cheaper limiter runs first. Here the guard
+	// above is a header-only read, and charging refused origins to the bucket
+	// would let hostile traffic from behind a shared NAT spend the legitimate
+	// clients' whole authentication budget. It is the sibling's order.
+	if (authRateLimiter !== null) {
+		const peer = srv.requestIP(req);
+		const address = rateLimitAddress(req, peer ? peer.address : '');
+		if (authRateLimitExceeded(address)) {
+			recordUpgradeRejection('auth_rate_limit');
+			warnRateLimitProxyCollapse(address, AUTH_DOOR);
+			return rateLimitedResponse();
 		}
 	}
 

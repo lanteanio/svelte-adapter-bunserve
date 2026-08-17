@@ -82,6 +82,52 @@ test('an unusable rate limit fails the build rather than disabling itself', () =
 	}
 });
 
+test('the auth preflight has its own path, guard and budget', () => {
+	const { options } = normalizeWsOptions(undefined);
+	assert.equal(options.authPath, '/__ws/auth');
+	assert.equal(options.authPathRequireOrigin, true);
+	// HIGHER than the upgrade door's ten, as uws defaults it: every reconnect
+	// that preflights also upgrades, so matching them would make this door the
+	// binding constraint on both.
+	assert.equal(options.authPathRateLimit, 30);
+	assert.equal(options.authPathRateLimitWindow, 10);
+});
+
+test('an authPath that is not an absolute path, or collides with the WS path, fails the build', () => {
+	assert.throws(() => normalizeWsOptions({ authPath: 'ws-auth' }), /authPath.*starting with/s);
+	assert.throws(() => normalizeWsOptions({ authPath: 42 }), /authPath.*absolute path string/s);
+	// The WebSocket lane is matched first, so an app would see its preflight
+	// answered with a 426 and nothing naming the option.
+	assert.throws(
+		() => normalizeWsOptions({ authPath: '/ws' }),
+		/authPath.*must differ from.*websocket.path/s
+	);
+	// Including when only ONE of the two moved onto the other's value.
+	assert.throws(
+		() => normalizeWsOptions({ path: '/__ws/auth' }),
+		/authPath.*must differ from/s
+	);
+});
+
+test('the auth budget takes the same zeroes as the upgrade one, and refuses the same values', () => {
+	assert.equal(normalizeWsOptions({ authPathRateLimit: 0 }).options.authPathRateLimit, 0);
+	assert.throws(
+		() => normalizeWsOptions({ authPathRateLimitWindow: 0 }),
+		/authPathRateLimitWindow.*greater than 0.*does not disable the limiter, it breaks it/s
+	);
+	for (const bad of ['30', null, {}, NaN, Infinity, -1, true]) {
+		assert.throws(
+			() => normalizeWsOptions({ authPathRateLimit: bad }),
+			/authPathRateLimit.*finite number/s,
+			`refuses ${JSON.stringify(bad) ?? String(bad)}`
+		);
+	}
+	assert.throws(
+		() => normalizeWsOptions({ authPathRequireOrigin: 'no' }),
+		/authPathRequireOrigin.*must be a boolean/s
+	);
+});
+
 test('upgradeTimeout defaults to the ten seconds uws defaults to', () => {
 	// A carried config that names no timeout has to get the same bound on both
 	// adapters, or the same hung dependency 504s on one and hangs on the other.

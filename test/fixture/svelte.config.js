@@ -49,9 +49,19 @@ if (which === 'bunserve' && dotfiles) {
 	// seconds, low enough for a test to reach without waiting - the default of
 	// ten would need eleven handshakes to prove anything, and the main build has
 	// the limiter off because every other suite drives it from one address.
+	// Both metered doors, each low enough for a test to reach and each with its
+	// own suite. They are deliberately the SAME number here: the property worth
+	// proving live is that the budgets are separate, and two doors that agree on
+	// the number make a shared-map regression show up as a refusal that arrives
+	// far too early rather than as an off-by-one nobody notices.
 	adapter = bunserve({
 		out: 'build-rate-limit',
-		websocket: { upgradeRateLimit: 3, upgradeRateLimitWindow: 10 }
+		websocket: {
+			upgradeRateLimit: 3,
+			upgradeRateLimitWindow: 10,
+			authPathRateLimit: 3,
+			authPathRateLimitWindow: 10
+		}
 	});
 } else if (which === 'bunserve' && upgradeTimeout) {
 	// The build for test/live/upgrade-timeout-check.mjs. Its own, because the

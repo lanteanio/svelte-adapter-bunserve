@@ -101,6 +101,15 @@ const DEFAULTS = {
 	// prefix is what makes it obviously not a page; Cloudflare Access is the
 	// documented reason an app would move it.
 	authPath: '/__ws/auth',
+	// Preflights one client address may make per window, and how long that window
+	// is in seconds. Both uws's numbers, and the limit is HIGHER than the upgrade
+	// door's on purpose: every reconnect that preflights also upgrades, so this
+	// door sees at least as much traffic during a reconnect wave, and matching
+	// them 1:1 would make the preflight the binding constraint on both. Zero
+	// disables it; the WINDOW refuses zero, for the reason the upgrade window
+	// does.
+	authPathRateLimit: 30,
+	authPathRateLimitWindow: 10,
 	// Whether that endpoint requires evidence the request came from a page this
 	// server trusts (CSRF defense). On by default, and off is how a native client
 	// that sends none of those headers is accepted.
@@ -428,6 +437,31 @@ export function normalizeWsOptions(input) {
 				zeroMeans: 'A zero WINDOW does not disable the limiter, it breaks it: every request ' +
 					'then looks like a fresh window, the estimate evaluates to NaN, and NaN >= limit ' +
 					'is false - so everything is admitted. Set `upgradeRateLimit` itself to 0 to ' +
+					'disable the limit deliberately.'
+			}
+		);
+	}
+	if (raw.authPathRateLimit !== undefined) {
+		options.authPathRateLimit = requireProtectiveNumber(
+			raw.authPathRateLimit,
+			'authPathRateLimit',
+			{ allowZero: true }
+		);
+	}
+	if (raw.authPathRateLimitWindow !== undefined) {
+		// Zero is refused here and accepted on the limit, exactly as at the
+		// upgrade door and for the same arithmetic: a zero window makes every
+		// request look like a fresh one, the sliding estimate divides by zero and
+		// evaluates to NaN, and `NaN >= limit` is false - so everything is
+		// admitted while the config says a limit is in force.
+		options.authPathRateLimitWindow = requireProtectiveNumber(
+			raw.authPathRateLimitWindow,
+			'authPathRateLimitWindow',
+			{
+				allowZero: false,
+				zeroMeans: 'A zero WINDOW does not disable the limiter, it breaks it: every request ' +
+					'then looks like a fresh window, the estimate evaluates to NaN, and NaN >= limit ' +
+					'is false - so everything is admitted. Set `authPathRateLimit` itself to 0 to ' +
 					'disable the limit deliberately.'
 			}
 		);

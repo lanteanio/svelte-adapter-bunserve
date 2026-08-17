@@ -115,6 +115,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the probes are matched first and the preflight would simply never be
   reached.
 
+- `websocket.authPathRateLimit` and `websocket.authPathRateLimitWindow`, a
+  per-client-address sliding-window limit on the auth preflight. Thirty per ten
+  seconds by default, as svelte-adapter-uws defaults them - **higher than
+  `upgradeRateLimit` on purpose**, because every reconnect that preflights also
+  upgrades, so this door sees at least as much traffic during a deploy's
+  reconnect wave and matching them 1:1 would make the preflight the binding
+  constraint on both. Over the limit is `429` with a `retry-after` naming the
+  window, and the `authenticate` hook is never called - so a credential check
+  against a database cannot be driven at raw server capacity from one address.
+  Set `authPathRateLimit: 0` to disable it; the WINDOW refuses zero, because a
+  zero window admits everything rather than disabling anything.
+
+  The two doors have SEPARATE budgets, which a shared map would quietly break:
+  spending the preflight allowance would then refuse handshakes the upgrade
+  limit would have admitted. Identity resolution, the monotonic window, the
+  bounded map and the proxy-collapse advisory are shared with the upgrade
+  limiter, and that advisory now names whichever door refused first rather than
+  always naming the upgrade knob. Refusals are counted as
+  `upgrade_rejected_total{reason: "auth_rate_limit"}`, which is where the
+  sibling counts them: a refused preflight is a socket that never opens, and a
+  dashboard reading upgrade refusals by reason would otherwise be blind to the
+  door that turned the client away first.
+
 - `websocket.upgradeAdmission`, admission control for the upgrade path, spelled
   and defaulted exactly as svelte-adapter-uws spells it so a config carried
   between the two adapters gates the same way. Four independent opt-in layers:

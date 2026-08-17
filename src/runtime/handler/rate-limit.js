@@ -1,10 +1,16 @@
-// The server's one upgrade rate limiter, plus the address it keys on.
+// The server's rate limiters for the doors that meter by client address - the
+// WebSocket upgrade and the auth preflight - plus the address they key on.
 //
-// It lives in its own module for the reason `admission.js` does: the limiter is
-// reached from the upgrade path, its periodic sweep is driven from the pressure
-// sampler, and importing either of those from the other to reach a singleton
-// would be a cycle. A second instance would be worse than a cycle - two maps,
-// each metering half the traffic, and a limit that admits twice what it says.
+// It lives in its own module for the reason `admission.js` does: the limiters
+// are reached from the request paths, their periodic sweep is driven from the
+// pressure sampler, and importing either of those from the other to reach a
+// singleton would be a cycle. A second instance of one would be worse than a
+// cycle - two maps, each metering half the traffic, and a limit that admits
+// twice what it says.
+//
+// The two doors are metered SEPARATELY, as the sibling meters them: every
+// reconnect that preflights also upgrades, so one shared budget would make
+// whichever door is tighter the binding constraint on both.
 
 import { ws_options, address_header, trusted_proxies, xff_depth } from './config.js';
 import { createSlidingWindowLimiter } from '../utils/rate-limiter.js';
@@ -78,6 +84,53 @@ export const upgradeRateLimitPerWindow = configuredLimit;
 export const upgradeRateLimitWindowSeconds = windowMs / 1000;
 
 /**
+ * The auth preflight's own budget, read the same way and defaulted HIGHER on
+ * purpose - the sibling's 30 per 10s against the upgrade door's 10.
+ *
+ * Every reconnect that preflights also upgrades, so this door sees at least as
+ * much traffic as that one during a deploy's reconnect wave, and a NAT'd network
+ * behind one address multiplies both. Matching them 1:1 would make the preflight
+ * the binding constraint and refuse traffic the upgrade limit would have
+ * admitted.
+ */
+const configuredAuthLimit = typeof ws_options?.authPathRateLimit === 'number'
+	&& Number.isFinite(ws_options.authPathRateLimit) && ws_options.authPathRateLimit > 0
+	? ws_options.authPathRateLimit
+	: 0;
+
+/** That door's window in milliseconds; the normalizer refuses a zero window. */
+const authWindowMs = (typeof ws_options?.authPathRateLimitWindow === 'number'
+	&& Number.isFinite(ws_options.authPathRateLimitWindow) && ws_options.authPathRateLimitWindow > 0
+	? ws_options.authPathRateLimitWindow
+	: 10) * 1000;
+
+/**
+ * Null when nothing is metered at that door, which its call site checks for
+ * rather than paying for a limiter whose limit is zero.
+ *
+ * A SECOND map with the same bounds, not a shared one: the maps are what bound
+ * memory under a flood, and an identity being known to one door says nothing
+ * about the other's budget.
+ *
+ * @type {ReturnType<typeof createSlidingWindowLimiter> | null}
+ */
+export const authRateLimiter = configuredAuthLimit > 0
+	? createSlidingWindowLimiter({
+		maxPerWindow: configuredAuthLimit,
+		windowMs: authWindowMs,
+		maxEntries: MAX_RATE_ENTRIES,
+		evictionSample: RATE_MAP_EVICTION_SAMPLE,
+		maxKeyLen: MAX_RATE_KEY_LEN
+	})
+	: null;
+
+/** The configured auth limit, for a refusal that wants to say what it was. */
+export const authRateLimitPerWindow = configuredAuthLimit;
+
+/** That door's window in seconds. */
+export const authRateLimitWindowSeconds = authWindowMs / 1000;
+
+/**
  * Record this handshake and report whether it is over the limit.
  *
  * THE CLOCK IS READ HERE, and only here, so metering and sweeping cannot end up
@@ -101,14 +154,27 @@ export function upgradeRateLimitExceeded(address) {
 }
 
 /**
- * Drop identities idle for two whole windows. Driven from the pressure
- * sampler's tick, which is the process's existing periodic work - a limiter
- * that is off schedules nothing, and the insertion-time cap is what bounds the
- * map between sweeps in any case.
+ * Record this preflight and report whether it is over the limit. The same
+ * clock, read in the same one place, for the reason above.
+ *
+ * @param {string} address
+ * @returns {boolean} true when the request should be REFUSED
  */
-export function sweepUpgradeRateLimit() {
-	if (upgradeRateLimiter === null) return;
-	upgradeRateLimiter.sweep(monotonicNow());
+export function authRateLimitExceeded(address) {
+	if (authRateLimiter === null) return false;
+	return authRateLimiter.exceeded(address, monotonicNow());
+}
+
+/**
+ * Drop identities idle for two whole windows, at both doors. Driven from the
+ * pressure sampler's tick, which is the process's existing periodic work - a
+ * limiter that is off schedules nothing, and the insertion-time cap is what
+ * bounds each map between sweeps in any case.
+ */
+export function sweepRateLimits() {
+	const now = monotonicNow();
+	if (upgradeRateLimiter !== null) upgradeRateLimiter.sweep(now);
+	if (authRateLimiter !== null) authRateLimiter.sweep(now);
 }
 
 /**
@@ -132,6 +198,59 @@ export function addressScope(address) {
 	if (a.startsWith('::ffff:')) return addressScope(a.slice('::ffff:'.length));
 	return 'public';
 }
+
+let warnedRateLimitProxyCollapse = false;
+/**
+ * Say once that this server may be metering every client as one.
+ *
+ * The signature is a refusal keyed on a loopback or private address while no
+ * `ADDRESS_HEADER` is configured, which is what an address-rewriting proxy in
+ * front of the server looks like from here: every client arrives as the
+ * gateway, they all share one bucket, and the per-address limit is really a
+ * single global cap. The symptom is intermittent 429s under trivial traffic,
+ * which is otherwise very hard to attribute.
+ *
+ * ONE flag across both doors, not one each: it describes the deployment rather
+ * than the door, the fix is the same either way, and whichever door refuses
+ * first names its own knob. One-shot rather than throttled, because a server
+ * directly facing the internet sees real client addresses here and never
+ * reaches it.
+ *
+ * @param {string} address the address the refusal was keyed on
+ * @param {{ what: string, knob: string, limit: number, windowSeconds: number }} door
+ */
+export function warnRateLimitProxyCollapse(address, door) {
+	if (warnedRateLimitProxyCollapse || address_header) return;
+	const scope = addressScope(address);
+	if (scope !== 'loopback' && scope !== 'private') return;
+	warnedRateLimitProxyCollapse = true;
+	console.warn(
+		`[ws] refused ${door.what} (429) keyed on a ${scope} client address (${address}) ` +
+		'while ADDRESS_HEADER is unset. If this server runs behind a reverse proxy, a load\n' +
+		'  balancer, or docker\'s userland-proxy, every client arrives as the same address and the\n' +
+		`  per-address \`${door.knob}\` (${door.limit} per ` +
+		`${door.windowSeconds}s) is really one GLOBAL cap. Restore real client addresses\n` +
+		'  with ADDRESS_HEADER=x-forwarded-for (plus XFF_DEPTH for the trusted hop count) and\n' +
+		'  TRUSTED_PROXIES, or set docker `userland-proxy: false`, or set\n' +
+		`  ${door.knob}: 0 if you throttle upstream.`
+	);
+}
+
+/** What the upgrade door calls itself in that advisory. */
+export const UPGRADE_DOOR = {
+	what: 'a WebSocket upgrade',
+	knob: 'websocket.upgradeRateLimit',
+	limit: upgradeRateLimitPerWindow,
+	windowSeconds: upgradeRateLimitWindowSeconds
+};
+
+/** And the auth preflight. */
+export const AUTH_DOOR = {
+	what: 'an auth preflight',
+	knob: 'websocket.authPathRateLimit',
+	limit: authRateLimitPerWindow,
+	windowSeconds: authRateLimitWindowSeconds
+};
 
 /**
  * Which address this handshake is metered as.
