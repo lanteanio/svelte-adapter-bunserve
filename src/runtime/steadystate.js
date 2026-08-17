@@ -277,22 +277,37 @@ export function checkStarvation(clients, publishLog, faults) {
  * - `deferredDepth` is zero. A callback still retained by the pacing queue is an
  *   upgrade that was never run and never refused.
  *
- * The opposite failure - a permit released twice - cannot be caught by reading
- * counters here, because `releaseConnection` throws on over-release and that
- * throw leaves through whatever called it. It surfaces as an uncaught error
- * rather than as a violation, which is louder, not quieter.
+ * - `overReleaseTotal` is zero. The opposite failure: a permit handed back more
+ *   times than it was taken. It cannot be seen in the counters above, because by
+ *   the time they are read the ledger has already been rebalanced by the extra
+ *   release. `releaseConnection` throws on it, and the throw was once assumed to
+ *   carry it out of the run - but one of the paths that can double-release is the
+ *   socket's close callback dispatched inside the app's `open` hook, and the hook
+ *   runner catches and logs. Caught and logged reaches neither the uncaught-error
+ *   channel nor any reading here, so the loudest failure in this lane was the
+ *   quietest to detect. The controller counts it before throwing, and that count
+ *   is what this reads.
  *
  * No fault guard. The fault engine gates FRAMES; the permit lifecycle runs on
  * the upgrade and close paths, which never travel that channel, so a dropped or
  * reordered frame cannot legitimately unbalance this.
  *
- * @param {{ maxConnections?: number, inFlight?: number, cursorInFlight?: number, connectionPermits?: number, deferredDepth?: number, openConnections?: number } | null | undefined} admission
+ * @param {{ maxConnections?: number, inFlight?: number, cursorInFlight?: number, connectionPermits?: number, deferredDepth?: number, overReleaseTotal?: number, openConnections?: number } | null | undefined} admission
  *   the controller's end-of-run reading, or null/undefined on an ungated server
  * @returns {SteadyStateViolation}
  */
 export function checkAdmissionSettled(admission) {
 	if (!admission) return null;
 	const open = admission.openConnections || 0;
+	// FIRST, because it is the one failure the other readings cannot show: the
+	// extra release rebalanced the very counters they compare, so a run that
+	// double-released can settle to a picture that looks perfect.
+	if (admission.overReleaseTotal) {
+		return {
+			category: 'steady.admission-unsettled',
+			context: { reading: 'overReleaseTotal', value: admission.overReleaseTotal, openConnections: open }
+		};
+	}
 	if (admission.inFlight) {
 		return {
 			category: 'steady.admission-unsettled',

@@ -124,8 +124,10 @@ test('closing the socket inside `open` ends its request, which is how the runtim
 	// close without the abort left the handshake's hang-up watch armed while its
 	// own socket tore down - so the interleaving that releases the permit TWICE
 	// could not occur here, and the corpus could not fail on it. It is the
-	// double release that is fatal: `releaseConnection` throws, and that throw
-	// leaves through the close callback.
+	// double release that is fatal: `releaseConnection` throws, and the throw
+	// comes out of a close callback dispatched inside this very `open` hook -
+	// which the hook runner catches and logs, so the count the controller keeps
+	// before throwing is what a harness can actually read.
 	__setSimHooks({
 		open: (ws) => { ws.end(4001, 'refused by the app'); }
 	});
@@ -136,9 +138,11 @@ test('closing the socket inside `open` ends its request, which is how the runtim
 
 		assert.equal(client.requestEnded, true, 'the request ended with the socket');
 		assert.equal(client.state, 'closed');
-		// And the accounting survived it: one release, not two. An over-release
-		// throws rather than miscounting, so a passing assertion here is also the
-		// statement that nothing threw.
+		// And the accounting survived it: one release, not two. The permit count
+		// alone cannot say so - a second release rebalances it to the same zero -
+		// so the over-release count is read beside it. That is the reading a
+		// swallowed throw cannot hide.
+		assert.equal(upgradeAdmission.overReleaseTotal, 0, 'no permit was given back twice');
 		assert.equal(upgradeAdmission.connectionPermits, 0);
 		assert.equal(upgradeAdmission.inFlight, 0);
 	} finally {

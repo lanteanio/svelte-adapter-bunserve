@@ -115,6 +115,20 @@ export function createUpgradeAdmission(opts) {
 	let deferredTail = 0;
 	let deferredDepth = 0;
 	let deferredRejectedTotal = 0;
+	/**
+	 * Cursor upgrades the SUB-BUDGET itself refused, as opposed to the ones the
+	 * main ceiling refused on the lane's behalf. Both answer the caller the same
+	 * way and are reported under the same reason; this is the only thing that can
+	 * say the carve-out ever bound.
+	 */
+	let cursorSubBudgetRefusals = 0;
+	/**
+	 * Permits handed back more times than they were taken. Never nonzero on a
+	 * correct run: one release too many means the ledger has already lost track of
+	 * who holds what, so a later client is either refused for a permit nobody
+	 * holds or admitted past the ceiling.
+	 */
+	let overReleaseTotal = 0;
 	/** @type {null | ((depth: number, oldestAgeMs: number, rejectedTotal: number) => void)} */
 	let deferredObserver = null;
 	let drainScheduled = false;
@@ -193,6 +207,14 @@ export function createUpgradeAdmission(opts) {
 		releaseConnection() {
 			if (maxConnections <= 0) return;
 			if (connectionPermits <= 0) {
+				// RECORDED BEFORE THE THROW, because the throw alone is not an
+				// oracle. It is raised wherever the second release happened, and one
+				// of those places is the socket's close callback dispatched inside
+				// the app's `open` hook - where the hook runner catches it and logs
+				// it. Caught and logged is invisible to a harness reading counters or
+				// uncaught errors, so the loudest failure in this file was the
+				// quietest one to detect. The count survives the catch.
+				overReleaseTotal++;
 				throw new Error('upgradeAdmission connection permit released without an acquisition.');
 			}
 			connectionPermits--;
@@ -210,7 +232,17 @@ export function createUpgradeAdmission(opts) {
 		 */
 		tryAcquireCursor() {
 			if (maxConcurrent > 0 && inFlight >= maxConcurrent) return false;
-			if (cursorInFlight >= cursorMaxConcurrent) return false;
+			if (cursorInFlight >= cursorMaxConcurrent) {
+				// Counted apart from the refusal itself, because the REFUSAL cannot
+				// tell these two causes apart and must not: a cursor upgrade refused
+				// by the main ceiling is reported as a lane refusal, which is the
+				// label uws gives it and the symptom either way. That leaves nothing
+				// able to say the sub-budget ever bound - a workload configured so it
+				// never can (a fraction of 1 carves the whole ceiling) produces the
+				// same refusals from the main ceiling and reads as covered.
+				cursorSubBudgetRefusals++;
+				return false;
+			}
 			inFlight++;
 			cursorInFlight++;
 			return true;
@@ -259,6 +291,21 @@ export function createUpgradeAdmission(opts) {
 		 * `cursorLane` option or no main ceiling to carve from).
 		 */
 		get cursorMaxConcurrent() { return cursorMaxConcurrent; },
+		/**
+		 * Cursor upgrades refused BY THE SUB-BUDGET rather than by the main
+		 * ceiling. The refusal reason cannot distinguish them - uws labels both as
+		 * lane refusals and a cursor client cannot connect either way - so without
+		 * this a workload whose carve-out can never bind is indistinguishable from
+		 * one that exercises it.
+		 */
+		get cursorSubBudgetRefusals() { return cursorSubBudgetRefusals; },
+		/**
+		 * Permits released more times than acquired. The release throws as well,
+		 * but a throw is only loud where something reports it - and one path that
+		 * can double-release runs inside the app's `open` hook, whose runner
+		 * catches and logs. This is what a harness reads instead.
+		 */
+		get overReleaseTotal() { return overReleaseTotal; },
 		/**
 		 * Read-only: `true` if a `tryAcquire()` would currently succeed. Acquires
 		 * nothing and mutates no counter, so a capacity probe can ask "is there
@@ -331,6 +378,8 @@ export function createUpgradeAdmission(opts) {
 			deferredTail = 0;
 			deferredDepth = 0;
 			deferredRejectedTotal = 0;
+			cursorSubBudgetRefusals = 0;
+			overReleaseTotal = 0;
 			// Cleared so the next run can schedule its own drain. Any drain still
 			// scheduled from the previous run is holding a timer on that run's
 			// scheduler, which is torn down with it, so nothing is left to cancel.

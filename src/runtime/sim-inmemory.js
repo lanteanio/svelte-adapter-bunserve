@@ -248,7 +248,7 @@ export function createInMemoryApp(opts) {
 	 * srv.upgrade() the raw ws exists and the real open handler has run. An
 	 * async upgrade settles during scheduler.run().
 	 *
-	 * @param {{ headers?: Record<string, string>, query?: string }} [connectOpts]
+	 * @param {{ headers?: Record<string, string>, query?: string, address?: string }} [connectOpts]
 	 */
 	function connect(connectOpts = {}) {
 		/** @type {Array<{ payload: string | Uint8Array, isBinary: boolean }>} */
@@ -292,8 +292,18 @@ export function createInMemoryApp(opts) {
 		// One address per client. Kept off the loopback and private ranges an
 		// advisory keys on, so a simulated refusal never reads as a
 		// misconfigured proxy.
+		//
+		// OVERRIDABLE, because "every client is a different client" is the right
+		// default and the wrong one for anything that meters by address: with a
+		// fresh address per connect, no workload can reach a rate-limit refusal at
+		// all, and the door's whole behaviour - the bucket key, the window, the
+		// advisory - has no oracle here. A caller that passes an address is saying
+		// these connections come from one client, which is what a NAT'd office, a
+		// mobile carrier, or an attacker looks like.
 		const n = connectSeq++;
-		const address = `198.18.${(n >> 8) & 0xff}.${n & 0xff}`;
+		const address = typeof connectOpts.address === 'string'
+			? connectOpts.address
+			: `198.18.${(n >> 8) & 0xff}.${n & 0xff}`;
 		pendingUpgrades.set(req, {
 			clientSide,
 			address,

@@ -155,6 +155,7 @@ test('a shed on the cursor sub-budget names the lane, not the main ceiling', asy
 	assert.equal(upgradeAdmission.inFlight, 1, 'while the main lane has room to spare');
 
 	const before = upgradeRejectionCounts();
+	const subBudgetBefore = upgradeAdmission.cursorSubBudgetRefusals;
 	const { result, warnings } = await capturingWarnings(
 		() => tryUpgrade(upgradeRequest({ cursor: true }), srv, '/ws')
 	);
@@ -163,6 +164,15 @@ test('a shed on the cursor sub-budget names the lane, not the main ceiling', asy
 	const after = upgradeRejectionCounts();
 	assert.equal(after.cursor_lane, before.cursor_lane + 1, 'counted as a lane refusal');
 	assert.equal(after.over_capacity, before.over_capacity, 'not as main-lane pressure');
+	// And the SUB-BUDGET is what refused, machine-checked rather than inferred
+	// from the headroom above. The reason label is the same for a cursor upgrade
+	// the main ceiling turned away, so without this the assertions above hold on
+	// a lane that can never bind - which is exactly the state the corpus is in.
+	assert.equal(
+		upgradeAdmission.cursorSubBudgetRefusals,
+		subBudgetBefore + 1,
+		'the carve-out refused it, not the ceiling above it'
+	);
 
 	assert.equal(warnings.length, 1);
 	assert.match(warnings[0], /cursor lane/, 'naming the lane');

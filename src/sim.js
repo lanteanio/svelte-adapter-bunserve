@@ -291,6 +291,7 @@ function admissionReading(app) {
 		cursorInFlight: upgradeAdmission.cursorInFlight,
 		connectionPermits: upgradeAdmission.connectionPermits,
 		deferredDepth: upgradeAdmission.deferredDepth,
+		overReleaseTotal: upgradeAdmission.overReleaseTotal,
 		openConnections: app._connections.size
 	};
 }

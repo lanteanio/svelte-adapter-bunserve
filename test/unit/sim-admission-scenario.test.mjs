@@ -151,6 +151,35 @@ test('every refusal reason the ceiling can give is given by some seed', async ()
 	}
 });
 
+test('what the cursor_lane refusals above actually prove, and what they do not', async () => {
+	// `cursor_lane` cannot say WHICH ceiling refused: a cursor upgrade the main
+	// ceiling turned away is reported as a lane refusal too, because that is
+	// uws's label and a cursor client cannot connect either way. So the reason
+	// appearing above is satisfied by a workload whose carve-out can never bind
+	// - a `fraction` of 1 carves the whole ceiling, and every refusal would still
+	// carry this label.
+	//
+	// It does not bind here. Reaching it needs three cursor handshakes parked at
+	// once, and this workload draws the lane and the parking independently, so a
+	// wave of six produces that combination too rarely to rely on. Pinned as a
+	// PROPERTY OF THIS WORKLOAD rather than left to be assumed either way: the
+	// sub-budget's own refusal is proved in upgrade-shed-observability.test.mjs,
+	// where the main lane is deliberately left with room to spare, and this says
+	// that the corpus is not a second oracle for it.
+	let subBudget = 0;
+	for (const seed of ['1', '2', '3', '4', '5', '6', '7', '8']) {
+		const before = upgradeAdmission.cursorSubBudgetRefusals;
+		await runSeed(seed);
+		subBudget += upgradeAdmission.cursorSubBudgetRefusals - before;
+	}
+	assert.equal(
+		subBudget,
+		0,
+		`the corpus reaches the lane label through the main ceiling only (saw ${subBudget} sub-budget refusals). ` +
+		'If this now fails, the workload reaches further than it did - widen the assertion rather than the workload.'
+	);
+});
+
 test('the pacing queue actually holds callbacks, rather than always running them straight through', async () => {
 	// `perTickBudget` only does anything once a tick's budget is spent, and the
 	// depth is back to zero by quiescence - which is what the steady-state

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { checkAdmissionSettled, runSteadyState } from '../../src/runtime/steadystate.js';
+import { createUpgradeAdmission } from '../../src/runtime/utils/upgrade-admission.js';
 
 // THE UPGRADE CEILING, READ AT REST.
 //
@@ -21,6 +22,33 @@ test('an ungated server has no ceiling to settle, and is not a violation', () =>
 	// cross-adapter corpus, which gates nothing of the sort.
 	assert.equal(checkAdmissionSettled(null), null);
 	assert.equal(checkAdmissionSettled(undefined), null);
+});
+
+test('a permit given back twice is a violation, and the counters cannot show it', () => {
+	// The failure this reading exists for. The extra release REBALANCED the very
+	// numbers the other readings compare, so a run that double-released settles to
+	// a picture that looks perfect: no slot in flight, permits equal to sockets,
+	// nothing deferred.
+	const settled = { maxConnections: 5, inFlight: 0, connectionPermits: 1, deferredDepth: 0, openConnections: 1 };
+	assert.equal(checkAdmissionSettled(settled), null, 'the other readings see nothing');
+	const v = checkAdmissionSettled({ ...settled, overReleaseTotal: 1 });
+	assert.equal(v && v.category, 'steady.admission-unsettled');
+	assert.equal(v && v.context.reading, 'overReleaseTotal');
+});
+
+test('the controller counts an over-release before it throws', () => {
+	// The throw was the whole detection story, and it is not one on its own: one
+	// path that can double-release is the socket's close callback dispatched
+	// inside the app's `open` hook, where the hook runner catches and logs. A
+	// caught throw reaches no harness. The count survives it.
+	const admission = createUpgradeAdmission({ maxConnections: 2 });
+	assert.equal(admission.overReleaseTotal, 0);
+	admission.tryAcquireConnection();
+	admission.releaseConnection();
+	assert.equal(admission.overReleaseTotal, 0, 'a matched release is not one');
+	assert.throws(() => admission.releaseConnection(), /released without an acquisition/);
+	assert.equal(admission.overReleaseTotal, 1, 'counted, whoever swallows the throw');
+	assert.equal(admission.connectionPermits, 0, 'and the ledger is not driven negative');
 });
 
 test('permits matching the live sockets is what settled means', () => {
