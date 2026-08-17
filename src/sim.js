@@ -162,6 +162,15 @@ function resetSimState() {
 	for (const reason of Object.keys(wsCounters.upgradeRejectedByReason)) {
 		wsCounters.upgradeRejectedByReason[reason] = 0;
 	}
+	// The admitted tally and the pressure-reason transitions are the same kind of
+	// state as the refusals above, and are reset for the same reason rather than
+	// because a fingerprint reads them today. A hypothesis comparing admitted
+	// against refused - the natural next one to write, since the refusals alone
+	// cannot say whether a door was busy or idle - would otherwise depend on how
+	// many seeds ran before it, and that dependence is invisible until a corpus
+	// is re-blessed in a different order.
+	wsCounters.upgradeAdmittedTotal = 0;
+	wsCounters.pressureReasonTransitions.clear();
 	topicPublishStats.clear();
 	lastPublishWarnAt.clear();
 	pressureListeners.clear();
@@ -386,12 +395,30 @@ async function admissionScenario(api, opts) {
 		}
 		await api.advance();
 
-		// The clients that go away mid-handshake. Only the parked ones can: the
-		// rest have already been answered by now, and `hangUp()` says so by
-		// returning false, which is what keeps this from silently modelling
-		// nothing.
+		// The clients that go away mid-handshake. Only a client still IN one can:
+		// a park-mode client whose handshake the ceiling already refused was
+		// answered before its hook ever ran, and asking it to hang up is asking
+		// for nothing. Which is why the state is read rather than the mode.
+		//
+		// AND THE ANSWER IS CHECKED, because a return value nobody reads is not a
+		// guard. `hangUp` refuses anything that is not mid-handshake, so a false
+		// here means the facade's own two notions of "still connecting" have come
+		// apart - and the failure that would otherwise follow is silent: every
+		// hang-up becomes a no-op, the mid-handshake abort ordering leaves the
+		// workload, and every fingerprint still matches, because a workload that
+		// stopped happening was never in one. The aggregate - that some client
+		// does leave mid-handshake, across seeds - is asserted in
+		// test/unit/sim-admission-scenario.test.mjs.
 		for (let i = from; i < to; i++) {
-			if (modes[i] === 'park' && api.rng.float() < 0.5) conns[i].hangUp();
+			if (modes[i] !== 'park' || api.rng.float() >= 0.5) continue;
+			if (conns[i].state !== 'connecting') continue;
+			if (!conns[i].hangUp()) {
+				throw new Error(
+					`sim scenario: client ${i} reports state 'connecting' but refused to hang up, so this ` +
+					'run models no mid-handshake abort for it. The client facade and the upgrade path ' +
+					'disagree about whether the handshake is still open.'
+				);
+			}
 		}
 		await api.advance();
 

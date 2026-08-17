@@ -52,8 +52,19 @@ const { setServer } = await import('../../src/runtime/handler/ws-state.js');
 const { setRuntimeEnv } = await import('../../src/runtime/runtime.js');
 const { __setSimHooks } = await import('../../src/runtime/sim-hooks.js');
 
-/** One app on the seeded clock, assembled the way runSim assembles it. */
+/**
+ * One app on the seeded clock, assembled the way runSim assembles it.
+ *
+ * The admission controller is reset first, as it is in the file next door: it
+ * is a module singleton built once from the options, so without this a test
+ * starts against whatever the previous one left holding, and the absolute
+ * counter assertions below would depend on the order the tests were declared
+ * in. A connection left open at the end of a test is legitimately still holding
+ * its permit, so the pollution is ordinary rather than a bug to be found by
+ * reading.
+ */
 function newApp() {
+	upgradeAdmission._resetForSim();
 	const rng = createSeededRng(DEFAULT_SEED);
 	const scheduler = createScheduler({ startEpoch: FIXED_EPOCH });
 	setRuntimeEnv(scheduler.buildEnv(rng), { force: true });
