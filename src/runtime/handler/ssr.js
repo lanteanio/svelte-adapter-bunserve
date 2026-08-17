@@ -5,7 +5,7 @@ import { clearTimer, randomUuid, setTimer } from '../runtime.js';
 import { response413, response500 } from './http-helpers.js';
 import { origin, address_header, xff_depth, body_size_limit, get_origin, trusted_proxies, warnUntrustedClaim, ws_options } from './config.js';
 import { isDedupBufferable } from './ssr-dedup.js';
-import { platform as realtimePlatform } from './platform.js';
+import { httpPlatform, platform as realtimePlatform } from './platform.js';
 
 /* global ENV_PREFIX */
 /* global HTTP_OPTIONS */
@@ -247,11 +247,19 @@ export async function handleSSR(request, direct) {
 		// request's identity, so a load function or form action can
 		// `platform.publish(...)` to connected clients - one object per
 		// request, with every method still resolving to the shared singleton.
-		// Without it, the request identity alone.
+		//
+		// Without it, the members that do not depend on a realtime tier, which
+		// is what makes `platform.metrics` and `platform.metricsSnapshot()` true
+		// of EVERY instance as documented rather than only of the ones that
+		// serve WebSockets. An app whose only use for this adapter's
+		// observability is a `/metrics` route needs no realtime tier to have
+		// one, and the route that reached for it on such a build used to throw
+		// `platform.metricsSnapshot is not a function`.
 		const requestId = resolveRequestId(request.headers.get('x-request-id')) || randomUuid();
-		const platform = ws_options
-			? Object.assign(Object.create(realtimePlatform), { requestId })
-			: { requestId };
+		const platform = Object.assign(
+			Object.create(ws_options ? realtimePlatform : httpPlatform),
+			{ requestId }
+		);
 
 		// Dedup: for anonymous GET/HEAD requests that arrive concurrently for the
 		// same URL, only the first (the leader) calls server.respond(). Subsequent

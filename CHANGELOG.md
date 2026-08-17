@@ -84,7 +84,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configure. Serve it from an ordinary route - `return new
   Response(await platform.metricsSnapshot())` - and register your own
   instruments on `platform.metrics`, where they land in the same document after
-  the adapter's own families.
+  the adapter's own families. Every instance means every instance: a build with
+  no WebSocket handler carries both members too, so an app whose only use for
+  this adapter's observability is a scrape route does not need a realtime tier
+  to have one.
 
   **The adapter owns the registry**, where svelte-adapter-uws takes one from a
   module named in `websocket.metrics`. That is a decision on evidence rather

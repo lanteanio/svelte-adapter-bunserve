@@ -44,6 +44,21 @@ try {
 	const prerendered = await fetch(`http://127.0.0.1:${PORT}/about/`);
 	check('prerendered pages still serve', prerendered.status === 200, `got ${prerendered.status}`);
 
+	// The observability members are documented as being on EVERY instance, and
+	// a scrape route is the most likely reason an app with no realtime tier
+	// reaches for `platform` at all. The route is the fixture's own
+	// `/metrics`, compiled into this build like any other: before the platform
+	// carried these without a WebSocket handler it answered 500 with
+	// `platform.metricsSnapshot is not a function`.
+	const metrics = await fetch(`http://127.0.0.1:${PORT}/metrics`);
+	const metricsBody = metrics.status === 200 ? await metrics.text() : '';
+	check('the scrape route serves without a realtime tier', metrics.status === 200, `got ${metrics.status}`);
+	check(
+		'the document it serves is the Prometheus one',
+		metricsBody.includes('# TYPE ') && metricsBody.includes('ws_connections'),
+		JSON.stringify(metricsBody.slice(0, 120))
+	);
+
 	// With no handler configured the ws path is not special: it falls through
 	// to the normal routing, which has no /ws route, so SvelteKit 404s.
 	const wsPath = await fetch(`http://127.0.0.1:${PORT}/ws`);

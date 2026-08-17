@@ -498,6 +498,56 @@ async function runSubscribeGate(ws, topic, verdict) {
 	}
 }
 
+/**
+ * The platform members EVERY build has, WebSocket handler or not.
+ *
+ * A build with no realtime tier has no realtime platform for a route to reach
+ * through - it gets the request identity and nothing else - and these two are
+ * documented as being on every instance, which is the whole point of them: an
+ * app can serve a scrape route without configuring a realtime tier at all. So
+ * they are defined once, here, and both platforms take them from this object
+ * rather than declaring their own copies.
+ */
+export const httpPlatform = {
+	/**
+	 * The metrics registry this instance writes to, for an app that wants to
+	 * register instruments of its own: `platform.metrics.counter('orders_total',
+	 * 'orders placed').inc({ tier })`. They land in the same document
+	 * `metricsSnapshot()` renders, after the adapter's own.
+	 *
+	 * NEVER NULL here, where svelte-adapter-uws returns null until a `metrics`
+	 * module is configured. The adapter owns the registry rather than taking one
+	 * from a module the app also imports - measured, a module imported by both a
+	 * route and the WebSocket handler is TWO instances in a build, so an app
+	 * scraping its own copy would render a registry the adapter never wrote to.
+	 * Reaching it through the platform is what makes there be exactly one.
+	 */
+	get metrics() {
+		return metricsRegistry;
+	},
+
+	/**
+	 * This instance's metrics as a Prometheus text document. Serve it from an
+	 * ordinary route:
+	 *
+	 *     export async function GET({ platform }) {
+	 *       return new Response(await platform.metricsSnapshot(), {
+	 *         headers: { 'content-type': 'text/plain; version=0.0.4' }
+	 *       });
+	 *     }
+	 *
+	 * The adapter's own counters are projected from the runtime's authoritative
+	 * state when this is called, so nothing is emitted on a hot path and the two
+	 * numbers cannot drift. The pressure-derived gauges are as fresh as the last
+	 * sampler tick, which `pressure_sample_timestamp_seconds` states outright.
+	 *
+	 * @returns {Promise<string>}
+	 */
+	metricsSnapshot() {
+		return metricsSnapshot();
+	}
+};
+
 export const platform = {
 	/**
 	 * Publish to every client subscribed to `topic`, wrapped in the
@@ -1951,44 +2001,6 @@ export const platform = {
 	},
 
 	/**
-	 * The metrics registry this instance writes to, for an app that wants to
-	 * register instruments of its own: `platform.metrics.counter('orders_total',
-	 * 'orders placed').inc({ tier })`. They land in the same document
-	 * `metricsSnapshot()` renders, after the adapter's own.
-	 *
-	 * NEVER NULL here, where svelte-adapter-uws returns null until a `metrics`
-	 * module is configured. The adapter owns the registry rather than taking one
-	 * from a module the app also imports - measured, a module imported by both a
-	 * route and the WebSocket handler is TWO instances in a build, so an app
-	 * scraping its own copy would render a registry the adapter never wrote to.
-	 * Reaching it through the platform is what makes there be exactly one.
-	 */
-	get metrics() {
-		return metricsRegistry;
-	},
-
-	/**
-	 * This instance's metrics as a Prometheus text document. Serve it from an
-	 * ordinary route:
-	 *
-	 *     export async function GET({ platform }) {
-	 *       return new Response(await platform.metricsSnapshot(), {
-	 *         headers: { 'content-type': 'text/plain; version=0.0.4' }
-	 *       });
-	 *     }
-	 *
-	 * The adapter's own counters are projected from the runtime's authoritative
-	 * state when this is called, so nothing is emitted on a hot path and the two
-	 * numbers cannot drift. The pressure-derived gauges are as fresh as the last
-	 * sampler tick, which `pressure_sample_timestamp_seconds` states outright.
-	 *
-	 * @returns {Promise<string>}
-	 */
-	metricsSnapshot() {
-		return metricsSnapshot();
-	},
-
-	/**
 	 * The protection posture level: 'normal' | 'elevated' | 'siege'. Reads
 	 * 'normal' when no posture machine is configured - the zero-config
 	 * posture, and the only one this adapter currently runs (the
@@ -2073,6 +2085,12 @@ export const platform = {
 		bytes: (n) => new Uint8Array(randomOctets(n))
 	}
 };
+
+// The members every build has, mixed in rather than restated. Descriptors, not
+// a spread: `metrics` is an accessor, and a spread would copy the value it
+// answered with at module-init time and quietly stop being the same member as
+// the one a build with no realtime tier serves.
+Object.defineProperties(platform, Object.getOwnPropertyDescriptors(httpPlatform));
 
 
 /**

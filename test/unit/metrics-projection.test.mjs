@@ -21,7 +21,7 @@ globalThis.WS_OPTIONS = normalizeWsOptions({
 register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { metricsSnapshot, metricsRegistry } = await import('../../src/runtime/handler/metrics.js');
-const { platform } = await import('../../src/runtime/handler/platform.js');
+const { httpPlatform, platform } = await import('../../src/runtime/handler/platform.js');
 const {
 	UPGRADE_REJECTION_REASONS, pressureSnapshot, recordUpgradeRejection, wsCounters
 } = await import('../../src/runtime/handler/ws-state.js');
@@ -164,6 +164,24 @@ test('the platform exposes the registry an app registers on', async () => {
 	assert.equal(value(text, 'orders_placed_total{tier="pro"}'), '2');
 	// After the adapter's own, so the document still starts with the manifest.
 	assert.ok(text.indexOf('orders_placed_total') > text.indexOf('upgrade_admitted_total'));
+});
+
+test('a build with no realtime tier serves the same two members', async () => {
+	// What a WebSocket-less build's request platform is prototype-linked to.
+	// Both members are documented as being on every instance, so they are
+	// defined once and the realtime platform takes them from here - a second
+	// declaration is how one of the two ends up answering with a different
+	// registry, or with nothing at all.
+	const requestPlatform = Object.assign(Object.create(httpPlatform), { requestId: 'r-1' });
+	assert.equal(requestPlatform.metrics, metricsRegistry);
+	assert.equal(typeof requestPlatform.metricsSnapshot, 'function');
+	assert.match(await requestPlatform.metricsSnapshot(), /^# HELP /);
+	// The realtime platform serves the SAME members, not copies of them.
+	assert.equal(
+		Object.getOwnPropertyDescriptor(platform, 'metrics').get,
+		Object.getOwnPropertyDescriptor(httpPlatform, 'metrics').get
+	);
+	assert.equal(platform.metricsSnapshot, httpPlatform.metricsSnapshot);
 });
 
 test('the snapshot is a promise resolving to text, never null', async () => {
