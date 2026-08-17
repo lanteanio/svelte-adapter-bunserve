@@ -22,7 +22,7 @@ import { isUpgradeOriginAllowed } from '../utils/ws-origin.js';
 import { resolveRequestId } from '../utils/request-id.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
 import { clearTimer, processMonotonicNow, randomFloat, randomUuid, setTimer } from '../runtime.js';
-import { WS_REQUEST_ID_KEY, isDraining, recordUpgradeRejection } from './ws-state.js';
+import { WS_REQUEST_ID_KEY, isDraining, recordUpgradeRejection, wsCounters } from './ws-state.js';
 import { get_origin, origin, upgrade_timeout_ms, ws_options, ws_path } from './config.js';
 import { WS_CONNECTION_PERMIT, awaitAdmissionSlot, upgradeAdmission } from './admission.js';
 import {
@@ -966,7 +966,14 @@ async function runUpgrade(req, srv, held) {
 		}
 		return new Response('WebSocket upgrade failed', { status: 400 });
 	}
-	if (ok) return undefined;
+	if (ok) {
+		// Counted where the handshake actually succeeded, not at `open`: an
+		// upgrade the runtime accepted is an upgrade this door admitted, and a
+		// socket that opens and closes in the same tick must still appear in the
+		// rate. One integer increment on a path that has just done a handshake.
+		wsCounters.upgradeAdmittedTotal++;
+		return undefined;
+	}
 
 	// Bun refused the handshake (a malformed request that carried the upgrade
 	// header). Nothing has been written yet, so a plain 400 is safe.

@@ -59,8 +59,6 @@ const PLATFORM_GAPS = {
 	publishGame: 'game ingress lane',
 	hlc: 'hybrid logical clock (cluster ordering)',
 	topicEpoch: 'resume epoch introspection',
-	metrics: 'metrics registry',
-	metricsSnapshot: 'metrics registry',
 	introspect: 'diagnostics'
 };
 

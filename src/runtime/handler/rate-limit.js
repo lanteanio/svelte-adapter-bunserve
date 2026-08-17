@@ -42,6 +42,20 @@ const RATE_MAP_EVICTION_SAMPLE = 16;
 const MAX_RATE_KEY_LEN = 128;
 
 /**
+ * Identities dropped at the map cap, per door.
+ *
+ * An eviction is not a refusal and is not visible to any client: the evicted
+ * identity simply starts a fresh window next time it is seen, so it gets a full
+ * allowance it had not earned. A steady rate here means the cap - not the
+ * configured limit - is what is deciding who gets metered, which is the one
+ * thing an operator cannot infer from the refusal counts.
+ *
+ * Two plain numbers rather than instruments: nothing reads them until something
+ * scrapes, and the eviction path is inside the limiter's insertion cap.
+ */
+export const rateMapEvictions = { upgrade: 0, auth: 0 };
+
+/**
  * Whether the limiter gates anything. `0` is the documented spelling for
  * "disabled", so a server that sets it pays for no map and no key folding.
  */
@@ -73,7 +87,8 @@ export const upgradeRateLimiter = configuredLimit > 0
 		windowMs,
 		maxEntries: MAX_RATE_ENTRIES,
 		evictionSample: RATE_MAP_EVICTION_SAMPLE,
-		maxKeyLen: MAX_RATE_KEY_LEN
+		maxKeyLen: MAX_RATE_KEY_LEN,
+		onEvict: () => { rateMapEvictions.upgrade++; }
 	})
 	: null;
 
@@ -120,7 +135,8 @@ export const authRateLimiter = configuredAuthLimit > 0
 		windowMs: authWindowMs,
 		maxEntries: MAX_RATE_ENTRIES,
 		evictionSample: RATE_MAP_EVICTION_SAMPLE,
-		maxKeyLen: MAX_RATE_KEY_LEN
+		maxKeyLen: MAX_RATE_KEY_LEN,
+		onEvict: () => { rateMapEvictions.auth++; }
 	})
 	: null;
 

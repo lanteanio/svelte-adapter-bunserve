@@ -255,6 +255,27 @@ export const SIGNALS = Object.freeze([
 ]);
 
 /**
+ * `pressure_reason` as a severity-ordered number, because a gauge cannot carry
+ * a string and an alert has to be able to say "worse than PSI".
+ *
+ * The order is the sibling's, value for value, and it mirrors the precedence
+ * the sampler itself applies: memory exhaustion outranks a posture engaged for
+ * capacity, which outranks the load signals. A dashboard that thresholds on this
+ * number must mean the same thing on both adapters.
+ *
+ * @type {Readonly<Record<string, number>>}
+ */
+export const PRESSURE_REASON_CODES = Object.freeze({
+	NONE: 0,
+	SUBSCRIBERS: 1,
+	PUBLISH_RATE: 2,
+	PSI: 3,
+	CPU_QUOTA: 4,
+	CAPACITY: 5,
+	MEMORY: 6
+});
+
+/**
  * The signals the renderer fills in itself, rather than reading from a sample.
  * Held here so the renderer and the manifest cannot drift about which those are.
  */

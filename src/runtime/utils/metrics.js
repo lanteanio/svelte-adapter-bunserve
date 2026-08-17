@@ -120,6 +120,7 @@ function renderLabels(labels) {
  *   counter: (name: string, help?: string, labelNames?: string[]) => { inc: (labels?: any, value?: number) => void },
  *   gauge: (name: string, help?: string) => { set: (value: number) => void },
  *   histogram: (name: string, help?: string, options?: { buckets?: number[] }) => { observe: (labels?: any, value?: number) => void },
+ *   projectCounter: (name: string, labels: Record<string, string> | undefined, value: number) => void,
  *   serialize: () => string,
  *   read: () => any[],
  *   reset: () => void
@@ -233,6 +234,32 @@ export function createMetricRegistry() {
 					histogram.sum += observed;
 				}
 			};
+		},
+
+		/**
+		 * Publish an ABSOLUTE value for a counter family whose authoritative
+		 * source is elsewhere in the runtime.
+		 *
+		 * This is how the adapter's own counters get here, and it is the whole
+		 * reason the emit sites the sibling has do not exist in this adapter. The
+		 * runtime already counts refusals, publishes and closed-socket aborts in
+		 * `wsCounters`; incrementing a second, parallel set of instruments at
+		 * those call sites would put a metrics write on hot paths and create two
+		 * numbers that can disagree. Projecting the authoritative one at read time
+		 * costs nothing until something scrapes, and cannot drift.
+		 *
+		 * The value is written as given rather than clamped to be non-decreasing.
+		 * In a build the sources are monotonic for the life of the process, so a
+		 * decrease can only come from a harness resetting them - and freezing the
+		 * metric at the old value there would hide the reset rather than show it.
+		 *
+		 * @param {string} name
+		 * @param {Record<string, string> | undefined} labels
+		 * @param {number} value
+		 */
+		projectCounter(name, labels, value) {
+			if (typeof value !== 'number' || !Number.isFinite(value)) return;
+			record(family(name, 'counter', undefined, null), labels, value, true);
 		},
 
 		/**

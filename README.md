@@ -262,6 +262,8 @@ export function POST({ platform }) {
 | `subscribe(ws, topic, options?)` | server-side subscribe THROUGH the authorization hook; `null` on success, else a reason: `INVALID_TOPIC`, `SUBSCRIBE_NOT_CONFIGURED`, `INTERNAL_ERROR`, `FORBIDDEN` (what a hook returning `false` becomes), `RATE_LIMITED`, `CANCELLED`, `CLOSED`, or the hook's own string |
 | `checkSubscribe(ws, topic, options?)` | run the hook without subscribing; the same reasons except the last three, which only an install can produce |
 | `unsubscribe(ws, topic)` | unsubscribe and keep bookkeeping in step |
+| `metrics` | the instance's metrics registry: `counter(name, help, labelNames?)`, `gauge`, `histogram`, `serialize()`. Register your own instruments on it |
+| `metricsSnapshot()` | `Promise<string>` - the whole Prometheus document, adapter families first |
 | `adviseReconnect(options?)` | jittered reconnect advice, then drain |
 | `connections` / `subscribers(topic)` / `forEachSubscriber(topic, fn)` | live counts and the per-subscriber walk |
 | `totalSubscriptions` / `publishCount` | instance-wide subscription total, and publishes since boot |
@@ -340,6 +342,58 @@ holds whichever gate you export - `subscribe` or `subscribeBatch` - because
 per-topic gate rather than supplementing it. A single `subscribe` frame is
 gated as a one-entry batch, so the hook decides every subscription regardless of
 which frame asked for it.
+
+### Metrics
+
+Every instance keeps a metrics registry and can render it as a Prometheus
+document. There is nothing to configure - serve it from an ordinary route:
+
+```js
+// src/routes/metrics/+server.js
+export async function GET({ platform }) {
+	return new Response(await platform.metricsSnapshot(), {
+		headers: { 'content-type': 'text/plain; version=0.0.4' }
+	});
+}
+```
+
+Your own instruments go on the same registry and land in the same document,
+after the adapter's own families:
+
+```js
+// src/ws-handler.js
+let orders;
+export function init({ platform }) {
+	orders = platform.metrics.counter('orders_placed_total', 'orders placed', ['tier']);
+}
+```
+
+**The adapter owns the registry, and that is deliberate.**
+svelte-adapter-uws takes one from a module you name in `websocket.metrics`.
+That cannot work here: measured on this repo's own fixture, a module imported
+by both a SvelteKit route and the WebSocket handler ends up as **two copies** in
+the built output, because SvelteKit's server bundle is already bundled before
+the adapter's own pass sees your handler. An app that imported its registry to
+serve `/metrics` would render one the adapter never wrote to - every adapter
+family stuck at zero, and nothing to indicate why. Reaching it through
+`platform`, which is the same object SSR already gets, is what makes there be
+exactly one.
+
+**Nothing is emitted from a hot path.** The runtime already counts refusals by
+reason, publishes, closed-socket aborts and the rest; the document is projected
+from those authoritative numbers when something scrapes. So metrics cost nothing
+until they are read, and there is no second tally that can disagree with the
+first. The pressure-derived gauges are as fresh as the last sampler tick, which
+`pressure_sample_timestamp_seconds` states outright - alert on its age rather
+than assuming the gauges beside it are current.
+
+The metric names are svelte-adapter-uws's, so dashboards move between the two
+adapters. Signals this adapter cannot measure are **absent** rather than zero: a
+zero published for something never measured reads as healthy and no alert ever
+fires. `metrics_snapshot_workers_expected`, `_reporting` and
+`metrics_snapshot_degraded` are always `1`, `1` and `0` here, because this
+adapter is single-process - they are carried so an alert written against the
+sibling still evaluates.
 
 ### Options
 

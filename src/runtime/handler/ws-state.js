@@ -680,7 +680,31 @@ export const wsCounters = {
 	 * @type {Record<string, number>}
 	 */
 	upgradeRejectedByReason: seedRejectionCounts(),
-	upgradeRejectedTotal: 0
+	upgradeRejectedTotal: 0,
+
+	/**
+	 * WebSocket upgrades that completed, since boot. The counterpart to the
+	 * refusals above, and the denominator that makes them readable: a refusal
+	 * count alone cannot tell a server turning away one client in a thousand
+	 * from one turning away every second client.
+	 *
+	 * Monotonic and never reset, unlike the live connection count, which is what
+	 * makes it a rate rather than a level.
+	 */
+	upgradeAdmittedTotal: 0,
+
+	/**
+	 * Pressure-reason changes, keyed `from>to`. Bounded by the reason
+	 * vocabulary squared - seven reasons, so at most 49 entries, and in practice
+	 * a handful.
+	 *
+	 * A transition count is what makes the reason gauge alertable: the gauge says
+	 * what is wrong now, and only the transitions say whether the server has been
+	 * flapping between healthy and saturated all night.
+	 *
+	 * @type {Map<string, number>}
+	 */
+	pressureReasonTransitions: new Map()
 };
 
 /**

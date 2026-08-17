@@ -79,6 +79,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `platform.metrics` and `platform.metricsSnapshot()`: a metrics registry on
+  every instance and the Prometheus document it renders, with nothing to
+  configure. Serve it from an ordinary route - `return new
+  Response(await platform.metricsSnapshot())` - and register your own
+  instruments on `platform.metrics`, where they land in the same document after
+  the adapter's own families.
+
+  **The adapter owns the registry**, where svelte-adapter-uws takes one from a
+  module named in `websocket.metrics`. That is a decision on evidence rather
+  than a simplification: measured on this repo's fixture, a module imported by
+  both a SvelteKit route and the WebSocket handler ends up as TWO copies in the
+  built output, because SvelteKit's server bundle is already bundled before the
+  adapter's own pass reads the handler. An app that imported its registry to
+  serve `/metrics` would render one the adapter never wrote to - every adapter
+  family stuck at zero with nothing to say why. Reaching it through `platform`,
+  the object SSR already receives, is what makes there be exactly one.
+  `platform.metrics` is therefore never `null` here, and `metricsSnapshot()`
+  resolves to a string rather than to `string | null`.
+
+  **Nothing is emitted from a hot path.** The runtime already counts refusals by
+  reason, publishes, closed-socket aborts, the admission gate's levels and the
+  pressure sampler's last reading; the document is projected from those
+  authoritative numbers when something scrapes. Metrics cost nothing until they
+  are read, and no second tally can disagree with the first. The
+  pressure-derived gauges are as fresh as the last sampler tick, which
+  `pressure_sample_timestamp_seconds` states outright.
+
+  The metric names, types and label vocabularies are svelte-adapter-uws's, so a
+  dashboard moves between the adapters. A signal this adapter cannot measure is
+  **absent** rather than published as zero, because a zero for something never
+  measured reads as healthy and no alert ever fires - so the upgrade and
+  connection counters, the pressure and memory gauges and the kernel readings
+  are here, while the relay, clustering, waiting-room, posture and egress
+  families are not, each waiting on its own recorded gap. `http_requests_total`
+  and the duration histograms need instrumentation on the request path itself
+  and are their own slice. `metrics_snapshot_workers_expected`, `_reporting`
+  and `metrics_snapshot_degraded` are always `1`, `1` and `0`: this adapter is
+  single-process, and they are carried so an alert written against the sibling
+  still evaluates rather than silently matching no series.
+
+  Two new counters back this: `upgrade_admitted_total` (the denominator the
+  refusal counts never had) and per-door rate-limit map evictions, which say
+  when the map cap rather than the configured limit is deciding who gets
+  metered.
+
 - The auth preflight endpoint, with `websocket.authPath` (default
   `/__ws/auth`) and `websocket.authPathRequireOrigin` (default `true`). Export
   an `authenticate` hook from your WebSocket handler and the adapter mounts a

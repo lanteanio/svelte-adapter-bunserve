@@ -190,6 +190,18 @@ function samplePressure(thresholds) {
 	wsCounters.leaseSaturationPeak *= 0.5;
 
 	const transitioned = effectiveReason !== pressureSnapshot.reason;
+	if (transitioned) {
+		// Counted HERE, where the previous reason is still readable, rather than
+		// below with the listener dispatch - by then the snapshot has been
+		// overwritten and only the destination would be knowable. One Map write
+		// per transition, on a path that already writes the whole snapshot, and
+		// the key space is the reason vocabulary squared.
+		const key = pressureSnapshot.reason + '>' + effectiveReason;
+		wsCounters.pressureReasonTransitions.set(
+			key,
+			(wsCounters.pressureReasonTransitions.get(key) ?? 0) + 1
+		);
+	}
 	pressureSnapshot.value = value;
 	pressureSnapshot.subscriberRatio = subscriberRatio;
 	pressureSnapshot.publishRate = publishRate;

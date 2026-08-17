@@ -70,8 +70,15 @@ const snapWire = {
 export function init({ platform }) {
 	platform.registerWireCodec(xyWire);
 	platform.registerWireCodec(snapWire);
+	// An APP instrument on the adapter's registry, so the live lane can prove
+	// the app's own metrics land in the same document as the adapter's - which
+	// is the thing a registry the app imported for itself could not do.
+	fixtureOpens = platform.metrics.counter('fixture_opens_total', 'sockets opened, counted by the app');
 	console.log(`[fixture] init connections=${platform.connections}`);
 }
+
+/** @type {{ inc: (labels?: any, value?: number) => void } | null} */
+let fixtureOpens = null;
 
 /**
  * Per-topic scripts for the honest-watermark lane, armed by `fixture-resume-script`.
@@ -229,6 +236,7 @@ export function open(ws, { platform }) {
 		ws.end(4003, 'refused by the app');
 		return;
 	}
+	fixtureOpens?.inc();
 	// Retained on purpose and never released; see LEAK_INJECT. Filled so the
 	// bytes are unambiguously touched on any allocator that maps lazily. On Bun
 	// it made no measurable difference across four isolated trials - the filled
