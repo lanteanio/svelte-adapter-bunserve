@@ -517,6 +517,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `XFF_DEPTH` is validated at boot and a value that cannot select a hop refuses
+  to start the process. A non-numeric or non-positive value parsed to `NaN` or
+  `0`, both of which slipped past the "chain shorter than the configured depth"
+  check in each of the two places that read a forwarded chain, and the read that
+  followed threw on `undefined`. The result was a 500 with a stack for every SSR
+  request and - since metering by client address resolves an address before
+  anything has authenticated - for every WebSocket handshake as well, on a
+  server that had started and reported itself healthy. `ADDRESS_HEADER`
+  deployments are the only ones that ever read the value; the default is `1` and
+  is unaffected. svelte-adapter-uws refuses the same values at boot with the
+  same message.
+
 - A client that opened a WebSocket handshake and hung up while the app's
   `upgrade` hook was still awaiting kept one `upgradeAdmission` in-flight slot
   and one connection permit until that hook settled. The hook is the app's - it

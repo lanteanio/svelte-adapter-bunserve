@@ -4,6 +4,7 @@ import { createTrustedProxyMatcher } from '../utils/trusted-proxies.js';
 
 /* global WS_OPTIONS */
 /* global WS_PATH */
+/* global ENV_PREFIX */
 
 /**
  * The `websocket` adapter options, validated and defaulted at build time by
@@ -78,6 +79,20 @@ export const is_tls = !!(ssl_cert && ssl_key);
 export const origin = parse_origin(env('ORIGIN', undefined));
 
 export const xff_depth = parseInt(env('XFF_DEPTH', '1'), 10);
+
+// REFUSED AT BOOT, because neither reader can survive it at request time.
+// `parseInt` gives `NaN` for a non-numeric value and `0` for `0`, and the guard
+// both readers share - `xff_depth > addresses.length` - is false for both, so
+// each falls through to `addresses[addresses.length - xff_depth]`, which is
+// `undefined`, and `.trim()` throws. On the SSR path that is a 500 per request;
+// on the upgrade path it is a 500 per HANDSHAKE, because metering by client
+// address made this run before anything has authenticated. A value that cannot
+// select a hop cannot serve traffic, so the process does not start with one.
+if (!Number.isInteger(xff_depth) || xff_depth < 1) {
+	throw new Error(
+		`Invalid ${ENV_PREFIX + 'XFF_DEPTH'}: '${env('XFF_DEPTH', '1')}'. Must be a positive integer.`
+	);
+}
 
 export const address_header = env('ADDRESS_HEADER', '').toLowerCase();
 
