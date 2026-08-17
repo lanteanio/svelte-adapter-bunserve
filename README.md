@@ -262,7 +262,7 @@ export function POST({ platform }) {
 | `subscribe(ws, topic, options?)` | server-side subscribe THROUGH the authorization hook; `null` on success, else a reason: `INVALID_TOPIC`, `SUBSCRIBE_NOT_CONFIGURED`, `INTERNAL_ERROR`, `FORBIDDEN` (what a hook returning `false` becomes), `RATE_LIMITED`, `CANCELLED`, `CLOSED`, or the hook's own string |
 | `checkSubscribe(ws, topic, options?)` | run the hook without subscribing; the same reasons except the last three, which only an install can produce |
 | `unsubscribe(ws, topic)` | unsubscribe and keep bookkeeping in step |
-| `metrics` | the instance's metrics registry: `counter(name, help, labelNames?)`, `gauge`, `histogram`, `serialize()`. Register your own instruments on it |
+| `metrics` | the instance's metrics registry: `counter(name, help, labelNames?)`, `gauge`, `histogram`, `projectCounter`, `serialize()`, `read()`, `reset()`. Register your own instruments on it; `serialize()` renders the same document `metricsSnapshot()` does, adapter families included |
 | `metricsSnapshot()` | `Promise<string>` - the whole Prometheus document, adapter families first |
 | `adviseReconnect(options?)` | jittered reconnect advice, then drain |
 | `connections` / `subscribers(topic)` / `forEachSubscriber(topic, fn)` | live counts and the per-subscriber walk |
@@ -346,7 +346,15 @@ which frame asked for it.
 ### Metrics
 
 Every instance keeps a metrics registry and can render it as a Prometheus
-document. There is nothing to configure - serve it from an ordinary route:
+document - **including a build with no WebSocket handler**, which is why the
+members live on `platform` rather than on the realtime tier. Such a build
+publishes the process families (`resident_memory_bytes`, `heap_used_ratio`) and
+whatever your app registered, and none of the realtime ones: a server with no
+upgrade path has not admitted zero upgrades, it has no upgrade door to count.
+Register from the route itself there, since there is no `init` hook to do it
+from.
+
+There is nothing to configure - serve it from an ordinary route:
 
 ```js
 // src/routes/metrics/+server.js
@@ -395,7 +403,10 @@ server that looks instrumented and is not.
 The metric names are svelte-adapter-uws's, so dashboards move between the two
 adapters. Signals this adapter cannot measure are **absent** rather than zero: a
 zero published for something never measured reads as healthy and no alert ever
-fires. `metrics_snapshot_workers_expected`, `_reporting` and
+fires. That applies over time as well as at boot - the pressure families appear
+at the sampler's first tick, roughly a second in, and the kernel readings
+disappear again if `/proc/pressure` stops answering rather than republishing the
+last figure as current. `metrics_snapshot_workers_expected`, `_reporting` and
 `metrics_snapshot_degraded` are always `1`, `1` and `0` here, because this
 adapter is single-process - they are carried so an alert written against the
 sibling still evaluates.

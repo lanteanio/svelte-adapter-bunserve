@@ -36,7 +36,11 @@
  * @property {string | null} unit for documentation; the name already carries it
  * @property {string} help one line, rendered into the document
  * @property {boolean} [optional] true when the signal is absent on some
- *   platforms or configurations, so a missing family is not a defect
+ *   platforms or configurations, so a missing family is not a defect. Every
+ *   realtime-tier signal carries it: a build with no WebSocket handler has no
+ *   such tier, and publishing zeros for one is the failure this whole manifest
+ *   is written against. A signal WITHOUT the flag must render on a default
+ *   build, and `metrics-registry.test.mjs` holds it to that.
  * @property {number[]} [buckets] histogram bounds, in the metric's own unit
  */
 
@@ -56,28 +60,32 @@ export const SIGNALS = Object.freeze([
 		type: 'counter',
 		labels: [],
 		unit: null,
-		help: 'WebSocket upgrades accepted'
+		help: 'WebSocket upgrades accepted',
+		optional: true
 	},
 	{
 		name: 'upgrade_rejected_total',
 		type: 'counter',
 		labels: ['reason'],
 		unit: null,
-		help: 'WebSocket upgrades rejected before open'
+		help: 'WebSocket upgrades rejected before open',
+		optional: true
 	},
 	{
 		name: 'upgrade_deferred_rejected_total',
 		type: 'counter',
 		labels: [],
 		unit: null,
-		help: 'Upgrade callbacks shed because the bounded deferral queue was full'
+		help: 'Upgrade callbacks shed because the bounded deferral queue was full',
+		optional: true
 	},
 	{
 		name: 'upgrade_rate_map_evicted_total',
 		type: 'counter',
 		labels: ['door'],
 		unit: null,
-		help: 'Rate-limit entries evicted at the map cap'
+		help: 'Rate-limit entries evicted at the map cap',
+		optional: true
 	},
 	{
 		name: 'upgrade_inflight',
@@ -110,42 +118,48 @@ export const SIGNALS = Object.freeze([
 		type: 'gauge',
 		labels: [],
 		unit: null,
-		help: 'Live WebSocket connections'
+		help: 'Live WebSocket connections',
+		optional: true
 	},
 	{
 		name: 'ws_subscriptions',
 		type: 'gauge',
 		labels: [],
 		unit: null,
-		help: 'Live topic subscriptions; divide by ws_connections for the subscriber ratio'
+		help: 'Live topic subscriptions; divide by ws_connections for the subscriber ratio',
+		optional: true
 	},
 	{
 		name: 'ws_publishes_total',
 		type: 'counter',
 		labels: [],
 		unit: null,
-		help: 'Publish calls made (fan-out is one call; not per-recipient deliveries)'
+		help: 'Publish calls made (fan-out is one call; not per-recipient deliveries)',
+		optional: true
 	},
 	{
 		name: 'ws_backpressure_max_bytes',
 		type: 'gauge',
 		labels: [],
 		unit: 'bytes',
-		help: 'Worst per-connection outbound buffered bytes over the sampled set'
+		help: 'Worst per-connection outbound buffered bytes over the sampled set',
+		optional: true
 	},
 	{
 		name: 'ws_backpressure_connections',
 		type: 'gauge',
 		labels: [],
 		unit: null,
-		help: 'Sampled connections holding a backpressured outbound queue'
+		help: 'Sampled connections holding a backpressured outbound queue',
+		optional: true
 	},
 	{
 		name: 'ws_closed_socket_aborts_total',
 		type: 'counter',
 		labels: [],
 		unit: null,
-		help: 'Sends and subscribes refused because the socket had already closed'
+		help: 'Sends and subscribes refused because the socket had already closed',
+		optional: true
 	},
 
 	// - Pressure ---------------------------------------------------------------
@@ -154,28 +168,32 @@ export const SIGNALS = Object.freeze([
 		type: 'gauge',
 		labels: [],
 		unit: 'ratio',
-		help: 'Instance saturation, 0 healthy to 1 at the configured thresholds'
+		help: 'Instance saturation, 0 healthy to 1 at the configured thresholds',
+		optional: true
 	},
 	{
 		name: 'pressure_reason',
 		type: 'gauge',
 		labels: [],
 		unit: 'enum',
-		help: 'Pressure reason as a severity-ordered code (0 none to 6 memory)'
+		help: 'Pressure reason as a severity-ordered code (0 none to 6 memory)',
+		optional: true
 	},
 	{
 		name: 'pressure_reason_transitions_total',
 		type: 'counter',
 		labels: ['from', 'to'],
 		unit: null,
-		help: 'Pressure reason changes, including incidents and recoveries'
+		help: 'Pressure reason changes, including incidents and recoveries',
+		optional: true
 	},
 	{
 		name: 'pressure_sample_timestamp_seconds',
 		type: 'gauge',
 		labels: [],
 		unit: SECONDS,
-		help: 'Unix time of the most recent pressure sample; alert on its age'
+		help: 'Unix time of the most recent pressure sample; alert on its age',
+		optional: true
 	},
 	{
 		name: 'resident_memory_bytes',

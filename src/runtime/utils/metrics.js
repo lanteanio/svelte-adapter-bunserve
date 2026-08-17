@@ -166,6 +166,11 @@ function renderLabels(labels) {
  * a registry that silently resets its counters on that is worse than one that
  * ignores the second call.
  *
+ * @param {{ beforeSerialize?: () => void }} [options]
+ *   `beforeSerialize` runs at the top of every `serialize()`, which is what lets
+ *   a caller that renders this registry directly - `platform.metrics` is a
+ *   documented member - get the same document the adapter's own snapshot
+ *   returns rather than whatever the last scrape left behind.
  * @returns {{
  *   counter: (name: string, help?: string, labelNames?: string[]) => { inc: (labels?: any, value?: number) => void },
  *   gauge: (name: string, help?: string) => { set: (value: number) => void },
@@ -329,7 +334,7 @@ export function createMetricRegistry(options = {}) {
 		existing.value = absolute ? delta : (existing.value ?? 0) + delta;
 	}
 
-	return {
+	const registry = {
 		counter(name, help) {
 			if (family(name, 'counter', help, null) === null) return INERT;
 			return {
@@ -446,28 +451,6 @@ export function createMetricRegistry(options = {}) {
 		},
 
 		/**
-		 * Retract a family so the next document omits it entirely.
-		 *
-		 * The counterpart to a projection that can stop being measurable. A gauge
-		 * whose source has gone away cannot be answered with a zero (that is a
-		 * measurement, and a false one) and cannot be left at its last value
-		 * either - a frozen reading published as current is the worse of the two,
-		 * because it looks alive. Retracting is the third answer: the family
-		 * disappears until something measures it again, which is what a scraper
-		 * reads as "this instance no longer reports this".
-		 *
-		 * Registration-state only, so re-registering later is a fresh family. Not
-		 * for app instruments: an app that stops writing to a counter still wants
-		 * its last total.
-		 *
-		 * @param {string} name
-		 * @returns {boolean} whether a family was there to retract
-		 */
-		retract(name) {
-			return families.delete(name);
-		},
-
-		/**
 		 * The whole document, in Prometheus text exposition format.
 		 *
 		 * MANIFEST ORDER FIRST, so two scrapes of an unchanged server are
@@ -552,6 +535,38 @@ export function createMetricRegistry(options = {}) {
 			families.clear();
 		}
 	};
+	RETRACTORS.set(registry, (name) => families.delete(name));
+	return registry;
+}
+
+/**
+ * Per-registry family retraction, held OFF the registry object.
+ *
+ * The registry is `platform.metrics` and an app holds it, so a method that drops
+ * a whole family with its accumulated totals must not be reachable by name
+ * there: a counter re-created at zero afterwards reads downstream as a reset and
+ * is charged as a full re-count, and unlike `reset()` the name gives no warning.
+ * The adapter's own projection does need it - for a gauge whose SOURCE stopped
+ * answering, where a zero would be a false measurement and the last value would
+ * be a frozen one published as current - and reaches it through the function
+ * below.
+ *
+ * @type {WeakMap<object, (name: string) => boolean>}
+ */
+const RETRACTORS = new WeakMap();
+
+/**
+ * Retract a family so the next document omits it entirely, until something
+ * measures it again. Registration state only, so a later write is a fresh
+ * family.
+ *
+ * @param {object} registry a registry from {@link createMetricRegistry}
+ * @param {string} name
+ * @returns {boolean} whether a family was there to retract
+ */
+export function retractFamily(registry, name) {
+	const retract = RETRACTORS.get(registry);
+	return retract === undefined ? false : retract(name);
 }
 
 /**

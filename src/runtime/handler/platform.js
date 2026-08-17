@@ -502,11 +502,11 @@ async function runSubscribeGate(ws, topic, verdict) {
  * The platform members EVERY build has, WebSocket handler or not.
  *
  * A build with no realtime tier has no realtime platform for a route to reach
- * through - it gets the request identity and nothing else - and these two are
- * documented as being on every instance, which is the whole point of them: an
- * app can serve a scrape route without configuring a realtime tier at all. So
- * they are defined once, here, and both platforms take them from this object
- * rather than declaring their own copies.
+ * through, and these two are documented as being on every instance - which is
+ * the whole point of them: an app can serve a scrape route without configuring a
+ * realtime tier at all. So a request on such a build is prototype-linked to THIS
+ * object (see `requestPlatform`), and the realtime platform takes the same
+ * members from it rather than declaring copies that could drift apart.
  */
 export const httpPlatform = {
 	/**
@@ -2091,6 +2091,24 @@ export const platform = {
 // answered with at module-init time and quietly stop being the same member as
 // the one a build with no realtime tier serves.
 Object.defineProperties(platform, Object.getOwnPropertyDescriptors(httpPlatform));
+
+/**
+ * The `platform` one request gets.
+ *
+ * ONE PLACE DECIDES THIS, because the choice is not obvious and getting it wrong
+ * is silent: with a realtime tier the request is prototype-linked to the
+ * realtime platform, and without one to the members that do not need a tier -
+ * where linking to nothing at all left a documented member throwing
+ * `platform.metricsSnapshot is not a function` on a whole class of build. The
+ * clone is per request and carries only the identity; every method still
+ * resolves to the shared singleton behind it.
+ *
+ * @param {string} requestId
+ * @returns {any}
+ */
+export function requestPlatform(requestId) {
+	return Object.assign(Object.create(ws_options ? platform : httpPlatform), { requestId });
+}
 
 
 /**

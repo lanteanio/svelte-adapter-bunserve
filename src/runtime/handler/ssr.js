@@ -5,7 +5,7 @@ import { clearTimer, randomUuid, setTimer } from '../runtime.js';
 import { response413, response500 } from './http-helpers.js';
 import { origin, address_header, xff_depth, body_size_limit, get_origin, trusted_proxies, warnUntrustedClaim, ws_options } from './config.js';
 import { isDedupBufferable } from './ssr-dedup.js';
-import { httpPlatform, platform as realtimePlatform } from './platform.js';
+import { requestPlatform } from './platform.js';
 
 /* global ENV_PREFIX */
 /* global HTTP_OPTIONS */
@@ -256,10 +256,7 @@ export async function handleSSR(request, direct) {
 		// one, and the route that reached for it on such a build used to throw
 		// `platform.metricsSnapshot is not a function`.
 		const requestId = resolveRequestId(request.headers.get('x-request-id')) || randomUuid();
-		const platform = Object.assign(
-			Object.create(ws_options ? realtimePlatform : httpPlatform),
-			{ requestId }
-		);
+		const platform = requestPlatform(requestId);
 
 		// Dedup: for anonymous GET/HEAD requests that arrive concurrently for the
 		// same URL, only the first (the leader) calls server.respond(). Subsequent

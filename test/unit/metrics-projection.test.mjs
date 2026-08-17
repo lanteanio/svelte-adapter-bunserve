@@ -21,6 +21,7 @@ globalThis.WS_OPTIONS = normalizeWsOptions({
 register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { metricsSnapshot, metricsRegistry } = await import('../../src/runtime/handler/metrics.js');
+const { SIGNALS } = await import('../../src/runtime/observability-manifest.js');
 const { httpPlatform, platform } = await import('../../src/runtime/handler/platform.js');
 const {
 	UPGRADE_REJECTION_REASONS, pressureSnapshot, recordUpgradeRejection, wsCounters
@@ -48,8 +49,6 @@ test('nothing the sampler produces is published before its first tick', async ()
 	const text = await metricsSnapshot();
 	for (const name of [
 		'pressure_sample_timestamp_seconds',
-		'resident_memory_bytes',
-		'heap_used_ratio',
 		'pressure_saturation',
 		'pressure_reason',
 		'ws_backpressure_max_bytes',
@@ -60,6 +59,12 @@ test('nothing the sampler produces is published before its first tick', async ()
 	// What the runtime knows continuously is published from the first scrape.
 	assert.notEqual(value(text, 'ws_connections'), undefined);
 	assert.notEqual(value(text, 'ws_subscriptions'), undefined);
+	// And so is the process itself. These are not the sampler's to withhold:
+	// they are read from the process when something scrapes, so an instance that
+	// runs no sampler at all still answers them.
+	assert.ok(Number(value(text, 'resident_memory_bytes')) > 0, 'resident memory is a real reading');
+	const ratio = Number(value(text, 'heap_used_ratio'));
+	assert.ok(ratio > 0 && ratio <= 1, `heap ratio is a fraction, got ${ratio}`);
 });
 
 test('the refusal bag is published under every reason, zeroes included', async () => {
@@ -130,17 +135,30 @@ test('the sample timestamp is in seconds, as its name says', async () => {
 });
 
 test('the pressure gauges carry the last sample', async () => {
+	// Stated explicitly rather than inherited from whichever test ran first: the
+	// stamp is what opens the window, and a test that depends on a neighbour for
+	// it passes or fails on declaration order.
+	wsCounters.lastSampleWallMs = 1_700_000_000_000;
 	pressureSnapshot.value = 0.5;
 	pressureSnapshot.maxBufferedBytes = 4096;
 	pressureSnapshot.backpressuredConnections = 2;
-	wsCounters.lastResidentBytes = 123456;
-	wsCounters.lastHeapUsedRatio = 0.25;
 	const text = await metricsSnapshot();
 	assert.equal(value(text, 'pressure_saturation'), '0.5');
 	assert.equal(value(text, 'ws_backpressure_max_bytes'), '4096');
 	assert.equal(value(text, 'ws_backpressure_connections'), '2');
-	assert.equal(value(text, 'resident_memory_bytes'), '123456');
-	assert.equal(value(text, 'heap_used_ratio'), '0.25');
+});
+
+test('the memory gauges are the process, not the sampler', async () => {
+	// They used to be republished from the sampler's cache, which meant a build
+	// with no WebSocket handler - where no sampler ever runs - could not answer
+	// them at all. They are read at projection time now, so a stale cache cannot
+	// be served and no realtime tier is needed to have them.
+	wsCounters.lastResidentBytes = 123456;
+	wsCounters.lastHeapUsedRatio = 0.25;
+	const text = await metricsSnapshot();
+	assert.notEqual(value(text, 'resident_memory_bytes'), '123456', 'not the cached figure');
+	assert.ok(Number(value(text, 'resident_memory_bytes')) > 1_000_000, 'a real resident size');
+	assert.notEqual(value(text, 'heap_used_ratio'), '0.25');
 });
 
 test('a reason transition is counted from and to', async () => {
@@ -208,6 +226,31 @@ test('and absent again when the kernel stops answering', async () => {
 	await metricsSnapshot();
 });
 
+test('a handle an app took on the same name cannot resurrect it permanently', async () => {
+	// Instruments resolve their family BY NAME on every write, which is what
+	// makes a handle survive `reset()` - and it means an app holding one for a
+	// name the adapter retracts re-creates the family by writing to it. The
+	// retraction has to keep working after that: guarded on the map delete it
+	// would fire once, find nothing, and never retract again, so the resurrected
+	// family would publish "the CPU is not stalled at all" from a source that
+	// stopped answering, for the life of the process.
+	pressureSnapshot.psi = { cpuSome10: 12.5, memoryFull10: 0, ioFull10: 3 };
+	await metricsSnapshot();
+	const appHandle = metricsRegistry.gauge('psi_cpu_some_avg10');
+	pressureSnapshot.psi = null;
+	assert.doesNotMatch(await metricsSnapshot(), /psi_cpu_some_avg10/, 'retracted');
+
+	appHandle.set(0);
+	assert.equal(value(await metricsSnapshot(), 'psi_cpu_some_avg10'), undefined,
+		'and retracted again on the very next scrape, not left publishing a zero');
+	// Twice more, because "fires once then never again" is exactly the shape of
+	// the guard this replaces.
+	appHandle.set(0);
+	assert.doesNotMatch(await metricsSnapshot(), /psi_cpu_some_avg10/);
+	appHandle.set(0);
+	assert.doesNotMatch(await metricsSnapshot(), /psi_cpu_some_avg10/);
+});
+
 test('the eviction counter names every door that meters', async () => {
 	// Both doors take the defaults here, so both keep a map, and both publish a
 	// zero from the first scrape - the flat line that says "no evictions" rather
@@ -248,6 +291,22 @@ test('a build with no realtime tier serves the same two members', async () => {
 	assert.equal(platform.metricsSnapshot, httpPlatform.metricsSnapshot);
 });
 
+test('every signal the manifest does not call optional actually renders', async () => {
+	// The flag is the manifest's own statement about which families a build may
+	// legitimately lack, and nothing read it - so it could disagree with the code
+	// in either direction with no mechanism able to report it. This is the
+	// direction that matters here: a default build, everything configured, and a
+	// declared signal still missing means the manifest is describing a document
+	// this adapter does not produce.
+	wsCounters.lastSampleWallMs = 1_700_000_000_000;
+	const text = await metricsSnapshot();
+	const missing = SIGNALS
+		.filter((s) => !s.optional)
+		.map((s) => s.name)
+		.filter((name) => family(text, name).length === 0);
+	assert.deepEqual(missing, [], 'declared, not optional, and absent');
+});
+
 test('serializing the registry directly projects too', async () => {
 	// `platform.metrics` is documented, and the registry it hands back is this
 	// one - so an app that renders it in a route, or a library handed the
@@ -257,7 +316,20 @@ test('serializing the registry directly projects too', async () => {
 	wsCounters.publishCount = 4242;
 	const direct = platform.metrics.serialize();
 	assert.equal(value(direct, 'ws_publishes_total'), '4242');
-	assert.equal(direct, await platform.metricsSnapshot());
+	// The same families, from the same projection. Compared family by family
+	// rather than as whole documents: the memory gauges are read from the
+	// process on every projection, so two documents taken a microsecond apart
+	// legitimately differ in those two lines and an equality over the whole text
+	// would be a test that fails on a true reading.
+	const snapshot = await platform.metricsSnapshot();
+	for (const name of ['ws_publishes_total', 'upgrade_admitted_total', 'ws_connections']) {
+		assert.equal(value(direct, name), value(snapshot, name), name);
+	}
+	assert.deepEqual(
+		direct.split('\n').filter((l) => l.startsWith('# TYPE ')),
+		snapshot.split('\n').filter((l) => l.startsWith('# TYPE ')),
+		'and the same families in the same order'
+	);
 });
 
 test('the snapshot is a promise resolving to text, never null', async () => {

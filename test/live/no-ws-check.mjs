@@ -55,8 +55,20 @@ try {
 	check('the scrape route serves without a realtime tier', metrics.status === 200, `got ${metrics.status}`);
 	check(
 		'the document it serves is the Prometheus one',
-		metricsBody.includes('# TYPE ') && metricsBody.includes('ws_connections'),
-		JSON.stringify(metricsBody.slice(0, 120))
+		metricsBody.includes('# TYPE ') && /^resident_memory_bytes \d+$/m.test(metricsBody),
+		JSON.stringify(metricsBody.slice(0, 160))
+	);
+	// And it describes THIS build. A server with no upgrade path has not admitted
+	// zero upgrades and is not holding zero subscriptions - it has no upgrade door
+	// and no subscriptions at all, and a flat zero series for each would read on a
+	// dashboard exactly like a realtime tier that nobody is using.
+	const realtimeFamilies = ['upgrade_admitted_total', 'upgrade_rejected_total', 'ws_connections',
+		'ws_subscriptions', 'ws_publishes_total', 'pressure_saturation'];
+	const leaked = realtimeFamilies.filter((n) => metricsBody.includes(n));
+	check(
+		'and says nothing about a realtime tier this build does not have',
+		leaked.length === 0,
+		JSON.stringify(leaked)
 	);
 
 	// With no handler configured the ws path is not special: it falls through

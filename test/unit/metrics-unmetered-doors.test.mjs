@@ -39,3 +39,4 @@ test('an unmetered door publishes no eviction series', async () => {
 	const text = await metricsSnapshot();
 	assert.doesNotMatch(text, /upgrade_rate_map_evicted_total/);
 });
+

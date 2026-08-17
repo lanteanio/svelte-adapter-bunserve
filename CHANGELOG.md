@@ -88,8 +88,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the document rather than published as a zero, and that holds over time,
   not only at boot: the sampler-derived gauges appear at its first tick, and the
   kernel readings disappear again if `/proc/pressure` stops answering, so a
-  frozen number is never served as a current one. Every instance means every
-  instance: a build with
+  frozen number is never served as a current one. It holds across
+  CONFIGURATIONS too - a build with no WebSocket handler publishes the process
+  families and whatever your app registered, and none of the realtime ones,
+  because a server with no upgrade path has not admitted zero upgrades. Every
+  instance means every instance: a build with
   no WebSocket handler carries both members too, so an app whose only use for
   this adapter's observability is a scrape route does not need a realtime tier
   to have one.

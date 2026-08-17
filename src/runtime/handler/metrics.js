@@ -20,11 +20,12 @@
  * does not need to. Left in place because the posture export beside it will.
  */
 
-import { createMetricRegistry } from '../utils/metrics.js';
+import { createMetricRegistry, retractFamily } from '../utils/metrics.js';
 import { PRESSURE_REASON_CODES } from '../observability-manifest.js';
 import { pressureSnapshot, wsConnections, wsCounters } from './ws-state.js';
 import { upgradeAdmission } from './admission.js';
 import { authRateLimiter, rateMapEvictions, upgradeRateLimiter } from './rate-limit.js';
+import { ws_options } from './config.js';
 
 /**
  * The one registry. Created eagerly rather than on first use: an app registers
@@ -44,24 +45,15 @@ export const metricsRegistry = createMetricRegistry({
 });
 
 /**
- * Gauges held once rather than re-registered per scrape.
+ * Every gauge, registered on FIRST VALUE rather than at module load.
  *
- * Only the ones the runtime can answer at any instant, from state it maintains
- * continuously. Everything the SAMPLER produces is optional below instead: those
- * have no value at all until its first tick, and a family registered here
- * renders a zero from the first scrape whether anything set it or not.
- */
-const gauges = {
-	connections: metricsRegistry.gauge('ws_connections'),
-	subscriptions: metricsRegistry.gauge('ws_subscriptions')
-};
-
-/**
- * Gauges that only exist on some configurations or platforms. Registered on
- * FIRST VALUE rather than at module load, because a registered family renders a
- * series - and a psi gauge reading zero on Windows, or an admission gauge
- * reading zero on a server with no ceiling, is a number that looks like a
- * measurement and is not one.
+ * NONE of them are registered eagerly, and that is the rule rather than a
+ * property of which ones happened to need it: a registered family renders a
+ * series whether anything set it or not, so eager registration publishes a
+ * zero for every configuration that cannot produce a reading - a psi gauge on
+ * Windows, an admission gauge with no ceiling, a connection count on a build
+ * with no WebSocket tier. The instrument is held here after the first set, so
+ * the cost is one map lookup per scrape rather than a re-registration.
  *
  * @type {Map<string, { set: (value: number) => void }>}
  */
@@ -92,7 +84,16 @@ function setOptional(name, value) {
  * @param {string} name
  */
 function clearOptional(name) {
-	if (optionalGauges.delete(name)) metricsRegistry.retract(name);
+	// BOTH, UNCONDITIONALLY. Guarding the retract on the map delete looks like an
+	// optimisation and is a leak: an app that took its own handle on the same
+	// name re-creates the family by writing to it (instruments resolve by name,
+	// which is what makes them survive a reset), the map entry is already gone,
+	// and the guard then skips the retract forever - so the resurrected family
+	// publishes a reading from a source that stopped answering, for the life of
+	// the process. Two map operations per scrape per name is not worth a rule
+	// that can only be wrong.
+	optionalGauges.delete(name);
+	retractFamily(metricsRegistry, name);
 }
 
 /**
@@ -104,6 +105,26 @@ function clearOptional(name) {
  * bounded by their own vocabularies.
  */
 export function projectMetrics() {
+	// - The process ------------------------------------------------------------
+	//
+	// True of any instance, WebSocket tier or not, and read HERE rather than
+	// taken from the pressure sampler's cache: that sampler only runs where a
+	// realtime tier exists, and a build with none can still answer these - it is
+	// the same process. A scrape is not a hot path, so this costs one call when
+	// something asks and nothing until then.
+	const mem = process.memoryUsage();
+	setOptional('resident_memory_bytes', mem.rss);
+	setOptional('heap_used_ratio', mem.heapTotal > 0 ? mem.heapUsed / mem.heapTotal : 0);
+
+	// EVERYTHING BELOW BELONGS TO THE REALTIME TIER, and a build with no
+	// WebSocket handler has none. Published anyway, those families told a server
+	// with no upgrade path at all that it had admitted no upgrades, refused none
+	// under each of eleven reasons, and was holding no subscriptions - seventeen
+	// zero series describing a tier that does not exist, on the exact build whose
+	// only use for this document is a scrape route. The rule the manifest states
+	// has no exception for "the number happens to be zero".
+	if (ws_options === null) return;
+
 	// - The upgrade door ------------------------------------------------------
 	metricsRegistry.projectCounter('upgrade_admitted_total', undefined, wsCounters.upgradeAdmittedTotal);
 	for (const [reason, count] of Object.entries(wsCounters.upgradeRejectedByReason)) {
@@ -147,8 +168,8 @@ export function projectMetrics() {
 	}
 
 	// - The connections -------------------------------------------------------
-	gauges.connections.set(wsConnections.size);
-	gauges.subscriptions.set(wsCounters.totalSubscriptions);
+	setOptional('ws_connections', wsConnections.size);
+	setOptional('ws_subscriptions', wsCounters.totalSubscriptions);
 	metricsRegistry.projectCounter('ws_publishes_total', undefined, wsCounters.publishCount);
 	metricsRegistry.projectCounter('ws_closed_socket_aborts_total', undefined, wsCounters.closedWsAborts);
 
@@ -172,8 +193,6 @@ export function projectMetrics() {
 		// records wall-clock ms; a scrape that read them as seconds would date
 		// every sample to 1970 and every freshness alert would fire forever.
 		setOptional('pressure_sample_timestamp_seconds', wsCounters.lastSampleWallMs / 1000);
-		setOptional('resident_memory_bytes', wsCounters.lastResidentBytes);
-		setOptional('heap_used_ratio', wsCounters.lastHeapUsedRatio);
 	}
 	for (const [key, count] of wsCounters.pressureReasonTransitions) {
 		const arrow = key.indexOf('>');
