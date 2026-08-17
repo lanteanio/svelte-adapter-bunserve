@@ -234,13 +234,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   raw server capacity from a single address.
 
   The identity is the socket peer unless `ADDRESS_HEADER` is set, in which case
-  the header is honoured only from a peer inside `TRUSTED_PROXIES`. Behind an
-  address-rewriting proxy with no header configured every client arrives as the
-  gateway and the per-client limit is really one global cap; the server says so
-  once, on the first refusal keyed on a loopback or private address. Unlike the
-  SSR resolver, a missing or unusable header falls back to the socket peer
-  rather than throwing - a bucket key is not `getClientAddress`, and a proxy
-  dropping a header would otherwise turn every upgrade into a 500.
+  the header is read - **and with `TRUSTED_PROXIES` unset it is read from
+  anyone**, exactly as the SSR resolver reads it. That makes the bucket key a
+  string the client chooses: a fresh value per request reaches no limit, and a
+  victim's address spends theirs. **Set `TRUSTED_PROXIES` whenever you set
+  `ADDRESS_HEADER`**, so the claim is honoured only where something you run
+  wrote it; the server says so at boot when a limiter is configured and it is
+  not. Unlike the SSR resolver, a missing or unusable header falls back to the
+  socket peer rather than throwing - a bucket key is not `getClientAddress`,
+  and a proxy dropping a header would otherwise turn every upgrade into a 500.
+
+  The server also says once per door, on the first refusal that looks like it,
+  that this instance may be metering every client as one - a client address
+  that could not be resolved at all, a configured `ADDRESS_HEADER` that did not
+  arrive on the request, or a loopback or private peer with no header
+  configured. All three are the same outage from the client's side:
+  intermittent `429`s under trivial traffic.
 
   IPv6 is keyed on its /64 allocation prefix (6to4 on its /48), because keying
   the full address lets one attacker source every request from a fresh one and

@@ -78,6 +78,15 @@ try {
 		opened.every((o) => o.ok), JSON.stringify(opened.map((o) => o.ok)));
 	for (const o of opened) if (o.ws) o.ws.close();
 
+	// And now spend the upgrade budget too, so ONE process has refused at both
+	// doors. That is what makes the advisory assertions below say something: a
+	// single latch for the whole process would leave the second door silent, and
+	// the operator chasing its 429s reading the first door's knob.
+	const overLimit = await openSocket();
+	check('the upgrade door refuses once its own budget is spent',
+		!overLimit.ok, JSON.stringify(overLimit.ok));
+	if (overLimit.ws) overLimit.ws.close();
+
 	// SSR is not metered by either door.
 	const page = await fetch(`${BASE}/`);
 	check('ordinary requests are not metered', page.status === 200, `got ${page.status}`);
@@ -90,16 +99,26 @@ try {
 // Read after the server is down, for the reason the sibling suite gives. This
 // suite connects over loopback with no ADDRESS_HEADER, which is the shape that
 // means every client may share one bucket - so the advisory must fire here or
-// it would never fire where it is needed. It fires for whichever door refuses
-// first, and here that is the preflight.
+// it would never fire where it is needed.
 const stderr = await new Response(proc.stderr).text();
 check('a loopback-keyed refusal warns that the limit may be global',
-	/refused an auth preflight \(429\) keyed on a loopback client address/.test(stderr),
-	JSON.stringify(stderr.slice(-300)));
+	/refused an auth preflight \(429\), and the client address is loopback/.test(stderr),
+	JSON.stringify(stderr.slice(-400)));
 check('and names this door\'s knob, not the other one\'s',
-	/websocket\.authPathRateLimit/.test(stderr) && /ADDRESS_HEADER/.test(stderr));
-check('once, not once per refusal',
-	(stderr.match(/keyed on a loopback client address/g) || []).length === 1);
+	/The limit is `websocket\.authPathRateLimit`/.test(stderr) && /ADDRESS_HEADER/.test(stderr));
+
+// BOTH doors refused in this one process, so both must have said so. The
+// advisory names a door, the limit it refused at, and the knob that changes it,
+// so one message for the process would leave the second door's operator
+// changing a knob that governs a different door.
+check('the other door in the same process gets its own advisory',
+	/refused a WebSocket upgrade \(429\), and the client address is loopback/.test(stderr),
+	JSON.stringify(stderr.slice(-400)));
+check('and that one names ITS knob',
+	/The limit is `websocket\.upgradeRateLimit`/.test(stderr));
+check('once per door, not once per refusal',
+	(stderr.match(/and the client address is loopback/g) || []).length === 2,
+	String((stderr.match(/and the client address is loopback/g) || []).length));
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed) {

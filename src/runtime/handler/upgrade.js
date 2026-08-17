@@ -710,7 +710,7 @@ async function runUpgrade(req, srv, held) {
 		const address = rateLimitAddress(req, peer ? peer.address : '');
 		if (upgradeRateLimitExceeded(address)) {
 			recordRefusal(req, 'ip_rate_limit');
-			warnRateLimitProxyCollapse(address, UPGRADE_DOOR);
+			warnRateLimitProxyCollapse(req, address, UPGRADE_DOOR);
 			return rateLimitedResponse();
 		}
 	}

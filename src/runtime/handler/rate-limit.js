@@ -146,6 +146,32 @@ export const authRateLimitPerWindow = configuredAuthLimit;
 /** That door's window in seconds. */
 export const authRateLimitWindowSeconds = authWindowMs / 1000;
 
+// SAID AT BOOT, once, while there is still an operator reading the log.
+//
+// `ADDRESS_HEADER` without `TRUSTED_PROXIES` makes the bucket key a string the
+// CLIENT supplies, and that is a different proposition for a limiter than it is
+// for `getClientAddress()`. The app-facing resolver inherits trust-verbatim from
+// adapter-node and an app reading an address knows to configure its proxy; a
+// limiter keyed on an unauthenticated value is a control anyone can step around
+// by sending a fresh value per request, and can point at a victim by sending
+// theirs. The refusals still happen, so nothing here looks broken from inside.
+//
+// A warning rather than a refusal, and the key is not changed: the two adapters
+// in this family resolve the same identity from the same configuration, and a
+// deployment that meters on the header today would collapse into its gateway's
+// bucket if this quietly stopped honouring it - a worse outage than the evasion
+// it would close. Making it a refusal is a family decision, and it belongs on
+// both adapters or neither.
+if (address_header && !trusted_proxies && (upgradeRateLimiter !== null || authRateLimiter !== null)) {
+	console.warn(
+		`[adapter] ADDRESS_HEADER is set to \`${address_header}\` and TRUSTED_PROXIES is not, so the\n` +
+		'  rate limiters key on a value any client can choose. A client can spend a fresh key per\n' +
+		'  request and never reach a limit, or send another client\'s address and spend theirs. Set\n' +
+		'  TRUSTED_PROXIES to your proxy\'s address or CIDR range, so the header is honoured only\n' +
+		'  where it was written by something you run.'
+	);
+}
+
 /**
  * Record this handshake and report whether it is over the limit.
  *
@@ -215,40 +241,82 @@ export function addressScope(address) {
 	return 'public';
 }
 
-let warnedRateLimitProxyCollapse = false;
 /**
- * Say once that this server may be metering every client as one.
+ * Doors that have already given the advisory below, by knob.
  *
- * The signature is a refusal keyed on a loopback or private address while no
- * `ADDRESS_HEADER` is configured, which is what an address-rewriting proxy in
- * front of the server looks like from here: every client arrives as the
- * gateway, they all share one bucket, and the per-address limit is really a
- * single global cap. The symptom is intermittent 429s under trivial traffic,
- * which is otherwise very hard to attribute.
+ * ONE LATCH PER DOOR, not one for the process. The message names a door, the
+ * limit it refused at, and the knob that changes it - so a single latch means
+ * whichever door happens to refuse first silences the other, and the operator
+ * chasing 429s on the auth preflight reads an advisory about
+ * `websocket.upgradeRateLimit`, changes it, and sees no difference. Two
+ * messages at most, and each is about the door it names.
  *
- * ONE flag across both doors, not one each: it describes the deployment rather
- * than the door, the fix is the same either way, and whichever door refuses
- * first names its own knob. One-shot rather than throttled, because a server
- * directly facing the internet sees real client addresses here and never
- * reaches it.
+ * @type {Set<string>}
+ */
+const warnedProxyCollapse = new Set();
+
+/**
+ * Say once, per door, that this server may be metering every client as one.
  *
+ * THREE SHAPES REACH THE SAME OUTCOME, and the advisory has to know all three,
+ * because the two that were missing are the ones where the collapse is TOTAL
+ * rather than per-gateway:
+ *
+ * - No client address at all. `requestIP` answers null for a socket already
+ *   gone, and on some deployment shapes it can answer null for live ones, so
+ *   every client keys on the empty string and the whole server shares one
+ *   bucket. Nothing about the empty key looks private or loopback, so the
+ *   scope test below never saw it.
+ * - `ADDRESS_HEADER` configured but not arriving. The resolver falls back to
+ *   the socket peer rather than throwing - deliberately, since a dropped
+ *   header must not 500 every handshake - so the deployment believes it is
+ *   metering clients while it is metering its gateway. Testing only that the
+ *   header is CONFIGURED, as this did, suppresses the advisory in exactly the
+ *   case the configuration is not working.
+ * - A loopback or private peer with no `ADDRESS_HEADER`: an address-rewriting
+ *   proxy in front of the server, every client arriving as the gateway.
+ *
+ * The symptom is the same for all three and is otherwise very hard to
+ * attribute: intermittent 429s under trivial traffic. One-shot rather than
+ * throttled, because a server directly facing the internet sees real client
+ * addresses here and reaches none of them.
+ *
+ * @param {Request} req the refused request, for the header the deployment named
  * @param {string} address the address the refusal was keyed on
  * @param {{ what: string, knob: string, limit: number, windowSeconds: number }} door
  */
-export function warnRateLimitProxyCollapse(address, door) {
-	if (warnedRateLimitProxyCollapse || address_header) return;
-	const scope = addressScope(address);
-	if (scope !== 'loopback' && scope !== 'private') return;
-	warnedRateLimitProxyCollapse = true;
+export function warnRateLimitProxyCollapse(req, address, door) {
+	if (warnedProxyCollapse.has(door.knob)) return;
+
+	/** @type {string | null} */
+	let cause = null;
+	if (address === '') {
+		cause =
+			'no client address could be resolved, so EVERY client shares one bucket and the\n' +
+			'  limit below is a single server-wide cap.';
+	} else if (address_header) {
+		if (req.headers.get(address_header) !== null) return;
+		cause =
+			`ADDRESS_HEADER is set to \`${address_header}\`, but this request did not carry it, so the\n` +
+			'  socket peer was metered instead. Behind a proxy that is one bucket for everyone;\n' +
+			'  check that the proxy sets the header on the WebSocket route as well as on ordinary\n' +
+			'  requests.';
+	} else {
+		const scope = addressScope(address);
+		if (scope !== 'loopback' && scope !== 'private') return;
+		cause =
+			`the client address is ${scope} (${address}) and ADDRESS_HEADER is unset. If this server\n` +
+			'  runs behind a reverse proxy, a load balancer, or docker\'s userland-proxy, every\n' +
+			'  client arrives as the same address and the limit below is really one GLOBAL cap.';
+	}
+
+	warnedProxyCollapse.add(door.knob);
 	console.warn(
-		`[ws] refused ${door.what} (429) keyed on a ${scope} client address (${address}) ` +
-		'while ADDRESS_HEADER is unset. If this server runs behind a reverse proxy, a load\n' +
-		'  balancer, or docker\'s userland-proxy, every client arrives as the same address and the\n' +
-		`  per-address \`${door.knob}\` (${door.limit} per ` +
-		`${door.windowSeconds}s) is really one GLOBAL cap. Restore real client addresses\n` +
-		'  with ADDRESS_HEADER=x-forwarded-for (plus XFF_DEPTH for the trusted hop count) and\n' +
-		'  TRUSTED_PROXIES, or set docker `userland-proxy: false`, or set\n' +
-		`  ${door.knob}: 0 if you throttle upstream.`
+		`[ws] refused ${door.what} (429), and ${cause}\n` +
+		`  The limit is \`${door.knob}\` (${door.limit} per ${door.windowSeconds}s).\n` +
+		'  Restore real client addresses with ADDRESS_HEADER=x-forwarded-for (plus XFF_DEPTH for\n' +
+		'  the trusted hop count) and TRUSTED_PROXIES, or set docker `userland-proxy: false`, or\n' +
+		`  set ${door.knob}: 0 if you throttle upstream.`
 	);
 }
 

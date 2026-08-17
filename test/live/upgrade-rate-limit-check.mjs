@@ -105,14 +105,14 @@ try {
 // the advisory must fire here, or it would never fire where it is needed.
 const stderr = await new Response(proc.stderr).text();
 check('a loopback-keyed refusal warns that the limit may be global',
-	/keyed on a loopback client address/.test(stderr),
-	JSON.stringify(stderr.slice(-200)));
+	/refused a WebSocket upgrade \(429\), and the client address is loopback/.test(stderr),
+	JSON.stringify(stderr.slice(-400)));
 check('and names the way out',
 	/ADDRESS_HEADER/.test(stderr) && /upgradeRateLimit: 0/.test(stderr));
-// Once, not once per refusal: it describes the deployment, and two refusals
-// happened above.
+// Once for this door, not once per refusal: it describes the deployment, and
+// two refusals happened above.
 check('once, not once per refusal',
-	(stderr.match(/keyed on a loopback client address/g) || []).length === 1);
+	(stderr.match(/and the client address is loopback/g) || []).length === 1);
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed) {

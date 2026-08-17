@@ -197,7 +197,7 @@ export function tryAuthEndpoint(req, srv, pathname) {
 			// otherwise write its own noise into the numbers an operator reads to
 			// decide whether the app is turning people away.
 			if (!req.signal.aborted) recordUpgradeRejection('auth_rate_limit');
-			warnRateLimitProxyCollapse(address, AUTH_DOOR);
+			warnRateLimitProxyCollapse(req, address, AUTH_DOOR);
 			return rateLimitedResponse();
 		}
 	}

@@ -549,9 +549,16 @@ Two things decide whether it means what it says:
   docker's `userland-proxy`, every client arrives as the gateway address and
   this per-client limit is really one GLOBAL cap - the symptom is intermittent
   `429`s on `/ws` under trivial traffic. Set `ADDRESS_HEADER=x-forwarded-for`
-  (with `XFF_DEPTH`, and `TRUSTED_PROXIES` so the claim is only honoured from
-  your own proxies), or set the limit to `0` if you throttle upstream. The
-  server says so once, on the first refusal that looks like this.
+  (with `XFF_DEPTH`), or set the limit to `0` if you throttle upstream. The
+  server says so once per door, on the first refusal that looks like this -
+  including when the header you configured did not arrive on the request, or
+  when no client address could be resolved at all.
+
+  **Set `TRUSTED_PROXIES` too.** Without it the header is honoured from
+  whoever sends it, so the limiter keys on a value the client chooses: a fresh
+  one per request never reaches a limit, and another client's address spends
+  theirs. It takes addresses or CIDR ranges, and the server warns at boot if a
+  limiter is configured and this is not.
 - **IPv6 is keyed on its /64**, not the full address, because a /64 is the
   smallest block a host is routinely given - keying the whole address would let
   one attacker source every request from a fresh one and never share a bucket
