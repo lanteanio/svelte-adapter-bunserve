@@ -31,7 +31,8 @@ register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { platform } = await import('../../src/runtime/handler/platform.js');
 const { KNOWN_ADAPTER_OPTIONS } = await import('../../src/adapter-options.js');
-const { KNOWN_WS_OPTION_KEYS, normalizeWsOptions } = await import('../../src/runtime/utils/ws-options.js');
+const { INERT_WS_OPTION_KEYS, KNOWN_WS_OPTION_KEYS, normalizeWsOptions } =
+	await import('../../src/runtime/utils/ws-options.js');
 
 const surface = JSON.parse(
 	readFileSync(new URL('../../probe/uws-surface.json', import.meta.url), 'utf8')
@@ -94,6 +95,10 @@ const ADAPTER_OPTION_EXTRAS = {
 
 /** `websocket.*` keys uws declares and this adapter does not accept. */
 const WS_OPTION_GAPS = {
+	// Accepted so a carried config builds, and not loaded - the feature is the
+	// operator-owned registry, which this adapter does not have. See
+	// INERT_WS_OPTION_KEYS.
+	metrics: 'operator-owned metrics registry',
 	adminPath: 'admin endpoint',
 	adminAuthAcknowledged: 'admin endpoint',
 	authorizeWireSubscribe: 'wire-subscribe authorization',
@@ -235,12 +240,42 @@ test('adapter options match the uws contract, or the difference is recorded', ()
 });
 
 test('websocket options match the uws contract, or the difference is recorded', () => {
+	// ACCEPTED IS NOT HONOURED. A key the validator stopped calling unknown so a
+	// carried config would build is still a feature this adapter does not have,
+	// and counting it as parity is how the list would come to say a migrating app
+	// keeps behaviour it actually loses. The nested probe next door already
+	// models this - it asks the validator whether the key does anything, not
+	// whether it is recognised - and this is the flat list's equivalent.
+	const ours = [...KNOWN_WS_OPTION_KEYS].filter((k) => !INERT_WS_OPTION_KEYS.has(k));
 	assertParity(
 		'websocket option',
-		[...KNOWN_WS_OPTION_KEYS],
+		ours,
 		surface.webSocketOptions,
 		WS_OPTION_GAPS,
 		WS_OPTION_EXTRAS
+	);
+});
+
+test('an accepted-but-inert key is recorded as a gap, and says so at build time', () => {
+	// Both halves, because either alone is a way for the key to look implemented:
+	// recorded as a gap but silently swallowed, or warned about but counted as
+	// parity.
+	for (const key of INERT_WS_OPTION_KEYS) {
+		assert.ok(
+			key in WS_OPTION_GAPS,
+			`\`websocket.${key}\` is accepted and not honoured, so it is a recorded gap`
+		);
+		assert.ok(
+			KNOWN_WS_OPTION_KEYS.has(key),
+			`\`websocket.${key}\` is accepted, or it would not need to be listed as inert`
+		);
+	}
+	// The one that exists today, driven through the real validator: a valid value
+	// builds, and the build says what the adapter does instead.
+	const { warnings } = normalizeWsOptions({ metrics: './src/lib/metrics.js' });
+	assert.ok(
+		warnings.some((w) => w.includes('`websocket.metrics`') && w.includes('does not load it')),
+		'the build says the module is not loaded'
 	);
 });
 

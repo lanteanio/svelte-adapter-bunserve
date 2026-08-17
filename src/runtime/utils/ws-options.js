@@ -126,6 +126,22 @@ const DEFAULTS = {
 export const KNOWN_WS_OPTION_KEYS = new Set(Object.keys(DEFAULTS));
 
 /**
+ * Keys the build ACCEPTS so a config carried from svelte-adapter-uws still
+ * builds, and deliberately does not honour. Each one warns at build time saying
+ * what this adapter does instead.
+ *
+ * Declared here rather than inferred, because "accepted" and "honoured" are two
+ * different questions and only one of them is answered by
+ * {@link KNOWN_WS_OPTION_KEYS}. A key in this set is a PARITY GAP - the feature
+ * is not implemented - and the parity oracle reads this set so it cannot report
+ * one as at parity merely because the validator stopped calling it unknown.
+ * Removing a key from here is part of implementing it.
+ *
+ * @type {ReadonlySet<string>}
+ */
+export const INERT_WS_OPTION_KEYS = new Set(['metrics']);
+
+/**
  * @param {unknown} value
  * @param {string} key
  * @returns {number}
