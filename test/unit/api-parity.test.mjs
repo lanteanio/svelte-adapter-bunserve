@@ -100,7 +100,6 @@ const WS_OPTION_GAPS = {
 	consistencyAuditIntervalMs: 'background audits',
 	resourceGrowthAuditIntervalMs: 'background audits',
 	stateHashIntervalMs: 'background audits',
-	metrics: 'pressure/protection observability',
 	postureExport: 'pressure/protection observability',
 	protection: 'pressure/protection observability',
 	primaryInit: 'multi-worker clustering',

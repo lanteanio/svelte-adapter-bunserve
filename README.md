@@ -387,6 +387,11 @@ first. The pressure-derived gauges are as fresh as the last sampler tick, which
 `pressure_sample_timestamp_seconds` states outright - alert on its age rather
 than assuming the gauges beside it are current.
 
+`websocket.metrics` - the sibling's option naming your registry module - is
+**accepted so a carried config builds, and not loaded**. The build says so, and
+names `platform.metrics` as where to go instead. Honouring it would produce a
+server that looks instrumented and is not.
+
 The metric names are svelte-adapter-uws's, so dashboards move between the two
 adapters. Signals this adapter cannot measure are **absent** rather than zero: a
 zero published for something never measured reads as healthy and no alert ever
@@ -417,6 +422,7 @@ adapter: bunserve({
 		handler: 'src/ws-handler.js',       // default
 		authPath: '/__ws/auth',             // the auth preflight POST; must differ from `path`
 		authPathRequireOrigin: true,        // CSRF guard on it; false accepts native clients
+		metrics: undefined,                 // accepted for config portability; NOT loaded - see Metrics
 		authPathRateLimit: 30,              // preflights per client address per window; 0 disables
 		authPathRateLimitWindow: 10,        // that window, in seconds
 		compressCredentialedResponses: false,

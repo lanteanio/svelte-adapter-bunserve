@@ -86,6 +86,10 @@ const DEFAULTS = {
 	// utils/upgrade-admission.js; the block is spelled exactly as uws spells it
 	// so a config carried between the adapters gates the same way in both.
 	upgradeAdmission: undefined,
+	// The path to an operator's metrics module, as uws declares it. ACCEPTED so a
+	// carried config builds, and NOT LOADED - see the validator for why a module
+	// cannot own the registry on this runtime.
+	metrics: undefined,
 	// Build-time rather than transport tuning, and nested HERE rather than at the
 	// top level because that is where svelte-adapter-uws declares them. The two
 	// adapters are drop-in replacements for each other, so a `websocket` block
@@ -552,6 +556,34 @@ export function normalizeWsOptions(input) {
 			);
 		}
 		options.path = raw.path;
+	}
+	if (raw.metrics !== undefined) {
+		// The TYPE is still checked, because a config that names something other
+		// than a module path is a mistake wherever it is going to be read.
+		if (typeof raw.metrics !== 'string' || raw.metrics.length === 0) {
+			throw new Error(
+				'adapter option `websocket.metrics` must be a path to a module whose default export is a ' +
+				`metrics registry (e.g. './src/lib/metrics.js') - got ${JSON.stringify(raw.metrics)}.`
+			);
+		}
+		options.metrics = raw.metrics;
+		// ACCEPTED AND NAMED, exactly as `upgradeAdmission.waitingRoom` is, and for
+		// a sharper reason: honouring it would produce a server that LOOKS
+		// instrumented and is not. On this runtime a module imported by both a
+		// SvelteKit route and the WebSocket handler is two separate copies in the
+		// build - SvelteKit's server bundle is bundled before the adapter's own
+		// pass reads the handler - so the adapter would write into one instance
+		// while the app's scrape route rendered the other, with every adapter
+		// family stuck at zero and nothing to say why. This adapter owns the
+		// registry instead, and the app reaches THAT one through the platform.
+		warnings.push(
+			'adapter option `websocket.metrics` names a module, and this adapter does not load it: it owns ' +
+			'the metrics registry itself, because a module imported by both a route and the WebSocket ' +
+			'handler is two separate instances in the built output - the adapter would write to one and ' +
+			'your scrape route would render the other. Reach the registry through `platform.metrics` ' +
+			'(register your own instruments on it) and serve `await platform.metricsSnapshot()` from a ' +
+			'route. Remove the option to silence this.'
+		);
 	}
 	if (raw.authPath !== undefined) {
 		if (typeof raw.authPath !== 'string' || raw.authPath[0] !== '/') {

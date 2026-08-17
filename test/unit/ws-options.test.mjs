@@ -82,6 +82,28 @@ test('an unusable rate limit fails the build rather than disabling itself', () =
 	}
 });
 
+test('`metrics` is accepted, named, and not loaded', () => {
+	// The key builds, because a config carried from the sibling has to. What it
+	// MEANS differs, and honouring it would produce a server that looks
+	// instrumented and is not - so the difference is said out loud at build time
+	// rather than discovered from a dashboard of zeroes.
+	const { options, warnings, unknownKeys } = normalizeWsOptions({ metrics: './src/lib/metrics.js' });
+	assert.equal(options.metrics, './src/lib/metrics.js');
+	assert.deepEqual(unknownKeys, [], 'not an unknown key - it is a known one with different semantics');
+	assert.equal(warnings.length, 1);
+	assert.match(warnings[0], /does not load it/);
+	assert.match(warnings[0], /platform\.metrics/);
+	assert.match(warnings[0], /platform\.metricsSnapshot/);
+});
+
+test('a `metrics` value that is not a module path still fails the build', () => {
+	// Wrong TYPE is a mistake wherever the value was going to be read.
+	for (const bad of [true, 42, {}, '']) {
+		assert.throws(() => normalizeWsOptions({ metrics: bad }), /websocket.metrics.*module/s,
+			`refuses ${JSON.stringify(bad)}`);
+	}
+});
+
 test('the auth preflight has its own path, guard and budget', () => {
 	const { options } = normalizeWsOptions(undefined);
 	assert.equal(options.authPath, '/__ws/auth');

@@ -124,6 +124,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when the map cap rather than the configured limit is deciding who gets
   metered.
 
+  `websocket.metrics` - the option naming a registry module on the sibling - is
+  accepted so a carried config builds, and is **not loaded**. The build warns
+  and names `platform.metrics` as the way in. Honouring it would produce a
+  server that looks instrumented and is not, for the two-copies reason above; a
+  value that is not a module path is still a build failure, because that is a
+  mistake wherever it was going to be read.
+
 - The auth preflight endpoint, with `websocket.authPath` (default
   `/__ws/auth`) and `websocket.authPathRequireOrigin` (default `true`). Export
   an `authenticate` hook from your WebSocket handler and the adapter mounts a
