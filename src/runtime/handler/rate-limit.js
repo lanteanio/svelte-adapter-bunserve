@@ -242,14 +242,9 @@ export function addressScope(address) {
 }
 
 /**
- * Doors that have already given the advisory below, by knob.
+ * Advisories already given, keyed by door AND by what was wrong.
  *
- * ONE LATCH PER DOOR, not one for the process. The message names a door, the
- * limit it refused at, and the knob that changes it - so a single latch means
- * whichever door happens to refuse first silences the other, and the operator
- * chasing 429s on the auth preflight reads an advisory about
- * `websocket.upgradeRateLimit`, changes it, and sees no difference. Two
- * messages at most, and each is about the door it names.
+ * See the latch note in `warnRateLimitProxyCollapse`.
  *
  * @type {Set<string>}
  */
@@ -265,52 +260,98 @@ const warnedProxyCollapse = new Set();
  * - No client address at all. `requestIP` answers null for a socket already
  *   gone, and on some deployment shapes it can answer null for live ones, so
  *   every client keys on the empty string and the whole server shares one
- *   bucket. Nothing about the empty key looks private or loopback, so the
- *   scope test below never saw it.
- * - `ADDRESS_HEADER` configured but not arriving. The resolver falls back to
- *   the socket peer rather than throwing - deliberately, since a dropped
- *   header must not 500 every handshake - so the deployment believes it is
- *   metering clients while it is metering its gateway. Testing only that the
- *   header is CONFIGURED, as this did, suppresses the advisory in exactly the
- *   case the configuration is not working.
+ *   bucket. Nothing about the empty key looks private or loopback.
+ * - `ADDRESS_HEADER` configured but not arriving, or arriving in a shape the
+ *   configured depth cannot read. The resolver falls back to the socket peer
+ *   rather than throwing - deliberately, since a dropped header must not 500
+ *   every handshake - so the deployment believes it is metering clients while
+ *   it is metering its gateway. THE SOURCE IS WHAT SAYS SO: asking the request
+ *   whether the header arrived answers yes for both of the unusable shapes.
+ * - The header arriving from a peer TRUSTED_PROXIES does not name. Correct for
+ *   a direct client, and a total permanent collapse when the allowlist simply
+ *   misses the real proxy - which nothing else reports, since the header is
+ *   present on every request and the boot warning only fires with no allowlist
+ *   at all.
  * - A loopback or private peer with no `ADDRESS_HEADER`: an address-rewriting
  *   proxy in front of the server, every client arriving as the gateway.
  *
- * The symptom is the same for all three and is otherwise very hard to
- * attribute: intermittent 429s under trivial traffic. One-shot rather than
- * throttled, because a server directly facing the internet sees real client
+ * The symptom is the same for all of them and is otherwise very hard to
+ * attribute: intermittent 429s under trivial traffic. One-shot per cause rather
+ * than throttled, because a server directly facing the internet sees real client
  * addresses here and reaches none of them.
  *
- * @param {Request} req the refused request, for the header the deployment named
+ * @param {string} source where the key came from, from `resolveRateLimitAddress`
  * @param {string} address the address the refusal was keyed on
  * @param {{ what: string, knob: string, limit: number, windowSeconds: number }} door
  */
-export function warnRateLimitProxyCollapse(req, address, door) {
-	if (warnedProxyCollapse.has(door.knob)) return;
-
+export function warnRateLimitProxyCollapse(source, address, door) {
 	/** @type {string | null} */
 	let cause = null;
-	if (address === '') {
+	/** @type {string} */
+	let kind;
+
+	if (source === 'header') {
+		// The header decided this key. An empty value is still a collapse - every
+		// client carrying one shares the empty bucket - but it is a value the
+		// CLIENT chose, so it is reported as what it is rather than as "the
+		// runtime could not see a peer".
+		if (address !== '') return;
+		kind = 'header-empty';
 		cause =
-			'no client address could be resolved, so EVERY client shares one bucket and the\n' +
-			'  limit below is a single server-wide cap.';
-	} else if (address_header) {
-		if (req.headers.get(address_header) !== null) return;
+			`the \`${address_header}\` value this request carried was empty, so it keyed on nothing.\n` +
+			'  Every client sending an empty one shares that bucket. The header is honoured from\n' +
+			'  whoever sends it unless TRUSTED_PROXIES names your proxies.';
+	} else if (source === 'header-absent') {
+		kind = 'header-absent';
 		cause =
 			`ADDRESS_HEADER is set to \`${address_header}\`, but this request did not carry it, so the\n` +
 			'  socket peer was metered instead. Behind a proxy that is one bucket for everyone;\n' +
 			'  check that the proxy sets the header on the WebSocket route as well as on ordinary\n' +
 			'  requests.';
+	} else if (source === 'header-unusable') {
+		kind = 'header-unusable';
+		cause =
+			`the \`${address_header}\` value this request carried could not be read at the configured\n` +
+			'  depth, so the socket peer was metered instead. A chain shorter than XFF_DEPTH, or one\n' +
+			'  past the 8 KiB ceiling, does both silently: behind a proxy EVERY client then meters as\n' +
+			'  the gateway and the limit below is one global cap. Check XFF_DEPTH against the number\n' +
+			'  of proxies that actually append to the chain.';
+	} else if (source === 'header-untrusted') {
+		// Ordinary for a genuinely direct client on a server that is also
+		// reachable through its proxy. A permanent, total collapse when the
+		// allowlist does not name the real proxy - and nothing else says so, since
+		// the header IS present on every request and the boot warning only fires
+		// when TRUSTED_PROXIES is unset.
+		kind = 'header-untrusted';
+		cause =
+			`this request carried \`${address_header}\`, but its peer (${address || 'unknown'}) is not in\n` +
+			'  TRUSTED_PROXIES, so the claim was ignored and the peer was metered. That is correct for\n' +
+			'  a client connecting directly. If it is your proxy, the allowlist does not name it - and\n' +
+			'  then EVERY client meters as that one address.';
+	} else if (address === '') {
+		kind = 'no-address';
+		cause =
+			'no client address could be resolved, so EVERY client shares one bucket and the\n' +
+			'  limit below is a single server-wide cap.';
 	} else {
 		const scope = addressScope(address);
 		if (scope !== 'loopback' && scope !== 'private') return;
+		kind = 'peer-' + scope;
 		cause =
 			`the client address is ${scope} (${address}) and ADDRESS_HEADER is unset. If this server\n` +
 			'  runs behind a reverse proxy, a load balancer, or docker\'s userland-proxy, every\n' +
 			'  client arrives as the same address and the limit below is really one GLOBAL cap.';
 	}
 
-	warnedProxyCollapse.add(door.knob);
+	// LATCHED PER DOOR AND PER CAUSE. Per door because the message names a door,
+	// a limit and a knob, so one latch for the process leaves the second door's
+	// operator changing an option that governs the other one. Per cause because
+	// some of these are reachable by a CLIENT - an empty header value is one
+	// request away - and a single latch per door would let anyone spend it and
+	// leave the deployment's real collapse permanently unmentionable.
+	const latch = door.knob + '\n' + kind;
+	if (warnedProxyCollapse.has(latch)) return;
+	warnedProxyCollapse.add(latch);
 	console.warn(
 		`[ws] refused ${door.what} (429), and ${cause}\n` +
 		`  The limit is \`${door.knob}\` (${door.limit} per ${door.windowSeconds}s).\n` +
@@ -318,6 +359,16 @@ export function warnRateLimitProxyCollapse(req, address, door) {
 		'  the trusted hop count) and TRUSTED_PROXIES, or set docker `userland-proxy: false`, or\n' +
 		`  set ${door.knob}: 0 if you throttle upstream.`
 	);
+}
+
+/**
+ * Forget every advisory latch. For the simulator alone, and for the reason the
+ * limiters have one: a corpus runs many servers in one process, and a latch
+ * taken by an early seed would silence every seed after it - making which seed
+ * warns depend on the order they ran in.
+ */
+export function _resetAdvisoriesForSim() {
+	warnedProxyCollapse.clear();
 }
 
 /** What the upgrade door calls itself in that advisory. */
@@ -337,7 +388,7 @@ export const AUTH_DOOR = {
 };
 
 /**
- * Which address this handshake is metered as.
+ * Which address this handshake is metered as, AND WHERE THE KEY CAME FROM.
  *
  * The same precedence the SSR path uses - socket peer by default, the
  * configured `ADDRESS_HEADER` when the direct peer is a trusted proxy - with
@@ -346,36 +397,55 @@ export const AUTH_DOOR = {
  * is missing, because an app asking for the client's address needs to know it
  * cannot be answered. Here the address is only ever a bucket key, and a proxy
  * that drops a header on some hop would otherwise turn every upgrade on the
- * server into a 500. Falling back to the socket peer meters those clients
- * together, which is what the proxy-collapse advisory in the upgrade path
- * exists to say out loud.
+ * server into a 500.
+ *
+ * THE SOURCE IS RETURNED BESIDE THE ADDRESS because every silent way this
+ * metering collapses is a statement about the source, not about the value. An
+ * advisory that re-derives it from the request can only approximate: asking
+ * "did the header arrive" answers yes for a chain shorter than `XFF_DEPTH` and
+ * for one past the size ceiling, and both of those meter every client on the
+ * server as the gateway - a total, permanent collapse that would then go
+ * unmentioned. Only the code that made the decision knows which branch it took.
+ *
+ * @param {Request} req
+ * @param {string} direct the socket peer address, or '' when unknown
+ * @returns {{ address: string, source: 'peer' | 'header' | 'header-untrusted' | 'header-absent' | 'header-unusable' }}
+ */
+export function resolveRateLimitAddress(req, direct) {
+	if (!address_header) return { address: direct, source: 'peer' };
+	// A header claim from a peer outside TRUSTED_PROXIES is ignored rather than
+	// refused: that request is a direct client, and its socket address IS its
+	// address. Ordinary on a server that is reachable directly as well as through
+	// its proxy; a collapse when the allowlist simply does not name the real one,
+	// which is why the source says which happened and the advisory decides.
+	if (trusted_proxies && !trusted_proxies.match(direct)) {
+		return { address: direct, source: 'header-untrusted' };
+	}
+	const value = req.headers.get(address_header);
+	if (value === null) return { address: direct, source: 'header-absent' };
+	if (address_header === 'x-forwarded-for') {
+		// The same 8 KiB ceiling the SSR path applies. Past it the value is not
+		// a hop chain any proxy produced, and the limiter's own key bound would
+		// truncate it anyway - but doing that here keeps the split and the trim
+		// below off a value that size.
+		if (value.length > 8192) return { address: direct, source: 'header-unusable' };
+		const addresses = value.split(',');
+		// Too few hops to satisfy the configured depth means the chain is not
+		// the one this deployment was configured for, so the claim is not
+		// honoured. SSR throws here; metering falls back to the peer.
+		if (xff_depth > addresses.length) return { address: direct, source: 'header-unusable' };
+		return { address: addresses[addresses.length - xff_depth].trim(), source: 'header' };
+	}
+	return { address: value, source: 'header' };
+}
+
+/**
+ * The address alone, for callers that only need a bucket key.
  *
  * @param {Request} req
  * @param {string} direct the socket peer address, or '' when unknown
  * @returns {string}
  */
 export function rateLimitAddress(req, direct) {
-	if (!address_header) return direct;
-	// A header claim from a peer outside TRUSTED_PROXIES is ignored rather than
-	// refused: that request is a direct client, and its socket address IS its
-	// address. Warning here is the SSR path's job - it sees the same peer and
-	// warns once - and a per-upgrade advisory on a flood would be its own
-	// amplifier.
-	if (trusted_proxies && !trusted_proxies.match(direct)) return direct;
-	const value = req.headers.get(address_header);
-	if (value === null) return direct;
-	if (address_header === 'x-forwarded-for') {
-		// The same 8 KiB ceiling the SSR path applies. Past it the value is not
-		// a hop chain any proxy produced, and the limiter's own key bound would
-		// truncate it anyway - but doing that here keeps the split and the trim
-		// below off a value that size.
-		if (value.length > 8192) return direct;
-		const addresses = value.split(',');
-		// Too few hops to satisfy the configured depth means the chain is not
-		// the one this deployment was configured for, so the claim is not
-		// honoured. SSR throws here; metering falls back to the peer.
-		if (xff_depth > addresses.length) return direct;
-		return addresses[addresses.length - xff_depth].trim();
-	}
-	return value;
+	return resolveRateLimitAddress(req, direct).address;
 }

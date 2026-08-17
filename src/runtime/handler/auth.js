@@ -32,6 +32,7 @@ import {
 	authRateLimitExceeded,
 	authRateLimitWindowSeconds,
 	rateLimitAddress,
+	resolveRateLimitAddress,
 	warnRateLimitProxyCollapse,
 	AUTH_DOOR
 } from './rate-limit.js';
@@ -190,14 +191,20 @@ export function tryAuthEndpoint(req, srv, pathname) {
 	// and the budget is spent on whoever is actually driving the door.
 	if (authRateLimiter !== null) {
 		const peer = srv.requestIP(req);
-		const address = rateLimitAddress(req, peer ? peer.address : '');
+		const { address, source } = resolveRateLimitAddress(req, peer ? peer.address : '');
 		if (authRateLimitExceeded(address)) {
 			// Not counted for a client that has already gone, exactly as the
 			// upgrade door declines to count one: a connect-then-drop fleet would
 			// otherwise write its own noise into the numbers an operator reads to
 			// decide whether the app is turning people away.
-			if (!req.signal.aborted) recordUpgradeRejection('auth_rate_limit');
-			warnRateLimitProxyCollapse(req, address, AUTH_DOOR);
+			// The advisory takes the same guard as the counter one line up, and for
+			// the same reason: `requestIP` answers null for a socket already gone,
+			// so a connect-then-drop fleet would otherwise make a healthy server
+			// announce that no client address can be resolved.
+			if (!req.signal.aborted) {
+				recordUpgradeRejection('auth_rate_limit');
+				warnRateLimitProxyCollapse(source, address, AUTH_DOOR);
+			}
 			return rateLimitedResponse();
 		}
 	}

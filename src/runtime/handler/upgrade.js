@@ -26,7 +26,7 @@ import { WS_REQUEST_ID_KEY, isDraining, recordUpgradeRejection, wsCounters } fro
 import { get_origin, origin, upgrade_timeout_ms, ws_options, ws_path } from './config.js';
 import { WS_CONNECTION_PERMIT, awaitAdmissionSlot, upgradeAdmission } from './admission.js';
 import {
-	rateLimitAddress,
+	resolveRateLimitAddress,
 	upgradeRateLimitExceeded,
 	upgradeRateLimiter,
 	upgradeRateLimitWindowSeconds,
@@ -717,10 +717,14 @@ async function runUpgrade(req, srv, held) {
 	// server capacity from one address.
 	if (upgradeRateLimiter !== null) {
 		const peer = srv.requestIP(req);
-		const address = rateLimitAddress(req, peer ? peer.address : '');
+		const { address, source } = resolveRateLimitAddress(req, peer ? peer.address : '');
 		if (upgradeRateLimitExceeded(address)) {
 			recordRefusal(req, 'ip_rate_limit');
-			warnRateLimitProxyCollapse(req, address, UPGRADE_DOOR);
+			// Not for a client that has already gone, exactly as the refusal beside
+			// it is not counted for one: `requestIP` answers null for a departed
+			// socket, so a connect-then-drop fleet would otherwise make a healthy
+			// server announce that it cannot resolve any client address.
+			if (!req.signal.aborted) warnRateLimitProxyCollapse(source, address, UPGRADE_DOOR);
 			return rateLimitedResponse();
 		}
 	}
