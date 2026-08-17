@@ -90,14 +90,16 @@ test('a refusal is answered before the app hook can be reached', async () => {
 	assert.equal(calls, 3, 'ran for the admitted three and no further');
 });
 
-test('a refused ORIGIN is not charged to the bucket', async () => {
-	// The ordering this door reverses on purpose. The upgrade door meters first
-	// because its origin comparison is the more expensive of the two; here the
-	// guard is a header-only read, and charging refused origins would let hostile
-	// traffic from behind a shared NAT spend the legitimate clients' whole
-	// authentication budget.
+test('a refused ORIGIN is charged, like everything else that reaches this door', async () => {
+	// The sibling meters AFTER its origin check so a refused origin is not
+	// charged. That ordering does not survive contact with this door: passing the
+	// guard needs only `x-requested-with`, an unverified header any client can
+	// set, so an attacker spends the budget anyway - and the only thing the
+	// ordering bought was an UNMETERED path through a guard that reconstructs the
+	// origin from headers whenever ORIGIN is unset. So this door meters first,
+	// exactly like the upgrade door, and everything that reaches it is charged.
 	fresh();
-	for (let i = 0; i < 10; i++) {
+	for (let i = 0; i < 3; i++) {
 		const req = new Request(SELF + AUTH_PATH, {
 			method: 'POST',
 			headers: { host: 'app.example', origin: 'https://evil.example' }
@@ -105,7 +107,7 @@ test('a refused ORIGIN is not charged to the bucket', async () => {
 		const res = await tryAuthEndpoint(req, { requestIP: () => ({ address: '203.0.113.7' }) }, AUTH_PATH);
 		assert.equal(res.status, 403, `refusal ${i + 1}`);
 	}
-	assert.equal((await post('203.0.113.7')).status, 204, 'the budget was never touched');
+	assert.equal((await post('203.0.113.7')).status, 429, 'the refusals spent the budget');
 });
 
 test('the two doors have separate budgets', async () => {

@@ -113,16 +113,113 @@ test('labels in a different order are one series, not two', () => {
 	assert.deepEqual(lines, ['pressure_reason_transitions_total{from="NONE",to="MEMORY"} 2']);
 });
 
-test('two label sets that only a forged separator would merge stay apart', () => {
-	// The key separator is NUL precisely because a printable one can be forged
-	// out of a label VALUE, and two distinct series merging is one wrong number
-	// that nothing downstream can detect.
+test('a label value cannot forge the key of another label set', () => {
+	// The registry is shared with the app, so label VALUES are not the adapter's
+	// to reason about: any separator can be forged out of one, and two distinct
+	// series merging is a single wrong number nothing downstream can detect. The
+	// key is length-prefixed for that reason, and the NUL case below is the one a
+	// separator-keyed registry gets wrong.
 	const registry = createMetricRegistry();
-	const counter = registry.counter('upgrade_rate_map_evicted_total');
-	counter.inc({ door: 'x,y' });
-	counter.inc({ 'door,z': 'y' });
-	const lines = registry.serialize().split('\n').filter((l) => l.startsWith('upgrade_rate_map_evicted_total{'));
+	const counter = registry.counter('upgrade_rejected_total');
+	counter.inc({ reason: 'a', extra: 'b' });
+	counter.inc({ reason: 'a' + String.fromCharCode(0) + 'extra' + String.fromCharCode(0) + 'b' });
+	const lines = registry.serialize().split('\n').filter((l) => l.startsWith('upgrade_rejected_total{'));
 	assert.equal(lines.length, 2, JSON.stringify(lines));
+	assert.ok(lines.every((l) => l.endsWith(' 1')), 'neither absorbed the other: ' + JSON.stringify(lines));
+});
+
+test('a label NAME the format cannot carry is dropped, not rendered', () => {
+	// A label name is an identifier, so it cannot be escaped - an invalid one can
+	// only be dropped or take the whole document down with it. The accident this
+	// is really for is `inc('foo')`: a string has indexed own keys.
+	const registry = createMetricRegistry();
+	registry.counter('upgrade_rejected_total').inc({ 'not a name': 'x', reason: 'draining' });
+	assert.equal(
+		registry.serialize().split('\n').find((l) => l.startsWith('upgrade_rejected_total{')),
+		'upgrade_rejected_total{reason="draining"} 1'
+	);
+
+	const stringLabels = createMetricRegistry();
+	stringLabels.counter('ws_publishes_total').inc('foo');
+	assert.equal(
+		stringLabels.serialize().split('\n').find((l) => l.startsWith('ws_publishes_total')),
+		'ws_publishes_total 1'
+	);
+});
+
+test('a metric NAME the format cannot carry is refused outright', () => {
+	// One malformed line makes a parser reject the whole scrape, so an app's bad
+	// instrument would take every adapter family with it.
+	const registry = createMetricRegistry();
+	registry.counter('app.latency').inc();
+	registry.counter(/** @type {any} */ (42)).inc();
+	registry.gauge('orders placed').set(1);
+	const text = registry.serialize();
+	assert.doesNotMatch(text, /app\.latency/);
+	assert.doesNotMatch(text, /orders placed/);
+	assert.doesNotMatch(text, /^42/m);
+});
+
+test('a help string cannot end the line it is on', () => {
+	// An unescaped newline in HELP leaves the remainder to be parsed as a sample,
+	// and the document is rejected whole - every adapter series with it.
+	const registry = createMetricRegistry();
+	registry.counter('app_own_total', 'orders placed\nby tier').inc();
+	const lines = registry.serialize().split('\n').filter((l) => l.includes('app_own_total'));
+	assert.deepEqual(lines, [
+		'# HELP app_own_total orders placed\\nby tier',
+		'# TYPE app_own_total counter',
+		'app_own_total 1'
+	]);
+});
+
+test('one name is one family of one type', () => {
+	// A histogram over a name already held by a gauge used to hand back a family
+	// with no buckets and throw out of the first observe; a gauge over a declared
+	// counter used to publish the manifest's reviewed help under the wrong type.
+	const registry = createMetricRegistry();
+	registry.gauge('app_thing').set(1);
+	assert.doesNotThrow(() => registry.histogram('app_thing', 'h', { buckets: [1] }).observe(0.5));
+	assert.doesNotMatch(registry.serialize(), /app_thing_bucket/);
+
+	registry.gauge('upgrade_admitted_total').set(5);
+	const declared = registry.serialize().split('\n').filter((l) => l.includes('upgrade_admitted_total'));
+	assert.deepEqual(declared, [], 'a declared counter is not re-registrable as a gauge');
+});
+
+test('a bucket bound that is not a finite number is dropped', () => {
+	// A bound reaches the `le` label verbatim, so one that is not a number makes
+	// the scrape unparseable long after the call site is out of sight.
+	const registry = createMetricRegistry();
+	registry.histogram('app_l_seconds', 'l', { buckets: [1, /** @type {any} */ ('a'), 1, Infinity] }).observe(0.5);
+	const lines = registry.serialize().split('\n').filter((l) => l.includes('_bucket'));
+	assert.deepEqual(lines, [
+		'app_l_seconds_bucket{le="1"} 1',
+		'app_l_seconds_bucket{le="+Inf"} 1'
+	]);
+});
+
+test('a negative observation is refused rather than making the sum go backwards', () => {
+	// A decreasing `_sum` reads as a counter reset everywhere downstream, and the
+	// sibling's merge drops such a histogram outright.
+	const registry = createMetricRegistry();
+	const histogram = registry.histogram('app_l_seconds', 'l', { buckets: [1] });
+	histogram.observe(2);
+	histogram.observe(-5);
+	const lines = registry.serialize().split('\n').filter((l) => l.includes('_sum') || l.includes('_count'));
+	assert.deepEqual(lines, ['app_l_seconds_sum 2', 'app_l_seconds_count 1']);
+});
+
+test('an instrument keeps working after the registry is reset', () => {
+	// The adapter holds its gauge handles for the life of the process, so an
+	// instrument that closed over the family object would keep writing into a
+	// detached one after any reset - silently removing nine live-state gauges
+	// from every later scrape while the counters carried on.
+	const registry = createMetricRegistry();
+	const gauge = registry.gauge('ws_connections');
+	registry.reset();
+	gauge.set(7);
+	assert.match(registry.serialize(), /^ws_connections 7$/m);
 });
 
 test('a label value cannot end the line or open a new sample', () => {

@@ -35,7 +35,9 @@ import {
 	warnRateLimitProxyCollapse,
 	AUTH_DOOR
 } from './rate-limit.js';
-import { recordUpgradeRejection } from './ws-state.js';
+import { isDraining, recordUpgradeRejection } from './ws-state.js';
+import { counters } from './state.js';
+import { requestDone } from './lifecycle.js';
 
 /**
  * Whether this server serves the endpoint at all.
@@ -157,6 +159,68 @@ export function tryAuthEndpoint(req, srv, pathname) {
 	if (pathname !== auth_path || !authEndpointMounted()) return null;
 	if (req.method !== 'POST') return methodNotAllowed();
 
+	// Shutdown has started: refuse rather than begin a credential check on a
+	// process that is about to exit. The upgrade door refuses for the same
+	// reason, and this door has a sharper version of it - a hook that rotates a
+	// session in the database and then loses its `Set-Cookie` to a severed
+	// connection signs the user out with a token the server has already
+	// replaced, which is exactly the vanishing-cookie failure this endpoint
+	// exists to remove.
+	if (isDraining()) {
+		return new Response('Server draining', {
+			status: 503,
+			headers: { 'retry-after': '1', 'content-type': 'text/plain' }
+		});
+	}
+
+	// METERED FIRST, ahead of the origin guard, which is the order the upgrade
+	// door uses and the OPPOSITE of the sibling's at this door.
+	//
+	// The sibling meters second so that refused origins are not charged, on the
+	// argument that hostile traffic behind a shared NAT would otherwise spend the
+	// legitimate clients' whole budget. That argument does not survive contact
+	// with this door: `x-requested-with: XMLHttpRequest` is an unverified header
+	// any client can set, and setting it passes the guard - so an attacker simply
+	// spends the budget anyway, and the only thing the ordering bought was an
+	// UNMETERED path. It is not even a cheap one. With no ORIGIN configured -
+	// the zero-config default - the guard reconstructs the origin from headers,
+	// which allocates and can throw and be caught, per request, unbilled.
+	//
+	// So every request that reaches this endpoint is charged, refused or not,
+	// and the budget is spent on whoever is actually driving the door.
+	if (authRateLimiter !== null) {
+		const peer = srv.requestIP(req);
+		const address = rateLimitAddress(req, peer ? peer.address : '');
+		if (authRateLimitExceeded(address)) {
+			// Not counted for a client that has already gone, exactly as the
+			// upgrade door declines to count one: a connect-then-drop fleet would
+			// otherwise write its own noise into the numbers an operator reads to
+			// decide whether the app is turning people away.
+			if (!req.signal.aborted) recordUpgradeRejection('auth_rate_limit');
+			warnRateLimitProxyCollapse(address, AUTH_DOOR);
+			return rateLimitedResponse();
+		}
+	}
+
+	// The self-origin this request is judged against, resolved exactly as the
+	// upgrade door resolves it: a configured ORIGIN wins, and without one the
+	// origin is reconstructed from the request, whose host the client chose.
+	//
+	// Resolved BEFORE the guard because the cookie jar needs it too. `req.url`
+	// carries the client's `Host` verbatim, so a proxy that rewrites Host to
+	// `localhost` (nginx's `proxy_set_header Host $proxy_host` default) would
+	// otherwise make the jar's `Secure` default read a plain-http localhost URL
+	// and drop `Secure` from every session cookie on an HTTPS site. The SSR path
+	// rebuilds its Request on the resolved origin for this same reason.
+	let selfOrigin = origin || '';
+	if (!selfOrigin) {
+		try {
+			selfOrigin = get_origin(req.headers);
+		} catch {
+			selfOrigin = '';
+		}
+	}
+
 	// BEFORE the app's hook, and before anything is read: the hook is a
 	// credential check, and a foreign origin should not be able to make this
 	// server run one.
@@ -167,17 +231,13 @@ export function tryAuthEndpoint(req, srv, pathname) {
 	// than frozen into a module constant: it is one property read on a door that
 	// does a database round trip.
 	if (ws_options.authPathRequireOrigin !== false) {
-		// The same self-origin resolution the upgrade door uses, so one
-		// `allowedOrigins` means one thing across both. A configured ORIGIN wins;
-		// without it the origin is reconstructed from the request, whose host the
-		// client chose - which the upgrade path already warns about once.
-		let selfOrigin = origin || '';
-		if (!selfOrigin) {
-			try {
-				selfOrigin = get_origin(req.headers);
-			} catch {
-				selfOrigin = '';
-			}
+		// An unresolvable self origin cannot be same-origin-checked, and must not
+		// be COMPARED: `normalizeOrigin` collapses `/` and a whitespace-only value
+		// to the empty string, so an empty selfOrigin would MATCH those rather
+		// than matching nothing. The upgrade door refuses on the same condition.
+		if (ws_options.allowedOrigins === 'same-origin' && !selfOrigin) {
+			warnAuthOriginRefused(req.headers.get('origin'));
+			return forbiddenOrigin();
 		}
 		if (!isAuthOriginAccepted(req.headers, selfOrigin, ws_options.allowedOrigins)) {
 			warnAuthOriginRefused(req.headers.get('origin'));
@@ -185,39 +245,59 @@ export function tryAuthEndpoint(req, srv, pathname) {
 		}
 	}
 
-	// METERED AFTER the origin check, which is the opposite order to the upgrade
-	// door's and deliberate on both. There the origin comparison may reconstruct
-	// an origin from headers, so the cheaper limiter runs first. Here the guard
-	// above is a header-only read, and charging refused origins to the bucket
-	// would let hostile traffic from behind a shared NAT spend the legitimate
-	// clients' whole authentication budget. It is the sibling's order.
-	if (authRateLimiter !== null) {
-		const peer = srv.requestIP(req);
-		const address = rateLimitAddress(req, peer ? peer.address : '');
-		if (authRateLimitExceeded(address)) {
-			recordUpgradeRejection('auth_rate_limit');
-			warnRateLimitProxyCollapse(address, AUTH_DOOR);
-			return rateLimitedResponse();
+	// Oversize is refused before the hook, for the reason the cap exists: a
+	// preflight normally carries nothing, so a large body is not a client this
+	// door needs to spend a credential check on.
+	const declaredHeader = req.headers.get('content-length');
+	if (declaredHeader === null) {
+		// A body with no declared length cannot be capped without reading it, and
+		// reading it here would take `await request.json()` away from the hook. So
+		// it is REFUSED rather than waved through: an undeclared body is the one
+		// shape that would make the cap decoration, since a client need only omit
+		// the header to send an endless one. The family client always declares a
+		// length, and a preflight with no body at all is unaffected.
+		if (req.headers.get('transfer-encoding') !== null) {
+			return new Response('Length Required', {
+				status: 411,
+				headers: { 'content-type': 'text/plain' }
+			});
 		}
+	} else {
+		const declared = Number(declaredHeader);
+		// A length that is not a number at all is refused too: it is not a request
+		// any client this endpoint serves produces, and waving it through would
+		// leave the cap deciding nothing.
+		if (!Number.isFinite(declared) || declared > AUTH_BODY_LIMIT) return response413();
 	}
 
-	// Declared oversize is refused before the hook, for the reason the cap
-	// exists: a preflight normally carries nothing, so a large declared body is
-	// not a client this door needs to spend a credential check on.
-	const declared = Number(req.headers.get('content-length'));
-	if (Number.isFinite(declared) && declared > AUTH_BODY_LIMIT) return response413();
-
-	return runAuthenticate(req, srv);
+	return runAuthenticate(req, srv, selfOrigin);
 }
 
 /**
  * Run the app's hook and turn what it answers with into the response.
  *
+ * COUNTED AS IN-FLIGHT, like the SSR path: `drain()` waits on that counter, and
+ * a credential check invisible to it is one a graceful shutdown severs
+ * mid-rotation.
+ *
  * @param {Request} req
  * @param {import('bun').Server} srv
+ * @param {string} selfOrigin this server's resolved origin, or '' when it could
+ *   not be resolved
  * @returns {Promise<Response>}
  */
-async function runAuthenticate(req, srv) {
+function runAuthenticate(req, srv, selfOrigin) {
+	counters.inFlightCount++;
+	return authenticateRequest(req, srv, selfOrigin).finally(requestDone);
+}
+
+/**
+ * @param {Request} req
+ * @param {import('bun').Server} srv
+ * @param {string} selfOrigin
+ * @returns {Promise<Response>}
+ */
+async function authenticateRequest(req, srv, selfOrigin) {
 	const requestId = resolveRequestId(req.headers.get('x-request-id')) ?? randomUuid();
 	// Prototype-linked, exactly as the SSR path builds its own: one object per
 	// request carrying this request's identity, with every method still
@@ -225,9 +305,16 @@ async function runAuthenticate(req, srv) {
 	const authPlatform = Object.assign(Object.create(platform), { requestId });
 
 	// The jar reads the request's Cookie header and accumulates what the hook
-	// sets. `request.url` is absolute, which is what the Secure default and
-	// relative Path resolution are derived from.
-	const cookies = createCookies(req.headers.get('cookie'), req.url);
+	// sets. Built on the RESOLVED origin rather than on `req.url`: the Secure
+	// default and relative Path resolution both come from this URL, and `req.url`
+	// carries whatever Host the client sent - so behind a proxy that rewrites it
+	// to localhost, every session cookie would go out without `Secure`. The path
+	// still comes from the request, because that is what a relative cookie path
+	// resolves against.
+	const jarUrl = selfOrigin
+		? selfOrigin + new URL(req.url).pathname
+		: req.url;
+	const cookies = createCookies(req.headers.get('cookie'), jarUrl);
 
 	const peer = srv.requestIP(req);
 	// Resolved exactly as the limiter's key is, and never throwing for the same
@@ -256,24 +343,47 @@ async function runAuthenticate(req, srv) {
 		return response500();
 	}
 
-	// `false` REJECTS with a plain 401, matching the family. Any cookie the hook
-	// set on its way to that decision still goes out: clearing a stale session is
-	// exactly what a refusing hook does.
-	if (result === false) {
-		return withCookies(
-			new Response('Unauthorized', { status: 401, headers: { 'content-type': 'text/plain' } }),
-			cookies
-		);
+	// GUARDED, and not merely for tidiness: everything below can throw on input
+	// the hook chose. `new Response(body, init)` throws on a body that has
+	// already been read - which is what a hook returning a MODULE-LEVEL constant
+	// Response does on its second request - and on a status the constructor
+	// refuses, and `headers.append` throws on a cookie line carrying a value the
+	// Headers API rejects. Outside a guard each of those escapes as a rejected
+	// promise into the server's top-level error handler, which prints a stack
+	// per request with no throttle at all: the exact amplifier the throttle above
+	// exists to close, reachable by an app pattern rather than by an attack.
+	try {
+		// `false` REJECTS with a plain 401, matching the family. Any cookie the
+		// hook set on its way to that decision still goes out: clearing a stale
+		// session is exactly what a refusing hook does.
+		if (result === false) {
+			return withCookies(
+				new Response('Unauthorized', { status: 401, headers: { 'content-type': 'text/plain' } }),
+				cookies
+			);
+		}
+
+		// A Response from the hook IS the answer, verbatim - status, headers, body
+		// - with the jar's cookies merged in, so `cookies.set()` and a returned
+		// Response work together rather than one silently winning.
+		if (result instanceof Response) return withCookies(new Response(result.body, result), cookies);
+
+		// Anything else is success, including the `undefined` a hook that only
+		// refreshes a cookie returns.
+		return withCookies(new Response(null, { status: 204 }), cookies);
+	} catch (err) {
+		const { log: logIt, count: n } = authThrewThrottle();
+		if (logIt) {
+			const suffix = n > 1 ? ` (occurrence ${n})` : '';
+			console.error(
+				`WebSocket auth preflight could not answer${suffix} (requestId ${requestId}). A hook that ` +
+				'returns a module-level Response hits this on its second request, because a body can only ' +
+				'be read once - return a fresh Response per call:',
+				err
+			);
+		}
+		return response500();
 	}
-
-	// A Response from the hook IS the answer, verbatim - status, headers, body -
-	// with the jar's cookies merged in, so `cookies.set()` and a returned
-	// Response work together rather than one silently winning.
-	if (result instanceof Response) return withCookies(new Response(result.body, result), cookies);
-
-	// Anything else is success, including the `undefined` a hook that only
-	// refreshes a cookie returns.
-	return withCookies(new Response(null, { status: 204 }), cookies);
 }
 
 /**

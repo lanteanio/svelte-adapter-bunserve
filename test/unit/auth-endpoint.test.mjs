@@ -16,7 +16,13 @@ globalThis.WS_PATH = '/ws';
 globalThis.WS_OPTIONS = normalizeWsOptions({
 	path: '/ws',
 	handler: 'src/ws-handler.js',
-	allowedOrigins: 'same-origin'
+	allowedOrigins: 'same-origin',
+	// OFF, for the reason the fixture's main build turns the upgrade limiter off:
+	// every request in this file comes from one address, which is one client by
+	// that measure. Left at the default of 30 per 10s, this file sits eight
+	// requests below the ceiling - so the next assertion anyone adds turns into a
+	// 429 reported as 'the auth endpoint is broken'.
+	authPathRateLimit: 0
 }).options;
 
 register('../helpers/ws-handler-loader.mjs', import.meta.url);

@@ -127,7 +127,18 @@ export function serializeCookie(name, value, options = {}) {
 	let out = name + '=' + encoded;
 	if (options.domain !== undefined) out += '; Domain=' + options.domain;
 	if (options.path !== undefined) out += '; Path=' + options.path;
-	if (options.expires !== undefined) out += '; Expires=' + options.expires.toUTCString();
+	if (options.expires !== undefined) {
+		// CHECKED like every other attribute, and it was the one that was not.
+		// `toUTCString` is called on whatever was handed in, so a duck-typed or
+		// subclassed date returns arbitrary text straight into the header - and an
+		// `Invalid Date` renders the literal words, a stray space inside an
+		// attribute, with nothing anywhere saying so. Requiring a real Date with a
+		// real time is what makes the rendered value a date at all.
+		if (!(options.expires instanceof Date) || !Number.isFinite(options.expires.getTime())) {
+			throw new Error(`Invalid Expires for cookie '${name}': expected a valid Date`);
+		}
+		out += '; Expires=' + options.expires.toUTCString();
+	}
 	if (options.maxAge !== undefined) {
 		if (!Number.isFinite(options.maxAge)) {
 			throw new Error(`Invalid Max-Age for cookie '${name}': ${options.maxAge}`);

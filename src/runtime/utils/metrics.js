@@ -26,22 +26,17 @@
 import { SIGNALS, SIGNALS_BY_NAME, SNAPSHOT_SIGNALS } from '../observability-manifest.js';
 
 /**
- * Separator for the label-set key.
- *
- * A label VALUE is arbitrary text, so a printable separator can be forged:
- * `{a: 'x,b', c: 'y'}` and `{a: 'x', 'b,c': 'y'}` would key alike and two
- * distinct series would silently merge into one wrong number. NUL cannot occur
- * in a label any caller can supply.
- *
- * Built from a char code rather than written literally, for the reason the
- * sibling gives: a raw NUL byte in the source makes the whole file binary to
- * git, and a file that cannot be diffed cannot be reviewed.
- */
-const LABEL_SEP = String.fromCharCode(0);
-
-/**
  * Stable key for a label set. SORTED, so two emits passing the same labels in a
  * different order are one series rather than two.
+ *
+ * LENGTH-PREFIXED, not separated. A separator - any separator - can be forged
+ * out of a label VALUE, and this registry is shared with the app, so the values
+ * are not the adapter's to reason about. The sibling keys on a NUL separator
+ * and can argue that no adapter-supplied label contains one; here
+ * `inc({ a: 'x\0b\0y' })` and `inc({ a: 'x', b: 'y' })` would produce the same
+ * key, silently merging two distinct series into one wrong number that nothing
+ * downstream could detect. A length prefix is injective for arbitrary strings,
+ * which is the property actually needed.
  *
  * @param {Record<string, string> | undefined | null} labels
  * @returns {string}
@@ -51,7 +46,62 @@ function labelKey(labels) {
 	const keys = Object.keys(labels).sort();
 	if (keys.length === 0) return '';
 	let out = '';
-	for (const key of keys) out += key + LABEL_SEP + String(labels[key]) + LABEL_SEP;
+	for (const key of keys) {
+		const value = String(labels[key]);
+		out += key.length + ':' + key + value.length + ':' + value;
+	}
+	return out;
+}
+
+/**
+ * A metric family name, as the exposition format defines one. An app registers
+ * on this registry, so a name it chooses reaches the document - and one
+ * malformed line makes a parser reject the WHOLE scrape, taking every adapter
+ * family with it.
+ */
+const METRIC_NAME = /^[a-zA-Z_:][a-zA-Z0-9_:]*$/;
+
+/** A label name, which is the same class minus the colon. */
+const LABEL_NAME = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+
+/**
+ * Escape a `# HELP` line's text. Only two characters are special there - a
+ * backslash and a newline - and an unescaped newline ends the line, leaving the
+ * remainder to be parsed as a sample and the document rejected.
+ *
+ * Label values are escaped separately and by different rules; this is the one
+ * an app's `help` string reaches.
+ *
+ * @param {string} help
+ * @returns {string}
+ */
+function escapeHelp(help) {
+	return help.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
+}
+
+/**
+ * Copy a caller's labels into a plain object, keeping only entries whose NAME
+ * the exposition format accepts.
+ *
+ * A copy, so a caller that mutates the object it passed cannot rewrite a series
+ * that is already keyed. A filter, because a label name is not escapable - it is
+ * an identifier - so an invalid one can only be dropped or take the whole
+ * document down with it. `inc('foo')` is the accident this is really for: a
+ * string has indexed own keys, and without the filter it renders as
+ * `{0="f",1="o",2="o"}`.
+ *
+ * @param {unknown} labels
+ * @returns {Record<string, string>}
+ */
+function cleanLabels(labels) {
+	/** @type {Record<string, string>} */
+	const out = {};
+	if (labels === undefined || labels === null || typeof labels !== 'object' || Array.isArray(labels)) {
+		return out;
+	}
+	for (const [name, value] of Object.entries(labels)) {
+		if (LABEL_NAME.test(name)) out[name] = String(value);
+	}
 	return out;
 }
 
@@ -126,34 +176,130 @@ function renderLabels(labels) {
  *   reset: () => void
  * }}
  */
-export function createMetricRegistry() {
+export function createMetricRegistry(options = {}) {
 	/** @type {Map<string, Family>} */
 	const families = new Map();
+	/** Names already refused, so one bad instrument warns once rather than per emit. */
+	const refused = new Set();
+
+	/**
+	 * Say once that a registration was refused. An app's mistake must be visible
+	 * - a silently ignored instrument is a dashboard panel that never fills in
+	 * with nothing anywhere explaining why - but it must not be repeatable into
+	 * a log flood, since the emit that carries it can be per request.
+	 *
+	 * @param {string} key
+	 * @param {string} message
+	 */
+	function warnOnce(key, message) {
+		if (refused.has(key)) return;
+		refused.add(key);
+		console.warn('[metrics] ' + message);
+	}
+
+	/** An instrument that accepts every call and records nothing. */
+	const INERT = Object.freeze({
+		inc() {}, set() {}, observe() {}
+	});
 
 	/**
 	 * @param {string} name
 	 * @param {'counter' | 'gauge' | 'histogram'} type
 	 * @param {string | undefined} help
 	 * @param {number[] | null} buckets
-	 * @returns {Family}
+	 * @returns {Family | null} null when the registration was refused
 	 */
 	function family(name, type, help, buckets) {
 		const existing = families.get(name);
-		if (existing !== undefined) return existing;
+		if (existing !== undefined) {
+			// A NAME IS ONE FAMILY OF ONE TYPE. Asking for a histogram over a name
+			// already held by a gauge used to hand back a family with no buckets and
+			// throw out of the first `observe`; and a gauge registered over a
+			// declared counter used to render `# TYPE ... gauge` under the
+			// manifest's reviewed help. Both are refused here instead, because a
+			// family cannot be two shapes and the document is where the damage
+			// would land.
+			if (existing.type !== type) {
+				warnOnce(
+					'type:' + name,
+					`\`${name}\` is already registered as a ${existing.type}; the ${type} registration is ` +
+					'ignored. One metric name is one family of one type.'
+				);
+				return null;
+			}
+			return existing;
+		}
+		if (typeof name !== 'string' || !METRIC_NAME.test(name)) {
+			warnOnce(
+				'name:' + String(name),
+				`${JSON.stringify(name)} is not a valid metric name and was ignored. A name must match ` +
+				'[a-zA-Z_:][a-zA-Z0-9_:]* - anything else makes the whole scrape unparseable, so one bad ' +
+				'instrument would take every other metric with it.'
+			);
+			return null;
+		}
 		const declared = SIGNALS_BY_NAME.get(name);
+		if (declared !== undefined && declared.type !== type) {
+			// The manifest is the contract for a declared name: its TYPE wins as
+			// surely as its help does, and a registration that disagrees is refused
+			// rather than published under a type an alert rule was not written for.
+			warnOnce(
+				'declared:' + name,
+				`\`${name}\` is declared by this adapter as a ${declared.type}; the ${type} registration ` +
+				'is ignored. Pick a name of your own for an instrument of a different type.'
+			);
+			return null;
+		}
 		/** @type {Family} */
 		const created = {
 			name,
 			type,
 			// The manifest wins over a call-site string for a declared signal, so
 			// the help text a scrape sees is the one that was reviewed.
-			help: declared !== undefined ? declared.help : (typeof help === 'string' ? help : name),
-			buckets: buckets === null ? null : [...buckets].sort((a, b) => a - b),
+			help: declared !== undefined
+				? declared.help
+				: escapeHelp(typeof help === 'string' ? help : name),
+			buckets,
 			series: new Map()
 		};
 		families.set(name, created);
 		return created;
 	}
+
+	/**
+	 * Resolve a family by NAME on every write rather than closing over the object.
+	 *
+	 * An instrument that held the object kept writing into a detached family
+	 * after `reset()` cleared the map - invisibly, since `serialize()` walks the
+	 * map. The adapter holds its gauge instruments for the life of the process,
+	 * so one `reset()` from app code silently removed nine live-state gauges from
+	 * every later scrape while the counters kept working: a half-dead document
+	 * that still looks healthy. One Map lookup per write is the price, on a path
+	 * that runs at scrape rate rather than per request.
+	 *
+	 * @param {string} name
+	 * @param {'counter' | 'gauge' | 'histogram'} type
+	 * @param {string | undefined} help
+	 * @param {number[] | null} buckets
+	 * @returns {Family | null}
+	 */
+	function resolve(name, type, help, buckets) {
+		const existing = families.get(name);
+		if (existing !== undefined && existing.type === type) return existing;
+		return family(name, type, help, buckets);
+	}
+
+	/**
+	 * Series one family may hold.
+	 *
+	 * The registry is shared with the app, and the classic way to melt a metrics
+	 * system is one label carrying request-derived data - a path, an id, a topic.
+	 * Unbounded, that is a leak with no ceiling and a scrape whose cost grows
+	 * with it. The adapter's own families are far below this (eleven refusal
+	 * reasons, two doors, at most 49 transitions), so the cap can only ever bind
+	 * on an app's.
+	 */
+	const MAX_SERIES_PER_FAMILY = 2000;
 
 	/**
 	 * @param {Family} target
@@ -165,8 +311,17 @@ export function createMetricRegistry() {
 		const key = labelKey(labels);
 		const existing = target.series.get(key);
 		if (existing === undefined) {
+			if (target.series.size >= MAX_SERIES_PER_FAMILY) {
+				warnOnce(
+					'cap:' + target.name,
+					`\`${target.name}\` reached ${MAX_SERIES_PER_FAMILY} label combinations; further ones ` +
+					'are dropped. A label carrying request-derived data (a path, an id) is the usual ' +
+					'cause - the series would otherwise grow without limit and every scrape with them.'
+				);
+				return;
+			}
 			target.series.set(key, {
-				labels: labels === undefined || labels === null ? {} : { ...labels },
+				labels: cleanLabels(labels),
 				value: delta
 			});
 			return;
@@ -176,9 +331,11 @@ export function createMetricRegistry() {
 
 	return {
 		counter(name, help) {
-			const target = family(name, 'counter', help, null);
+			if (family(name, 'counter', help, null) === null) return INERT;
 			return {
 				inc(labels, value) {
+					const target = resolve(name, 'counter', help, null);
+					if (target === null) return;
 					// A non-number `value` is 1, not NaN: the contract says value
 					// defaults to 1, and a caller passing something unusable must not
 					// be able to poison a series into unreadability for the life of
@@ -193,35 +350,59 @@ export function createMetricRegistry() {
 			};
 		},
 		gauge(name, help) {
-			const target = family(name, 'gauge', help, null);
+			if (family(name, 'gauge', help, null) === null) return INERT;
 			return {
 				set(value) {
-					if (typeof value !== 'number') return;
+					const target = resolve(name, 'gauge', help, null);
+					if (target === null || typeof value !== 'number') return;
 					record(target, undefined, value, true);
 				}
 			};
 		},
 		histogram(name, help, options) {
-			const buckets = Array.isArray(options?.buckets) && options.buckets.length > 0
+			// VALIDATED at registration, not at observe: a bound is written once and
+			// read on every scrape, so a bound that is not a finite number renders
+			// into the `le` label and makes the document unparseable long after the
+			// call site that supplied it is out of sight. Duplicates are dropped for
+			// the same reason - two identical `le` lines are two series with one
+			// name.
+			const requested = Array.isArray(options?.buckets) && options.buckets.length > 0
 				? options.buckets
 				: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
-			const target = family(name, 'histogram', help, buckets);
+			const buckets = [...new Set(requested.filter((bound) => typeof bound === 'number' && Number.isFinite(bound)))]
+				.sort((a, b) => a - b);
+			if (buckets.length !== requested.length) {
+				warnOnce(
+					'buckets:' + name,
+					`\`${name}\` was given bucket bounds that are not finite numbers, or duplicates; ` +
+					`${requested.length - buckets.length} were dropped. A bound reaches the \`le\` label ` +
+					'verbatim, and one that is not a number makes the whole scrape unparseable.'
+				);
+			}
+			if (buckets.length === 0 || family(name, 'histogram', help, buckets) === null) return INERT;
 			return {
 				observe(labels, value) {
+					const target = resolve(name, 'histogram', help, buckets);
+					if (target === null) return;
 					// `observe(value)` and `observe(labels, value)` are both in the
 					// wild, and the one-argument form is the common one for an
 					// unlabelled histogram.
 					const observed = typeof labels === 'number' && value === undefined ? labels : value;
 					const observedLabels = typeof labels === 'number' && value === undefined ? undefined : labels;
 					if (typeof observed !== 'number' || !Number.isFinite(observed)) return;
+					// REFUSED, rather than recorded into a sum that then goes
+					// backwards. A decreasing `_sum` reads as a counter reset to
+					// everything downstream, and the sibling's merge drops any
+					// histogram whose sum is negative outright - so a document with one
+					// in it is one the family cannot agree on.
+					if (observed < 0) return;
 					const bounds = /** @type {number[]} */ (target.buckets);
 					const key = labelKey(observedLabels);
 					let entry = target.series.get(key);
 					if (entry === undefined || entry.histogram === undefined) {
+						if (target.series.size >= MAX_SERIES_PER_FAMILY) return;
 						entry = {
-							labels: observedLabels === undefined || observedLabels === null
-								? {}
-								: { ...observedLabels },
+							labels: cleanLabels(observedLabels),
 							histogram: { counts: new Array(bounds.length).fill(0), count: 0, sum: 0 }
 						};
 						target.series.set(key, entry);
@@ -259,7 +440,9 @@ export function createMetricRegistry() {
 		 */
 		projectCounter(name, labels, value) {
 			if (typeof value !== 'number' || !Number.isFinite(value)) return;
-			record(family(name, 'counter', undefined, null), labels, value, true);
+			const target = resolve(name, 'counter', undefined, null);
+			if (target === null) return;
+			record(target, labels, value, true);
 		},
 
 		/**
@@ -277,6 +460,11 @@ export function createMetricRegistry() {
 		 * that never goes away.
 		 */
 		serialize() {
+			// The projection runs FIRST when one is installed, so a caller that
+			// serializes the registry directly - the member this adapter documents on
+			//  - gets the same document  returns
+			// rather than one whose adapter families are stale or missing.
+			if (typeof options.beforeSerialize === 'function') options.beforeSerialize();
 			/** @type {string[]} */
 			const out = [];
 			/** @type {Set<string>} */
@@ -320,7 +508,7 @@ export function createMetricRegistry() {
 					if (entry.histogram !== undefined) {
 						out.push({
 							name: target.name,
-							labels: entry.labels,
+							labels: { ...entry.labels },
 							histogram: {
 								buckets: /** @type {number[]} */ (target.buckets).slice(),
 								counts: entry.histogram.counts.slice(),
@@ -329,7 +517,7 @@ export function createMetricRegistry() {
 							}
 						});
 					} else {
-						out.push({ name: target.name, labels: entry.labels, value: entry.value });
+						out.push({ name: target.name, labels: { ...entry.labels }, value: entry.value });
 					}
 				}
 			}
@@ -361,9 +549,15 @@ function renderFamily(out, target) {
 	}
 	out.push(`# HELP ${target.name} ${target.help}`);
 	out.push(`# TYPE ${target.name} ${target.type}`);
-	// Sorted by label key, so a family with several label sets renders in a
-	// stable order across scrapes rather than in insertion order.
-	for (const key of [...target.series.keys()].sort()) {
+	// Sorted by the RENDERED label block, not by the internal key: the key is
+	// length-prefixed so that it cannot be forged, which makes its sort order an
+	// artefact of value lengths rather than anything a reader would recognise.
+	// Sorting on what the document actually shows is what makes two scrapes
+	// diffable by eye.
+	const ordered = [...target.series.entries()]
+		.map(([key, entry]) => ({ key, entry, rendered: renderLabels(entry.labels) }))
+		.sort((a, b) => (a.rendered < b.rendered ? -1 : a.rendered > b.rendered ? 1 : 0));
+	for (const { key } of ordered) {
 		const entry = /** @type {{ labels: Record<string, string>, value?: number, histogram?: any }} */ (
 			target.series.get(key)
 		);
