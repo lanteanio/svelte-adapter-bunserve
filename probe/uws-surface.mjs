@@ -18,7 +18,7 @@ import { writeFileSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -211,7 +211,7 @@ function nestedOptionKeys(source) {
  * @param {number} open index of the opening `(`
  * @returns {string} the text between the parentheses
  */
-function callArgs(source, open) {
+export function callArgs(source, open) {
 	let depth = 0;
 	/** @type {string | null} */
 	let inStr = null;
@@ -257,7 +257,7 @@ function callArgs(source, open) {
  * @param {string} guardsSource uws's `src/config-guards.js` at the pinned commit
  * @returns {Record<string, { allowZero: boolean, floor: number, ceiling: number | null, integerRequired: boolean }>}
  */
-function protectiveNumberRanges(indexSource, guardsSource) {
+export function protectiveNumberRanges(indexSource, guardsSource) {
 	// The floor rule lives in the guard rather than at the call sites, so it is
 	// READ rather than assumed. A release that redefined what `allowZero` means
 	// would otherwise be recorded here as though nothing had moved, and every
@@ -312,79 +312,94 @@ function protectiveNumberRanges(indexSource, guardsSource) {
 	return out;
 }
 
-const uwsRoot = findUws();
-const ref = process.env.UWS_REF || 'HEAD';
-const commit = execFileSync('git', ['rev-parse', ref], { cwd: uwsRoot, encoding: 'utf8' }).trim();
-const dts = showAtRef(uwsRoot, commit, 'src/index.d.ts');
-const pkg = JSON.parse(showAtRef(uwsRoot, commit, 'package.json'));
-const schema = showAtRef(uwsRoot, commit, 'protocol.schema.json');
-const indexSource = showAtRef(uwsRoot, commit, 'src/index.js');
-const guardsSource = showAtRef(uwsRoot, commit, 'src/config-guards.js');
+/**
+ * Read uws at the pinned commit and write the manifest.
+ *
+ * SPLIT FROM MODULE SCOPE so this file can be imported without running the
+ * probe. The extractors above decide what the parity gate compares, which makes
+ * them load-bearing, and an extractor nothing can drive is a manifest nobody
+ * checked - the same failure the floors below exist to catch, one level up.
+ * Running the file directly is unchanged.
+ */
+function main() {
+	const uwsRoot = findUws();
+	const ref = process.env.UWS_REF || 'HEAD';
+	const commit = execFileSync('git', ['rev-parse', ref], { cwd: uwsRoot, encoding: 'utf8' }).trim();
+	const dts = showAtRef(uwsRoot, commit, 'src/index.d.ts');
+	const pkg = JSON.parse(showAtRef(uwsRoot, commit, 'package.json'));
+	const schema = showAtRef(uwsRoot, commit, 'protocol.schema.json');
+	const indexSource = showAtRef(uwsRoot, commit, 'src/index.js');
+	const guardsSource = showAtRef(uwsRoot, commit, 'src/config-guards.js');
 
-const surface = {
-	// Provenance, so a stale or mis-sourced manifest is visible in review. The
-	// commit matters as much as the version: it is what makes this reproducible
-	// while the uws working tree is mid-change.
-	uwsVersion: pkg.version,
-	uwsRef: ref,
-	uwsCommit: commit,
-	// The family protocol schema, recorded as a hash: this repo VENDORS a
-	// byte-identical copy at its root (uws is the schema's home; the copy is
-	// what ships to consumers and what the runtime reads its protocol
-	// revision from), and the parity test compares the committed copy against
-	// this hash so the two cannot drift apart silently.
-	protocolSchemaSha256: createHash('sha256').update(schema, 'utf8').digest('hex'),
-	platform: interfaceMembers(dts, 'Platform'),
-	adapterOptions: interfaceMembers(dts, 'AdapterOptions'),
-	webSocketOptions: interfaceMembers(dts, 'WebSocketOptions'),
-	// The keys INSIDE the nested option blocks, which the flat lists above
-	// cannot see. A whole sub-key can be missing here while the top-level name
-	// matches on both sides - which is exactly how `upgradeAdmission.waitingRoom`
-	// went unnoticed until it turned a working uws config into a build failure.
-	//
-	// Read from index.js rather than the .d.ts because uws already maintains
-	// this as data for its own validator, so recording it costs nothing and
-	// cannot drift from what uws actually accepts.
-	nestedWebSocketOptions: nestedOptionKeys(indexSource),
-	// The accepted VALUE RANGE behind each of those names. Two adapters can
-	// declare the same option and disagree about what it accepts, and that
-	// disagreement is invisible to every list above: it is a config that builds
-	// on one adapter and fails the build on the other, which is the failure the
-	// whole parity effort exists to remove.
-	protectiveNumbers: protectiveNumberRanges(indexSource, guardsSource),
-	exports: Object.keys(pkg.exports ?? {}).sort()
-};
+	const surface = {
+		// Provenance, so a stale or mis-sourced manifest is visible in review. The
+		// commit matters as much as the version: it is what makes this reproducible
+		// while the uws working tree is mid-change.
+		uwsVersion: pkg.version,
+		uwsRef: ref,
+		uwsCommit: commit,
+		// The family protocol schema, recorded as a hash: this repo VENDORS a
+		// byte-identical copy at its root (uws is the schema's home; the copy is
+		// what ships to consumers and what the runtime reads its protocol
+		// revision from), and the parity test compares the committed copy against
+		// this hash so the two cannot drift apart silently.
+		protocolSchemaSha256: createHash('sha256').update(schema, 'utf8').digest('hex'),
+		platform: interfaceMembers(dts, 'Platform'),
+		adapterOptions: interfaceMembers(dts, 'AdapterOptions'),
+		webSocketOptions: interfaceMembers(dts, 'WebSocketOptions'),
+		// The keys INSIDE the nested option blocks, which the flat lists above
+		// cannot see. A whole sub-key can be missing here while the top-level name
+		// matches on both sides - which is exactly how `upgradeAdmission.waitingRoom`
+		// went unnoticed until it turned a working uws config into a build failure.
+		//
+		// Read from index.js rather than the .d.ts because uws already maintains
+		// this as data for its own validator, so recording it costs nothing and
+		// cannot drift from what uws actually accepts.
+		nestedWebSocketOptions: nestedOptionKeys(indexSource),
+		// The accepted VALUE RANGE behind each of those names. Two adapters can
+		// declare the same option and disagree about what it accepts, and that
+		// disagreement is invisible to every list above: it is a config that builds
+		// on one adapter and fails the build on the other, which is the failure the
+		// whole parity effort exists to remove.
+		protectiveNumbers: protectiveNumberRanges(indexSource, guardsSource),
+		exports: Object.keys(pkg.exports ?? {}).sort()
+	};
 
-// Floors, not exact counts: this guards against a parser change silently
-// emitting a degenerate manifest that the parity test would then "pass"
-// against. An assertion that cannot fail is the failure mode this repo keeps
-// re-learning, and a manifest generator is a place it hides well.
-const FLOORS = { platform: 30, adapterOptions: 5, webSocketOptions: 5, exports: 5 };
-for (const [key, floor] of Object.entries(FLOORS)) {
-	if (surface[key].length < floor) {
+	// Floors, not exact counts: this guards against a parser change silently
+	// emitting a degenerate manifest that the parity test would then "pass"
+	// against. An assertion that cannot fail is the failure mode this repo keeps
+	// re-learning, and a manifest generator is a place it hides well.
+	const FLOORS = { platform: 30, adapterOptions: 5, webSocketOptions: 5, exports: 5 };
+	for (const [key, floor] of Object.entries(FLOORS)) {
+		if (surface[key].length < floor) {
+			throw new Error(
+				`extracted only ${surface[key].length} ${key} entries from uws (expected at least ` +
+				`${floor}). The .d.ts shape probably changed - fix the extractor rather than ` +
+				'lowering the floor, and never commit a manifest this small.'
+			);
+		}
+	}
+
+	// The range dimension gets its own floor, because it is an object rather than
+	// a list and would sail past the check above as a silent {}. A manifest with no
+	// ranges makes the range test vacuous, which is the one outcome worse than not
+	// having written it.
+	const RANGE_FLOOR = 6;
+	const rangeCount = Object.keys(surface.protectiveNumbers).length;
+	if (rangeCount < RANGE_FLOOR) {
 		throw new Error(
-			`extracted only ${surface[key].length} ${key} entries from uws (expected at least ` +
-			`${floor}). The .d.ts shape probably changed - fix the extractor rather than ` +
-			'lowering the floor, and never commit a manifest this small.'
+			`extracted only ${rangeCount} protective-number ranges from uws (expected at least ` +
+			`${RANGE_FLOOR}). The guard call shape probably changed - fix the extractor rather than ` +
+			'lowering the floor.'
 		);
 	}
+	const out = join(HERE, 'uws-surface.json');
+	writeFileSync(out, JSON.stringify(surface, null, '\t') + '\n');
+	console.log(`uws ${surface.uwsVersion} -> ${out}`);
+	for (const key of Object.keys(FLOORS)) console.log(`  ${key}: ${surface[key].length}`);
+	console.log(`  protectiveNumbers: ${rangeCount}`);
 }
 
-// The range dimension gets its own floor, because it is an object rather than
-// a list and would sail past the check above as a silent {}. A manifest with no
-// ranges makes the range test vacuous, which is the one outcome worse than not
-// having written it.
-const RANGE_FLOOR = 6;
-const rangeCount = Object.keys(surface.protectiveNumbers).length;
-if (rangeCount < RANGE_FLOOR) {
-	throw new Error(
-		`extracted only ${rangeCount} protective-number ranges from uws (expected at least ` +
-		`${RANGE_FLOOR}). The guard call shape probably changed - fix the extractor rather than ` +
-		'lowering the floor.'
-	);
-}
-const out = join(HERE, 'uws-surface.json');
-writeFileSync(out, JSON.stringify(surface, null, '\t') + '\n');
-console.log(`uws ${surface.uwsVersion} -> ${out}`);
-for (const key of Object.keys(FLOORS)) console.log(`  ${key}: ${surface[key].length}`);
-console.log(`  protectiveNumbers: ${rangeCount}`);
+// Only when RUN, never when imported. `process.argv[1]` is the entry script, so
+// this compares what node was asked to execute against this module's own URL.
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) main();
