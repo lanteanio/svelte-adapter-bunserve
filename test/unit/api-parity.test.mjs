@@ -256,6 +256,129 @@ test('websocket options match the uws contract, or the difference is recorded', 
 	);
 });
 
+/**
+ * Values every protective number is driven through, chosen for the boundaries
+ * rather than for coverage: zero, a fraction below every floor, the floor
+ * itself, fractions above it, and sizes on either side of the fixed-width
+ * bound uws grew later.
+ */
+const RANGE_PROBE_VALUES = [0, 0.5, 1, 1.5, 2, 1000, 1048576, 1048576.5, 2147483647, 3000000000];
+
+/**
+ * Whether uws accepts a value, decided from the range it records in the
+ * manifest rather than from a copy of its guard kept here. Mirrors the shape of
+ * `assertProtectiveNumber`: a ceiling brings a SAFE-INTEGER requirement with it,
+ * because in uws the two arrive together and for the same reason.
+ *
+ * @param {{ allowZero: boolean, floor: number, ceiling: number | null, integerRequired: boolean }} contract
+ * @param {number} value
+ * @returns {boolean}
+ */
+function uwsAcceptsValue(contract, value) {
+	if (!Number.isFinite(value)) return false;
+	if (value === 0) return contract.allowZero;
+	if (value < contract.floor) return false;
+	if (contract.ceiling !== null && (!Number.isSafeInteger(value) || value > contract.ceiling)) return false;
+	return true;
+}
+
+/**
+ * Whether THIS adapter accepts a value, decided by running the real validator.
+ *
+ * @param {string} key
+ * @param {number} value
+ * @returns {boolean}
+ */
+function weAcceptValue(key, value) {
+	try {
+		normalizeWsOptions({ [key]: value });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Options this adapter accepts a NARROWER set of values for than uws, with the
+ * reason each difference exists.
+ *
+ * Every entry here is forced by Bun, not chosen: Bun.serve validates these
+ * three itself and throws on a value uws would take. Widening any of them to
+ * match uws would move a build-time refusal into a server that fails to start,
+ * which is worse than the difference. The measured errors are quoted so the
+ * next reader can re-run them rather than trust this list.
+ *
+ * The list is EXACT in both directions - an unrecorded difference fails, and so
+ * does an entry that no longer describes one.
+ */
+const RANGE_DIVERGENCES = {
+	maxPayloadLength: {
+		refuses: [1.5, 1048576.5],
+		because: 'Bun.serve throws "websocket expects maxPayloadLength to be an integer" (measured on 1.3.14)'
+	},
+	maxBackpressure: {
+		refuses: [1.5, 1048576.5],
+		because: 'Bun.serve throws "websocket expects backpressureLimit to be an integer" (measured on 1.3.14)'
+	},
+	idleTimeout: {
+		refuses: [0.5, 1.5, 1000, 1048576, 1048576.5, 2147483647, 3000000000],
+		because: 'Bun.serve throws "websocket expects idleTimeout to be an integer" (measured on 1.3.14), ' +
+			'and separately refuses anything above 960, which the validator reports as its own error'
+	}
+};
+
+test('the VALUES each option accepts match uws, or the difference is recorded', () => {
+	// THE LISTS ABOVE COMPARE NAMES. Two adapters can agree on every option name
+	// and still disagree about what those options accept, and that disagreement
+	// is not cosmetic: it is a config that builds on one adapter and fails the
+	// build on the other, which is the failure this whole file exists to catch.
+	// It got past every other test in this repo once - a rate-limit window whose
+	// floor was 0.001 here against 1 there - and was found by a person reading
+	// two validators side by side, because nothing mechanical could see it.
+	for (const [key, contract] of Object.entries(surface.protectiveNumbers)) {
+		const narrower = RANGE_PROBE_VALUES.filter(
+			(v) => uwsAcceptsValue(contract, v) && !weAcceptValue(key, v)
+		);
+		const recorded = RANGE_DIVERGENCES[key];
+		assert.deepEqual(
+			narrower,
+			recorded ? recorded.refuses : [],
+			recorded
+				? `\`websocket.${key}\` no longer refuses exactly what the divergence records. ` +
+					`Recorded: ${JSON.stringify(recorded.refuses)} (${recorded.because}). ` +
+					'Update the entry, or delete it if the difference is gone.'
+				: `\`websocket.${key}\` refuses ${JSON.stringify(narrower)}, which uws accepts, and ` +
+					'nothing records why. A config valid on uws must build here: either widen this ' +
+					'adapter to take them, or add an entry to RANGE_DIVERGENCES saying what forces the ' +
+					'difference.'
+		);
+	}
+});
+
+test('and this adapter never accepts a bound uws would refuse', () => {
+	// The other direction, and the one with no allowlist. Accepting MORE than
+	// uws does not break a migration into this adapter - it breaks the way back
+	// out, which is the half of "drop-in replacement" that is easy to forget:
+	// the config an operator tuned here fails the build there, and the failure
+	// arrives long after the decision that caused it.
+	//
+	// Empty today at the pinned commit. It is the check that turns uws's later
+	// bounds into a failing test here rather than a silent divergence: uws has
+	// since capped `maxPayloadLength` at 0x7fffffff, so the day this repo's pin
+	// moves past that release, this test names the option and the value.
+	for (const [key, contract] of Object.entries(surface.protectiveNumbers)) {
+		const looser = RANGE_PROBE_VALUES.filter(
+			(v) => weAcceptValue(key, v) && !uwsAcceptsValue(contract, v)
+		);
+		assert.deepEqual(
+			looser,
+			[],
+			`\`websocket.${key}\` accepts ${JSON.stringify(looser)}, which uws refuses. A config ` +
+				'tuned here would fail the build on uws, so this adapter has to refuse them too.'
+		);
+	}
+});
+
 test('an accepted-but-inert key is recorded as a gap, and says so at build time', () => {
 	// Both halves, because either alone is a way for the key to look implemented:
 	// recorded as a gap but silently swallowed, or warned about but counted as

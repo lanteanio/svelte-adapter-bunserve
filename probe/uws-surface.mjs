@@ -202,12 +202,124 @@ function nestedOptionKeys(source) {
 	return out;
 }
 
+/**
+ * Read a balanced `(...)` argument list starting at the `(` of a call, with
+ * quotes and comments respected so a brace or paren inside a message string
+ * cannot end the scan early.
+ *
+ * @param {string} source
+ * @param {number} open index of the opening `(`
+ * @returns {string} the text between the parentheses
+ */
+function callArgs(source, open) {
+	let depth = 0;
+	/** @type {string | null} */
+	let inStr = null;
+	let inLine = false;
+	let inBlock = false;
+	for (let p = open; p < source.length; p++) {
+		const c = source[p];
+		const n = source[p + 1];
+		if (inLine) { if (c === '\n') inLine = false; continue; }
+		if (inBlock) { if (c === '*' && n === '/') { inBlock = false; p++; } continue; }
+		if (inStr) {
+			if (c === '\\') p++;
+			else if (c === inStr) inStr = null;
+			continue;
+		}
+		if (c === '/' && n === '*') { inBlock = true; p++; continue; }
+		if (c === '/' && n === '/') { inLine = true; continue; }
+		if (c === '"' || c === "'" || c === '`') { inStr = c; continue; }
+		if (c === '(') depth++;
+		else if (c === ')') {
+			depth--;
+			if (depth === 0) return source.slice(open + 1, p);
+		}
+	}
+	throw new Error('unbalanced argument list while reading a protective-number call site');
+}
+
+/**
+ * The accepted VALUE RANGE of every option uws guards as a protective number.
+ *
+ * The flat key lists prove both adapters NAME an option. They cannot prove both
+ * ACCEPT the same values for it, and that is a real difference: a window whose
+ * floor is 0.001 on one adapter and 1 on the other is portable in name and not
+ * in fact, so a config builds on one and fails the build on the other. That
+ * exact difference reached this repo once, and nothing mechanical could see it
+ * - it took a reader comparing two validators side by side.
+ *
+ * Read from uws's own validator at the pinned commit, for the same reason the
+ * nested keys are: it is what uws actually enforces, so the record cannot drift
+ * from the behaviour it claims to describe.
+ *
+ * @param {string} indexSource uws's `src/index.js` at the pinned commit
+ * @param {string} guardsSource uws's `src/config-guards.js` at the pinned commit
+ * @returns {Record<string, { allowZero: boolean, floor: number, ceiling: number | null, integerRequired: boolean }>}
+ */
+function protectiveNumberRanges(indexSource, guardsSource) {
+	// The floor rule lives in the guard rather than at the call sites, so it is
+	// READ rather than assumed. A release that redefined what `allowZero` means
+	// would otherwise be recorded here as though nothing had moved, and every
+	// range in this manifest would be wrong in the same direction at once.
+	const floorRule = /const floor\s*=\s*allowZero\s*\?\s*(-?[\d.]+)\s*:\s*(-?[\d.]+)\s*;/.exec(guardsSource);
+	if (!floorRule) {
+		throw new Error(
+			'uws no longer derives the protective-number floor from `allowZero`. The range dimension ' +
+			'needs a new source - fix the extractor rather than letting it record the old rule.'
+		);
+	}
+	const zeroFloor = Number(floorRule[1]);
+	const nonZeroFloor = Number(floorRule[2]);
+	// Whether the guard has a ceiling MECHANISM, which is a separate question
+	// from whether any call passes one. At the pinned commit there is none, so a
+	// `ceiling` that appears later registers as a new mechanism AND a new bound
+	// rather than as an option key the guard silently ignores.
+	const ceilingSupported = /Number\.isSafeInteger/.test(guardsSource);
+
+	/** @type {Record<string, { allowZero: boolean, floor: number, ceiling: number | null, integerRequired: boolean }>} */
+	const out = {};
+	const call = /assertProtectiveNumber\s*\(/g;
+	let m;
+	while ((m = call.exec(indexSource)) !== null) {
+		const args = callArgs(indexSource, indexSource.indexOf('(', m.index));
+		const key = /^\s*\w+\s*,\s*'([^']+)'/.exec(args);
+		// A call whose second argument is not a literal key name is not something
+		// this extractor can record, and recording it wrongly is worse than not
+		// recording it - so it fails rather than guesses.
+		if (!key) {
+			throw new Error(
+				`a protective-number call site does not name its option as a string literal, so its ` +
+				`range cannot be recorded: ${args.slice(0, 120).replace(/\s+/g, ' ')}`
+			);
+		}
+		const allowZero = !/allowZero\s*:\s*false/.test(args);
+		const ceilingMatch = /ceiling\s*:\s*(0x[0-9a-fA-F]+|[\d_]+)/.exec(args);
+		const ceiling = ceilingMatch ? Number(ceilingMatch[1].replace(/_/g, '')) : null;
+		out[key[1]] = {
+			allowZero,
+			floor: allowZero ? zeroFloor : nonZeroFloor,
+			ceiling,
+			// uws requires a SAFE INTEGER only where it also imposes a ceiling -
+			// the two arrive together in its guard, because the reason for both is
+			// the same fixed-width store on the receiving side.
+			integerRequired: ceilingSupported && ceiling !== null
+		};
+	}
+	if (Object.keys(out).length === 0) {
+		throw new Error('parsed no protective-number call sites; the guard call shape changed.');
+	}
+	return out;
+}
+
 const uwsRoot = findUws();
 const ref = process.env.UWS_REF || 'HEAD';
 const commit = execFileSync('git', ['rev-parse', ref], { cwd: uwsRoot, encoding: 'utf8' }).trim();
 const dts = showAtRef(uwsRoot, commit, 'src/index.d.ts');
 const pkg = JSON.parse(showAtRef(uwsRoot, commit, 'package.json'));
 const schema = showAtRef(uwsRoot, commit, 'protocol.schema.json');
+const indexSource = showAtRef(uwsRoot, commit, 'src/index.js');
+const guardsSource = showAtRef(uwsRoot, commit, 'src/config-guards.js');
 
 const surface = {
 	// Provenance, so a stale or mis-sourced manifest is visible in review. The
@@ -233,7 +345,13 @@ const surface = {
 	// Read from index.js rather than the .d.ts because uws already maintains
 	// this as data for its own validator, so recording it costs nothing and
 	// cannot drift from what uws actually accepts.
-	nestedWebSocketOptions: nestedOptionKeys(showAtRef(uwsRoot, commit, 'src/index.js')),
+	nestedWebSocketOptions: nestedOptionKeys(indexSource),
+	// The accepted VALUE RANGE behind each of those names. Two adapters can
+	// declare the same option and disagree about what it accepts, and that
+	// disagreement is invisible to every list above: it is a config that builds
+	// on one adapter and fails the build on the other, which is the failure the
+	// whole parity effort exists to remove.
+	protectiveNumbers: protectiveNumberRanges(indexSource, guardsSource),
 	exports: Object.keys(pkg.exports ?? {}).sort()
 };
 
@@ -252,7 +370,21 @@ for (const [key, floor] of Object.entries(FLOORS)) {
 	}
 }
 
+// The range dimension gets its own floor, because it is an object rather than
+// a list and would sail past the check above as a silent {}. A manifest with no
+// ranges makes the range test vacuous, which is the one outcome worse than not
+// having written it.
+const RANGE_FLOOR = 6;
+const rangeCount = Object.keys(surface.protectiveNumbers).length;
+if (rangeCount < RANGE_FLOOR) {
+	throw new Error(
+		`extracted only ${rangeCount} protective-number ranges from uws (expected at least ` +
+		`${RANGE_FLOOR}). The guard call shape probably changed - fix the extractor rather than ` +
+		'lowering the floor.'
+	);
+}
 const out = join(HERE, 'uws-surface.json');
 writeFileSync(out, JSON.stringify(surface, null, '\t') + '\n');
 console.log(`uws ${surface.uwsVersion} -> ${out}`);
 for (const key of Object.keys(FLOORS)) console.log(`  ${key}: ${surface[key].length}`);
+console.log(`  protectiveNumbers: ${rangeCount}`);

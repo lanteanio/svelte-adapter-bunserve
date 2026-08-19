@@ -470,6 +470,15 @@ export function normalizeWsOptions(input) {
 	const warnings = [];
 	const options = { ...DEFAULTS };
 
+	// INTEGERS, where uws takes any finite number at or above 1. The difference is
+	// Bun's rather than a preference: Bun.serve validates both of these itself and
+	// refuses a fractional one outright ("websocket expects maxPayloadLength to be an"
+	// integer", and the same for backpressureLimit), so widening these to match
+	// uws would trade a build error for a server that does not start - which is the
+	// worse of the two by the whole distance between build time and deploy time.
+	//
+	// Pinned rather than left as prose: api-parity.test.mjs drives both accepted
+	// ranges and fails if this stops being true in either direction.
 	if (raw.maxPayloadLength !== undefined) {
 		options.maxPayloadLength = requirePositiveInt(raw.maxPayloadLength, 'maxPayloadLength');
 	}
@@ -560,6 +569,12 @@ export function normalizeWsOptions(input) {
 	if (raw.idleTimeout !== undefined) {
 		const idle = raw.idleTimeout;
 		// 0 is legal here (disables the timeout) so this is not requirePositiveInt.
+		//
+		// An INTEGER for the same reason the two bounds above are one: Bun refuses a
+		// fractional idleTimeout when the server is constructed, so uws taking 0.5
+		// is a difference this adapter cannot close by accepting it. Both this and
+		// the ceiling below are recorded against uws's accepted range in
+		// api-parity.test.mjs, so neither can quietly stop being true.
 		if (!Number.isInteger(idle) || /** @type {number} */ (idle) < 0) {
 			throw new Error(
 				'adapter option `websocket.idleTimeout` must be a non-negative integer number of seconds, ' +

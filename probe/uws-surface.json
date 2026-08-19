@@ -127,6 +127,56 @@
 			"path"
 		]
 	},
+	"protectiveNumbers": {
+		"upgradeRateLimit": {
+			"allowZero": true,
+			"floor": 0,
+			"ceiling": null,
+			"integerRequired": false
+		},
+		"authPathRateLimit": {
+			"allowZero": true,
+			"floor": 0,
+			"ceiling": null,
+			"integerRequired": false
+		},
+		"upgradeRateLimitWindow": {
+			"allowZero": false,
+			"floor": 1,
+			"ceiling": null,
+			"integerRequired": false
+		},
+		"authPathRateLimitWindow": {
+			"allowZero": false,
+			"floor": 1,
+			"ceiling": null,
+			"integerRequired": false
+		},
+		"maxPayloadLength": {
+			"allowZero": false,
+			"floor": 1,
+			"ceiling": null,
+			"integerRequired": false
+		},
+		"maxBackpressure": {
+			"allowZero": false,
+			"floor": 1,
+			"ceiling": null,
+			"integerRequired": false
+		},
+		"idleTimeout": {
+			"allowZero": true,
+			"floor": 0,
+			"ceiling": null,
+			"integerRequired": false
+		},
+		"upgradeTimeout": {
+			"allowZero": true,
+			"floor": 0,
+			"ceiling": null,
+			"integerRequired": false
+		}
+	},
 	"exports": [
 		".",
 		"./client",

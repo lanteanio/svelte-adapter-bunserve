@@ -79,6 +79,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Option parity is now checked by VALUE, not only by name. `probe/uws-surface.json`
+  records the range svelte-adapter-uws accepts for every option it guards as a
+  protective number - read from its own validator at the pinned commit - and the
+  parity suite drives this adapter's validator over the same values. A config that
+  builds on one adapter and fails the build on the other is the failure the parity
+  work exists to remove, and until now nothing could see one: both adapters named
+  `upgradeRateLimitWindow`, so a floor of 0.001 here against 1 there was a
+  difference no test in either repo could reach.
+
+  Three differences remain, each recorded with the measured reason for it:
+  `maxPayloadLength`, `maxBackpressure` and `idleTimeout` take integers here where
+  uws takes any finite number, because Bun validates all three itself and refuses
+  a fractional value when the server is constructed. Widening them to match would
+  trade a build error for a server that does not start. The record is exact in
+  both directions - an unrecorded difference fails the suite, and so does an entry
+  that no longer describes one.
+
 - `platform.metrics` and `platform.metricsSnapshot()`: a metrics registry on
   every instance and the Prometheus document it renders, with nothing to
   configure. Serve it from an ordinary route - `return new
