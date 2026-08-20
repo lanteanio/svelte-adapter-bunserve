@@ -319,10 +319,19 @@ test('an empty cursorLane survives normalization, because it is what enables the
 
 test('a value uws accepts is accepted here too, rather than failing the build', () => {
 	// THE DROP-IN CONSTRAINT, and the reason this does not simply validate
-	// harder. uws range-checks only the two integer ceilings and clamps the
-	// cursor fraction; every value below runs there. Refusing any of them would
-	// turn a working uws deployment into a build failure on the way across,
-	// which is a worse outcome than the sloppy value being refused.
+	// harder. At the PINNED uws commit, uws range-checks only the two integer
+	// ceilings and clamps the cursor fraction; every value below runs there.
+	// Refusing any of them would turn a working uws deployment into a build
+	// failure on the way across, which is a worse outcome than the sloppy value
+	// being refused.
+	//
+	// PINNED-CONTRACT, NOT PERMANENT. uws has since tightened its gate to refuse
+	// all four bounds unless they are non-negative safe integers, so `1.5` and
+	// `2.5` below are values it no longer accepts. This adapter follows the pin
+	// in probe/uws-surface.json, so they still build here and this test is still
+	// right - but whoever moves that pin has to tighten these two and rewrite
+	// this list, and the range oracle in api-parity.test.mjs will not say so:
+	// it reads the top-level protective numbers, and these are nested.
 	for (const block of [
 		{ maxConcurrent: 1.5 },
 		{ perTickBudget: 2.5 },
