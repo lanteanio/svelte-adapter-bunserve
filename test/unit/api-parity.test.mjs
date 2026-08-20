@@ -48,6 +48,9 @@ const DYNAMIC_PLATFORM_MEMBERS = ['requestId'];
 
 /** uws platform members this adapter does not implement. */
 const PLATFORM_GAPS = {
+	diagnostic: 'request tracing',
+	trace: 'request tracing',
+	traceContext: 'request tracing',
 	authorizeWireSubscribe: 'wire-subscribe authorization',
 	grantPublish: 'client-publish grants',
 	publishGrant: 'client-publish grants',
@@ -77,20 +80,18 @@ const PLATFORM_EXTRAS = {
 /**
  * Top-level adapter options uws declares and this adapter does not accept.
  *
- * Empty against the pinned release: every top-level option uws ships is
- * accepted here. Kept as a list rather than deleted so the next uws release
- * that adds one fails this file instead of passing unnoticed.
+ * Both entries arrived with the tracing surface and the static-cache header
+ * work. Neither is implemented here, so both are acknowledged rather than
+ * counted as parity.
  */
-const ADAPTER_OPTION_GAPS = {};
+const ADAPTER_OPTION_GAPS = {
+	staticCacheControl: 'static cache-control headers',
+	tracing: 'request tracing'
+};
 
 /** Top-level adapter options this adapter accepts that uws does not declare. */
 const ADAPTER_OPTION_EXTRAS = {
-	staticCacheMaxFileSize: 'drift: no equivalent in the pinned uws release',
-	// Not drift: uws added this option in 2a78e11, after the commit this
-	// manifest pins. Both adapters refuse dot-segment static paths by default
-	// and spell the opt-out the same way. The entry goes when the pin moves
-	// past that commit, which the staleness check will demand.
-	staticDotfiles: 'ahead of the pin: uws adopted the same option in 2a78e11'
+	staticCacheMaxFileSize: 'drift: no equivalent in the pinned uws release'
 };
 
 /** `websocket.*` keys uws declares and this adapter does not accept. */
@@ -100,6 +101,8 @@ const WS_OPTION_GAPS = {
 	// INERT_WS_OPTION_KEYS.
 	metrics: 'operator-owned metrics registry',
 	adminPath: 'admin endpoint',
+	maxTopicSeqEntries: 'bounded topic-seq registry',
+	messageAdmission: 'inbound message admission',
 	adminAuthAcknowledged: 'admin endpoint',
 	authorizeWireSubscribe: 'wire-subscribe authorization',
 	consistencyAuditIntervalMs: 'background audits',
@@ -120,6 +123,8 @@ const WS_OPTION_GAPS = {
  */
 const EXPORT_GAPS = {
 	'./client': 'browser client',
+	'./connection': 'connection introspection',
+	'./observability': 'request tracing',
 	'./plugins/channels': 'plugin: channels',
 	'./plugins/channels/client': 'plugin: channels',
 	'./plugins/crdt': 'plugin: crdt',
@@ -312,10 +317,6 @@ function weAcceptValue(key, value) {
  * does an entry that no longer describes one.
  */
 const RANGE_DIVERGENCES = {
-	maxPayloadLength: {
-		refuses: [1.5, 1048576.5],
-		because: 'Bun.serve throws "websocket expects maxPayloadLength to be an integer" (measured on 1.3.14)'
-	},
 	maxBackpressure: {
 		refuses: [1.5, 1048576.5],
 		because: 'Bun.serve throws "websocket expects backpressureLimit to be an integer" (measured on 1.3.14)'
@@ -450,13 +451,10 @@ const NESTED_GAPS = {
 
 /** Sub-keys this adapter accepts that the pinned uws release does not declare. */
 const NESTED_EXTRAS = {
-	upgradeAdmission: {
-		// Not drift: uws grew both after the commit this manifest pins, and this
-		// adapter implements them with uws's own semantics and defaults. The
-		// entries go when the pin moves past them.
-		maxConnections: 'ahead of the pin: uws added it after this commit',
-		maxDeferred: 'ahead of the pin: uws added it after this commit'
-	}
+	// Empty: uws declares every sub-key this adapter accepts. `maxConnections`
+	// and `maxDeferred` were recorded here while they were ahead of the pin, and
+	// the pin has now moved past the release that adopted them.
+	upgradeAdmission: {}
 };
 
 test('nested websocket option blocks match the uws contract, or the difference is recorded', () => {

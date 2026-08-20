@@ -185,21 +185,23 @@ function describeValue(value) {
  * while leaving the deferred ceiling at 0, so the pacing queue is full on
  * arrival and every upgrade is refused. Neither says anything.
  *
- * FINITE NUMBER is the whole rule, deliberately. uws range-checks only the two
- * integer ceilings and clamps the cursor fraction, so a fractional or negative
- * value runs there and refusing it here would turn a working uws deployment into
- * a build failure on the way across. What does NOT run anywhere is a value the
- * comparisons cannot order - a string, a boolean, NaN - which is the failure
- * this refuses and the only one it refuses.
+ * A NON-NEGATIVE SAFE INTEGER, which is what uws requires of all four. It used
+ * to range-check only two of them and take a fractional value for the rest, and
+ * this adapter matched that deliberately - refusing a value uws runs would turn
+ * a working deployment into a build failure on the way across. uws has since
+ * tightened all four, so matching it now means tightening too: a count is a
+ * whole number of things, and `maxConcurrent: 1.5` was never a bound anyone
+ * meant.
  *
  * @param {unknown} value
  * @param {string} key
  * @returns {number}
  */
 function requireAdmissionCount(value, key) {
-	if (typeof value === 'number' && Number.isFinite(value)) return value;
+	if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return value;
 	throw new Error(
-		'adapter option `websocket.upgradeAdmission.' + key + '` must be a finite number - got ' +
+		'adapter option `websocket.upgradeAdmission.' + key + '` must be a non-negative safe ' +
+		'integer - got ' +
 		describeValue(value) + '. This option bounds a resource, and every comparison against a ' +
 		'non-number is false, so an unrecognized value does not fall back to the default: it ' +
 		'turns the bound off, or refuses every upgrade. If the value comes from the ' +
@@ -273,6 +275,17 @@ function requireProtectiveNumber(
 		`(e.g. Number(process.env.WS_${key.toUpperCase()})).`
 	);
 }
+
+/**
+ * The largest `maxPayloadLength`, in BYTES.
+ *
+ * uws's bound, adopted so a config cannot be tuned here and refused there. It
+ * hands the limit to a receiver that stores it in a fixed-width integer and
+ * truncates anything larger, which reports the configured figure back while
+ * enforcing a different one. Bun has no such limit and accepts 3000000000
+ * without complaint, so nothing but this line would catch it.
+ */
+const MAX_PAYLOAD_LENGTH_CEILING = 0x7fffffff;
 
 /**
  * The shortest rate-limit window, in SECONDS.
@@ -549,17 +562,37 @@ export function normalizeWsOptions(input) {
 	const warnings = [];
 	const options = { ...DEFAULTS };
 
-	// INTEGERS, where uws takes any finite number at or above 1. The difference is
-	// Bun's rather than a preference: Bun.serve validates both of these itself and
-	// refuses a fractional one outright ("websocket expects maxPayloadLength to be an"
-	// integer", and the same for backpressureLimit), so widening these to match
-	// uws would trade a build error for a server that does not start - which is the
-	// worse of the two by the whole distance between build time and deploy time.
+	// INTEGERS, and for two different reasons now.
+	//
+	// Bun validates both itself and refuses a fractional one outright ("websocket
+	// expects maxPayloadLength to be an integer", and the same for
+	// backpressureLimit), so accepting one here would trade a build error for a
+	// server that does not start - the worse of the two by the whole distance
+	// between build time and deploy time. That is the ONLY reason for
+	// `maxBackpressure`, which uws still takes as any finite number at or above 1,
+	// so this adapter stays narrower there and the difference stays recorded.
+	//
+	// `maxPayloadLength` also has a CEILING, and that one is uws's: it hands the
+	// bound to a receiver that stores it in a fixed-width integer and truncates
+	// anything larger, so past the ceiling the configured figure is reported back
+	// while a different one is enforced. Bun takes 3000000000 without complaint,
+	// which is exactly why the bound has to be stated here - a config tuned
+	// against Bun alone would fail the build on uws.
 	//
 	// Pinned rather than left as prose: api-parity.test.mjs drives both accepted
-	// ranges and fails if this stops being true in either direction.
+	// ranges and fails if either stops being true in either direction.
 	if (raw.maxPayloadLength !== undefined) {
 		options.maxPayloadLength = requirePositiveInt(raw.maxPayloadLength, 'maxPayloadLength');
+		if (options.maxPayloadLength > MAX_PAYLOAD_LENGTH_CEILING) {
+			throw new Error(
+				'adapter option `websocket.maxPayloadLength` must be no greater than ' +
+				MAX_PAYLOAD_LENGTH_CEILING + ' - got ' + describeValue(raw.maxPayloadLength) + '. ' +
+				'Bun takes a larger bound without complaint and svelte-adapter-uws refuses it, so a ' +
+				'config tuned here would fail the build there. The reason is uws\'s receiver: it stores ' +
+				'this limit in a fixed-width integer, so past this point the figure you configured is ' +
+				'reported back while a truncated one is enforced.'
+			);
+		}
 	}
 	if (raw.maxBackpressure !== undefined) {
 		options.maxBackpressure = requirePositiveInt(raw.maxBackpressure, 'maxBackpressure');

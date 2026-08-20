@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The parity pin moved to svelte-adapter-uws 0.6.0-next.92, 166 commits on from
+  the commit it had been held at, and the vendored `protocol.schema.json` was
+  re-taken from it. What uws added in between is recorded rather than quietly
+  counted as parity: `platform.diagnostic`, `platform.trace` and
+  `platform.traceContext`, the `tracing` and `staticCacheControl` adapter
+  options, `websocket.maxTopicSeqEntries` and `websocket.messageAdmission`, and
+  the `./connection` and `./observability` export subpaths are all gaps this
+  adapter does not implement. Two entries went the other way and were deleted:
+  uws now declares `staticDotfiles` and both `upgradeAdmission.maxConnections`
+  and `.maxDeferred`, which this adapter had been carrying as ahead-of-the-pin
+  extras.
+
+  `websocket.maxPayloadLength` gained a ceiling of 2147483647 as part of the
+  move. Bun accepts a larger bound without complaint and uws refuses it, so a
+  config tuned here alone would have failed the build there - the difference the
+  value-range check added in this release exists to catch, caught by it on the
+  first regeneration.
+
 - **BREAKING** `websocketPath`, `websocketHandler` and
   `compressCredentialedResponses` moved from the top level into the `websocket`
   block, as `websocket.path`, `websocket.handler` and
@@ -571,11 +589,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was full on arrival and every upgrade was refused. Neither said anything. An
   unconverted environment variable is the realistic way to write one.
 
-  A finite number is the whole rule. uws range-checks only the two integer
-  ceilings and clamps the cursor fraction, so fractional and negative values run
-  there and are still accepted here - refusing them would turn a working uws
-  deployment into a build failure on the way across. What is refused is what
-  runs nowhere: a string, a boolean, `NaN`, `Infinity`, a BigInt.
+  A non-negative safe integer, which is what svelte-adapter-uws requires of all
+  four. It used to range-check only the two ceilings and take a fractional value
+  for the rest, and this adapter matched that on purpose - refusing a value uws
+  runs would turn a working deployment into a build failure on the way across.
+  uws has since tightened all four, so this follows: a count is a whole number
+  of things, and `maxConcurrent: 1.5` was never a bound anyone meant.
+
+  The cursor fraction is the one that stays loose, because uws still CLAMPS it
+  rather than refusing: a fraction above 1, at 0, or below it is a number uws
+  runs, so it builds here too.
 
   `upgradeAdmission.cursorLane.fraction` is refused on the same terms. The gate
   tests `typeof fraction === 'number'` and falls back to 0.25 when it is not, so

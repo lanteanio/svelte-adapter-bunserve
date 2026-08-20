@@ -1,8 +1,8 @@
 {
-	"uwsVersion": "0.6.0-next.90",
-	"uwsRef": "7b9ba00",
-	"uwsCommit": "7b9ba000056b7cb198cd83605355302ecec3853c",
-	"protocolSchemaSha256": "41fcfc48a166974d9cc2bb62332aa5e3f8918229d541ce3c6d2f18a93084ab75",
+	"uwsVersion": "0.6.0-next.92",
+	"uwsRef": "HEAD",
+	"uwsCommit": "a2deed49a512f47b986228418020b63b45fda99b",
+	"protocolSchemaSha256": "0b82ec36a19ac524d1930b617a95c5220c77cfbe1f852284b545da1090c4d862",
 	"platform": [
 		"adviseReconnect",
 		"authorizeWireSubscribe",
@@ -11,6 +11,7 @@
 		"checkSubscribe",
 		"closedWsAborts",
 		"connections",
+		"diagnostic",
 		"forEachSubscriber",
 		"grantPublish",
 		"hlc",
@@ -45,6 +46,8 @@
 		"subscribers",
 		"topic",
 		"topicEpoch",
+		"trace",
+		"traceContext",
 		"unsubscribe"
 	],
 	"adapterOptions": [
@@ -53,7 +56,10 @@
 		"out",
 		"precompress",
 		"readinessCheckPath",
+		"staticCacheControl",
+		"staticDotfiles",
 		"staticHeaders",
+		"tracing",
 		"websocket"
 	],
 	"webSocketOptions": [
@@ -75,6 +81,8 @@
 		"idleTimeout",
 		"maxBackpressure",
 		"maxPayloadLength",
+		"maxTopicSeqEntries",
+		"messageAdmission",
 		"metrics",
 		"path",
 		"postureExport",
@@ -95,6 +103,8 @@
 		"upgradeAdmission": [
 			"cursorLane",
 			"maxConcurrent",
+			"maxConnections",
+			"maxDeferred",
 			"perTickBudget",
 			"waitingRoom"
 		],
@@ -103,22 +113,25 @@
 		],
 		"upgradeAdmission.waitingRoom": [
 			"admitCheckPath",
+			"appName",
+			"incidentId",
 			"path",
 			"pollIntervalMs",
+			"renderer",
 			"retryAfterSeconds",
+			"statusUrl",
+			"supportUrl",
 			"template"
 		],
-		"pressure": [
-			"cpuThrottledRatio",
-			"memoryHeapUsedRatio",
-			"psiCpuSome",
-			"psiIoFull",
-			"psiMemoryFull",
-			"publishRatePerSec",
-			"sampleIntervalMs",
-			"subscriberRatio",
-			"topicPublishBytesPerSec",
-			"topicPublishRatePerSec"
+		"messageAdmission": [
+			"globalBytesRate",
+			"globalConcurrent",
+			"globalRate",
+			"maxQueue",
+			"perConnectionBytesRate",
+			"perConnectionConcurrent",
+			"perConnectionRate",
+			"rateWindowMs"
 		],
 		"workers": [
 			"compute"
@@ -155,8 +168,8 @@
 		"maxPayloadLength": {
 			"allowZero": false,
 			"floor": 1,
-			"ceiling": null,
-			"integerRequired": false
+			"ceiling": 2147483647,
+			"integerRequired": true
 		},
 		"maxBackpressure": {
 			"allowZero": false,
@@ -175,11 +188,19 @@
 			"floor": 0,
 			"ceiling": null,
 			"integerRequired": false
+		},
+		"maxTopicSeqEntries": {
+			"allowZero": true,
+			"floor": 0,
+			"ceiling": null,
+			"integerRequired": false
 		}
 	},
 	"exports": [
 		".",
 		"./client",
+		"./connection",
+		"./observability",
 		"./plugins/channels",
 		"./plugins/channels/client",
 		"./plugins/crdt",

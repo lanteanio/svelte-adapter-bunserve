@@ -319,26 +319,29 @@ test('an empty cursorLane survives normalization, because it is what enables the
 
 test('a value uws accepts is accepted here too, rather than failing the build', () => {
 	// THE DROP-IN CONSTRAINT, and the reason this does not simply validate
-	// harder. At the PINNED uws commit, uws range-checks only the two integer
-	// ceilings and clamps the cursor fraction; every value below runs there.
-	// Refusing any of them would turn a working uws deployment into a build
-	// failure on the way across, which is a worse outcome than the sloppy value
-	// being refused.
+	// harder in every direction. A value uws runs has to build here, or carrying
+	// a working config across turns into a build failure on the way.
 	//
-	// PINNED-CONTRACT, NOT PERMANENT. uws has since tightened its gate to refuse
-	// all four bounds unless they are non-negative safe integers, so `1.5` and
-	// `2.5` below are values it no longer accepts. This adapter follows the pin
-	// in probe/uws-surface.json, so they still build here and this test is still
-	// right - but whoever moves that pin has to tighten these two and rewrite
-	// this list, and the range oracle in api-parity.test.mjs will not say so:
-	// it reads the top-level protective numbers, and these are nested.
+	// The counts are no longer among those values. uws range-checked two of the
+	// four and took a fractional value for the rest; it now refuses all four
+	// unless they are non-negative safe integers, and this adapter follows,
+	// because a count is a whole number of things and `maxConcurrent: 1.5` was
+	// never a bound anyone meant. What survives here is the cursor fraction,
+	// which uws still CLAMPS rather than refuses - a fraction above 1, at 0, or
+	// below it is a number uws runs, so refusing it here would be this adapter
+	// inventing a failure.
 	for (const block of [
-		{ maxConcurrent: 1.5 },
-		{ perTickBudget: 2.5 },
 		{ cursorLane: { fraction: 5 } },
 		{ cursorLane: { fraction: 0 } },
 		{ cursorLane: { fraction: -1 } }
 	]) {
+		assert.doesNotThrow(
+			() => normalizeWsOptions({ upgradeAdmission: block }),
+			`uws runs ${JSON.stringify(block)}`
+		);
+	}
+	// And the counts uws does run: whole, non-negative, zero meaning off.
+	for (const block of [{ maxConcurrent: 1000 }, { perTickBudget: 64 }, { maxConcurrent: 0 }]) {
 		assert.doesNotThrow(
 			() => normalizeWsOptions({ upgradeAdmission: block }),
 			`uws runs ${JSON.stringify(block)}`
@@ -358,10 +361,10 @@ test('a bound that is not a number is refused at build time, not carried into th
 	// gate reads `(opts && opts.x) || 0`, so a non-empty string is truthy and
 	// becomes the bound itself.
 	for (const key of ['maxConcurrent', 'maxConnections', 'perTickBudget', 'maxDeferred']) {
-		for (const bad of ['1000', '', true, false, null, NaN, Infinity, {}, [], 10n]) {
+		for (const bad of ['1000', '', true, false, null, NaN, Infinity, {}, [], 10n, 1.5, -1]) {
 			assert.throws(
 				() => normalizeWsOptions({ upgradeAdmission: { [key]: bad } }),
-				/must be a finite number/,
+				/must be a non-negative safe integer/,
 				`refuses ${key}: ${String(bad)}`
 			);
 		}
