@@ -559,6 +559,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The four `websocket.upgradeAdmission` bounds are checked at build time. They
+  were passed through unexamined on the grounds that the gate applies uws's own
+  rules, which is true of `maxConnections` and `maxDeferred` and false of the
+  other two: the gate reads `maxConcurrent` and `perTickBudget` as `(opts.x) || 0`,
+  so a non-empty string is truthy and becomes the bound itself. A string
+  `maxConcurrent` compared as `inFlight >= 'abc'` is false forever, so the
+  concurrency ceiling was off while the config asked for one; a string
+  `perTickBudget` was worse than off, failing the test that would have run
+  callbacks inline while leaving the deferred ceiling at 0, so the pacing queue
+  was full on arrival and every upgrade was refused. Neither said anything. An
+  unconverted environment variable is the realistic way to write one.
+
+  A finite number is the whole rule. uws range-checks only the two integer
+  ceilings and clamps the cursor fraction, so fractional and negative values run
+  there and are still accepted here - refusing them would turn a working uws
+  deployment into a build failure on the way across. What is refused is what
+  runs nowhere: a string, a boolean, `NaN`, `Infinity`, a BigInt.
+
+  `upgradeAdmission.cursorLane.fraction` is refused on the same terms. The gate
+  tests `typeof fraction === 'number'` and falls back to 0.25 when it is not, so
+  a typo did not fail - it reserved a quarter of the main ceiling for a lane
+  nobody had sized. Numbers are still clamped rather than refused, as uws clamps
+  them.
+
+- An option error message no longer fails with a different error than the one it
+  was written to report. The messages rendered the rejected value with
+  `JSON.stringify`, which THROWS on a BigInt, so `upgradeRateLimit: 10n` failed
+  the build with "Do not know how to serialize a BigInt" - naming neither the
+  option nor what it accepts, on a value someone wrote precisely because they
+  meant a large integer. Twenty-eight of the twenty-nine `websocket` options
+  reported this way. Values that JSON has no representation for (a function, a
+  symbol, a circular object, one whose getters throw) render as themselves now;
+  everything else reads exactly as it did.
+
 - **BREAKING (bucket identity)** A rate-limit key no longer carries a port.
   `1.2.3.4:5678` and `[::ffff:1.2.3.4]:5678` keyed as written, so an
   `ADDRESS_HEADER` whose proxy reports the peer SOCKET rather than the peer host

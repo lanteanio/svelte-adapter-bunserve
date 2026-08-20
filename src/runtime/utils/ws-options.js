@@ -142,6 +142,72 @@ export const KNOWN_WS_OPTION_KEYS = new Set(Object.keys(DEFAULTS));
 export const INERT_WS_OPTION_KEYS = new Set(['metrics']);
 
 /**
+ * Render a rejected option value for a message that must not itself fail.
+ *
+ * `JSON.stringify` is the obvious choice and the wrong one: it THROWS on a
+ * BigInt, so `upgradeRateLimit: 10n` failed the build with "Do not know how to
+ * serialize a BigInt" - an error about the message builder, naming neither the
+ * option nor what it accepts, on a value someone wrote precisely because they
+ * meant a large integer. It also returns `undefined` for a function or a bare
+ * `undefined`, which reads as the word "undefined" pasted into the sentence.
+ *
+ * Every other value renders exactly as `JSON.stringify` renders it, so the
+ * messages read as they always did.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+function describeValue(value) {
+	if (typeof value === 'bigint') return `${value}n`;
+	if (typeof value === 'symbol') return String(value);
+	if (typeof value === 'function') return `[Function${value.name ? ' ' + value.name : ''}]`;
+	try {
+		const shown = JSON.stringify(value);
+		// `undefined` for a value JSON has no representation for.
+		return shown === undefined ? String(value) : shown;
+	} catch {
+		// A circular object, or one whose getters throw. The tag form renders
+		// anything, and a message about a bad value must not fail with a
+		// different error than the one it was written to report.
+		return Object.prototype.toString.call(value);
+	}
+}
+
+/**
+ * A NUMBER that bounds the upgrade gate.
+ *
+ * CHECKED HERE, at build time, because two of the four fail SILENTLY at the
+ * other end. `createUpgradeAdmission` reads `maxConcurrent` and `perTickBudget`
+ * as `(opts && opts.x) || 0`, and a non-empty string is truthy, so the string
+ * survives as the bound: `inFlight >= 'abc'` is false forever and the concurrency
+ * ceiling is off while the config says it is on. `perTickBudget` is worse than
+ * off - the string also fails the `<= 0` test that would run callbacks inline,
+ * while leaving the deferred ceiling at 0, so the pacing queue is full on
+ * arrival and every upgrade is refused. Neither says anything.
+ *
+ * FINITE NUMBER is the whole rule, deliberately. uws range-checks only the two
+ * integer ceilings and clamps the cursor fraction, so a fractional or negative
+ * value runs there and refusing it here would turn a working uws deployment into
+ * a build failure on the way across. What does NOT run anywhere is a value the
+ * comparisons cannot order - a string, a boolean, NaN - which is the failure
+ * this refuses and the only one it refuses.
+ *
+ * @param {unknown} value
+ * @param {string} key
+ * @returns {number}
+ */
+function requireAdmissionCount(value, key) {
+	if (typeof value === 'number' && Number.isFinite(value)) return value;
+	throw new Error(
+		'adapter option `websocket.upgradeAdmission.' + key + '` must be a finite number - got ' +
+		describeValue(value) + '. This option bounds a resource, and every comparison against a ' +
+		'non-number is false, so an unrecognized value does not fall back to the default: it ' +
+		'turns the bound off, or refuses every upgrade. If the value comes from the ' +
+		'environment, convert it explicitly (e.g. Number(process.env.WS_MAX_CONCURRENT)).'
+	);
+}
+
+/**
  * @param {unknown} value
  * @param {string} key
  * @returns {number}
@@ -149,7 +215,7 @@ export const INERT_WS_OPTION_KEYS = new Set(['metrics']);
 function requirePositiveInt(value, key) {
 	if (!Number.isInteger(value) || /** @type {number} */ (value) <= 0) {
 		throw new Error(
-			`adapter option \`websocket.${key}\` must be a positive integer, got ${JSON.stringify(value)}.`
+			`adapter option \`websocket.${key}\` must be a positive integer, got ${describeValue(value)}.`
 		);
 	}
 	return /** @type {number} */ (value);
@@ -189,7 +255,7 @@ function requireProtectiveNumber(
 		if (value >= min) return value;
 		if (value > 0) {
 			throw new Error(
-				`adapter option \`websocket.${key}\` must be at least ${min}, got ${JSON.stringify(value)}. ` +
+				`adapter option \`websocket.${key}\` must be at least ${min}, got ${describeValue(value)}. ` +
 				minMeans
 			);
 		}
@@ -201,7 +267,7 @@ function requireProtectiveNumber(
 	const bound = allowZero ? '>= 0' : min > Number.MIN_VALUE ? `>= ${min}` : '> 0';
 	throw new Error(
 		`adapter option \`websocket.${key}\` must be a finite number ${bound}, ` +
-		`got ${JSON.stringify(value)}. This option bounds a resource, and every comparison against a ` +
+		`got ${describeValue(value)}. This option bounds a resource, and every comparison against a ` +
 		'non-number is false - so an unrecognized value would disable the bound entirely rather than ' +
 		'fall back to the default. If the value comes from the environment, convert it explicitly ' +
 		`(e.g. Number(process.env.WS_${key.toUpperCase()})).`
@@ -270,12 +336,13 @@ function requireUpgradeAdmission(value, warnings) {
 	}
 	/** @type {Record<string, unknown>} */
 	const out = {};
-	// Passed through unexamined, deliberately. createUpgradeAdmission applies
-	// uws's own rules - maxConnections and maxDeferred must be non-negative safe
-	// integers, and nothing else is range-checked - so validating harder here
-	// would refuse configs uws runs.
+	// CHECKED, not waved past. The rationale for passing these through was that
+	// createUpgradeAdmission applies the rules, which is true of maxConnections and
+	// maxDeferred - it refuses both as non-negative safe integers - and false of the
+	// other two, which it reads through `|| 0` and never examines again. What each
+	// of those then does to a running server is in requireAdmissionCount.
 	for (const key of ['maxConcurrent', 'maxConnections', 'perTickBudget', 'maxDeferred']) {
-		if (raw[key] !== undefined) out[key] = raw[key];
+		if (raw[key] !== undefined) out[key] = requireAdmissionCount(raw[key], key);
 	}
 	if (raw.cursorLane !== undefined) {
 		if (raw.cursorLane === null || typeof raw.cursorLane !== 'object' || Array.isArray(raw.cursorLane)) {
@@ -294,8 +361,20 @@ function requireUpgradeAdmission(value, warnings) {
 		}
 		// Preserved even when empty: `cursorLane: {}` is what ENABLES the lane at
 		// the default fraction, so dropping an empty object would silently turn
-		// the feature off. The fraction itself is clamped by the controller, as
-		// uws clamps it, rather than refused.
+		// the feature off. A fraction that IS a number is clamped by the controller
+		// rather than refused, as uws clamps it - but it has to be one first. The
+		// controller tests `typeof fraction === 'number'` and falls back to 0.25 when
+		// it is not, so a typo did not fail: it bought a reserved lane sized by a
+		// default nobody chose, and said nothing.
+		if (lane.fraction !== undefined &&
+			(typeof lane.fraction !== 'number' || !Number.isFinite(lane.fraction))) {
+			throw new Error(
+				'adapter option `websocket.upgradeAdmission.cursorLane.fraction` must be a finite ' +
+				`number - got ${describeValue(lane.fraction)}. A non-number is not refused by the ` +
+				'controller, it is silently read as the default, so the lane would be sized by ' +
+				'something nobody asked for.'
+			);
+		}
 		out.cursorLane = lane.fraction === undefined ? {} : { fraction: lane.fraction };
 	}
 	// ACCEPTED AND NAMED, because this adapter has no holding page. uws serves
@@ -322,7 +401,7 @@ function requireUpgradeAdmission(value, warnings) {
 function requireBoolean(value, key) {
 	if (typeof value !== 'boolean') {
 		throw new Error(
-			`adapter option \`websocket.${key}\` must be a boolean, got ${JSON.stringify(value)}.`
+			`adapter option \`websocket.${key}\` must be a boolean, got ${describeValue(value)}.`
 		);
 	}
 	return value;
@@ -373,7 +452,7 @@ function requirePressureThresholds(value, warnings) {
 	if (typeof value !== 'object' || Array.isArray(value)) {
 		throw new Error(
 			'adapter option `websocket.pressure` must be an object of thresholds (or `false`), e.g. ' +
-			'{ publishRatePerSec: 5000, sampleIntervalMs: 1000 }, got ' + JSON.stringify(value) + '.'
+			'{ publishRatePerSec: 5000, sampleIntervalMs: 1000 }, got ' + describeValue(value) + '.'
 		);
 	}
 	const raw = /** @type {Record<string, unknown>} */ (value);
@@ -398,7 +477,7 @@ function requirePressureThresholds(value, warnings) {
 		if (typeof v !== 'number' || !Number.isFinite(v)) {
 			throw new Error(
 				`adapter option \`websocket.pressure.${key}\` must be a number or false ` +
-				`(false disables the signal), got ${JSON.stringify(v)}.`
+				`(false disables the signal), got ${describeValue(v)}.`
 			);
 		}
 		if (v <= 0) {
@@ -407,7 +486,7 @@ function requirePressureThresholds(value, warnings) {
 			// single sample - permanent pressure, which reads as a broken
 			// server rather than as the "off" the author probably meant.
 			warnings.push(
-				`adapter option \`websocket.pressure.${key}\` is ${JSON.stringify(v)}, so that signal ` +
+				`adapter option \`websocket.pressure.${key}\` is ${describeValue(v)}, so that signal ` +
 				'fires on every sample (thresholds are compared with >=). Use `false` to disable it.'
 			);
 		}
@@ -419,7 +498,7 @@ function requirePressureThresholds(value, warnings) {
 		if (typeof v !== 'number' || !Number.isFinite(v)) {
 			throw new Error(
 				'adapter option `websocket.pressure.sampleIntervalMs` must be a number of milliseconds, ' +
-				`got ${JSON.stringify(v)}.`
+				`got ${describeValue(v)}.`
 			);
 		}
 		if (v < PRESSURE_INTERVAL_MIN_MS) {
@@ -558,7 +637,7 @@ export function normalizeWsOptions(input) {
 		if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) {
 			throw new Error(
 				'adapter option `websocket.upgradeTimeout` must be a non-negative, finite number of ' +
-				`seconds, got ${JSON.stringify(seconds)}. Use 0 to disable the timeout deliberately; ` +
+				`seconds, got ${describeValue(seconds)}. Use 0 to disable the timeout deliberately; ` +
 				'anything unrecognized would disable it silently, because a comparison against a ' +
 				'non-number is false. If the value comes from the environment, convert it explicitly ' +
 				'(e.g. Number(process.env.WS_UPGRADE_TIMEOUT)).'
@@ -578,7 +657,7 @@ export function normalizeWsOptions(input) {
 		if (!Number.isInteger(idle) || /** @type {number} */ (idle) < 0) {
 			throw new Error(
 				'adapter option `websocket.idleTimeout` must be a non-negative integer number of seconds, ' +
-				`got ${JSON.stringify(idle)}.`
+				`got ${describeValue(idle)}.`
 			);
 		}
 		if (/** @type {number} */ (idle) > BUN_IDLE_TIMEOUT_MAX) {
@@ -625,7 +704,7 @@ export function normalizeWsOptions(input) {
 		if (typeof raw.handler !== 'string' || raw.handler.length === 0) {
 			throw new Error(
 				'adapter option `websocket.handler` must be a path to the module exporting your ' +
-				`WebSocket hooks (e.g. 'src/ws-handler.js') - got ${JSON.stringify(raw.handler)}.`
+				`WebSocket hooks (e.g. 'src/ws-handler.js') - got ${describeValue(raw.handler)}.`
 			);
 		}
 		options.handler = raw.handler;
@@ -634,7 +713,7 @@ export function normalizeWsOptions(input) {
 		if (typeof raw.path !== 'string' || raw.path[0] !== '/') {
 			throw new Error(
 				"adapter option `websocket.path` must be an absolute path string starting with '/' " +
-				`(e.g. '/ws') - got ${JSON.stringify(raw.path)}.`
+				`(e.g. '/ws') - got ${describeValue(raw.path)}.`
 			);
 		}
 		options.path = raw.path;
@@ -645,7 +724,7 @@ export function normalizeWsOptions(input) {
 		if (typeof raw.metrics !== 'string' || raw.metrics.length === 0) {
 			throw new Error(
 				'adapter option `websocket.metrics` must be a path to a module whose default export is a ' +
-				`metrics registry (e.g. './src/lib/metrics.js') - got ${JSON.stringify(raw.metrics)}.`
+				`metrics registry (e.g. './src/lib/metrics.js') - got ${describeValue(raw.metrics)}.`
 			);
 		}
 		// NOT STORED. The type check above is worth doing wherever the value was
@@ -676,7 +755,7 @@ export function normalizeWsOptions(input) {
 		if (typeof raw.authPath !== 'string' || raw.authPath[0] !== '/') {
 			throw new Error(
 				"adapter option `websocket.authPath` must be an absolute path string starting with '/' " +
-				`(e.g. '/__ws/auth') - got ${JSON.stringify(raw.authPath)}.`
+				`(e.g. '/__ws/auth') - got ${describeValue(raw.authPath)}.`
 			);
 		}
 		options.authPath = raw.authPath;
@@ -749,7 +828,7 @@ export function normalizeWsOptions(input) {
 		} else {
 			throw new Error(
 				'adapter option `websocket.compression` must be a boolean, a { compress, decompress } object, ' +
-				`or a numeric uWS compressor constant, got ${JSON.stringify(c)}.`
+				`or a numeric uWS compressor constant, got ${describeValue(c)}.`
 			);
 		}
 	}
@@ -765,7 +844,7 @@ export function normalizeWsOptions(input) {
 		if (!ok) {
 			throw new Error(
 				"adapter option `websocket.allowedOrigins` must be 'same-origin', 'any' (or its family " +
-				`spelling '*'), or an array of origin strings, got ${JSON.stringify(a)}.`
+				`spelling '*'), or an array of origin strings, got ${describeValue(a)}.`
 			);
 		}
 		// `['*']` is a silent deny-all: inside the array the token is compared

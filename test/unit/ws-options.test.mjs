@@ -425,3 +425,45 @@ test('pressure never reaches Bun.serve (it is an adapter-level sampler knob)', (
 	const { options } = normalizeWsOptions({ pressure: { publishRatePerSec: 100 } });
 	assert.equal('pressure' in toBunWebsocketOptions(options), false);
 });
+test('the message about a bad value does not fail with a different error', () => {
+	// A BigInt is the realistic way in: it is what someone writes when they mean
+	// a large integer, and `JSON.stringify` THROWS on one. The build then failed
+	// with "Do not know how to serialize a BigInt" - an error about the message
+	// builder, naming neither the option nor what it accepts - for every option
+	// validated this way, which is nearly all of them.
+	for (const key of ['upgradeRateLimit', 'upgradeRateLimitWindow', 'maxPayloadLength', 'idleTimeout']) {
+		assert.throws(
+			() => normalizeWsOptions({ [key]: 10n }),
+			(err) => {
+				assert.ok(!/serialize a BigInt/.test(err.message), `${key} does not fail in the serializer`);
+				assert.ok(err.message.includes(`\`websocket.${key}\``), `${key} names itself`);
+				assert.ok(err.message.includes('10n'), `${key} shows the value as it was written`);
+				return true;
+			}
+		);
+	}
+});
+
+test('and renders the shapes JSON has no answer for', () => {
+	// Each of these either throws inside `JSON.stringify` or renders as the bare
+	// word "undefined" pasted into the sentence. None of them should be able to
+	// take the build down with an error about the reporter.
+	const circular = /** @type {Record<string, unknown>} */ ({});
+	circular.self = circular;
+	const hostile = { get boom() { throw new Error('getter'); } };
+	for (const bad of [circular, hostile, Symbol('s'), () => {}, undefined]) {
+		// `undefined` is skipped by the validators as "not provided", so it is
+		// paired with a key that is present to force the message path.
+		const value = bad === undefined ? Number.NaN : bad;
+		assert.throws(
+			() => normalizeWsOptions({ upgradeRateLimit: value }),
+			(err) => {
+				assert.ok(
+					err.message.includes('`websocket.upgradeRateLimit`'),
+					`names the option for ${String(value)}`
+				);
+				return true;
+			}
+		);
+	}
+});

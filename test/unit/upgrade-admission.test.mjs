@@ -342,6 +342,66 @@ test('a value uws accepts is accepted here too, rather than failing the build', 
 	);
 });
 
+test('a bound that is not a number is refused at build time, not carried into the gate', () => {
+	// THE HOLE THE PIN ABOVE LEFT. That test says a value uws RUNS must build
+	// here, and it is right; this one covers the values nothing runs. An
+	// unconverted environment variable is the realistic way to get one, and the
+	// gate reads `(opts && opts.x) || 0`, so a non-empty string is truthy and
+	// becomes the bound itself.
+	for (const key of ['maxConcurrent', 'maxConnections', 'perTickBudget', 'maxDeferred']) {
+		for (const bad of ['1000', '', true, false, null, NaN, Infinity, {}, [], 10n]) {
+			assert.throws(
+				() => normalizeWsOptions({ upgradeAdmission: { [key]: bad } }),
+				/must be a finite number/,
+				`refuses ${key}: ${String(bad)}`
+			);
+		}
+	}
+});
+
+test('what those values did to a running gate, which is why the build refuses them', () => {
+	// Kept as a live demonstration rather than a sentence in a comment, because
+	// the guard above looks like fussiness until you see the cost. Both are
+	// driven through the controller directly, since the build no longer lets
+	// either shape reach it.
+	//
+	// A string ceiling admits everyone: `inFlight >= 'x'` is false forever.
+	const noCeiling = createUpgradeAdmission({ maxConcurrent: 'definitely-not-valid' });
+	let admitted = 0;
+	for (let i = 0; i < 500; i++) if (noCeiling.tryAcquire()) admitted++;
+	assert.equal(admitted, 500, 'the concurrency ceiling was off while the config asked for one');
+
+	// A string pacing budget is worse than off: it fails the `<= 0` test that
+	// would run callbacks inline, and leaves the deferred ceiling at 0, so the
+	// queue is full on arrival and every upgrade is refused.
+	const noUpgrades = createUpgradeAdmission({ perTickBudget: 'definitely-not-valid' });
+	let ran = 0;
+	for (let i = 0; i < 10; i++) noUpgrades.admit(() => { ran++; });
+	assert.equal(ran, 0, 'nothing ran');
+	assert.equal(noUpgrades.deferredDepth, 0, 'and nothing was queued to run later');
+	assert.equal(noUpgrades.deferredRejectedTotal, 10, 'every upgrade was refused instead');
+});
+
+test('a cursor fraction that is not a number is refused rather than silently defaulted', () => {
+	// The controller tests `typeof fraction === 'number'` and falls back to 0.25
+	// when it is not, so this shape did not fail - it reserved a quarter of the
+	// main ceiling for a lane the operator never sized, and said nothing. The
+	// numbers uws clamps are still accepted; the pin above covers those.
+	for (const bad of ['0.25', true, null, NaN, {}, 5n]) {
+		assert.throws(
+			() => normalizeWsOptions({ upgradeAdmission: { cursorLane: { fraction: bad } } }),
+			/cursorLane\.fraction` must be a finite number/,
+			`refuses fraction ${String(bad)}`
+		);
+	}
+	// And the silent default it used to take, shown for what it was.
+	assert.equal(
+		createUpgradeAdmission({ maxConcurrent: 100, cursorLane: { fraction: 'x' } }).cursorMaxConcurrent,
+		25,
+		'a quarter of the ceiling, from a value nobody chose'
+	);
+});
+
 test('the two ceilings uws range-checks are still range-checked, at the controller', () => {
 	assert.throws(
 		() => createUpgradeAdmission({ maxConnections: 1.5 }),
