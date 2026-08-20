@@ -156,6 +156,20 @@ test('a value that only looks like IPv4 with a port keeps every byte', () => {
 	assert.equal(key('203.0.113.7:80x'), '203.0.113.7:80x');
 });
 
+test('and the port range is bounded where it actually ends', () => {
+	// THE OFF-BY-ONE, which the cases above step over: they use values far enough
+	// outside the range that a bound placed one short of it, or one past, would
+	// still pass every one of them. 65535 is the largest port there is, so it is
+	// a socket and folds; 65536 is not, so the value is something else and keeps
+	// every byte. Both directions cost a real client its bucket if they move -
+	// folding too eagerly hands an opaque value the key a real client meters
+	// under, and folding too timidly gives one client a fresh bucket per request.
+	assert.equal(key('203.0.113.7:65535'), '203.0.113.7', 'the largest real port is a port');
+	assert.equal(key('203.0.113.7:65536'), '203.0.113.7:65536', 'one past it is not');
+	// The bottom of the range, for the same reason: port 0 is a port.
+	assert.equal(key('203.0.113.7:0'), '203.0.113.7');
+});
+
 test('a bracketed value that is not an address keeps every byte', () => {
 	// Brackets mean an IP literal, so a bracketed ADDRESS may lose them and its
 	// port. Anything else is a client-supplied string, and unwrapping it would
