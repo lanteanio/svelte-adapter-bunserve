@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { callArgs, protectiveNumberRanges } from '../../probe/uws-surface.mjs';
+import { admissionBoundRanges, callArgs, protectiveNumberRanges } from '../../probe/uws-surface.mjs';
 
 // THE GENERATOR, DRIVEN.
 //
@@ -128,4 +128,31 @@ test('callArgs stops at the matching bracket, not the first one', () => {
 
 test('callArgs refuses an unbalanced argument list rather than returning a prefix', () => {
 	assert.throws(() => callArgs('f(a, b', 1), /unbalanced argument list/);
+});
+
+test('the admission bounds are read from the words the gate throws', () => {
+	// uws states this rule in its own assertion text, so the manifest takes it
+	// from there rather than restating it. A rule restated here could disagree
+	// with the throw and nothing would notice.
+	const gate = `
+		if (configuredMaxConcurrent !== undefined && (!Number.isSafeInteger(x) || x < 0)) {
+			throw new TypeError('upgradeAdmission.maxConcurrent must be a non-negative safe integer.');
+		}
+		if (configuredPerTickBudget !== undefined) {
+			throw new TypeError('upgradeAdmission.perTickBudget must be a non-negative safe integer.');
+		}
+	`;
+	assert.deepEqual(admissionBoundRanges(gate), {
+		maxConcurrent: { allowZero: true, floor: 0, ceiling: null, integerRequired: true },
+		perTickBudget: { allowZero: true, floor: 0, ceiling: null, integerRequired: true }
+	});
+});
+
+test('a gate that no longer asserts them fails rather than recording no rule', () => {
+	// An empty contract would make the nested range test vacuous, which reads
+	// exactly like a range test that passed.
+	assert.throws(
+		() => admissionBoundRanges('const maxConcurrent = (opts && opts.maxConcurrent) || 0;'),
+		/parsed no upgradeAdmission bound guards/
+	);
 });

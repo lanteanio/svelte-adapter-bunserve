@@ -313,6 +313,41 @@ export function protectiveNumberRanges(indexSource, guardsSource) {
 }
 
 /**
+ * The accepted range of each `upgradeAdmission` sub-key, read from the gate uws
+ * builds rather than from the config guard.
+ *
+ * A SECOND SOURCE, because uws validates these in a different place from the
+ * options above: the top-level protective numbers are asserted while the config
+ * is read, and these four are asserted inside `createUpgradeAdmission`. That
+ * split is not cosmetic - it is why the range dimension could not see them, and
+ * why this adapter carried a looser rule for them than uws did without any test
+ * noticing. The rule is taken from uws's own assertion text, so it cannot say
+ * something the throw does not.
+ *
+ * @param {string} controllerSource uws's `src/runtime/utils/upgrade-admission.js` at the pin
+ * @returns {Record<string, { allowZero: boolean, floor: number, ceiling: number | null, integerRequired: boolean }>}
+ */
+export function admissionBoundRanges(controllerSource) {
+	/** @type {Record<string, { allowZero: boolean, floor: number, ceiling: number | null, integerRequired: boolean }>} */
+	const out = {};
+	// `upgradeAdmission.<key> must be a non-negative safe integer.` - the whole
+	// rule, in the words the build uses to state it.
+	const guard = /upgradeAdmission\.([A-Za-z_$][\w$]*) must be a non-negative safe integer/g;
+	let m;
+	while ((m = guard.exec(controllerSource)) !== null) {
+		out[m[1]] = { allowZero: true, floor: 0, ceiling: null, integerRequired: true };
+	}
+	if (Object.keys(out).length === 0) {
+		throw new Error(
+			'parsed no upgradeAdmission bound guards from uws. Either the gate stopped asserting ' +
+			'them or it words the assertion differently now - fix the extractor rather than ' +
+			'recording an empty contract, which would make the nested range test vacuous.'
+		);
+	}
+	return out;
+}
+
+/**
  * Read uws at the pinned commit and write the manifest.
  *
  * SPLIT FROM MODULE SCOPE so this file can be imported without running the
@@ -330,6 +365,7 @@ function main() {
 	const schema = showAtRef(uwsRoot, commit, 'protocol.schema.json');
 	const indexSource = showAtRef(uwsRoot, commit, 'src/index.js');
 	const guardsSource = showAtRef(uwsRoot, commit, 'src/config-guards.js');
+	const admissionSource = showAtRef(uwsRoot, commit, 'src/runtime/utils/upgrade-admission.js');
 
 	const surface = {
 		// Provenance, so a stale or mis-sourced manifest is visible in review. The
@@ -362,6 +398,10 @@ function main() {
 		// on one adapter and fails the build on the other, which is the failure the
 		// whole parity effort exists to remove.
 		protectiveNumbers: protectiveNumberRanges(indexSource, guardsSource),
+		// The same dimension for the sub-keys, which uws asserts somewhere else
+		// entirely - inside the gate it builds, not while it reads the config. That
+		// split is why a looser rule for these went unnoticed here.
+		nestedProtectiveNumbers: { upgradeAdmission: admissionBoundRanges(admissionSource) },
 		exports: Object.keys(pkg.exports ?? {}).sort()
 	};
 
@@ -385,6 +425,14 @@ function main() {
 	// ranges makes the range test vacuous, which is the one outcome worse than not
 	// having written it.
 	const RANGE_FLOOR = 6;
+	const NESTED_RANGE_FLOOR = 4;
+	const nestedCount = Object.keys(surface.nestedProtectiveNumbers.upgradeAdmission).length;
+	if (nestedCount < NESTED_RANGE_FLOOR) {
+		throw new Error(
+			`extracted only ${nestedCount} upgradeAdmission bound guards from uws (expected at ` +
+			`least ${NESTED_RANGE_FLOOR}). Fix the extractor rather than lowering the floor.`
+		);
+	}
 	const rangeCount = Object.keys(surface.protectiveNumbers).length;
 	if (rangeCount < RANGE_FLOOR) {
 		throw new Error(
@@ -398,6 +446,7 @@ function main() {
 	console.log(`uws ${surface.uwsVersion} -> ${out}`);
 	for (const key of Object.keys(FLOORS)) console.log(`  ${key}: ${surface[key].length}`);
 	console.log(`  protectiveNumbers: ${rangeCount}`);
+	console.log(`  nestedProtectiveNumbers: ${nestedCount}`);
 }
 
 // Only when RUN, never when imported. `process.argv[1]` is the entry script, so

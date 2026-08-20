@@ -196,6 +196,34 @@
 			"integerRequired": false
 		}
 	},
+	"nestedProtectiveNumbers": {
+		"upgradeAdmission": {
+			"maxConcurrent": {
+				"allowZero": true,
+				"floor": 0,
+				"ceiling": null,
+				"integerRequired": true
+			},
+			"maxConnections": {
+				"allowZero": true,
+				"floor": 0,
+				"ceiling": null,
+				"integerRequired": true
+			},
+			"perTickBudget": {
+				"allowZero": true,
+				"floor": 0,
+				"ceiling": null,
+				"integerRequired": true
+			},
+			"maxDeferred": {
+				"allowZero": true,
+				"floor": 0,
+				"ceiling": null,
+				"integerRequired": true
+			}
+		}
+	},
 	"exports": [
 		".",
 		"./client",

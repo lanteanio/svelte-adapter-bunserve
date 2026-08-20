@@ -283,7 +283,11 @@ function uwsAcceptsValue(contract, value) {
 	if (!Number.isFinite(value)) return false;
 	if (value === 0) return contract.allowZero;
 	if (value < contract.floor) return false;
-	if (contract.ceiling !== null && (!Number.isSafeInteger(value) || value > contract.ceiling)) return false;
+	// Checked apart, because they no longer arrive together: uws couples a ceiling
+	// with a safe-integer requirement in its config guard, and the gate asserts the
+	// integer rule for the admission bounds with no ceiling at all.
+	if (contract.integerRequired && !Number.isSafeInteger(value)) return false;
+	if (contract.ceiling !== null && value > contract.ceiling) return false;
 	return true;
 }
 
@@ -376,6 +380,40 @@ test('and this adapter never accepts a bound uws would refuse', () => {
 			[],
 			`\`websocket.${key}\` accepts ${JSON.stringify(looser)}, which uws refuses. A config ` +
 				'tuned here would fail the build on uws, so this adapter has to refuse them too.'
+		);
+	}
+});
+
+test('the nested upgradeAdmission bounds accept what uws accepts, in both directions', () => {
+	// THE DIMENSION THE TEST ABOVE CANNOT REACH. uws asserts the top-level
+	// protective numbers while it reads the config and these four inside the gate
+	// it builds, so they live in a different file and never appeared in the range
+	// manifest. That gap was not hypothetical: this adapter required only a finite
+	// number for them while uws required a non-negative safe integer, so
+	// `maxConcurrent: 1.5` built here and failed there, and nothing said so.
+	//
+	// No allowlist in either direction. There is no runtime reason for these to
+	// differ - unlike the three above, which Bun forces - so a difference here is
+	// a defect rather than a fact to record.
+	const contracts = surface.nestedProtectiveNumbers.upgradeAdmission;
+	for (const [key, contract] of Object.entries(contracts)) {
+		const narrower = RANGE_PROBE_VALUES.filter(
+			(v) => uwsAcceptsValue(contract, v) && !weAcceptValue('upgradeAdmission', { [key]: v })
+		);
+		const looser = RANGE_PROBE_VALUES.filter(
+			(v) => weAcceptValue('upgradeAdmission', { [key]: v }) && !uwsAcceptsValue(contract, v)
+		);
+		assert.deepEqual(
+			narrower,
+			[],
+			`\`websocket.upgradeAdmission.${key}\` refuses ${JSON.stringify(narrower)}, which uws ` +
+				'accepts, so a config that runs there fails the build here.'
+		);
+		assert.deepEqual(
+			looser,
+			[],
+			`\`websocket.upgradeAdmission.${key}\` accepts ${JSON.stringify(looser)}, which uws ` +
+				'refuses, so a config tuned here fails the build there.'
 		);
 	}
 });
