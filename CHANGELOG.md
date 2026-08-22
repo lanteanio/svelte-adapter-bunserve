@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A `websocket.*` option written at the TOP level is now answered with its
+  real home: a top-level `maxPayloadLength` is met with a suggestion of
+  `websocket.maxPayloadLength`, rather than with an unrelated top-level option
+  or with nothing at all. A correctly spelled key sitting one level too high is
+  the single mistake the spelling suggestion could not reach, because no
+  top-level name resembles it - so the option was dropped with the protection
+  it configures never applied, and no usable hint. That is the shape the move
+  of `path`, `handler` and `compressCredentialedResponses` into the
+  `websocket` block makes easiest to hit.
+
 - The parity pin moved to svelte-adapter-uws 0.6.0-next.92, 166 commits on from
   the commit it had been held at, and the vendored `protocol.schema.json` was
   re-taken from it. What uws added in between is recorded rather than quietly

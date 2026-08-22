@@ -7,7 +7,7 @@ import {
 	suggestOption,
 	unknownOptionWarnings
 } from '../../src/adapter-options.js';
-import { normalizeWsOptions } from '../../src/runtime/utils/ws-options.js';
+import { KNOWN_WS_OPTION_KEYS, normalizeWsOptions } from '../../src/runtime/utils/ws-options.js';
 
 // The two-tier option policy. The whole point is the config-file user who gets
 // no type checking: a key they misspelled is destructured away and the default
@@ -46,6 +46,34 @@ test('a key resembling nothing gets no misleading suggestion', () => {
 	assert.match(warning, /unknown option/);
 	assert.doesNotMatch(warning, /Did you mean/);
 	assert.equal(suggestOption('zzzzzzzzzzzz'), undefined);
+});
+
+test('a websocket option written at the top level is pointed at its real home', () => {
+	// The likeliest way to lose a real option, and the one a spell-check cannot
+	// reach: the key is spelled correctly and simply sits a level too high. No
+	// top-level name resembles it, so before this it drew either silence or a
+	// suggestion to rename it to something unrelated - while the protection it
+	// configures never applied.
+	const [warning] = unknownOptionWarnings({ maxPayloadLength: 1024 });
+	assert.match(warning, /unknown option `maxPayloadLength`/);
+	assert.match(warning, /Did you mean `websocket\.maxPayloadLength`\?/);
+});
+
+test('every websocket option can name its own home', () => {
+	// Guards the two key sets against drifting apart: a websocket option added
+	// later has to be answerable here too, or it becomes the one shape this file
+	// cannot explain.
+	for (const key of KNOWN_WS_OPTION_KEYS) {
+		assert.equal(suggestOption(key), `websocket.${key}`, `${key} names its home`);
+	}
+});
+
+test('a top-level near-miss is still answered at the top level', () => {
+	// The nested home is the LAST answer, not the first. A key that is merely
+	// misspelled is still a top-level key, and pointing it into `websocket` would
+	// be a worse suggestion than the one it already had.
+	assert.equal(suggestOption('staticHeader'), 'staticHeaders');
+	assert.equal(suggestOption('healthcheckpath'), 'healthCheckPath');
 });
 
 test('every known option is listed, and suggests itself', () => {

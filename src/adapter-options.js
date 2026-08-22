@@ -17,6 +17,8 @@
 // question, and deferring it to boot - or to the first request that needed
 // it - moves the failure far away from its cause.
 
+import { KNOWN_WS_OPTION_KEYS } from './runtime/utils/ws-options.js';
+
 /** Every option the adapter reads. Anything not in here draws a warning. */
 export const KNOWN_ADAPTER_OPTIONS = [
 	'out',
@@ -63,8 +65,12 @@ function editDistance(a, b) {
  * not match half the list, and a case-only difference always wins - that is the
  * single most common way this option surface is mistyped.
  *
+ * A correctly spelled `websocket.*` key written at the TOP level is answered
+ * with its real home rather than with a top-level near-miss, because that key
+ * is not misspelled at all and no amount of edit distance will find it.
+ *
  * @param {string} name
- * @returns {string | undefined}
+ * @returns {string | undefined} a known option, or a `websocket.`-prefixed path
  */
 export function suggestOption(name) {
 	const lower = name.toLowerCase();
@@ -80,7 +86,12 @@ export function suggestOption(name) {
 			best = known;
 		}
 	}
-	return bestDistance <= limit ? best : undefined;
+	if (bestDistance <= limit) return best;
+	// The option is spelled correctly and sits one level too high, so the search
+	// above cannot reach it: nothing at the top level resembles `maxPayloadLength`,
+	// and the key is dropped with the protection it configures never applied.
+	// Naming its real home is the only answer that gets the config working.
+	return KNOWN_WS_OPTION_KEYS.has(name) ? `websocket.${name}` : undefined;
 }
 
 /**
