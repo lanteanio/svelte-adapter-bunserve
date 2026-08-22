@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { admissionBoundRanges, callArgs, protectiveNumberRanges } from '../../probe/uws-surface.mjs';
+import { admissionBoundRanges, blankNonCode, callArgs, protectiveNumberRanges } from '../../probe/uws-surface.mjs';
 
 // THE GENERATOR, DRIVEN.
 //
@@ -130,22 +130,182 @@ test('callArgs refuses an unbalanced argument list rather than returning a prefi
 	assert.throws(() => callArgs('f(a, b', 1), /unbalanced argument list/);
 });
 
-test('the admission bounds are read from the words the gate throws', () => {
-	// uws states this rule in its own assertion text, so the manifest takes it
-	// from there rather than restating it. A rule restated here could disagree
-	// with the throw and nothing would notice.
-	const gate = `
-		if (configuredMaxConcurrent !== undefined && (!Number.isSafeInteger(x) || x < 0)) {
-			throw new TypeError('upgradeAdmission.maxConcurrent must be a non-negative safe integer.');
-		}
-		if (configuredPerTickBudget !== undefined) {
-			throw new TypeError('upgradeAdmission.perTickBudget must be a non-negative safe integer.');
-		}
-	`;
-	assert.deepEqual(admissionBoundRanges(gate), {
-		maxConcurrent: { allowZero: true, floor: 0, ceiling: null, integerRequired: true },
-		perTickBudget: { allowZero: true, floor: 0, ceiling: null, integerRequired: true }
+// PROSE IS NOT CODE, and the manifest is where that distinction is load-bearing.
+//
+// uws writes operator-facing sentences into the option values it validates and
+// documents its guards at length in the comments above them. Both places are
+// full of text that looks exactly like the thing being extracted - the phrase
+// `allowZero: false`, a ceiling, the sentence a guard throws. A rule read out of
+// one of them is not merely wrong: it is a contract the parity tests then agree
+// with, so every one of them passes and nothing anywhere reports a problem.
+//
+// Each case below is a source that says something the code does not do.
+
+test('prose inside an option value cannot flip allowZero', () => {
+	// The call passes no allowZero at all, so the uws default governs it. Only
+	// the sentence says otherwise, and a sentence guards nothing.
+	const index =
+		"assertProtectiveNumber(websocket, 'window', 'websocket.window', {\n" +
+		"\tzeroMeans: 'pass allowZero: false to refuse zero outright, which this call does not do'\n" +
+		'});';
+	const range = protectiveNumberRanges(index, PINNED_GUARD).window;
+	assert.equal(range.allowZero, true, 'the default applies; the prose is not the call');
+	assert.equal(range.floor, 0, 'and the floor follows the default, not the sentence');
+});
+
+test('prose inside an option value cannot fabricate a ceiling', () => {
+	// Read against the guard that HAS a ceiling mechanism, so a fabricated bound
+	// would also drag the safe-integer requirement in behind it - one sentence
+	// silently tightening the manifest twice.
+	const index =
+		"assertProtectiveNumber(websocket, 'maxBackpressure', 'websocket.maxBackpressure', {\n" +
+		"\tallowZero: false,\n" +
+		"\tzeroMeans: 'unlike maxPayloadLength, which carries ceiling: 2147483647, this one has none'\n" +
+		'});';
+	const range = protectiveNumberRanges(index, CEILING_GUARD).maxBackpressure;
+	assert.equal(range.ceiling, null, 'no ceiling is passed, so none is recorded');
+	assert.equal(range.integerRequired, false, 'and nothing arrives behind a bound that is not there');
+});
+
+test('a comment among the arguments cannot add a bound the call does not pass', () => {
+	const index =
+		"assertProtectiveNumber(websocket, 'window', 'websocket.window', {\n" +
+		'\t// this used to be ceiling: 2147483647 with allowZero: false\n' +
+		"\tzeroMeans: 'disabled'\n" +
+		'});';
+	const range = protectiveNumberRanges(index, CEILING_GUARD).window;
+	assert.equal(range.allowZero, true, 'a note about the past is not the present rule');
+	assert.equal(range.ceiling, null);
+});
+
+test('a call site written in a comment is not a call site', () => {
+	const index = [
+		"// assertProtectiveNumber(websocket, 'ghost', 'websocket.ghost', { allowZero: false });",
+		"assertProtectiveNumber(websocket, 'real');"
+	].join('\n');
+	assert.deepEqual(Object.keys(protectiveNumberRanges(index, PINNED_GUARD)), ['real']);
+});
+
+test('a pattern is not read as a string, so the code after it survives', () => {
+	// uws matches header names with patterns like /['"`]\s*set-cookie\s*['"`]/i.
+	// Read that backtick as the start of a template literal and every line below
+	// it is blanked - which costs the manifest call sites that nothing then
+	// reports as missing, because what is gone was never counted.
+	const index =
+		'const rx = /[`\'"]\\s*set-cookie/i;\n' +
+		"assertProtectiveNumber(websocket, 'window', 'websocket.window', { allowZero: false });";
+	const ranges = protectiveNumberRanges(index, PINNED_GUARD);
+	assert.deepEqual(Object.keys(ranges), ['window'], 'the call site below the pattern is still found');
+	assert.equal(ranges.window.floor, 1);
+});
+
+test('a division is not read as the start of a pattern', () => {
+	const src = 'const ratio = a / b + c / d;';
+	assert.equal(blankNonCode(src), src, 'nothing here is prose, so nothing is blanked');
+});
+
+test('blanking preserves every offset and newline', () => {
+	// The whole technique depends on it: a match found in the blanked copy is
+	// sliced out of the original, so the two must line up character for character.
+	const src = "const a = 'one';\n// two\nconst b = `three`;\n/* four\nfive */\nconst c = 6;\n";
+	const blanked = blankNonCode(src);
+	assert.equal(blanked.length, src.length);
+	assert.deepEqual(
+		blanked.split('\n').map((l) => l.length),
+		src.split('\n').map((l) => l.length)
+	);
+	assert.match(blanked, /const c = 6;/);
+	assert.doesNotMatch(blanked, /two|three|four|five/);
+});
+
+test('an escape at the very end of a source does not shift every offset', () => {
+	// A truncated file ends mid-literal on a backslash. Blanking the character
+	// it escapes then writes one past the end, which lengthens the copy - and a
+	// copy one character longer than the original silently misaligns every slice
+	// taken from it afterwards.
+	const src = "const s = 'x\\";
+	assert.equal(blankNonCode(src).length, src.length);
+});
+
+/** The gate as uws writes it at the pin: a binding, then the guard that governs it. */
+const PINNED_GATE = `
+	const configuredMaxConcurrent = opts && opts.maxConcurrent;
+	if (
+		configuredMaxConcurrent !== undefined &&
+		(!Number.isSafeInteger(configuredMaxConcurrent) || configuredMaxConcurrent < 0)
+	) {
+		throw new TypeError('upgradeAdmission.maxConcurrent must be a non-negative safe integer.');
+	}
+	const maxConcurrent = configuredMaxConcurrent || 0;
+`;
+
+test('an admission bound is read from the comparison that enforces it', () => {
+	assert.deepEqual(admissionBoundRanges(PINNED_GATE), {
+		maxConcurrent: { allowZero: true, floor: 0, ceiling: null, integerRequired: true }
 	});
+});
+
+test('the diagnostic sentence alone does not mint a bound', () => {
+	// THE SHAPE THAT GOT PAST EVERYTHING. The guard is gone and only the sentence
+	// describing it remains, which is the state a source reaches when a rule is
+	// relaxed and its comment is not. Recording a rule from the leftover text
+	// holds this adapter to something uws stopped enforcing, and every range
+	// assertion keeps passing while it does.
+	const relaxed = PINNED_GATE.replace(
+		/\tif \([\s\S]*?\n\t}\n/,
+		"\t// was: upgradeAdmission.maxConcurrent must be a non-negative safe integer.\n"
+	);
+	assert.match(relaxed, /was: upgradeAdmission/, 'the sentence really is still there');
+	assert.throws(
+		() => admissionBoundRanges(relaxed),
+		/parsed no upgradeAdmission bound guards/,
+		'an unenforced rule is not recorded as an enforced one'
+	);
+});
+
+test('an option the gate stops guarding drops out rather than lingering', () => {
+	const twoKeys =
+		PINNED_GATE +
+		'\tconst configuredMaxDeferred = opts && opts.maxDeferred;\n' +
+		"\t// upgradeAdmission.maxDeferred must be a non-negative safe integer.\n";
+	assert.deepEqual(
+		Object.keys(admissionBoundRanges(twoKeys)),
+		['maxConcurrent'],
+		'nothing enforces maxDeferred, so the manifest claims nothing about it'
+	);
+});
+
+test('a tightened comparison is recorded as tightened', () => {
+	// `<= 0` refuses zero where `< 0` admits it. Reading the bound from the
+	// comparison is what makes the difference visible at all.
+	const tightened = PINNED_GATE
+		.replace('configuredMaxConcurrent < 0', 'configuredMaxConcurrent <= 0')
+		.replace('must be a non-negative safe integer', 'must be a positive safe integer');
+	assert.deepEqual(admissionBoundRanges(tightened), {
+		maxConcurrent: { allowZero: false, floor: 1, ceiling: null, integerRequired: true }
+	});
+});
+
+test('a guard and a diagnostic that disagree fail rather than picking one', () => {
+	// Which half is wrong cannot be decided from here, and guessing either way
+	// writes a contract nobody checked.
+	const drifted = PINNED_GATE.replace('configuredMaxConcurrent < 0', 'configuredMaxConcurrent <= 0');
+	assert.throws(() => admissionBoundRanges(drifted), /guard and its diagnostic disagree/);
+});
+
+test('a diagnostic naming another option fails rather than being recorded under it', () => {
+	const misnamed = PINNED_GATE.replace('upgradeAdmission.maxConcurrent must', 'upgradeAdmission.maxDeferred must');
+	assert.throws(() => admissionBoundRanges(misnamed), /guard and its diagnostic disagree/);
+});
+
+test('a guard shaped differently fails rather than recording the old rule', () => {
+	// The alternative is a manifest that keeps describing a bound uws has moved,
+	// which is the one outcome worse than recording nothing.
+	const reshaped = PINNED_GATE.replace(
+		'!Number.isSafeInteger(configuredMaxConcurrent) || configuredMaxConcurrent < 0',
+		'typeof configuredMaxConcurrent !== "number"'
+	);
+	assert.throws(() => admissionBoundRanges(reshaped), /no longer the shape this extractor reads/);
 });
 
 test('a gate that no longer asserts them fails rather than recording no rule', () => {

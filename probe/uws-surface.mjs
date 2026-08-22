@@ -75,6 +75,167 @@ function findUws() {
 }
 
 /**
+ * Blank every comment and every string BODY, leaving code at its own offsets.
+ *
+ * Every extractor below asks the same question of uws's source: does this text
+ * state a rule the build actually enforces? Text alone cannot answer it. uws
+ * writes operator-facing prose into its own option values and its own comments,
+ * and that prose says things like `allowZero: false` and quotes the sentences
+ * its guards throw - so a regex over raw source reads a comment describing a
+ * bound as though it were the bound. The manifest that results does not fail:
+ * it states a contract the parity tests then agree with, and every one of them
+ * passes.
+ *
+ * So the position is established first and the text is read second. Offsets,
+ * lengths and newlines are preserved exactly, which is what lets a match found
+ * in the blanked copy be sliced out of the original: the blanked copy proves
+ * WHERE something sits, the original says WHAT it is.
+ *
+ * Quote characters survive and their contents do not, because a string literal
+ * is still a value in the code - `('name', {...})` has to keep its shape - while
+ * what is written inside it is prose. Comments go entirely; they are not code.
+ * A template literal's `${...}` is blanked with the rest of its body, which
+ * loses code positions rather than inventing them: the failure that leaves is a
+ * rule read as absent, never a rule invented from prose.
+ *
+ * REGULAR EXPRESSION LITERALS ARE PART OF THIS, not a refinement of it. uws
+ * matches header names with patterns like `/['"`]\s*set-cookie\s*['"`]/i`, and
+ * a scanner that does not know a regex when it sees one reads that backtick as
+ * the start of a template literal and blanks every line after it. The file then
+ * yields no call sites at all - which this extractor does report, loudly, but
+ * only because it counts what it found. Telling a regex from a division needs
+ * the token before it, so that is tracked.
+ *
+ * @param {string} source
+ * @returns {string} same length, same newlines, non-code blanked to spaces
+ */
+export function blankNonCode(source) {
+	const out = source.split('');
+	const word = /[\w$]/;
+	// A `/` after a value is division; after one of these it can only begin a
+	// pattern.
+	const beforePattern = new Set([
+		'return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete',
+		'void', 'throw', 'case', 'do', 'else', 'yield', 'await'
+	]);
+	// Bounded because an escape can be the last character in the file: writing
+	// one past the end would append rather than overwrite, and every offset after
+	// it would be a character out - which is the one thing callers rely on.
+	const blank = (p) => {
+		if (p < source.length && source[p] !== '\n') out[p] = ' ';
+	};
+
+	/** @type {string | null} */
+	let inStr = null;
+	let inLine = false;
+	let inBlock = false;
+	// The last character that was code and not whitespace, which is the only
+	// thing that distinguishes `a / b` from `replace(/b/, ...)`.
+	let prev = -1;
+
+	for (let p = 0; p < source.length; p++) {
+		const c = source[p];
+		const n = source[p + 1];
+		if (inLine) {
+			if (c === '\n') inLine = false;
+			else blank(p);
+			continue;
+		}
+		if (inBlock) {
+			blank(p);
+			if (c === '*' && n === '/') {
+				blank(p + 1);
+				p++;
+				inBlock = false;
+			}
+			continue;
+		}
+		if (inStr) {
+			// The escape and the character it escapes both go, so an escaped
+			// quote cannot be read as the end of the literal.
+			if (c === '\\') {
+				blank(p);
+				blank(p + 1);
+				p++;
+				continue;
+			}
+			if (c === inStr) {
+				inStr = null;
+				prev = p;
+			} else blank(p);
+			continue;
+		}
+		if (c === '/' && n === '*') {
+			blank(p);
+			blank(p + 1);
+			p++;
+			inBlock = true;
+			continue;
+		}
+		if (c === '/' && n === '/') {
+			blank(p);
+			blank(p + 1);
+			p++;
+			inLine = true;
+			continue;
+		}
+		if (c === '/') {
+			let pattern = true;
+			if (prev >= 0) {
+				const pc = source[prev];
+				if (pc === ')' || pc === ']' || word.test(pc)) {
+					pattern = false;
+					if (word.test(pc)) {
+						let s = prev;
+						while (s > 0 && word.test(source[s - 1])) s--;
+						if (beforePattern.has(source.slice(s, prev + 1))) pattern = true;
+					}
+				}
+			}
+			const end = pattern ? patternEnd(source, p) : -1;
+			if (end !== -1) {
+				for (let i = p + 1; i < end; i++) blank(i);
+				p = end;
+				prev = end;
+				continue;
+			}
+		}
+		if (c === '"' || c === "'" || c === '`') {
+			inStr = c;
+			continue;
+		}
+		if (c !== ' ' && c !== '\t' && c !== '\n' && c !== '\r') prev = p;
+	}
+	return out.join('');
+}
+
+/**
+ * The index of the `/` closing a regular expression literal opened at `open`,
+ * or -1 when it does not close on its line - in which case it was a division
+ * sign and not a pattern at all.
+ *
+ * @param {string} source
+ * @param {number} open
+ * @returns {number}
+ */
+function patternEnd(source, open) {
+	let inClass = false;
+	for (let p = open + 1; p < source.length; p++) {
+		const c = source[p];
+		if (c === '\\') {
+			p++;
+			continue;
+		}
+		if (c === '\n') return -1;
+		if (inClass) {
+			if (c === ']') inClass = false;
+		} else if (c === '[') inClass = true;
+		else if (c === '/') return p;
+	}
+	return -1;
+}
+
+/**
  * Member names declared directly on a top-level `export interface <name>`.
  *
  * Comments and strings are blanked before member detection so prose inside a
@@ -86,49 +247,19 @@ function findUws() {
  * @returns {string[]}
  */
 export function interfaceMembers(source, name) {
+	// Member names are identifiers, so the blanked copy carries everything this
+	// reads. A string literal type spanning lines cannot fabricate a member and
+	// a `//` inside one cannot blank the rest of a real declaration.
+	const code = blankNonCode(source);
 	const header = new RegExp(`export interface ${name}\\s*(<[^>]*>)?\\s*(extends [^{]+)?{`);
-	const found = header.exec(source);
+	const found = header.exec(code);
 	if (!found) throw new Error(`interface ${name} not found in index.d.ts`);
-	const open = source.indexOf('{', found.index);
+	const open = code.indexOf('{', found.index);
 
 	let depth = 0;
 	let end = -1;
-	let inBlock = false;
-	let inLine = false;
-	/** @type {string | null} */
-	let inStr = null;
-	for (let p = open; p < source.length; p++) {
-		const c = source[p];
-		const n = source[p + 1];
-		if (inLine) {
-			if (c === '\n') inLine = false;
-			continue;
-		}
-		if (inBlock) {
-			if (c === '*' && n === '/') {
-				inBlock = false;
-				p++;
-			}
-			continue;
-		}
-		if (inStr) {
-			if (c === '\\') p++;
-			else if (c === inStr) inStr = null;
-			continue;
-		}
-		if (c === '/' && n === '*') {
-			inBlock = true;
-			p++;
-			continue;
-		}
-		if (c === '/' && n === '/') {
-			inLine = true;
-			continue;
-		}
-		if (c === '"' || c === "'" || c === '`') {
-			inStr = c;
-			continue;
-		}
+	for (let p = open; p < code.length; p++) {
+		const c = code[p];
 		if (c === '{') depth++;
 		else if (c === '}') {
 			depth--;
@@ -140,10 +271,7 @@ export function interfaceMembers(source, name) {
 	}
 	if (end === -1) throw new Error(`interface ${name} is not closed`);
 
-	const scrubbed = source
-		.slice(open + 1, end)
-		.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
-		.replace(/\/\/[^\n]*/g, (m) => ' '.repeat(m.length));
+	const scrubbed = code.slice(open + 1, end);
 
 	const members = new Set();
 	let nest = 0;
@@ -172,30 +300,38 @@ export function interfaceMembers(source, name) {
  * @returns {Record<string, string[]>}
  */
 function nestedOptionKeys(source) {
-	const start = source.indexOf('export const KNOWN_NESTED_WEBSOCKET_OPTION_KEYS');
+	const code = blankNonCode(source);
+	const start = code.indexOf('export const KNOWN_NESTED_WEBSOCKET_OPTION_KEYS');
 	if (start === -1) throw new Error('uws no longer declares KNOWN_NESTED_WEBSOCKET_OPTION_KEYS; the nested parity dimension needs a new source.');
-	const open = source.indexOf('{', start);
+	const open = code.indexOf('{', start);
 	// Balanced scan rather than a regex: the value is an object of `new Set([...])`
-	// literals, so the first `}` is nowhere near the end.
+	// literals, so the first `}` is nowhere near the end. Scanned over the blanked
+	// copy so a brace inside prose cannot end the declaration early.
 	let depth = 0;
 	let end = -1;
-	for (let i = open; i < source.length; i++) {
-		if (source[i] === '{') depth++;
-		else if (source[i] === '}') {
+	for (let i = open; i < code.length; i++) {
+		if (code[i] === '{') depth++;
+		else if (code[i] === '}') {
 			depth--;
 			if (depth === 0) { end = i; break; }
 		}
 	}
 	if (end === -1) throw new Error('could not find the end of KNOWN_NESTED_WEBSOCKET_OPTION_KEYS.');
-	const body = source.slice(open, end + 1);
+	const codeBody = code.slice(open, end + 1);
+	const rawBody = source.slice(open, end + 1);
 	/** @type {Record<string, string[]>} */
 	const out = {};
-	// Each entry is `key: new Set([...])` or `'quoted.key': new Set([...])`.
-	const entry = /(?:'([^']+)'|([A-Za-z_$][\w$]*))\s*:\s*new Set\(\[([^\]]*)\]\)/g;
+	// Each entry is `key: new Set([...])` or `'quoted.key': new Set([...])`. The
+	// entry SHAPE is matched in the blanked body, so only a real declaration is
+	// read; the names and keys are then sliced out of the original at the offsets
+	// that match found, because those are the one thing the blanking removes.
+	const entry = /(?:'([^']+)'|([A-Za-z_$][\w$]*))\s*:\s*new Set\(\[([^\]]*)\]\)/dg;
 	let m;
-	while ((m = entry.exec(body)) !== null) {
-		const name = m[1] ?? m[2];
-		const keys = [...m[3].matchAll(/'([^']+)'/g)].map((k) => k[1]).sort();
+	while ((m = entry.exec(codeBody)) !== null) {
+		const quoted = m.indices[1];
+		const name = quoted ? rawBody.slice(quoted[0], quoted[1]) : m[2];
+		const [ks, ke] = m.indices[3];
+		const keys = [...rawBody.slice(ks, ke).matchAll(/'([^']+)'/g)].map((k) => k[1]).sort();
 		if (keys.length) out[name] = keys;
 	}
 	if (Object.keys(out).length === 0) throw new Error('parsed no nested option blocks; the declaration shape changed.');
@@ -262,7 +398,13 @@ export function protectiveNumberRanges(indexSource, guardsSource) {
 	// READ rather than assumed. A release that redefined what `allowZero` means
 	// would otherwise be recorded here as though nothing had moved, and every
 	// range in this manifest would be wrong in the same direction at once.
-	const floorRule = /const floor\s*=\s*allowZero\s*\?\s*(-?[\d.]+)\s*:\s*(-?[\d.]+)\s*;/.exec(guardsSource);
+	// Read against code, never against prose. uws documents this guard at length
+	// in the comments above it and writes operator-facing text into the options
+	// it validates, so raw source offers several convincing places to find a rule
+	// that nothing runs.
+	const guardsCode = blankNonCode(guardsSource);
+	const indexCode = blankNonCode(indexSource);
+	const floorRule = /const floor\s*=\s*allowZero\s*\?\s*(-?[\d.]+)\s*:\s*(-?[\d.]+)\s*;/.exec(guardsCode);
 	if (!floorRule) {
 		throw new Error(
 			'uws no longer derives the protective-number floor from `allowZero`. The range dimension ' +
@@ -275,28 +417,34 @@ export function protectiveNumberRanges(indexSource, guardsSource) {
 	// from whether any call passes one. At the pinned commit there is none, so a
 	// `ceiling` that appears later registers as a new mechanism AND a new bound
 	// rather than as an option key the guard silently ignores.
-	const ceilingSupported = /Number\.isSafeInteger/.test(guardsSource);
+	const ceilingSupported = /Number\.isSafeInteger/.test(guardsCode);
 
 	/** @type {Record<string, { allowZero: boolean, floor: number, ceiling: number | null, integerRequired: boolean }>} */
 	const out = {};
 	const call = /assertProtectiveNumber\s*\(/g;
 	let m;
-	while ((m = call.exec(indexSource)) !== null) {
-		const args = callArgs(indexSource, indexSource.indexOf('(', m.index));
-		const key = /^\s*\w+\s*,\s*'([^']+)'/.exec(args);
+	while ((m = call.exec(indexCode)) !== null) {
+		const open = indexCode.indexOf('(', m.index);
+		// Two views of the same span: the blanked one to decide what the call
+		// PASSES, the original to read the option name it passes.
+		const args = callArgs(indexCode, open);
+		const rawArgs = callArgs(indexSource, open);
+		const key = /^\s*\w+\s*,\s*'([^']+)'/d.exec(args);
 		// A call whose second argument is not a literal key name is not something
 		// this extractor can record, and recording it wrongly is worse than not
 		// recording it - so it fails rather than guesses.
 		if (!key) {
 			throw new Error(
 				`a protective-number call site does not name its option as a string literal, so its ` +
-				`range cannot be recorded: ${args.slice(0, 120).replace(/\s+/g, ' ')}`
+				`range cannot be recorded: ${rawArgs.slice(0, 120).replace(/\s+/g, ' ')}`
 			);
 		}
+		const [nameStart, nameEnd] = key.indices[1];
+		const name = rawArgs.slice(nameStart, nameEnd);
 		const allowZero = !/allowZero\s*:\s*false/.test(args);
 		const ceilingMatch = /ceiling\s*:\s*(0x[0-9a-fA-F]+|[\d_]+)/.exec(args);
 		const ceiling = ceilingMatch ? Number(ceilingMatch[1].replace(/_/g, '')) : null;
-		out[key[1]] = {
+		out[name] = {
 			allowZero,
 			floor: allowZero ? zeroFloor : nonZeroFloor,
 			ceiling,
@@ -321,21 +469,39 @@ export function protectiveNumberRanges(indexSource, guardsSource) {
  * is read, and these four are asserted inside `createUpgradeAdmission`. That
  * split is not cosmetic - it is why the range dimension could not see them, and
  * why this adapter carried a looser rule for them than uws did without any test
- * noticing. The rule is taken from uws's own assertion text, so it cannot say
- * something the throw does not.
+ * noticing.
+ *
+ * THE RULE IS READ FROM THE CONDITION, not from the sentence next to it. A
+ * diagnostic is text, and text survives the code it describes: a guard can be
+ * loosened or deleted while its message stays behind in a comment or a string,
+ * and a contract minted from that sentence describes a rule nothing runs. So
+ * each bound is taken from the comparison that enforces it, and the message is
+ * then required to AGREE with what the comparison does. Either half alone can
+ * be wrong in silence; disagreement between them is the thing worth failing on,
+ * and it fails here rather than reaching the manifest.
  *
  * @param {string} controllerSource uws's `src/runtime/utils/upgrade-admission.js` at the pin
  * @returns {Record<string, { allowZero: boolean, floor: number, ceiling: number | null, integerRequired: boolean }>}
  */
 export function admissionBoundRanges(controllerSource) {
+	const code = blankNonCode(controllerSource);
 	/** @type {Record<string, { allowZero: boolean, floor: number, ceiling: number | null, integerRequired: boolean }>} */
 	const out = {};
-	// `upgradeAdmission.<key> must be a non-negative safe integer.` - the whole
-	// rule, in the words the build uses to state it.
-	const guard = /upgradeAdmission\.([A-Za-z_$][\w$]*) must be a non-negative safe integer/g;
-	let m;
-	while ((m = guard.exec(controllerSource)) !== null) {
-		out[m[1]] = { allowZero: true, floor: 0, ceiling: null, integerRequired: true };
+	// Each bound arrives as a binding and the guard that governs it:
+	//
+	//   const configuredMaxConcurrent = opts && opts.maxConcurrent;
+	//   if (configuredMaxConcurrent !== undefined && (!Number.isSafeInteger(...) || ... < 0)) {
+	//       throw new TypeError('upgradeAdmission.maxConcurrent must be a non-negative safe integer.');
+	//   }
+	//
+	// Walking the bindings rather than the messages is what ties a rule to the
+	// key it actually governs: the binding names the option, and the condition
+	// that reads that binding is the only thing entitled to state its bound.
+	const binding = /const\s+([A-Za-z_$][\w$]*)\s*=\s*\(?\s*opts\s*(?:&&\s*opts\.|\?\.)\s*([A-Za-z_$][\w$]*)/g;
+	let b;
+	while ((b = binding.exec(code)) !== null) {
+		const bound = admissionGuard(code, controllerSource, binding.lastIndex, b[1], b[2]);
+		if (bound) out[b[2]] = bound;
 	}
 	if (Object.keys(out).length === 0) {
 		throw new Error(
@@ -345,6 +511,83 @@ export function admissionBoundRanges(controllerSource) {
 		);
 	}
 	return out;
+}
+
+/**
+ * The bound a single `upgradeAdmission` binding is held to, or `null` when the
+ * gate does not guard it at all.
+ *
+ * An unguarded option is a real answer and is recorded as one by being left
+ * out: nothing enforces it, so the manifest should not claim anything does. A
+ * guard that IS present but shaped differently than this reads is not a real
+ * answer - it is an extractor that has fallen behind uws - so that throws.
+ *
+ * @param {string} code the controller with comments and string bodies blanked
+ * @param {string} source the controller as written
+ * @param {number} from offset just past the binding
+ * @param {string} held the local the binding introduces
+ * @param {string} key the `upgradeAdmission` option it holds
+ * @returns {{ allowZero: boolean, floor: number, ceiling: number | null, integerRequired: boolean } | null}
+ */
+function admissionGuard(code, source, from, held, key) {
+	// `$` is legal in an identifier and special in a pattern.
+	const h = held.replace(/\$/g, '\\$');
+	const mentions = new RegExp(`\\b${h}\\b`);
+	const test = /\bif\s*\(/g;
+	test.lastIndex = from;
+	let f;
+	while ((f = test.exec(code)) !== null) {
+		const open = code.indexOf('(', f.index);
+		const condition = callArgs(code, open);
+		if (!mentions.test(condition)) continue;
+
+		// Structure exactly, spacing not at all: uws wraps this condition across
+		// four lines and the line breaks are not the contract.
+		const shape = new RegExp(
+			`^${h}!==undefined&&\\(!Number\\.isSafeInteger\\(${h}\\)\\|\\|${h}(<=?)0\\)$`
+		);
+		const governed = shape.exec(condition.replace(/\s+/g, ''));
+		if (!governed) {
+			throw new Error(
+				`the upgradeAdmission.${key} guard is no longer the shape this extractor reads: ` +
+				`${condition.replace(/\s+/g, ' ').trim().slice(0, 160)}. Read the new bound from it ` +
+				'rather than leaving the old one recorded, which would hold this adapter to a rule uws dropped.'
+			);
+		}
+		// `< 0` admits zero; `<= 0` does not. The floor follows the comparison,
+		// so a guard that tightened is recorded as tightened.
+		const allowZero = governed[1] === '<';
+
+		const close = open + 1 + condition.length;
+		const opens = /^\s*\{\s*throw new TypeError\s*\(/.exec(code.slice(close + 1));
+		if (!opens) {
+			throw new Error(
+				`the upgradeAdmission.${key} guard no longer throws directly, so what it refuses ` +
+				'cannot be read from it. Fix the extractor rather than recording an unchecked rule.'
+			);
+		}
+		const throwOpen = close + opens[0].length;
+		const stated = /^\s*'([^']*)'\s*$/d.exec(callArgs(code, throwOpen));
+		if (!stated) {
+			throw new Error(
+				`the upgradeAdmission.${key} diagnostic is no longer a single string literal, so the ` +
+				'guard and the words it states cannot be compared.'
+			);
+		}
+		const [ms, me] = stated.indices[1];
+		const message = callArgs(source, throwOpen).slice(ms, me);
+		const says = /^upgradeAdmission\.([A-Za-z_$][\w$]*) must be a (non-negative|positive) safe integer\.$/.exec(message);
+		const wording = allowZero ? 'non-negative' : 'positive';
+		if (!says || says[1] !== key || says[2] !== wording) {
+			throw new Error(
+				`the upgradeAdmission.${key} guard and its diagnostic disagree. The condition refuses ` +
+				`anything but a ${wording} safe integer; the message says "${message}". One of them is ` +
+				'wrong, and which one cannot be decided here - fix uws or the extractor before recording it.'
+			);
+		}
+		return { allowZero, floor: allowZero ? 0 : 1, ceiling: null, integerRequired: true };
+	}
+	return null;
 }
 
 /**
