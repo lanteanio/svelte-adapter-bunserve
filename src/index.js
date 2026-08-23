@@ -8,7 +8,7 @@ import json from '@rollup/plugin-json';
 import { normalizeStaticHeaders } from './build-config.js';
 import { listExcludedDotPaths } from './static-scan.js';
 import { assertScalarOptions, unknownOptionWarnings } from './adapter-options.js';
-import { normalizeWsOptions } from './runtime/utils/ws-options.js';
+import { describeValue, normalizeWsOptions } from './runtime/utils/ws-options.js';
 
 const runtimeDir = fileURLToPath(new URL('./runtime', import.meta.url).href);
 
@@ -93,7 +93,7 @@ export default function (opts = {}) {
 			throw new Error(
 				`readinessCheckPath must be an absolute path string starting with '/' ` +
 				`(e.g. '/readyz'), or false to disable the readiness route - ` +
-				`got ${JSON.stringify(readinessCheckPath)}.`
+				`got ${describeValue(readinessCheckPath)}.`
 			);
 		}
 		if (healthCheckPath !== false && readinessCheckPath === healthCheckPath) {
@@ -108,7 +108,7 @@ export default function (opts = {}) {
 		throw new Error(
 			`staticCacheMaxFileSize must be a positive integer byte count ` +
 			`(files larger than this are served from disk via Bun.file instead of the in-memory cache) - ` +
-			`got ${JSON.stringify(staticCacheMaxFileSize)}.`
+			`got ${describeValue(staticCacheMaxFileSize)}.`
 		);
 	}
 

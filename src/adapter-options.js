@@ -17,7 +17,7 @@
 // question, and deferring it to boot - or to the first request that needed
 // it - moves the failure far away from its cause.
 
-import { KNOWN_WS_OPTION_KEYS } from './runtime/utils/ws-options.js';
+import { KNOWN_WS_OPTION_KEYS, describeValue } from './runtime/utils/ws-options.js';
 
 /** Every option the adapter reads. Anything not in here draws a warning. */
 export const KNOWN_ADAPTER_OPTIONS = [
@@ -132,7 +132,7 @@ export function assertScalarOptions(opts) {
 	for (const key of ['precompress']) {
 		if (key in opts && typeof opts[key] !== 'boolean') {
 			throw new Error(
-				`adapter option \`${key}\` must be true or false - got ${JSON.stringify(opts[key])}. ` +
+				`adapter option \`${key}\` must be true or false - got ${describeValue(opts[key])}. ` +
 				'A non-boolean is not coerced: a string like "no" is truthy, so the option would read ' +
 				'as enabled while plainly meaning the opposite.'
 			);
@@ -144,15 +144,8 @@ export function assertScalarOptions(opts) {
 	// developer never meant to publish is reachable, and a message that only
 	// says "must be a boolean" leaves them guessing which boolean is safe.
 	if ('staticDotfiles' in opts && typeof opts.staticDotfiles !== 'boolean') {
-		// JSON.stringify throws on a BigInt and erases functions and Symbols;
-		// String() throws on a null-prototype object. The tag form renders any
-		// object, String() everything else - so the message about a bad value
-		// cannot itself fail with a different error.
-		const shown = typeof opts.staticDotfiles === 'object' && opts.staticDotfiles !== null
-			? Object.prototype.toString.call(opts.staticDotfiles)
-			: String(opts.staticDotfiles);
 		throw new Error(
-			`adapter option \`staticDotfiles\` must be true or false - got ${shown} (${typeof opts.staticDotfiles}). ` +
+			`adapter option \`staticDotfiles\` must be true or false - got ${describeValue(opts.staticDotfiles)} (${typeof opts.staticDotfiles}). ` +
 			'The default (false) refuses every dot-segment static path except .well-known/*; ' +
 			'true indexes and serves them all.'
 		);
@@ -161,7 +154,7 @@ export function assertScalarOptions(opts) {
 	for (const key of ['out', 'envPrefix']) {
 		if (key in opts && typeof opts[key] !== 'string') {
 			throw new Error(
-				`adapter option \`${key}\` must be a string - got ${JSON.stringify(opts[key])}.`
+				`adapter option \`${key}\` must be a string - got ${describeValue(opts[key])}.`
 			);
 		}
 	}
@@ -174,7 +167,7 @@ export function assertScalarOptions(opts) {
 		if (typeof value !== 'string' || value[0] !== '/') {
 			throw new Error(
 				`adapter option \`healthCheckPath\` must be an absolute path string starting with '/' ` +
-				`(e.g. '/healthz'), or false to disable the liveness route - got ${JSON.stringify(value)}.`
+				`(e.g. '/healthz'), or false to disable the liveness route - got ${describeValue(value)}.`
 			);
 		}
 	}

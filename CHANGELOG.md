@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- An option value that cannot be JSON-serialized is now refused by the option
+  it names rather than by the message builder. `staticCacheMaxFileSize: 1024n`
+  failed the build with "Do not know how to serialize a BigInt" - an error
+  naming neither the option nor what it accepts, on a value written precisely
+  because a large integer was meant. Every adapter-option diagnostic renders
+  its value through one total formatter now, so a BigInt, a Symbol, a function
+  or an object whose getters throw all describe themselves instead of
+  replacing the message with an error of their own.
+
 - A `websocket.*` option written at the TOP level is now answered with its
   real home: a top-level `maxPayloadLength` is met with a suggestion of
   `websocket.maxPayloadLength`, rather than with an unrelated top-level option

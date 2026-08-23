@@ -8,6 +8,7 @@ import {
 	unknownOptionWarnings
 } from '../../src/adapter-options.js';
 import { KNOWN_WS_OPTION_KEYS, normalizeWsOptions } from '../../src/runtime/utils/ws-options.js';
+import adapter from '../../src/index.js';
 
 // The two-tier option policy. The whole point is the config-file user who gets
 // no type checking: a key they misspelled is destructured away and the default
@@ -83,6 +84,54 @@ test('every known option is listed, and suggests itself', () => {
 	for (const key of KNOWN_ADAPTER_OPTIONS) {
 		assert.deepEqual(unknownOptionWarnings({ [key]: null }), [], `${key} is recognised`);
 		assert.equal(suggestOption(key), key);
+	}
+});
+
+test('a BigInt is refused by the option it names, not by the message builder', () => {
+	// `JSON.stringify` THROWS on a BigInt. A diagnostic built with it fails with
+	// "Do not know how to serialize a BigInt" - an error about the message
+	// builder, naming neither the option nor what it accepts, on a value someone
+	// wrote precisely BECAUSE they meant a large integer. The value that is
+	// hardest to render is the one most likely to be written here.
+	const cases = [
+		['staticCacheMaxFileSize', /positive integer byte count/],
+		['readinessCheckPath', /absolute path string/],
+		['healthCheckPath', /absolute path string/],
+		['precompress', /must be true or false/],
+		['staticDotfiles', /must be true or false/],
+		['out', /must be a string/]
+	];
+	for (const [option, accepts] of cases) {
+		assert.throws(
+			() => adapter({ [option]: 1024n }),
+			(err) => {
+				assert.match(err.message, new RegExp(option), `${option}: the message names the option`);
+				assert.match(err.message, accepts, `${option}: and what it accepts`);
+				assert.match(err.message, /1024n/, `${option}: and the value it was given`);
+				assert.doesNotMatch(
+					err.message,
+					/serialize a BigInt/,
+					`${option}: the diagnostic must not fail with an error of its own`
+				);
+				return true;
+			}
+		);
+	}
+});
+
+test('a value that resists rendering is still described rather than thrown over', () => {
+	// The other shapes JSON.stringify has no answer for. None of them should
+	// reach the operator as an error about the error.
+	const hostile = [Symbol('nope'), function named() {}, { get x() { throw new Error('getter'); } }];
+	for (const value of hostile) {
+		assert.throws(
+			() => adapter({ precompress: value }),
+			(err) => {
+				assert.match(err.message, /must be true or false/);
+				assert.doesNotMatch(err.message, /getter/, 'a throwing getter does not become the message');
+				return true;
+			}
+		);
 	}
 });
 

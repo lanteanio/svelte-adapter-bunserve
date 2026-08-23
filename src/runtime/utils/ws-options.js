@@ -157,7 +157,7 @@ export const INERT_WS_OPTION_KEYS = new Set(['metrics']);
  * @param {unknown} value
  * @returns {string}
  */
-function describeValue(value) {
+export function describeValue(value) {
 	if (typeof value === 'bigint') return `${value}n`;
 	if (typeof value === 'symbol') return String(value);
 	if (typeof value === 'function') return `[Function${value.name ? ' ' + value.name : ''}]`;
