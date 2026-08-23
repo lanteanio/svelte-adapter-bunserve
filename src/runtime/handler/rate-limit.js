@@ -362,13 +362,24 @@ export function warnRateLimitProxyCollapse(source, address, door) {
 }
 
 /**
- * Forget every advisory latch. For the simulator alone, and for the reason the
- * limiters have one: a corpus runs many servers in one process, and a latch
- * taken by an early seed would silence every seed after it - making which seed
- * warns depend on the order they ran in.
+ * Forget everything this module carries between seeds. For the simulator alone.
+ *
+ * ONE SEAM, because the reason is one reason and a second entry point is how
+ * half of it gets forgotten: a corpus runs many servers in one process, so any
+ * module-level value that survives a run makes a seed depend on how many ran
+ * before it. That is invisible until a corpus is re-blessed in a different
+ * order, and then it is a fingerprint nobody can reproduce.
+ *
+ * The advisory latches, because a latch taken by an early seed silences every
+ * seed after it. And the eviction counters, which no oracle reads TODAY - the
+ * same standing the admitted tally had right up until it was read. A counter
+ * that only accumulates is not visibly wrong; it is wrong the moment something
+ * looks at it, which is exactly when nobody is looking for this.
  */
-export function _resetAdvisoriesForSim() {
+export function _resetRateLimitForSim() {
 	warnedProxyCollapse.clear();
+	rateMapEvictions.upgrade = 0;
+	rateMapEvictions.auth = 0;
 }
 
 /** What the upgrade door calls itself in that advisory. */

@@ -939,6 +939,16 @@ async function runUpgrade(req, srv, held) {
 		// Re-checked after the wait: the client may have left while this
 		// handshake was parked, and the pacing queue can park it across many
 		// turns.
+		//
+		// COVERED BY upgrade-pacing-hangup.test.mjs, NOT BY THE CORPUS, and the
+		// difference is recorded here because it is the kind of thing that gets
+		// found twice. Delete this line and all 40 seeds still match: the corpus
+		// scenario only ever hangs a client up while its handshake is parked in
+		// the APP HOOK, never in the pacing queue, so it cannot reach this. The
+		// dedicated test pairs a one-per-tick budget with a queue that has room
+		// and aborts the client that lands in it, which is the only shape that
+		// does - and that test goes red on the same deletion. A fingerprint gate
+		// proves a run is reproducible, not that every branch was taken.
 		if (!held.hasPermit) return abandonedResponse();
 		// Stamped before the upgrade rather than after: once `srv.upgrade`
 		// returns true the socket may already have been handed to `open`, and a

@@ -94,6 +94,21 @@ test('runs are order-independent: a seed rerun after other seeds is unchanged', 
 	assert.equal(again, first, 'cross-seed module state leaked into the rerun');
 });
 
+test('the eviction counters belong to the run, not to the process', async () => {
+	// THE STATE THE FINGERPRINT CANNOT SEE. The test above proves that everything
+	// a fingerprint reads is reset; these counters are read by nothing today, so
+	// that gate stays green while they accumulate across every seed in the
+	// corpus. They are wrong the moment something looks at them - which is when
+	// an eviction oracle is written, and nobody writing it would suspect the
+	// numbers of predating their own run.
+	const { rateMapEvictions } = await import('../../src/runtime/handler/rate-limit.js');
+	rateMapEvictions.upgrade = 7;
+	rateMapEvictions.auth = 9;
+	await runSim({ seed: '1' });
+	assert.equal(rateMapEvictions.upgrade, 0, 'the upgrade door counts this run alone');
+	assert.equal(rateMapEvictions.auth, 0, 'and so does the auth door');
+});
+
 test('the committed corpus declares the family swarm config', () => {
 	// The fingerprints are only comparable to the sibling adapter's corpus
 	// under the SAME knobs; pin them so a config edit cannot silently

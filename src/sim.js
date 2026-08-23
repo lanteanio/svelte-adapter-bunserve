@@ -77,7 +77,7 @@ const {
 	wsCounters
 } = await import('./runtime/handler/ws-state.js');
 const { upgradeAdmission } = await import('./runtime/handler/admission.js');
-const { upgradeRateLimiter, authRateLimiter, _resetAdvisoriesForSim } =
+const { upgradeRateLimiter, authRateLimiter, _resetRateLimitForSim } =
 	await import('./runtime/handler/rate-limit.js');
 const { _resetWireCodecRegistry } = await import('./runtime/handler/codec-registry.js');
 const { _resetSharedWireIds } = await import('./runtime/utils/shared-wire-id.js');
@@ -135,11 +135,14 @@ function resetSimState() {
 	// and a unit test that assembles this graph and drives that door would
 	// otherwise leave its windows spent for the next.
 	if (authRateLimiter !== null) authRateLimiter._resetForSim();
-	// The advisory latches, for the same reason the windows above are cleared: a
-	// latch taken by an early seed silences every seed after it, so which seed
-	// warns would depend on the order they ran in. The sim's own peer address is
-	// private, so this IS reachable from a corpus run.
-	_resetAdvisoriesForSim();
+	// Everything the rate-limit module carries between seeds: the advisory
+	// latches, for the same reason the windows above are cleared - a latch taken
+	// by an early seed silences every seed after it, so which seed warns would
+	// depend on the order they ran in - and the eviction counters, which nothing
+	// reads yet and which would therefore go on accumulating unnoticed until
+	// something did. The sim's own peer address is private, so this IS reachable
+	// from a corpus run.
+	_resetRateLimitForSim();
 	wsCounters.closedWsAborts = 0;
 	wsCounters.droppedReleaseRecords = 0;
 	wsCounters.publishCount = 0;
