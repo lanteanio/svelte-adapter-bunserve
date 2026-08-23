@@ -1,7 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { admissionBoundRanges, blankNonCode, callArgs, protectiveNumberRanges } from '../../probe/uws-surface.mjs';
+import { readFileSync } from 'node:fs';
+
+import {
+	admissionBoundRanges,
+	blankNonCode,
+	callArgs,
+	nestedOptionKeys,
+	pinnedRef,
+	protectiveNumberRanges
+} from '../../probe/uws-surface.mjs';
 
 // THE GENERATOR, DRIVEN.
 //
@@ -84,8 +93,42 @@ test('a ceiling the guard does not implement is not reported as one it enforces'
 	// actually accepts - a failure invented here rather than found.
 	const index = "assertProtectiveNumber(websocket, 'x', 'websocket.x', { allowZero: false, ceiling: 0x7fffffff });";
 	const range = protectiveNumberRanges(index, PINNED_GUARD);
-	assert.equal(range.x.ceiling, 2147483647, 'the value is still recorded');
-	assert.equal(range.x.integerRequired, false, 'but the guard enforces nothing with it');
+	assert.equal(range.x.ceiling, null, 'an argument the guard never compares against bounds nothing');
+	assert.equal(range.x.integerRequired, false, 'and nothing rides along behind it');
+});
+
+test('a safe-integer check elsewhere in the guard is not a ceiling', () => {
+	// THE DIRECTION THAT MATTERS. A ceiling recorded but not enforced makes the
+	// manifest STRICTER than uws, so the parity gate holds this adapter to a
+	// bound uws does not have and this adapter refuses a config that builds
+	// there. The never-looser test cannot see it, because it is not looser.
+	//
+	// `Number.isSafeInteger` is an ordinary thing for a validator to use on some
+	// other option, so its presence was never evidence of anything. The guard
+	// below drops the ceiling branch and keeps such a use.
+	const unrelated = PINNED_GUARD.replace(
+		'const floor = allowZero ? 0 : 1;',
+		'const floor = allowZero ? 0 : 1;\n\tif (!Number.isSafeInteger(bag.retries)) throw new Error("retries");'
+	);
+	const index = "assertProtectiveNumber(websocket, 'x', 'websocket.x', { allowZero: false, ceiling: 0x7fffffff });";
+	const range = protectiveNumberRanges(index, unrelated).x;
+	assert.equal(range.ceiling, null, 'no comparison against the ceiling, so no ceiling');
+	assert.equal(range.integerRequired, false);
+});
+
+test('the ceiling is read from the guard that implements it, not from the file around it', () => {
+	// A module validating a dozen options has the words for every rule in it
+	// somewhere. Only this function decides what a protective number accepts.
+	const neighbour = PINNED_GUARD +
+		'\nexport function assertSomethingElse(bag, key) {\n' +
+		'\tif (ceiling > 0 && (!Number.isSafeInteger(value) || value > ceiling)) throw new Error("nope");\n' +
+		'}\n';
+	const index = "assertProtectiveNumber(websocket, 'x', 'websocket.x', { ceiling: 4096 });";
+	assert.equal(
+		protectiveNumberRanges(index, neighbour).x.ceiling,
+		null,
+		'the enforcement belongs to the other function'
+	);
 });
 
 test('a call site that does not name its option as a literal is refused, not guessed', () => {
@@ -225,6 +268,50 @@ test('an escape at the very end of a source does not shift every offset', () => 
 	// taken from it afterwards.
 	const src = "const s = 'x\\";
 	assert.equal(blankNonCode(src).length, src.length);
+});
+
+test('a nested key commented out inside the brackets is not still declared', () => {
+	// A removal reads as a declaration if the keys are recovered from raw text:
+	// the key uws deleted survives in the manifest as one it still accepts, and
+	// the nested parity dimension then holds this adapter to it. Both comment
+	// spellings, because only one of them is the obvious one to think of.
+	const block =
+		'export const KNOWN_NESTED_WEBSOCKET_OPTION_KEYS = {\n' +
+		"\tupgradeAdmission: new Set(['real', /* was 'ghost' */ 'other'])\n" +
+		'};';
+	assert.deepEqual(nestedOptionKeys(block).upgradeAdmission, ['other', 'real']);
+
+	const line =
+		'export const KNOWN_NESTED_WEBSOCKET_OPTION_KEYS = {\n' +
+		'\tupgradeAdmission: new Set([\n' +
+		"\t\t'real',\n" +
+		"\t\t// 'ghost',\n" +
+		"\t\t'other'\n" +
+		'\t])\n' +
+		'};';
+	assert.deepEqual(nestedOptionKeys(line).upgradeAdmission, ['other', 'real']);
+});
+
+test('a nested block whose name is quoted is still read from the original', () => {
+	// The names come back out of the raw source at offsets found in the blanked
+	// copy, so the dotted spelling has to survive that round trip intact.
+	const source =
+		'export const KNOWN_NESTED_WEBSOCKET_OPTION_KEYS = {\n' +
+		"\t'upgradeAdmission.cursorLane': new Set(['fraction'])\n" +
+		'};';
+	assert.deepEqual(nestedOptionKeys(source), { 'upgradeAdmission.cursorLane': ['fraction'] });
+});
+
+test('the manifest names an immutable commit, so regenerating cannot re-pin it', () => {
+	// A regeneration is a CHECK that the manifest still describes the commit it
+	// names. Defaulting to HEAD made an ordinary `npm run probe:uws` adopt
+	// whatever the sibling checkout had moved to - and a prerelease version does
+	// not change on every commit, so the only trace could be one sha in a diff
+	// whose version line says nothing moved.
+	const manifest = JSON.parse(readFileSync(new URL('../../probe/uws-surface.json', import.meta.url), 'utf8'));
+	assert.match(manifest.uwsCommit, /^[0-9a-f]{40}$/, 'the commit is a full sha');
+	assert.equal(manifest.uwsRef, manifest.uwsCommit, 'and the ref it was taken at is that same commit');
+	assert.equal(pinnedRef(), manifest.uwsCommit, 'which is what a regeneration reads by default');
 });
 
 /** The gate as uws writes it at the pin: a binding, then the guard that governs it. */

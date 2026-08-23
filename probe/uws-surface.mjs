@@ -14,7 +14,7 @@
 // consumer, and it distinguishes public API from whatever the implementation
 // happens to expose.
 
-import { writeFileSync, existsSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
@@ -47,9 +47,34 @@ function showAtRef(repo, ref, path) {
 	} catch (err) {
 		throw new Error(
 			`could not read ${path} at ${ref} from ${repo}.\n` +
-			'Pass a ref that exists (UWS_REF=<sha|tag|branch>); the default is HEAD.\n' +
+			'Pass a ref that exists (UWS_REF=<sha|tag|branch>); the default is the commit the ' +
+			'committed manifest already names, so a checkout missing that commit needs a fetch.\n' +
 			String(err.message ?? err)
 		);
+	}
+}
+
+/**
+ * The commit the committed manifest already names, which is what a regeneration
+ * defaults to reading.
+ *
+ * Returns `null` before the manifest exists, or when what it carries is not a
+ * full sha - the two cases where there is no pin to honour and following the
+ * checkout is the only thing left to do.
+ *
+ * @returns {string | null}
+ */
+export function pinnedRef() {
+	const at = join(HERE, 'uws-surface.json');
+	if (!existsSync(at)) return null;
+	try {
+		const { uwsCommit } = JSON.parse(readFileSync(at, 'utf8'));
+		// A full sha only. A branch or a tag can be moved under this adapter by
+		// someone else's push, which is the thing being fixed rather than a
+		// shorter spelling of it.
+		return typeof uwsCommit === 'string' && /^[0-9a-f]{40}$/.test(uwsCommit) ? uwsCommit : null;
+	} catch {
+		return null;
 	}
 }
 
@@ -299,7 +324,7 @@ export function interfaceMembers(source, name) {
  * @param {string} source uws's `src/index.js` at the pinned commit
  * @returns {Record<string, string[]>}
  */
-function nestedOptionKeys(source) {
+export function nestedOptionKeys(source) {
 	const code = blankNonCode(source);
 	const start = code.indexOf('export const KNOWN_NESTED_WEBSOCKET_OPTION_KEYS');
 	if (start === -1) throw new Error('uws no longer declares KNOWN_NESTED_WEBSOCKET_OPTION_KEYS; the nested parity dimension needs a new source.');
@@ -330,8 +355,15 @@ function nestedOptionKeys(source) {
 	while ((m = entry.exec(codeBody)) !== null) {
 		const quoted = m.indices[1];
 		const name = quoted ? rawBody.slice(quoted[0], quoted[1]) : m[2];
+		// The keys are found in the BLANKED bracket span and only then read out of
+		// the original. Slicing the raw span and matching quotes there would count
+		// a key that had been commented out INSIDE the brackets - the removal
+		// still reads as a declaration, so a key uws deleted survives in the
+		// manifest as one it still accepts.
 		const [ks, ke] = m.indices[3];
-		const keys = [...rawBody.slice(ks, ke).matchAll(/'([^']+)'/g)].map((k) => k[1]).sort();
+		const keys = [...codeBody.slice(ks, ke).matchAll(/'([^']+)'/dg)]
+			.map((k) => rawBody.slice(ks + k.indices[1][0], ks + k.indices[1][1]))
+			.sort();
 		if (keys.length) out[name] = keys;
 	}
 	if (Object.keys(out).length === 0) throw new Error('parsed no nested option blocks; the declaration shape changed.');
@@ -376,6 +408,38 @@ export function callArgs(source, open) {
 }
 
 /**
+ * The `{...}` body of a named function declaration, or `null` when the source
+ * does not declare one.
+ *
+ * Read so a rule can be looked for INSIDE the guard that implements it. These
+ * modules validate a dozen options apiece, and the same words - a floor, a safe
+ * integer, a comparison - appear in all of them, so a file-wide match answers a
+ * question about a different option than the one being asked about.
+ *
+ * @param {string} code source with comments and string bodies blanked
+ * @param {string} name the declared function
+ * @returns {string | null}
+ */
+function functionBody(code, name) {
+	const at = code.search(new RegExp(`function\\s+${name}\\s*\\(`));
+	if (at === -1) return null;
+	// Past the parameter list first: it carries its own braces (a destructured
+	// options argument) and a `)` cannot be assumed to be the first one.
+	const open = code.indexOf('(', at);
+	const brace = code.indexOf('{', open + 1 + callArgs(code, open).length);
+	if (brace === -1) return null;
+	let depth = 0;
+	for (let p = brace; p < code.length; p++) {
+		if (code[p] === '{') depth++;
+		else if (code[p] === '}') {
+			depth--;
+			if (depth === 0) return code.slice(brace, p + 1);
+		}
+	}
+	return null;
+}
+
+/**
  * The accepted VALUE RANGE of every option uws guards as a protective number.
  *
  * The flat key lists prove both adapters NAME an option. They cannot prove both
@@ -404,7 +468,17 @@ export function protectiveNumberRanges(indexSource, guardsSource) {
 	// that nothing runs.
 	const guardsCode = blankNonCode(guardsSource);
 	const indexCode = blankNonCode(indexSource);
-	const floorRule = /const floor\s*=\s*allowZero\s*\?\s*(-?[\d.]+)\s*:\s*(-?[\d.]+)\s*;/.exec(guardsCode);
+	// And read inside the GUARD, not across the file. Every rule below is a
+	// property of one function, so a match anywhere else in a module that
+	// validates a dozen other options says nothing about this one.
+	const body = functionBody(guardsCode, 'assertProtectiveNumber');
+	if (!body) {
+		throw new Error(
+			'uws no longer declares assertProtectiveNumber as a function, so the protective-number ' +
+			'ranges have no source. Fix the extractor rather than recording the last rule it read.'
+		);
+	}
+	const floorRule = /const floor\s*=\s*allowZero\s*\?\s*(-?[\d.]+)\s*:\s*(-?[\d.]+)\s*;/.exec(body);
 	if (!floorRule) {
 		throw new Error(
 			'uws no longer derives the protective-number floor from `allowZero`. The range dimension ' +
@@ -413,11 +487,26 @@ export function protectiveNumberRanges(indexSource, guardsSource) {
 	}
 	const zeroFloor = Number(floorRule[1]);
 	const nonZeroFloor = Number(floorRule[2]);
-	// Whether the guard has a ceiling MECHANISM, which is a separate question
-	// from whether any call passes one. At the pinned commit there is none, so a
-	// `ceiling` that appears later registers as a new mechanism AND a new bound
-	// rather than as an option key the guard silently ignores.
-	const ceilingSupported = /Number\.isSafeInteger/.test(guardsCode);
+	// Whether the guard ENFORCES a ceiling, which is a different question from
+	// whether the word appears anywhere near one. The mechanism is three things
+	// together - the branch is entered only for a ceiling that was passed, the
+	// value is compared against it, and the safe-integer rule rides along - and
+	// the whole point of naming all three is that the presence of any one of them
+	// proves nothing. `Number.isSafeInteger` in particular is an ordinary thing
+	// for a validator to use elsewhere, so treating it as the signal reads a
+	// ceiling into a guard that stopped comparing against one.
+	//
+	// The direction of that error is why it is worth this much care. A ceiling
+	// recorded but not enforced makes the manifest STRICTER than uws, and the
+	// parity gate then holds this adapter to a bound uws does not have - so this
+	// adapter refuses a config that builds there. That is a failure invented
+	// here rather than found, and it fails in the one direction the never-looser
+	// test cannot see, because it is not looser.
+	const enforcement = body.replace(/\s+/g, '');
+	const ceilingEnforced =
+		enforcement.includes('ceiling>0') &&
+		enforcement.includes('value>ceiling') &&
+		enforcement.includes('Number.isSafeInteger(value)');
 
 	/** @type {Record<string, { allowZero: boolean, floor: number, ceiling: number | null, integerRequired: boolean }>} */
 	const out = {};
@@ -442,7 +531,11 @@ export function protectiveNumberRanges(indexSource, guardsSource) {
 		const [nameStart, nameEnd] = key.indices[1];
 		const name = rawArgs.slice(nameStart, nameEnd);
 		const allowZero = !/allowZero\s*:\s*false/.test(args);
-		const ceilingMatch = /ceiling\s*:\s*(0x[0-9a-fA-F]+|[\d_]+)/.exec(args);
+		// A ceiling the guard does not compare against is an argument that goes
+		// nowhere, so it is recorded as the nothing it enforces.
+		const ceilingMatch = ceilingEnforced
+			? /ceiling\s*:\s*(0x[0-9a-fA-F]+|[\d_]+)/.exec(args)
+			: null;
 		const ceiling = ceilingMatch ? Number(ceilingMatch[1].replace(/_/g, '')) : null;
 		out[name] = {
 			allowZero,
@@ -450,8 +543,9 @@ export function protectiveNumberRanges(indexSource, guardsSource) {
 			ceiling,
 			// uws requires a SAFE INTEGER only where it also imposes a ceiling -
 			// the two arrive together in its guard, because the reason for both is
-			// the same fixed-width store on the receiving side.
-			integerRequired: ceilingSupported && ceiling !== null
+			// the same fixed-width store on the receiving side. A ceiling survives
+			// above only when the guard enforces it, so this follows from it.
+			integerRequired: ceiling !== null
 		};
 	}
 	if (Object.keys(out).length === 0) {
@@ -601,7 +695,15 @@ function admissionGuard(code, source, from, held, key) {
  */
 function main() {
 	const uwsRoot = findUws();
-	const ref = process.env.UWS_REF || 'HEAD';
+	// DEFAULT TO THE PIN, never to HEAD. Regenerating this manifest is normally a
+	// CHECK that it still describes the commit it names - not an invitation to
+	// adopt whatever the sibling checkout has moved to since. With HEAD as the
+	// default, an ordinary `npm run probe:uws` re-pins this adapter to a tree
+	// nobody reviewed; and because a prerelease version string does not change
+	// on every commit, the only trace can be one sha in a diff whose version line
+	// says nothing moved. Moving the pin is a deliberate act, so it is spelled
+	// like one: UWS_REF=<sha>.
+	const ref = process.env.UWS_REF || pinnedRef() || 'HEAD';
 	const commit = execFileSync('git', ['rev-parse', ref], { cwd: uwsRoot, encoding: 'utf8' }).trim();
 	const dts = showAtRef(uwsRoot, commit, 'src/index.d.ts');
 	const pkg = JSON.parse(showAtRef(uwsRoot, commit, 'package.json'));

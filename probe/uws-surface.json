@@ -1,6 +1,6 @@
 {
 	"uwsVersion": "0.6.0-next.92",
-	"uwsRef": "HEAD",
+	"uwsRef": "a2deed49a512f47b986228418020b63b45fda99b",
 	"uwsCommit": "a2deed49a512f47b986228418020b63b45fda99b",
 	"protocolSchemaSha256": "0b82ec36a19ac524d1930b617a95c5220c77cfbe1f852284b545da1090c4d862",
 	"platform": [
