@@ -252,3 +252,78 @@ test('getUserData throws once the connection is detached', () => {
 	// The adapter's own teardown still reads it.
 	assert.deepEqual(ws._rawUserData(), { user: 'u1' });
 });
+
+test('an unsendable close code becomes 1000 with the reason kept, said once out loud', () => {
+	// uWS puts any code on the wire, so hook code has never had this argument
+	// checked; a runtime that refuses the code would turn an app's cleanup
+	// call into a crash in the one path least likely to be wrapped in a try.
+	// The reason is where the app put the part a human reads, and 1000 is the
+	// only spelling that keeps it - a no-code close cannot carry one.
+	const warned = [];
+	const realWarn = console.warn;
+	console.warn = (...args) => { warned.push(args.join(' ')); };
+	try {
+		for (const code of [999, 1006, 2999, 5000, 1000.5]) {
+			const raw = fakeSocket();
+			wsFacade(raw).end(code, 'maintenance');
+			assert.deepEqual(
+				raw.calls.at(-1),
+				['close', 1000, 'maintenance'],
+				`code ${code} is clamped and the reason survives`
+			);
+		}
+	} finally {
+		console.warn = realWarn;
+	}
+	assert.equal(warned.filter((w) => /refuses to put/.test(w)).length, 1, 'one warning, not one per close');
+});
+
+test('every sendable close code passes through untouched', () => {
+	for (const code of [1000, 1003, 1007, 1014, 3000, 4999]) {
+		const raw = fakeSocket();
+		wsFacade(raw).end(code, 'bye');
+		assert.deepEqual(raw.calls.at(-1), ['close', code, 'bye'], `code ${code} is the app's to send`);
+	}
+});
+
+test('an oversize reason is cut at the last whole code point that fits', () => {
+	// The runtime refuses a reason over 123 UTF-8 bytes, and a cut that splits
+	// a code point would re-refuse the frame it was made to save.
+	const raw = fakeSocket();
+	wsFacade(raw).end(4000, 'x' + '€'.repeat(41)); // 1 + 41*3 = 124 bytes
+	const [, code, reason] = raw.calls.at(-1);
+	assert.equal(code, 4000);
+	assert.equal(new TextEncoder().encode(reason).length, 121, 'cut before the split code point, not through it');
+	assert.equal(reason, 'x' + '€'.repeat(40), 'what survives is a clean prefix');
+	assert.doesNotMatch(reason, /�/, 'and no replacement character was minted');
+
+	const ascii = fakeSocket();
+	wsFacade(ascii).end(4000, 'r'.repeat(200));
+	assert.equal(ascii.calls.at(-1)[2], 'r'.repeat(123), 'an ASCII reason cuts at exactly the byte limit');
+});
+
+test('a reason with no code is carried on 1000 rather than dropped', () => {
+	// A close frame cannot carry a reason without a code, and the reason is
+	// the half the caller plainly cared about.
+	const raw = fakeSocket();
+	wsFacade(raw).end(undefined, 'session rotated');
+	assert.deepEqual(raw.calls.at(-1), ['close', 1000, 'session rotated']);
+
+	const bare = fakeSocket();
+	wsFacade(bare).end();
+	assert.deepEqual(bare.calls.at(-1), ['close', undefined, undefined], 'no arguments stay no arguments');
+});
+
+test('the close(code, reason) spelling is sanitized the same way', () => {
+	const realWarn = console.warn;
+	console.warn = () => {};
+	try {
+		const raw = fakeSocket();
+		wsFacade(raw).close(2999, 'y'.repeat(200));
+		const [, code, reason] = raw.calls.at(-1);
+		assert.equal(code, 1000);
+		assert.equal(reason, 'y'.repeat(123));
+	} finally {
+		console.warn = realWarn;
+	}
+});

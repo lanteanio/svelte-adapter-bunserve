@@ -6,7 +6,9 @@
  * This is REQUIRED equipment, not a convenience layer, for one reason: Bun
  * throws on nothing. A closed socket's `subscribe()` returns `true`, its
  * `getBufferedAmount()` returns 0, and its `send()` returns 0 (all probed - see
- * probe/bun-api-facts.report.md, `closed-socket-behavior`). uWS throws on every
+ * probe/bun-api-facts.report.md, `closed-socket-behavior`; newer runtimes
+ * answer a closed subscribe with `false` instead of `true`, which is still an
+ * answer where the contract here is a throw). uWS throws on every
  * one of those, and consumers depend on the throw: the extensions' cursor and
  * presence modules call raw `ws.subscribe(...)` inside a try/catch and convert
  * the throw into a `WsClosedError` so the caller can roll back. Hand them a
@@ -79,6 +81,60 @@ function warnCloseArgs() {
 		'  have been honoured as a graceful close, which is what they mean; use end(code, reason)\n' +
 		'  to say so directly, or close() with no arguments for the hard cut.'
 	);
+}
+
+/** The close codes the runtime will put on the wire: 1000-1003, 1007-1014, 3000-4999. */
+const sendableCloseCode = (code) =>
+	Number.isInteger(code) &&
+	((code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) || (code >= 3000 && code <= 4999));
+
+const utf8 = new TextEncoder();
+const utf8back = new TextDecoder();
+
+let warnedUnsendableClose = false;
+
+/**
+ * A (code, reason) pair the runtime will accept, from whatever the caller
+ * passed. uWS puts any code and any reason on the wire, so hook code written
+ * against it has never had these arguments checked; Bun instead THROWS on a
+ * code outside its sendable set and on a reason over 123 UTF-8 bytes - and a
+ * throw out of a close call lands in cleanup paths, the code least likely to
+ * be wrapped in a try. So the pair is made sendable here: a close must close.
+ *
+ * An unsendable code becomes 1000, because the reason string is where an app
+ * puts the part a human reads and 1000 is the only spelling that keeps it - a
+ * no-code close cannot carry a reason. Said once out loud, so the app learns
+ * its code never reaches clients. An oversize reason is cut at the last whole
+ * code point that fits, since a split one would re-refuse the frame.
+ *
+ * @param {number | undefined} code
+ * @param {string | undefined} reason
+ * @returns {[] | [number] | [number, string]}
+ */
+function sendableClose(code, reason) {
+	if (typeof reason === 'string' && reason.length * 4 > 123) {
+		const bytes = utf8.encode(reason);
+		if (bytes.length > 123) {
+			let cut = 123;
+			while (cut > 0 && (bytes[cut] & 0xc0) === 0x80) cut--;
+			reason = utf8back.decode(bytes.subarray(0, cut));
+		}
+	}
+	if (code === undefined) {
+		return typeof reason === 'string' && reason.length > 0 ? [1000, reason] : [];
+	}
+	if (!sendableCloseCode(code)) {
+		if (!warnedUnsendableClose) {
+			warnedUnsendableClose = true;
+			console.warn(
+				`[ws] a close was requested with code ${String(code)}, which the runtime refuses to put ` +
+				'on the wire (sendable: 1000-1003, 1007-1014, 3000-4999). The socket was closed with ' +
+				'1000 and the reason kept, so the close still happens - but clients never see this code.'
+			);
+		}
+		code = 1000;
+	}
+	return typeof reason === 'string' ? [code, reason] : [code];
 }
 
 /**
@@ -217,8 +273,10 @@ export function wsFacade(raw) {
 		 * @returns {boolean}
 		 */
 		subscribe(topic) {
-			// Bun returns true here even on a closed socket. The whole reason
-			// this facade exists.
+			// Bun answers a closed subscribe with a boolean - true on 1.3, false
+			// on 1.4 - and either one is an answer where the contract here is a
+			// throw. The whole reason this facade exists; the closed check makes
+			// the runtime's choice of boolean unobservable.
 			assertOpen('subscribe');
 			return raw.subscribe(topic);
 		},
@@ -259,12 +317,17 @@ export function wsFacade(raw) {
 		 * Safe to call on an already-closed socket: closing twice is a no-op,
 		 * not an error, so cleanup paths do not need their own guard.
 		 *
+		 * The pair goes through {@link sendableClose} first: uWS puts any code
+		 * and any reason on the wire, so callers have never had these checked,
+		 * and a runtime that throws on an unsendable pair would turn an app's
+		 * cleanup call into a crash.
+		 *
 		 * @param {number} [code]
 		 * @param {string} [reason]
 		 */
 		end(code, reason) {
 			if (closed || raw.readyState !== OPEN) return;
-			raw.close(code, reason);
+			raw.close(...sendableClose(code, reason));
 		},
 
 		/**
@@ -287,7 +350,7 @@ export function wsFacade(raw) {
 			if (closed || raw.readyState !== OPEN) return;
 			if (code !== undefined) {
 				warnCloseArgs();
-				raw.close(code, reason);
+				raw.close(...sendableClose(code, reason));
 				return;
 			}
 			raw.terminate();

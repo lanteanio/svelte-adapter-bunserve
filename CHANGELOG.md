@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A close code or reason the runtime refuses to put on the wire no longer
+  turns a graceful close into a crash. uWS sends any `(code, reason)` a hook
+  passes, so code written against the family surface has never had these
+  arguments checked - and a runtime that throws on a code outside
+  1000-1003/1007-1014/3000-4999 or a reason over 123 UTF-8 bytes would throw
+  out of `end()` and `close()`, the calls that live in cleanup paths. An
+  unsendable code is clamped to 1000 with the reason kept (a no-code close
+  cannot carry one), said once out loud so the app learns its code never
+  reaches clients; an oversize reason is cut at the last whole code point
+  that fits; a reason with no code rides on 1000 rather than being dropped.
+
 - `platform.publish()` reads the three answers the runtime actually gives,
   rather than two. On Bun 1.4 a frame queued for a subscriber under
   backpressure comes back as `-1`, which the old byte-count-or-zero reading
