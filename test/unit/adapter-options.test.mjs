@@ -135,6 +135,64 @@ test('a value that resists rendering is still described rather than thrown over'
 	}
 });
 
+test('a value that fails every renderer is still refused by the option it names', () => {
+	// The renderer behind the diagnostic runs code the value brought with it:
+	// `JSON.stringify` calls enumerable getters, and the `[object Tag]` fallback
+	// reads Symbol.toStringTag - a getter - and touches a proxy's internals,
+	// which a revoked one answers by throwing. A value can therefore defeat the
+	// first renderer AND the one guarding it, and the diagnostic written to stop
+	// the build with an answer then stops it with a question.
+	const twoRenderersDeep = {
+		get x() { throw new Error('enumerable getter'); },
+		get [Symbol.toStringTag]() { throw new Error('tag getter'); }
+	};
+	const { proxy: revoked, revoke } = Proxy.revocable({}, {});
+	revoke();
+	for (const value of [twoRenderersDeep, revoked]) {
+		assert.throws(
+			() => adapter({ staticCacheMaxFileSize: value }),
+			(err) => {
+				assert.match(err.message, /staticCacheMaxFileSize/, 'the message names the option');
+				assert.match(err.message, /positive integer byte count/, 'and what it accepts');
+				assert.doesNotMatch(err.message, /tag getter|enumerable getter/, 'a throwing getter does not become the message');
+				assert.doesNotMatch(err.message, /revoked/i, 'nor does the proxy machinery');
+				return true;
+			}
+		);
+	}
+});
+
+test('an ordinary Symbol.toStringTag still renders, through the tag it declares', () => {
+	// The guarded fallback must stay a renderer, not become a blindfold: a value
+	// that merely resists JSON (circular) but answers the tag question politely
+	// is still shown by its tag.
+	const config = { [Symbol.toStringTag]: 'Config' };
+	config.self = config;
+	assert.throws(
+		() => adapter({ staticCacheMaxFileSize: config }),
+		(err) => {
+			assert.match(err.message, /staticCacheMaxFileSize/);
+			assert.match(err.message, /\[object Config\]/, 'the tag the value declares is the rendering');
+			return true;
+		}
+	);
+});
+
+test('a function whose name is booby-trapped is still refused as a function', () => {
+	// Reading `.name` runs a getter. The function branch sits before the guarded
+	// renderers, so it is inside the same guard rather than trusted.
+	const fn = () => {};
+	Object.defineProperty(fn, 'name', { get() { throw new Error('name getter'); } });
+	assert.throws(
+		() => adapter({ precompress: fn }),
+		(err) => {
+			assert.match(err.message, /must be true or false/);
+			assert.doesNotMatch(err.message, /name getter/);
+			return true;
+		}
+	);
+});
+
 test('a non-boolean for a boolean option THROWS, and says why coercion is refused', () => {
 	// The worst case in the set: 'no' is truthy, so the option reads as ON while
 	// its author plainly meant OFF.

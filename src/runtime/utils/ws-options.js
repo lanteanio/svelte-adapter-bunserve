@@ -158,18 +158,27 @@ export const INERT_WS_OPTION_KEYS = new Set(['metrics']);
  * @returns {string}
  */
 export function describeValue(value) {
-	if (typeof value === 'bigint') return `${value}n`;
-	if (typeof value === 'symbol') return String(value);
-	if (typeof value === 'function') return `[Function${value.name ? ' ' + value.name : ''}]`;
+	// Every renderer here except the last line can execute code the VALUE
+	// brought with it: `JSON.stringify` calls toJSON and enumerable getters,
+	// `String` calls toString, reading `.name` off a function runs a getter or a
+	// proxy trap, and even `Object.prototype.toString` reads Symbol.toStringTag
+	// - a getter - and touches a proxy's internals, which a revoked one answers
+	// by throwing. So each renderer is a guarded attempt, ordered by how much of
+	// the value it reads, and the final answer is a literal that reads nothing.
 	try {
+		if (typeof value === 'bigint') return `${value}n`;
+		if (typeof value === 'symbol') return String(value);
+		if (typeof value === 'function') return `[Function${value.name ? ' ' + value.name : ''}]`;
 		const shown = JSON.stringify(value);
 		// `undefined` for a value JSON has no representation for.
 		return shown === undefined ? String(value) : shown;
 	} catch {
-		// A circular object, or one whose getters throw. The tag form renders
-		// anything, and a message about a bad value must not fail with a
-		// different error than the one it was written to report.
+		// Fall through to a renderer that reads less of the value.
+	}
+	try {
 		return Object.prototype.toString.call(value);
+	} catch {
+		return '[value that refuses to be rendered]';
 	}
 }
 

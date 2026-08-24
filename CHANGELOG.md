@@ -27,7 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because a large integer was meant. Every adapter-option diagnostic renders
   its value through one total formatter now, so a BigInt, a Symbol, a function
   or an object whose getters throw all describe themselves instead of
-  replacing the message with an error of their own.
+  replacing the message with an error of their own. Total includes the
+  formatter's own fallbacks: rendering a value can run code the value brought
+  with it (a `toJSON`, a `toString`, a `Symbol.toStringTag` getter, a revoked
+  proxy's traps), so every renderer is guarded and the last resort is a
+  literal that reads nothing from the value at all.
 
 - A `websocket.*` option written at the TOP level is now answered with its
   real home: a top-level `maxPayloadLength` is met with a suggestion of
