@@ -346,25 +346,66 @@ export function nestedOptionKeys(source) {
 	const rawBody = source.slice(open, end + 1);
 	/** @type {Record<string, string[]>} */
 	const out = {};
-	// Each entry is `key: new Set([...])` or `'quoted.key': new Set([...])`. The
+	// Each entry is `key: new Set([...])`, with the name bare or quoted in either
+	// delimiter - both are ordinary JavaScript, so which one uws writes is a
+	// style choice an upstream edit can flip without changing the contract. The
 	// entry SHAPE is matched in the blanked body, so only a real declaration is
 	// read; the names and keys are then sliced out of the original at the offsets
-	// that match found, because those are the one thing the blanking removes.
-	const entry = /(?:'([^']+)'|([A-Za-z_$][\w$]*))\s*:\s*new Set\(\[([^\]]*)\]\)/dg;
+	// the match found, because those are the one thing the blanking removes.
+	const entry = /(?:'([^']*)'|"([^"]*)"|([A-Za-z_$][\w$]*))\s*:\s*new Set\(\[([^\]]*)\]\)/dg;
 	let m;
+	let entries = 0;
 	while ((m = entry.exec(codeBody)) !== null) {
-		const quoted = m.indices[1];
-		const name = quoted ? rawBody.slice(quoted[0], quoted[1]) : m[2];
+		entries++;
+		const quoted = m.indices[1] ?? m.indices[2];
+		const name = quoted ? rawBody.slice(quoted[0], quoted[1]) : m[3];
 		// The keys are found in the BLANKED bracket span and only then read out of
 		// the original. Slicing the raw span and matching quotes there would count
 		// a key that had been commented out INSIDE the brackets - the removal
 		// still reads as a declaration, so a key uws deleted survives in the
 		// manifest as one it still accepts.
-		const [ks, ke] = m.indices[3];
-		const keys = [...codeBody.slice(ks, ke).matchAll(/'([^']+)'/dg)]
-			.map((k) => rawBody.slice(ks + k.indices[1][0], ks + k.indices[1][1]))
+		const [ks, ke] = m.indices[4];
+		const span = codeBody.slice(ks, ke);
+		const literals = [...span.matchAll(/'([^']*)'|"([^"]*)"/dg)];
+		const keys = literals
+			.map((k) => {
+				const [s, e] = k.indices[1] ?? k.indices[2];
+				return rawBody.slice(ks + s, ks + e);
+			})
 			.sort();
+		// FAIL ON WHAT THE SCAN DID NOT CLAIM. A key spelled some way this
+		// extractor does not read would otherwise just be absent, and an absent
+		// key does not fail anything: the manifest thins, the parity candidates
+		// are derived from the thinned manifest, and every check stays green
+		// while a piece of the contract is simply gone. A loud refusal is the
+		// only version of this failure anyone gets to see.
+		let unclaimed = span;
+		for (const k of literals) {
+			const [s, e] = k.indices[0];
+			unclaimed = unclaimed.slice(0, s) + ' '.repeat(e - s) + unclaimed.slice(e);
+		}
+		if (!/^[\s,]*$/.test(unclaimed)) {
+			const at = unclaimed.search(/[^\s,]/);
+			throw new Error(
+				`the nested option block '${name}' contains an entry this extractor cannot read: ` +
+				`"${rawBody.slice(ks + at, ks + at + 60).replace(/\s+/g, ' ').trim()}". Teach the ` +
+				'extractor the new spelling rather than publishing the keys it happened to recognise - ' +
+				'a partial list holds this adapter to part of a contract and calls it all of one.'
+			);
+		}
 		if (keys.length) out[name] = keys;
+	}
+	// Every Set in the declaration must belong to an entry the shape above
+	// claimed, or a block whose NAME is spelled some way this does not read
+	// (computed, a template literal) would vanish with all its keys while the
+	// blocks around it keep the count above zero.
+	const declared = [...codeBody.matchAll(/new Set\s*\(/g)].length;
+	if (declared !== entries) {
+		throw new Error(
+			`the nested option declaration carries ${declared} Set(s) but only ${entries} matched the ` +
+			'entry shape this extractor reads. A block is spelled some way it does not recognise - ' +
+			'teach it the new spelling rather than publishing a manifest missing that block.'
+		);
 	}
 	if (Object.keys(out).length === 0) throw new Error('parsed no nested option blocks; the declaration shape changed.');
 	return out;

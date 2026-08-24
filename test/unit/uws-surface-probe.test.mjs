@@ -386,6 +386,74 @@ test('a nested block whose name is quoted is still read from the original', () =
 	assert.deepEqual(nestedOptionKeys(source), { 'upgradeAdmission.cursorLane': ['fraction'] });
 });
 
+test('a nested key keeps its contract whichever quote delimiter spells it', () => {
+	// Which quote uws writes is a style choice, and a style-only edit upstream
+	// must not be able to delete a key from this adapter's contract. A key seen
+	// only under one delimiter FAILS OPEN: it is simply absent, the parity
+	// candidates are derived from the thinned manifest, and every check stays
+	// green while the contract shrinks.
+	const doubled =
+		'export const KNOWN_NESTED_WEBSOCKET_OPTION_KEYS = {\n' +
+		'\t"upgradeAdmission.cursorLane": new Set(["fraction"])\n' +
+		'};';
+	assert.deepEqual(nestedOptionKeys(doubled), { 'upgradeAdmission.cursorLane': ['fraction'] });
+
+	const mixed =
+		'export const KNOWN_NESTED_WEBSOCKET_OPTION_KEYS = {\n' +
+		'\tupgradeAdmission: new Set([\'maxConcurrent\', "maxDeferred"])\n' +
+		'};';
+	assert.deepEqual(
+		nestedOptionKeys(mixed).upgradeAdmission,
+		['maxConcurrent', 'maxDeferred'],
+		'one Set may spell its keys both ways and loses neither'
+	);
+
+	const delimitersMatter =
+		'export const KNOWN_NESTED_WEBSOCKET_OPTION_KEYS = {\n' +
+		'\tupgradeAdmission: new Set(["it\'s"])\n' +
+		'};';
+	assert.deepEqual(
+		nestedOptionKeys(delimitersMatter).upgradeAdmission,
+		["it's"],
+		'a delimiter only closes the quote it opened'
+	);
+});
+
+test('a Set entry the extractor cannot read fails rather than thinning the list', () => {
+	// The half that matters. Recognising more spellings shrinks the blind spot;
+	// only refusing to publish past an unrecognised one removes it. Each shape
+	// below is a key the old scan would have silently dropped while the keys
+	// around it kept every count and every check green.
+	const shapes = [
+		["\tupgradeAdmission: new Set(['real', `ghost`])\n", 'a template-literal key'],
+		["\tupgradeAdmission: new Set(['real', GHOST_KEY])\n", 'an identifier'],
+		["\tupgradeAdmission: new Set([...SHARED, 'real'])\n", 'a spread']
+	];
+	for (const [entry, what] of shapes) {
+		const block = 'export const KNOWN_NESTED_WEBSOCKET_OPTION_KEYS = {\n' + entry + '};';
+		assert.throws(
+			() => nestedOptionKeys(block),
+			/entry this extractor cannot read/,
+			`${what} is refused, not skipped`
+		);
+	}
+});
+
+test('a block spelled some way the extractor cannot read fails rather than vanishing', () => {
+	// A whole block can disappear while its neighbours keep the result nonempty,
+	// so the count of Sets is held against the count of entries that matched.
+	const computed =
+		'export const KNOWN_NESTED_WEBSOCKET_OPTION_KEYS = {\n' +
+		"\tupgradeAdmission: new Set(['maxConcurrent']),\n" +
+		"\t[NESTED_BLOCK]: new Set(['fraction'])\n" +
+		'};';
+	assert.throws(
+		() => nestedOptionKeys(computed),
+		/only 1 matched the entry shape/,
+		'the unmatched Set is refused, not lost'
+	);
+});
+
 test('the manifest names an immutable commit, so regenerating cannot re-pin it', () => {
 	// A regeneration is a CHECK that the manifest still describes the commit it
 	// names. Defaulting to HEAD made an ordinary `npm run probe:uws` adopt
