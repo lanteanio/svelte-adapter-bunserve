@@ -440,6 +440,11 @@ export function resolveRateLimitAddress(req, direct) {
 		// truncate it anyway - but doing that here keeps the split and the trim
 		// below off a value that size.
 		if (value.length > 8192) return { address: direct, source: 'header-unusable' };
+		// Duplicate X-Forwarded-For headers read back as one chain, joined with
+		// ', ' per the Fetch spec, and the split below must see that WHOLE chain:
+		// the depth counts from the end, and the end is the only part a client
+		// cannot write - a forged prefix, as text or as extra headers, lengthens
+		// the left edge and never moves the right one.
 		const addresses = value.split(',');
 		// Too few hops to satisfy the configured depth means the chain is not
 		// the one this deployment was configured for, so the claim is not
