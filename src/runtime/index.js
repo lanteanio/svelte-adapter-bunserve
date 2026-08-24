@@ -140,11 +140,17 @@ async function graceful_shutdown(reason) {
 
 	// Step 2: Graceful stop - refuses new connections; in-flight HTTP requests
 	// run to completion (probed Bun.serve semantics). Fire-and-forget: stop()'s
-	// own settlement is NOT a gate here, because graceful stop leaves idle
-	// connections open (probed), so awaiting it would park shutdown on every
-	// keep-alive client until the timeout. The gate is the SSR drain counter,
+	// own settlement is NOT a gate here, twice over. On runtimes where graceful
+	// stop leaves idle connections open (probed), awaiting it would park
+	// shutdown on every keep-alive client until the timeout. On runtimes where
+	// the promise resolves only when the LAST connection closes, it stays
+	// pending on a connection that sent part of a request and then stopped - so
+	// a shutdown gated on it hangs on one stalled client until the platform's
+	// kill arrives, which on a rolling deploy is a pod that eats its whole
+	// grace period and dies by SIGKILL. The gate is the SSR drain counter,
 	// raced against the shutdown timeout - same contract as the family's
-	// other adapters.
+	// other adapters - and the stop(true) below is what ends a connection that
+	// will never finish its request.
 	// Older Bun versions return undefined here, current ones a promise; its
 	// settlement is deliberately not awaited (see above), so swallow any
 	// rejection rather than let it surface as an unhandled rejection during

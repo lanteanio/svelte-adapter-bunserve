@@ -73,6 +73,28 @@ try {
 	// Let the welcome and the fixture's `opened` envelope land.
 	await Bun.sleep(300);
 
+	// A HALF-SENT REQUEST, parked for the whole shutdown. `server.stop()`
+	// resolves only when the last connection closes, and a connection that sent
+	// part of a request and then stopped never closes on its own - so a
+	// shutdown gated on stop()'s settlement hangs on one stalled client, which
+	// on a rolling deploy is a pod that eats its whole grace period and dies by
+	// SIGKILL. The sequence under test never awaits that promise, and the
+	// stop(true) at its end is what closes this socket; the exit-0-in-time
+	// checks below are only proof of that while this socket is being held open.
+	let halfSentClosed = false;
+	const halfSent = await Bun.connect({
+		hostname: '127.0.0.1',
+		port: PORT,
+		socket: {
+			data() { /* no response is expected for half a request */ },
+			close() { halfSentClosed = true; },
+			error() { /* a reset at hard-close still counts as closed */ halfSentClosed = true; }
+		}
+	});
+	// Headers deliberately unterminated: the request is never dispatched, so no
+	// drain counter sees it - only the connection accounting stop() waits on.
+	halfSent.write('GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n');
+
 	const startedAt = Date.now();
 	proc.kill('SIGTERM');
 
@@ -160,6 +182,15 @@ try {
 		`shutdown completes well inside SHUTDOWN_TIMEOUT (took ${elapsed}ms)`,
 		typeof exitCode === 'number' && elapsed < 30000,
 		`elapsed=${elapsed}ms`
+	);
+	// The half-sent request neither held the shutdown open (the two checks
+	// above passed with it parked) nor survived it: the hard-close is what
+	// ends a connection that will never finish its request.
+	await Bun.sleep(100);
+	check(
+		'the half-sent request is closed by the hard-close, not waited on',
+		halfSentClosed,
+		'socket still open after the process exited'
 	);
 	check('shutdown reports completion', /Shutdown complete\./.test(out), JSON.stringify(out.slice(-200)));
 
