@@ -186,6 +186,63 @@ test('a ceiling branch behind the acceptance return enforces nothing', () => {
 	);
 });
 
+test('a return no recognised branch governs fails the extractor', () => {
+	// The plainest relaxation of all: a bare return BEFORE the branches makes
+	// every one of them dead code while each stays letter-perfect, and the
+	// guard accepts everything the recorded ranges say it refuses. An `else
+	// return` on a refusing branch is the same hole spelled as a refactor.
+	const index = "assertProtectiveNumber(websocket, 'w', 'websocket.w', { allowZero: false });";
+	const early = PINNED_GUARD.replace(
+		'if (value === undefined || value === null) return;',
+		'return;\n\tif (value === undefined || value === null) return;'
+	);
+	assert.throws(
+		() => protectiveNumberRanges(index, early),
+		/no recognised branch governs/,
+		'an unconditional early return is refused, not walked past'
+	);
+	const elseReturn = PINNED_GUARD.replace(
+		"if (typeof value === 'number'",
+		"if (!allowZero && value === 0) { throw new Error('zero'); } else return;\n\tif (typeof value === 'number'"
+	);
+	assert.throws(
+		() => protectiveNumberRanges(index, elseReturn),
+		/no recognised branch governs/,
+		'a refusing branch that accepts everything else is refused too'
+	);
+});
+
+test('a guard that can swallow its own refusal fails the extractor', () => {
+	// The ceiling branch is verified to govern a throw - and a try around it
+	// makes that throw refuse nothing while every check on the branch itself
+	// still passes. Control-flow constructs the walker does not model are
+	// refused before it starts, because any of them can reroute what the
+	// recorded ranges depend on.
+	const swallowed = CEILING_GUARD
+		.replace('if (ceiling > 0', 'try { if (ceiling > 0')
+		.replace("throw new Error('ceiling');\n\t}", "throw new Error('ceiling');\n\t} } catch {}");
+	assert.match(swallowed, /catch \{\}/, 'the wrapper really is in place');
+	const index = "assertProtectiveNumber(websocket, 'x', 'websocket.x', { ceiling: 100 });";
+	assert.throws(
+		() => protectiveNumberRanges(index, swallowed),
+		/construct this extractor does not walk/,
+		'a swallowed throw is not recorded as enforcement'
+	);
+});
+
+test('whitespace inside a string literal is part of the condition', () => {
+	// Flat whitespace-stripping would equate 'number' with 'number ', reading
+	// an acceptance that is always false as the ordinary one - a manifest
+	// LOOSER than the guard, which is the drift this probe exists to catch.
+	const spaced = PINNED_GUARD.replace("typeof value === 'number'", "typeof value === 'number '");
+	const index = "assertProtectiveNumber(websocket, 'w', 'websocket.w', { allowZero: false });";
+	assert.throws(
+		() => protectiveNumberRanges(index, spaced),
+		/condition this extractor does not read/,
+		'the literal is compared by its exact content'
+	);
+});
+
 test('a guard that stops ending in refusal fails rather than recording its floors', () => {
 	// Every branch can be correct and the guard still accept everything: a value
 	// no branch claims falls out of the bottom, and a function that returns
@@ -437,6 +494,26 @@ test('a Set entry the extractor cannot read fails rather than thinning the list'
 			`${what} is refused, not skipped`
 		);
 	}
+});
+
+test('the amount of whitespace inside a Set construction changes nothing', () => {
+	// `new` and `Set` split across a line break is ordinary JavaScript, and a
+	// spelling the entry shape misses while the Set count also misses it is a
+	// block that vanishes with all its keys - the silent half of the failure
+	// the count exists to make loud. So the entry shape tolerates the
+	// whitespace, and the count is written broader than the entry, never
+	// narrower.
+	const wrapped =
+		'export const KNOWN_NESTED_WEBSOCKET_OPTION_KEYS = {\n' +
+		"\tupgradeAdmission: new Set(['maxConcurrent']),\n" +
+		"\t'upgradeAdmission.cursorLane': new\n\t\tSet(['fraction']),\n" +
+		"\tpressure: new Set (['sampleMs'])\n" +
+		'};';
+	assert.deepEqual(nestedOptionKeys(wrapped), {
+		upgradeAdmission: ['maxConcurrent'],
+		'upgradeAdmission.cursorLane': ['fraction'],
+		pressure: ['sampleMs']
+	});
 });
 
 test('a block spelled some way the extractor cannot read fails rather than vanishing', () => {

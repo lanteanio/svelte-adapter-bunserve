@@ -352,7 +352,7 @@ export function nestedOptionKeys(source) {
 	// entry SHAPE is matched in the blanked body, so only a real declaration is
 	// read; the names and keys are then sliced out of the original at the offsets
 	// the match found, because those are the one thing the blanking removes.
-	const entry = /(?:'([^']*)'|"([^"]*)"|([A-Za-z_$][\w$]*))\s*:\s*new Set\(\[([^\]]*)\]\)/dg;
+	const entry = /(?:'([^']*)'|"([^"]*)"|([A-Za-z_$][\w$]*))\s*:\s*new\s+Set\s*\(\s*\[([^\]]*)\]\s*\)/dg;
 	let m;
 	let entries = 0;
 	while ((m = entry.exec(codeBody)) !== null) {
@@ -399,7 +399,11 @@ export function nestedOptionKeys(source) {
 	// claimed, or a block whose NAME is spelled some way this does not read
 	// (computed, a template literal) would vanish with all its keys while the
 	// blocks around it keep the count above zero.
-	const declared = [...codeBody.matchAll(/new Set\s*\(/g)].length;
+	// `\s+` on both sides of the same tokens as the entry shape, so a spelling
+	// the entry regex tolerates is never one this count refuses - and the count
+	// stays broader than the entry, never narrower, because only that direction
+	// fails loud when the two disagree.
+	const declared = [...codeBody.matchAll(/\bnew\s+Set\b/g)].length;
 	if (declared !== entries) {
 		throw new Error(
 			`the nested option declaration carries ${declared} Set(s) but only ${entries} matched the ` +
@@ -520,16 +524,54 @@ function guardEnforcesCeiling(body, bodyRaw) {
 		'&&(!Number.isSafeInteger(value)||value>ceiling)';
 	const ZERO = '!allowZero&&value===0';
 
+	// Constructs that move control or meaning somewhere the branch walk below
+	// cannot see are refused before it starts: a `try` can swallow the very
+	// throw the walk just verified, and a nested function's branches would be
+	// read as though they were the guard's own.
+	const foreign = /\b(?:try|catch|finally|function|while|for|switch|do)\b|=>/.exec(body);
+	if (foreign) {
+		throw new Error(
+			`assertProtectiveNumber carries a construct this extractor does not walk ` +
+			`("${body.slice(foreign.index, foreign.index + 20).trim()}"), which can reroute or ` +
+			'swallow the control flow the recorded ranges depend on. Fix the extractor against ' +
+			'the new guard shape rather than recording rules it cannot verify.'
+		);
+	}
+
+	// A condition is compared as WRITTEN - whitespace stripped outside string
+	// literals only, and literal bodies kept exactly. Stripping the raw text
+	// flat would equate `'number'` with `'number '`, and a blanked copy cannot
+	// tell `'number'` from `'string'` at all; the delimiters survive blanking,
+	// so they mark where the raw text is to be kept verbatim.
+	const canonical = (condCode, condRaw) => {
+		let out = '';
+		/** @type {string | null} */
+		let quote = null;
+		for (let i = 0; i < condCode.length; i++) {
+			const c = condCode[i];
+			if (quote) {
+				out += condRaw[i];
+				if (c === quote) quote = null;
+			} else if (c === '"' || c === "'" || c === '`') {
+				quote = c;
+				out += condRaw[i];
+			} else if (!/\s/.test(condRaw[i])) {
+				out += condRaw[i];
+			}
+		}
+		return out;
+	};
+
 	let acceptTail = -1;
 	let ceilingAt = -1;
+	/** The `return` tokens a recognised branch governs; any other is refused. */
+	const sanctioned = new Set();
 	const branch = /\bif\s*\(/g;
 	let f;
 	while ((f = branch.exec(body)) !== null) {
 		const open = body.indexOf('(', f.index);
 		const condition = callArgs(body, open);
-		// The condition is compared as WRITTEN, not as blanked: `'number'` is a
-		// string, and a blanked copy cannot tell it from `'string'`.
-		const stated = bodyRaw.slice(open + 1, open + 1 + condition.length).replace(/\s+/g, '');
+		const stated = canonical(condition, bodyRaw.slice(open + 1, open + 1 + condition.length));
 		const close = open + 1 + condition.length;
 		const tail = body.slice(close + 1);
 		if (stated === UNSET || stated === ACCEPT) {
@@ -540,7 +582,9 @@ function guardEnforcesCeiling(body, bodyRaw) {
 					'extractor against the new shape rather than recording the old rule.'
 				);
 			}
-			if (stated === ACCEPT) acceptTail = close + 1 + tail.indexOf('return') + 'return'.length;
+			const at = close + 1 + tail.indexOf('return');
+			sanctioned.add(at);
+			if (stated === ACCEPT) acceptTail = at + 'return'.length;
 		} else if (stated === CEILING || stated === ZERO) {
 			if (!/^\s*\{?\s*throw\b/.test(tail)) {
 				throw new Error(
@@ -573,11 +617,18 @@ function guardEnforcesCeiling(body, bodyRaw) {
 			'the extractor against the new shape rather than recording a bound nothing reaches.'
 		);
 	}
-	if (/\breturn\b/.test(body.slice(acceptTail))) {
-		throw new Error(
-			'assertProtectiveNumber returns somewhere after its acceptance branch, so it can accept ' +
-			'a value the recorded ranges say it refuses. Fix the extractor against the new shape.'
-		);
+	// EVERY return must be one a recognised branch governs. Only refusing a
+	// return after the acceptance branch would miss the plainer relaxation: a
+	// bare `return;` (or an `else return`) BEFORE it accepts every value
+	// unconditionally while each recognised branch stays letter-perfect.
+	for (const r of body.matchAll(/\breturn\b/g)) {
+		if (!sanctioned.has(r.index)) {
+			throw new Error(
+				'assertProtectiveNumber returns somewhere no recognised branch governs, so it can ' +
+				'accept a value the recorded ranges say it refuses. Fix the extractor against the ' +
+				'new shape rather than recording rules the guard does not enforce.'
+			);
+		}
 	}
 	const throws = [...body.matchAll(/\bthrow\b/g)];
 	const last = throws.length ? throws[throws.length - 1].index : -1;
