@@ -319,9 +319,11 @@ async function probeCloseVsTerminate() {
 	// The pairs the spec calls unsendable, plus a reason one byte over the
 	// 123-byte cap. What the runtime does with them decides what a facade may
 	// pass through from a caller: observed across generations, an unchecked
-	// pair either throws at the call, reaches the client verbatim, or surfaces
-	// client-side as a 1002 protocol error - and which one depends on the code
-	// and the runtime version, which is why the facade clamps instead.
+	// pair reaches the client verbatim, surfaces client-side as a 1002
+	// protocol error, is silently rewritten to a different code, or has its
+	// reason truncated - and which of those depends on the code and the
+	// runtime version, with a throw at the call the documented direction of
+	// travel. That spread is why the facade clamps instead.
 	for (const [code, reason, label] of [
 		[999, 'x', 'code below the range'],
 		[1005, 'x', 'code reserved for no-status'],
