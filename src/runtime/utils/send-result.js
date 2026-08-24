@@ -74,3 +74,43 @@ export function mapSendResult(result) {
 	if (result === -1) return SEND_BACKPRESSURE;
 	return SEND_DROPPED;
 }
+
+/**
+ * Whether a native FAN-OUT publish reached anyone.
+ *
+ * The sibling of {@link mapSendResult} for `server.publish()`, and it lives
+ * beside it so the two cannot drift: the runtime answers both calls from the
+ * same set of codes, and a rule stated twice is a rule that eventually
+ * disagrees with itself.
+ *
+ * THREE ANSWERS, not two. The byte count when the frame went out, `-1` when a
+ * subscriber is under backpressure and the frame was queued for it, and `0`
+ * when it was DISCARDED or the topic had no subscriber. An earlier runtime
+ * could not say the middle one - a frame discarded for a subscriber came back
+ * as the byte count like any other - so the answer set widened rather than
+ * changed meaning, and reading the result as a byte count that might be zero
+ * silently loses both new cases.
+ *
+ * A QUEUED FRAME COUNTS AS REACHED. It is what the older runtime answered for
+ * that same case, so treating `-1` as "nobody got it" changes what `publish()`
+ * returns under an app that changed nothing - and an app that retries on
+ * `false` then sends it twice, to a subscriber whose socket is already behind.
+ *
+ * ONLY THE DOCUMENTED CODES CLAIM DELIVERY, which is why this is not simply
+ * `result !== 0`. An unrecognized negative, or a NaN, must not answer
+ * "reached" - the same conservative direction `mapSendResult` takes, for the
+ * same reason: being wrong toward "nobody got it" costs a resend, being wrong
+ * toward "delivered" loses the frame silently, and only one of those
+ * self-heals.
+ *
+ * Unlike `mapSendResult` this carries no closed-socket ordering contract:
+ * a fan-out has no one socket to be closed, and the runtime answers `0` for
+ * an empty topic rather than throwing.
+ *
+ * @param {unknown} result - the raw return value of `server.publish()`
+ * @returns {boolean} whether at least one subscriber got it or has it queued
+ */
+export function publishReached(result) {
+	if (typeof result !== 'number' || Number.isNaN(result)) return false;
+	return result > 0 || result === -1;
+}

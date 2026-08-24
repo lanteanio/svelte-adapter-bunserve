@@ -30,7 +30,7 @@
 
 import { completeEnvelope } from '../utils/envelope.js';
 import { isSystemTopic, isValidWireTopic, createTopicHelperCache } from '../utils/topic.js';
-import { SEND_DROPPED } from '../utils/send-result.js';
+import { SEND_DROPPED, publishReached } from '../utils/send-result.js';
 import { isValidResumeEpoch, isValidResumeSeq } from '../utils/resume-input.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
 import { processMonotonicNow, randomBytes as randomOctets, randomFloat, randomU32, randomUuid, wallEpoch } from '../runtime.js';
@@ -558,7 +558,10 @@ export const platform = {
 	 * @param {string} event
 	 * @param {unknown} data
 	 * @param {{ seq?: boolean | number, jitterMs?: number, compress?: boolean }} [options]
-	 * @returns {boolean} whether any local subscriber received it
+	 * @returns {boolean} whether the frame reached at least one local
+	 *   subscriber. A subscriber under backpressure counts: the frame is queued
+	 *   for its socket rather than discarded, and reporting that as "nobody got
+	 *   it" is what makes an app send it a second time.
 	 */
 	publish(topic, event, data, options) {
 		// The call's options are read first, one read per documented field
@@ -608,9 +611,7 @@ export const platform = {
 			captureResumeFrame(topic, seq, envelope, compress, null, authoritative);
 		}
 		const result = server.publish(topic, envelope, compress);
-		// Bun returns the byte count on delivery and 0 when the topic has no
-		// subscribers (probed).
-		return typeof result === 'number' && result > 0;
+		return publishReached(result);
 	},
 
 	/**
@@ -793,7 +794,7 @@ export const platform = {
 		// JSON fast path: no live connection wants binary for this codec.
 		if (excludeWs === null && !capCounts.has(wire.capability)) {
 			const result = server.publish(topic, envelope, compress);
-			return typeof result === 'number' && result > 0;
+			return publishReached(result);
 		}
 
 		const seqOnWire = seq == null ? 0 : seq;
@@ -925,7 +926,7 @@ export const platform = {
 		if (payload == null) {
 			if (excludeWs === null) {
 				const result = server.publish(topic, envelope, compress);
-				return typeof result === 'number' && result > 0;
+				return publishReached(result);
 			}
 			// Declined frame with sender exclusion: the same JSON envelope the
 			// single fan-out would have sent, delivered per subscriber so the
@@ -995,9 +996,10 @@ export const platform = {
 				binBytes = server.publish(bin, buildBinaryFrame(wire.schemaVersion, id, seqOnWire, payload), compress);
 			}
 			const jsonBytes = server.publish(json, envelope, compress);
-			// Native publish returns the byte count on delivery, 0 for an empty
-			// cohort - so this reports honestly whether any cohort had a member.
-			return (typeof binBytes === 'number' && binBytes > 0) || (typeof jsonBytes === 'number' && jsonBytes > 0);
+			// Either cohort reaching anyone is a delivery. `binBytes` stays 0
+			// when no binary cohort exists, which is the same "nobody" the
+			// runtime reports for an empty topic.
+			return publishReached(binBytes) || publishReached(jsonBytes);
 		}
 
 		let delivered = false;
@@ -1311,7 +1313,7 @@ export const platform = {
 			let anyBytes = false;
 			for (let i = 0; i < n; i++) {
 				const r = server.publish(topic, envs[i], compress);
-				if (typeof r === 'number' && r > 0) anyBytes = true;
+				if (publishReached(r)) anyBytes = true;
 			}
 			return anyBytes;
 		}

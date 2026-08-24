@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `platform.publish()` reads the three answers the runtime actually gives,
+  rather than two. On Bun 1.4 a frame queued for a subscriber under
+  backpressure comes back as `-1`, which the old byte-count-or-zero reading
+  called "nobody got it" - so an app retrying on `false` would have sent it a
+  second time, to a socket already behind. A discarded frame and an empty
+  topic both answer `0` and still read as unreached. Only the codes the
+  runtime documents claim delivery: an unrecognized one reads as unreached,
+  the conservative direction the per-socket send mapping already took, since
+  a needless resend self-heals and a false delivery loses the frame in
+  silence.
+
 - An option value that cannot be JSON-serialized is now refused by the option
   it names rather than by the message builder. `staticCacheMaxFileSize: 1024n`
   failed the build with "Do not know how to serialize a BigInt" - an error
