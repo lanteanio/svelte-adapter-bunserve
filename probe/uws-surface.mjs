@@ -416,9 +416,13 @@ export function callArgs(source, open) {
  * integer, a comparison - appear in all of them, so a file-wide match answers a
  * question about a different option than the one being asked about.
  *
+ * Returned as OFFSETS rather than as the text, because the callers need the
+ * same span in two views - the blanked copy to find where a condition sits,
+ * the original to read what it says - and only offsets carry across both.
+ *
  * @param {string} code source with comments and string bodies blanked
  * @param {string} name the declared function
- * @returns {string | null}
+ * @returns {{ from: number, to: number } | null} offsets of `{`..`}` inclusive
  */
 function functionBody(code, name) {
 	const at = code.search(new RegExp(`function\\s+${name}\\s*\\(`));
@@ -433,10 +437,122 @@ function functionBody(code, name) {
 		if (code[p] === '{') depth++;
 		else if (code[p] === '}') {
 			depth--;
-			if (depth === 0) return code.slice(brace, p + 1);
+			if (depth === 0) return { from: brace, to: p };
 		}
 	}
 	return null;
+}
+
+/**
+ * Whether `assertProtectiveNumber`'s own control flow enforces a passed
+ * ceiling - decided from the conditions that govern its returns and throws,
+ * never from which tokens the body happens to contain.
+ *
+ * Token presence proves nothing twice over. A floor DECLARATION can outlive
+ * the comparison that used it, so a guard accepting every finite value still
+ * carries `const floor = allowZero ? 0 : 1;`. And `ceiling > 0`,
+ * `value > ceiling` and `Number.isSafeInteger(value)` can all sit in
+ * expressions that govern no throw. In both cases a rule nothing runs would be
+ * recorded as enforced, which makes the manifest STRICTER than uws - the
+ * parity gate then holds this adapter to a bound uws does not have, so this
+ * adapter refuses a config that builds there. That is a failure invented here
+ * rather than found, and it fails in the one direction the never-looser test
+ * cannot see, because it is not looser.
+ *
+ * So every `if` in the body must be one of the four branches the guard is
+ * known to have, each verified to govern the statement that gives it meaning:
+ * an unset option and an accepted value RETURN, a refused one THROWS. A
+ * condition this does not recognise fails the extractor rather than being
+ * guessed about, refusal must come BEFORE acceptance can return past it, and
+ * the body must end by throwing - a guard that falls through accepts
+ * everything its earlier branches did not, however correct those branches are.
+ *
+ * @param {string} body guard body, comments and string bodies blanked
+ * @param {string} bodyRaw the same span as written
+ * @returns {boolean} whether a passed ceiling is enforced
+ */
+function guardEnforcesCeiling(body, bodyRaw) {
+	const UNSET = 'value===undefined||value===null';
+	const ACCEPT = "typeofvalue==='number'&&Number.isFinite(value)&&value>=floor";
+	const CEILING =
+		"ceiling>0&&typeofvalue==='number'&&Number.isFinite(value)&&value>=floor" +
+		'&&(!Number.isSafeInteger(value)||value>ceiling)';
+	const ZERO = '!allowZero&&value===0';
+
+	let acceptTail = -1;
+	let ceilingAt = -1;
+	const branch = /\bif\s*\(/g;
+	let f;
+	while ((f = branch.exec(body)) !== null) {
+		const open = body.indexOf('(', f.index);
+		const condition = callArgs(body, open);
+		// The condition is compared as WRITTEN, not as blanked: `'number'` is a
+		// string, and a blanked copy cannot tell it from `'string'`.
+		const stated = bodyRaw.slice(open + 1, open + 1 + condition.length).replace(/\s+/g, '');
+		const close = open + 1 + condition.length;
+		const tail = body.slice(close + 1);
+		if (stated === UNSET || stated === ACCEPT) {
+			if (!/^\s*\{?\s*return\b/.test(tail)) {
+				throw new Error(
+					`assertProtectiveNumber's "${stated === ACCEPT ? 'acceptance' : 'unset'}" condition no ` +
+					'longer governs a return, so what the guard accepts cannot be read from it. Fix the ' +
+					'extractor against the new shape rather than recording the old rule.'
+				);
+			}
+			if (stated === ACCEPT) acceptTail = close + 1 + tail.indexOf('return') + 'return'.length;
+		} else if (stated === CEILING || stated === ZERO) {
+			if (!/^\s*\{?\s*throw\b/.test(tail)) {
+				throw new Error(
+					`assertProtectiveNumber's "${stated === CEILING ? 'ceiling' : 'zero'}" condition no ` +
+					'longer governs a throw, so it refuses nothing. Fix the extractor against the new ' +
+					'shape rather than recording a bound nothing enforces.'
+				);
+			}
+			if (stated === CEILING) ceilingAt = f.index;
+		} else {
+			throw new Error(
+				'assertProtectiveNumber carries a condition this extractor does not read: ' +
+				`"${bodyRaw.slice(open + 1, open + 1 + condition.length).replace(/\s+/g, ' ').trim().slice(0, 160)}". ` +
+				'Read the new rule from it rather than recording the old one - an unread branch can be ' +
+				'the one that decides what the guard accepts.'
+			);
+		}
+	}
+	if (acceptTail === -1) {
+		throw new Error(
+			'assertProtectiveNumber no longer accepts a value through the floor comparison this ' +
+			'extractor reads, so the recorded floors would describe a rule nothing runs. Fix the ' +
+			'extractor against the new guard shape.'
+		);
+	}
+	if (ceilingAt > acceptTail) {
+		throw new Error(
+			'assertProtectiveNumber compares against its ceiling only AFTER acceptance has returned, ' +
+			'so the comparison is unreachable for every accepted value. One of the two moved - fix ' +
+			'the extractor against the new shape rather than recording a bound nothing reaches.'
+		);
+	}
+	if (/\breturn\b/.test(body.slice(acceptTail))) {
+		throw new Error(
+			'assertProtectiveNumber returns somewhere after its acceptance branch, so it can accept ' +
+			'a value the recorded ranges say it refuses. Fix the extractor against the new shape.'
+		);
+	}
+	const throws = [...body.matchAll(/\bthrow\b/g)];
+	const last = throws.length ? throws[throws.length - 1].index : -1;
+	const finalThrow = last === -1 ? null : /^throw\s+new\s+Error\s*\(/.exec(body.slice(last));
+	const finalOpen = finalThrow ? body.indexOf('(', last) : -1;
+	if (
+		finalOpen === -1 ||
+		!/^\s*;?\s*\}\s*$/.test(body.slice(finalOpen + 1 + callArgs(body, finalOpen).length + 1))
+	) {
+		throw new Error(
+			'assertProtectiveNumber no longer ends by throwing, so a value its branches do not ' +
+			'accept falls through and is accepted silently. Fix the extractor against the new shape ' +
+			'rather than recording floors the guard no longer enforces.'
+		);
+	}
+	return ceilingAt !== -1;
 }
 
 /**
@@ -471,13 +587,15 @@ export function protectiveNumberRanges(indexSource, guardsSource) {
 	// And read inside the GUARD, not across the file. Every rule below is a
 	// property of one function, so a match anywhere else in a module that
 	// validates a dozen other options says nothing about this one.
-	const body = functionBody(guardsCode, 'assertProtectiveNumber');
-	if (!body) {
+	const span = functionBody(guardsCode, 'assertProtectiveNumber');
+	if (!span) {
 		throw new Error(
 			'uws no longer declares assertProtectiveNumber as a function, so the protective-number ' +
 			'ranges have no source. Fix the extractor rather than recording the last rule it read.'
 		);
 	}
+	const body = guardsCode.slice(span.from, span.to + 1);
+	const bodyRaw = guardsSource.slice(span.from, span.to + 1);
 	const floorRule = /const floor\s*=\s*allowZero\s*\?\s*(-?[\d.]+)\s*:\s*(-?[\d.]+)\s*;/.exec(body);
 	if (!floorRule) {
 		throw new Error(
@@ -487,26 +605,7 @@ export function protectiveNumberRanges(indexSource, guardsSource) {
 	}
 	const zeroFloor = Number(floorRule[1]);
 	const nonZeroFloor = Number(floorRule[2]);
-	// Whether the guard ENFORCES a ceiling, which is a different question from
-	// whether the word appears anywhere near one. The mechanism is three things
-	// together - the branch is entered only for a ceiling that was passed, the
-	// value is compared against it, and the safe-integer rule rides along - and
-	// the whole point of naming all three is that the presence of any one of them
-	// proves nothing. `Number.isSafeInteger` in particular is an ordinary thing
-	// for a validator to use elsewhere, so treating it as the signal reads a
-	// ceiling into a guard that stopped comparing against one.
-	//
-	// The direction of that error is why it is worth this much care. A ceiling
-	// recorded but not enforced makes the manifest STRICTER than uws, and the
-	// parity gate then holds this adapter to a bound uws does not have - so this
-	// adapter refuses a config that builds there. That is a failure invented
-	// here rather than found, and it fails in the one direction the never-looser
-	// test cannot see, because it is not looser.
-	const enforcement = body.replace(/\s+/g, '');
-	const ceilingEnforced =
-		enforcement.includes('ceiling>0') &&
-		enforcement.includes('value>ceiling') &&
-		enforcement.includes('Number.isSafeInteger(value)');
+	const ceilingEnforced = guardEnforcesCeiling(body, bodyRaw);
 
 	/** @type {Record<string, { allowZero: boolean, floor: number, ceiling: number | null, integerRequired: boolean }>} */
 	const out = {};

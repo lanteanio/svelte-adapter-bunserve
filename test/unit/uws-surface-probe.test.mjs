@@ -40,7 +40,10 @@ export function assertProtectiveNumber(bag, key, surface, { allowZero = true, ce
 /** The same guard once it grew the fixed-width bound, which brings safe-integer with it. */
 const CEILING_GUARD = PINNED_GUARD.replace(
 	'if (typeof value ===',
-	'if (ceiling > 0 && (!Number.isSafeInteger(value) || value > ceiling)) throw new Error("ceiling");\n\tif (typeof value ==='
+	"if (ceiling > 0 && typeof value === 'number' && Number.isFinite(value) && value >= floor &&\n" +
+	"\t\t(!Number.isSafeInteger(value) || value > ceiling)) {\n" +
+	"\t\tthrow new Error('ceiling');\n" +
+	'\t}\n\tif (typeof value ==='
 );
 
 test('the floor is READ from the guard, not assumed by the extractor', () => {
@@ -97,7 +100,7 @@ test('a ceiling the guard does not implement is not reported as one it enforces'
 	assert.equal(range.x.integerRequired, false, 'and nothing rides along behind it');
 });
 
-test('a safe-integer check elsewhere in the guard is not a ceiling', () => {
+test('a safe-integer check elsewhere in the guard is refused, not read around', () => {
 	// THE DIRECTION THAT MATTERS. A ceiling recorded but not enforced makes the
 	// manifest STRICTER than uws, so the parity gate holds this adapter to a
 	// bound uws does not have and this adapter refuses a config that builds
@@ -105,15 +108,96 @@ test('a safe-integer check elsewhere in the guard is not a ceiling', () => {
 	//
 	// `Number.isSafeInteger` is an ordinary thing for a validator to use on some
 	// other option, so its presence was never evidence of anything. The guard
-	// below drops the ceiling branch and keeps such a use.
+	// below drops the ceiling branch and keeps such a use - and because a branch
+	// the extractor does not understand could be the one that decides what the
+	// guard accepts, the whole guard is refused rather than the branch skipped.
 	const unrelated = PINNED_GUARD.replace(
 		'const floor = allowZero ? 0 : 1;',
 		'const floor = allowZero ? 0 : 1;\n\tif (!Number.isSafeInteger(bag.retries)) throw new Error("retries");'
 	);
 	const index = "assertProtectiveNumber(websocket, 'x', 'websocket.x', { allowZero: false, ceiling: 0x7fffffff });";
-	const range = protectiveNumberRanges(index, unrelated).x;
-	assert.equal(range.ceiling, null, 'no comparison against the ceiling, so no ceiling');
-	assert.equal(range.integerRequired, false);
+	assert.throws(
+		() => protectiveNumberRanges(index, unrelated),
+		/condition this extractor does not read/,
+		'an unfamiliar branch fails the extractor instead of being guessed about'
+	);
+});
+
+test('a floor declaration the acceptance no longer compares against is not a floor', () => {
+	// The declaration is a token, not a rule: `const floor = allowZero ? 0 : 1;`
+	// can stand in a guard whose acceptance stopped reading it, and that guard
+	// accepts zero for an option the manifest would claim refuses it - stricter
+	// than uws, invisible to the never-looser test. The extractor reads the
+	// acceptance CONDITION, so a guard that dropped the comparison is a shape it
+	// refuses rather than a floor it records.
+	const relaxed = PINNED_GUARD.replace(
+		"if (typeof value === 'number' && Number.isFinite(value) && value >= floor) return;",
+		"if (typeof value === 'number' && Number.isFinite(value)) return;"
+	);
+	assert.match(relaxed, /const floor = allowZero/, 'the declaration really is still there');
+	const index = "assertProtectiveNumber(websocket, 'w', 'websocket.w', { allowZero: false });";
+	assert.throws(
+		() => protectiveNumberRanges(index, relaxed),
+		/condition this extractor does not read/,
+		'the retained declaration does not become a recorded floor'
+	);
+});
+
+test('ceiling tokens that govern no throw do not become a ceiling', () => {
+	// Both spellings of "present but not load-bearing". As bare expressions the
+	// tokens govern nothing and no ceiling is recorded; as a branch that does
+	// something OTHER than refuse, the guard is a shape the extractor does not
+	// understand and it fails rather than deciding which half to believe.
+	const observedInConst = PINNED_GUARD.replace(
+		'const floor = allowZero ? 0 : 1;',
+		'const floor = allowZero ? 0 : 1;\n' +
+		'\tconst audited = ceiling > 0 && (!Number.isSafeInteger(value) || value > ceiling);\n' +
+		'\tvoid audited;'
+	);
+	const index = "assertProtectiveNumber(websocket, 'x', 'websocket.x', { allowZero: false, ceiling: 100 });";
+	const range = protectiveNumberRanges(index, observedInConst).x;
+	assert.equal(range.ceiling, null, 'expressions that refuse nothing bound nothing');
+	assert.equal(range.integerRequired, false, 'and nothing rides along behind them');
+
+	const observedInBranch = CEILING_GUARD.replace("throw new Error('ceiling');", 'overCeiling += 1;');
+	assert.throws(
+		() => protectiveNumberRanges(index, observedInBranch),
+		/no longer governs a throw/,
+		'a ceiling condition that stops refusing fails the extractor'
+	);
+});
+
+test('a ceiling branch behind the acceptance return enforces nothing', () => {
+	// The comparison exists, governs a throw, and never runs: every accepted
+	// value has already returned by the time control would reach it.
+	const reordered = PINNED_GUARD.replace(
+		"if (typeof value === 'number' && Number.isFinite(value) && value >= floor) return;",
+		"if (typeof value === 'number' && Number.isFinite(value) && value >= floor) return;\n" +
+		"\tif (ceiling > 0 && typeof value === 'number' && Number.isFinite(value) && value >= floor &&\n" +
+		'\t\t(!Number.isSafeInteger(value) || value > ceiling)) {\n' +
+		"\t\tthrow new Error('ceiling');\n" +
+		'\t}'
+	);
+	const index = "assertProtectiveNumber(websocket, 'x', 'websocket.x', { ceiling: 100 });";
+	assert.throws(
+		() => protectiveNumberRanges(index, reordered),
+		/only AFTER acceptance has returned/,
+		'unreachable enforcement is refused, not recorded'
+	);
+});
+
+test('a guard that stops ending in refusal fails rather than recording its floors', () => {
+	// Every branch can be correct and the guard still accept everything: a value
+	// no branch claims falls out of the bottom, and a function that returns
+	// undefined reads to its caller exactly like one that accepted.
+	const fallsThrough = PINNED_GUARD.replace("\tthrow new Error('nope');\n", '');
+	assert.doesNotMatch(fallsThrough, /nope/, 'the final refusal really is gone');
+	const index = "assertProtectiveNumber(websocket, 'w', 'websocket.w', { allowZero: false });";
+	assert.throws(
+		() => protectiveNumberRanges(index, fallsThrough),
+		/no longer ends by throwing/,
+		'floors are not recorded for a guard anything can fall through'
+	);
 });
 
 test('the ceiling is read from the guard that implements it, not from the file around it', () => {
