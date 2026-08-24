@@ -96,10 +96,16 @@ let warnedUnsendableClose = false;
 /**
  * A (code, reason) pair the runtime will accept, from whatever the caller
  * passed. uWS puts any code and any reason on the wire, so hook code written
- * against it has never had these arguments checked; Bun instead THROWS on a
- * code outside its sendable set and on a reason over 123 UTF-8 bytes - and a
- * throw out of a close call lands in cleanup paths, the code least likely to
- * be wrapped in a try. So the pair is made sendable here: a close must close.
+ * against it has never had these arguments checked. What an unchecked pair
+ * does downstream depends on the runtime generation - measured: on Bun 1.3.14
+ * a close(5000) reaches the client verbatim while a close(999) surfaces
+ * client-side as a 1002 protocol error; on 1.4.0 both surface as 1002, the
+ * runtime refusing to put them on the wire; and the documented direction of
+ * travel is a spec-shaped close that THROWS on a code outside 1000-1003 /
+ * 1007-1014 / 3000-4999 or a reason over 123 UTF-8 bytes - a throw that would
+ * land in cleanup paths, the code least likely to be wrapped in a try. Every
+ * one of those outcomes is worse than closing, so the pair is made sendable
+ * here: a close must close, with the same clean result on every generation.
  *
  * An unsendable code becomes 1000, because the reason string is where an app
  * puts the part a human reads and 1000 is the only spelling that keeps it - a

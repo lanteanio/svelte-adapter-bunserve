@@ -57,14 +57,17 @@ const DEFAULT_PRESSURE_THRESHOLDS = {
 	//
 	// heapUsed/heapTotal is a saturation measure only where the engine
 	// over-allocates its heap. It does not here: a freshly booted, idle
-	// server measured 0.90 to 0.94 (test/live/pressure-check.mjs pins that
-	// it stays high), because this engine keeps heapTotal fitted close to
-	// heapUsed. Against the family's 0.85 the signal therefore fires on an
-	// idle process and never clears - `platform.pressure.active` would be
-	// true for the life of every zero-config app, `onPressure` would announce
-	// MEMORY once after boot and never recover, and a posture machine reading
-	// it could never relax. A signal that is always on carries no
-	// information and actively misleads, so it is off until the family
+	// server measured 0.90 to 0.94 on Bun 1.3.14 and 0.81 on 1.4.0
+	// (test/live/pressure-check.mjs pins that it stays high), because this
+	// engine keeps heapTotal fitted close to heapUsed on both generations.
+	// Against the family's 0.85 the signal therefore fires on an idle 1.3
+	// process and never clears, and on 1.4 idles a whisker under the
+	// threshold, where ordinary allocation churn crosses it with no real
+	// pressure behind it - `platform.pressure.active` would be true or
+	// flapping for the life of every zero-config app, `onPressure` would
+	// announce MEMORY without meaning it, and a posture machine reading it
+	// could never settle. A signal that is always or arbitrarily on carries
+	// no information and actively misleads, so it is off until the family
 	// settles on a memory reading that means the same thing on both engines.
 	//
 	// Set `websocket: { pressure: { memoryHeapUsedRatio: 0.85 } }` to opt

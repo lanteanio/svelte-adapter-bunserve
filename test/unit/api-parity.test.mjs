@@ -327,12 +327,14 @@ function weAcceptValue(key, value) {
 const RANGE_DIVERGENCES = {
 	maxBackpressure: {
 		refuses: [1.5, 1048576.5],
-		because: 'Bun.serve throws "websocket expects backpressureLimit to be an integer" (measured on 1.3.14)'
+		because: 'Bun.serve throws "websocket expects backpressureLimit to be an integer" ' +
+			'(measured on 1.3.14 and 1.4.0, identical message on both)'
 	},
 	idleTimeout: {
 		refuses: [0.5, 1.5, 1000, 1048576, 1048576.5, 2147483647, 3000000000],
-		because: 'Bun.serve throws "websocket expects idleTimeout to be an integer" (measured on 1.3.14), ' +
-			'and separately refuses anything above 960, which the validator reports as its own error'
+		because: 'Bun.serve throws "websocket expects idleTimeout to be an integer" (measured on ' +
+			'1.3.14 and 1.4.0, identical message on both), and separately refuses anything above ' +
+			'960, which the validator reports as its own error'
 	}
 };
 
