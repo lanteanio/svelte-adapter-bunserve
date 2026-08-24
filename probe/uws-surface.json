@@ -1,7 +1,7 @@
 {
 	"uwsVersion": "0.6.0-next.92",
-	"uwsRef": "a2deed49a512f47b986228418020b63b45fda99b",
-	"uwsCommit": "a2deed49a512f47b986228418020b63b45fda99b",
+	"uwsRef": "1d93b7355a0ffdf882737b04db35526c2fdb4576",
+	"uwsCommit": "1d93b7355a0ffdf882737b04db35526c2fdb4576",
 	"protocolSchemaSha256": "0b82ec36a19ac524d1930b617a95c5220c77cfbe1f852284b545da1090c4d862",
 	"platform": [
 		"adviseReconnect",
@@ -77,6 +77,7 @@
 		"compressCredentialedResponses",
 		"compression",
 		"consistencyAuditIntervalMs",
+		"egress",
 		"handler",
 		"idleTimeout",
 		"maxBackpressure",

@@ -28,17 +28,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of `path`, `handler` and `compressCredentialedResponses` into the
   `websocket` block makes easiest to hit.
 
-- The parity pin moved to svelte-adapter-uws 0.6.0-next.92, 166 commits on from
-  the commit it had been held at, and the vendored `protocol.schema.json` was
-  re-taken from it. What uws added in between is recorded rather than quietly
+- The parity pin moved to the svelte-adapter-uws 0.6.0-next.92 release cut, and
+  the vendored `protocol.schema.json` was re-taken from it. The pin names a
+  COMMIT rather than a version, because it has to: commits twenty apart both
+  read `0.6.0-next.92`, so the version alone cannot say which tree parity was
+  measured against. What uws added in between is recorded rather than quietly
   counted as parity: `platform.diagnostic`, `platform.trace` and
   `platform.traceContext`, the `tracing` and `staticCacheControl` adapter
-  options, `websocket.maxTopicSeqEntries` and `websocket.messageAdmission`, and
-  the `./connection` and `./observability` export subpaths are all gaps this
-  adapter does not implement. Two entries went the other way and were deleted:
-  uws now declares `staticDotfiles` and both `upgradeAdmission.maxConnections`
-  and `.maxDeferred`, which this adapter had been carrying as ahead-of-the-pin
-  extras.
+  options, `websocket.maxTopicSeqEntries`, `websocket.messageAdmission` and
+  `websocket.egress` - the outbound half of what `messageAdmission` bounds on
+  the way in - and the `./connection` and `./observability` export subpaths are
+  all gaps this adapter does not implement. Two entries went the other way and
+  were deleted: uws now declares `staticDotfiles` and both
+  `upgradeAdmission.maxConnections` and `.maxDeferred`, which this adapter had
+  been carrying as ahead-of-the-pin extras.
 
   `websocket.maxPayloadLength` gained a ceiling of 2147483647 as part of the
   move. Bun accepts a larger bound without complaint and uws refuses it, so a
