@@ -201,6 +201,9 @@ export async function handleSSR(request, direct) {
 		// which matches the zero-config origin. Rebuild the Request only when
 		// ORIGIN / PROTOCOL_HEADER / HOST_HEADER / PORT_HEADER produce something
 		// else - the copy constructor preserves method, headers, and body stream.
+		// The rebuild must stay AHEAD of anything that reads the body: copying a
+		// request whose body has been read throws on runtimes that enforce
+		// single-use bodies, so only headers may be consulted above this line.
 		const kitRequest = base_origin === reqUrl.origin
 			? request
 			: new Request(base_origin + url, request);

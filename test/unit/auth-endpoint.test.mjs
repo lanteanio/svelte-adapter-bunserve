@@ -292,3 +292,28 @@ test('a hook that rejects asynchronously is the same 500', async () => {
 	__setHooks({ authenticate: async () => { throw new Error('boom'); } });
 	assert.equal((await call(preflight())).status, 500);
 });
+
+test('the body reaches the hook unread, so the hook can read it', async () => {
+	// The endpoint refuses oversize bodies by the DECLARED length and never by
+	// reading, because the body belongs to the hook: `await request.json()` is
+	// the documented way an app takes a credential payload, and a body the
+	// adapter had already read - or a request cloned after reading it - would
+	// throw the hook's read on a runtime that enforces single-use bodies. The
+	// unread hand-off is the property everything downstream relies on, so it
+	// is pinned where the hand-off happens.
+	let sawUnused = null;
+	let payload = null;
+	__setHooks({
+		authenticate: async (request) => {
+			sawUnused = request.bodyUsed === false;
+			payload = await request.json();
+		}
+	});
+	const res = await call(preflight(
+		{ 'content-type': 'application/json', 'content-length': '17' },
+		{ body: '{"token":"abc12"}' }
+	));
+	assert.equal(res.status, 204);
+	assert.equal(sawUnused, true, 'the adapter has not touched the body before the hook');
+	assert.deepEqual(payload, { token: 'abc12' }, 'and the hook reads what the client sent');
+});
