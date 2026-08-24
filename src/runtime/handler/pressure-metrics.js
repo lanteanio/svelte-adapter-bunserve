@@ -315,11 +315,12 @@ export function grantSizeFor() {
 	// No heap term, for the same measured reason the memory THRESHOLD is off
 	// by default above: leaseGrantSize narrows the window once the ratio
 	// passes 0.7, a knee calibrated against an over-allocating heap. This
-	// engine reports 0.90 to 0.94 on an IDLE server, so feeding it that
-	// number collapses every window to roughly a sixteenth of the base
-	// (~15 permits instead of 256) on a server under no load at all - the
-	// opposite of the "healthy worker hands out the full window" contract.
-	// Subscriber load is engine-independent and still narrows the window.
+	// engine reports 0.90 to 0.94 on an IDLE server on Bun 1.3.14 and 0.81
+	// on 1.4.0, so feeding it either number collapses the window on a server
+	// under no load at all - to roughly a sixteenth of the base (~15 permits
+	// instead of 256) on the older generation, about a fifth (~49) on the
+	// newer - the opposite of the "healthy worker hands out the full window"
+	// contract. Subscriber load is engine-independent and still narrows it.
 	const count = leaseGrantSize({ heapRatio: 0, subscriberRatio: subRatio });
 	return { count, ttlMs: DEFAULT_GRANT.ttlMs };
 }

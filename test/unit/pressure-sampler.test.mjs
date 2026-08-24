@@ -307,8 +307,9 @@ test('grantSizeFor wires the LIVE readings into the sizing math', () => {
 test('resolvePressureThresholds pins all ten defaults and clamps the interval both ways', () => {
 	const d = resolvePressureThresholds(undefined);
 	assert.deepEqual(d, {
-		// OFF by default here, unlike the sibling's 0.85: this engine reports
-		// 0.9+ on an idle server, so the family threshold fires on a healthy
+		// OFF by default here, unlike the sibling's 0.85: this engine idles
+		// with its heap mostly full (0.90-0.94 measured on Bun 1.3.14, 0.81
+		// on 1.4.0), so the family threshold fires or flaps on a healthy
 		// process. Pinned so the divergence can never become accidental.
 		memoryHeapUsedRatio: false,
 		publishRatePerSec: 10000,

@@ -51,6 +51,9 @@ jobs:
       # Zig-to-Rust rewrite and runs as a SECOND lane, not a replacement. The
       # floor moves only after the rewrite has had time in the wild with both
       # lanes green.
+      # fail-fast off: a broken 1.4 lane must not cancel the floor lane's
+      # verdict, which is the one that decides whether main is releasable.
+      fail-fast: false
       matrix:
         bun-version: ['1.3.14', '1.4.0']
     steps:
@@ -96,6 +99,9 @@ jobs:
     strategy:
       # Both generations, same suite: a new runtime implementation is exactly
       # what a wire-contract lane exists to hold still. The floor stays 1.3.14.
+      # fail-fast off: a broken 1.4 lane must not cancel the floor lane's
+      # verdict, which is the one that decides whether main is releasable.
+      fail-fast: false
       matrix:
         bun-version: ['1.3.14', '1.4.0']
     steps:
@@ -138,6 +144,9 @@ jobs:
       # baselines (Bun.serve idle memory dropped by roughly a third); what
       # they watch for - a slope - is exactly what a rewritten runtime could
       # reintroduce. The floor stays 1.3.14.
+      # fail-fast off: a broken 1.4 lane must not cancel the floor lane's
+      # verdict, which is the one that decides whether main is releasable.
+      fail-fast: false
       matrix:
         bun-version: ['1.3.14', '1.4.0']
     steps:

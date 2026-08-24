@@ -297,8 +297,9 @@ test('os-pressure: psi and cpu.stat parse, deltas baseline at zero, failed probe
 test('resolvePressureThresholds: defaults, override merge, interval clamp', () => {
 	const d = resolvePressureThresholds(undefined);
 	// Disabled by default on this engine (see pressure-metrics.js): an idle
-	// server measures 0.9+, so the family's 0.85 would fire on a healthy
-	// process. Opting back in is one option key.
+	// server measures 0.90-0.94 on Bun 1.3.14 and 0.81 on 1.4.0, so the
+	// family's 0.85 fires or flaps on a healthy process. Opting back in is
+	// one option key.
 	assert.equal(d.memoryHeapUsedRatio, false);
 	assert.equal(resolvePressureThresholds({ memoryHeapUsedRatio: 0.85 }).memoryHeapUsedRatio, 0.85,
 		'the sibling threshold is one option away');

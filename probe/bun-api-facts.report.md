@@ -1,6 +1,6 @@
 # Bun server API facts
 
-Generated 2026-08-15T21:00:15.757Z by `probe/bun-api-facts.mjs`.
+Generated 2026-08-24T21:16:24.335Z by `probe/bun-api-facts.mjs`.
 
 - Bun version: **1.3.14** (revision 0d9b296af33f2b851fcbf4df3e9ec89751734ba4)
 - Platform: win32/x64
@@ -113,6 +113,22 @@ Re-run after every Bun upgrade; review any diff before trusting the upgrade.
   - returned undefined
 - client close event after ws.close(1012)
   - {"code":1012,"reason":"draining","wasClean":false}
+- ws.close with code below the range on the server
+  - returned undefined
+- client close event after the code below the range
+  - {"code":1002,"reasonBytes":1,"wasClean":false}
+- ws.close with code reserved for no-status on the server
+  - returned undefined
+- client close event after the code reserved for no-status
+  - {"code":1000,"reasonBytes":0,"wasClean":false}
+- ws.close with code above the range on the server
+  - returned undefined
+- client close event after the code above the range
+  - {"code":5000,"reasonBytes":1,"wasClean":false}
+- ws.close with reason one byte over the cap on the server
+  - returned undefined
+- client close event after the reason one byte over the cap
+  - {"code":4000,"reasonBytes":123,"wasClean":false}
 
 ## closed-socket-behavior
 
@@ -193,7 +209,7 @@ Re-run after every Bun upgrade; review any diff before trusting the upgrade.
 - custom upgrade header present on the 101 response
   - true
 - raw 101 status line + headers
-  - HTTP/1.1 101 Switching Protocols | x-probe-upgrade: yes | Upgrade: websocket | Connection: Upgrade | Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo= | Date: Sat, 15 Aug 2026 21:00:10 GMT
+  - HTTP/1.1 101 Switching Protocols | x-probe-upgrade: yes | Upgrade: websocket | Connection: Upgrade | Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo= | Date: Mon, 24 Aug 2026 21:16:19 GMT
 
 ## upgrade-abort
 

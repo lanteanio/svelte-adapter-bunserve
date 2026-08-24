@@ -316,6 +316,41 @@ async function probeCloseVsTerminate() {
 			}
 		} finally { server.stop(true); }
 	}
+	// The pairs the spec calls unsendable, plus a reason one byte over the
+	// 123-byte cap. What the runtime does with them decides what a facade may
+	// pass through from a caller: observed across generations, an unchecked
+	// pair either throws at the call, reaches the client verbatim, or surfaces
+	// client-side as a 1002 protocol error - and which one depends on the code
+	// and the runtime version, which is why the facade clamps instead.
+	for (const [code, reason, label] of [
+		[999, 'x', 'code below the range'],
+		[1005, 'x', 'code reserved for no-status'],
+		[5000, 'x', 'code above the range'],
+		[4000, 'r'.repeat(124), 'reason one byte over the cap']
+	]) {
+		const { server, firstWs } = serveWs();
+		try {
+			const client = await openClient(server);
+			const ws = await firstWs();
+			const closed = closeEvent(client);
+			const call = callAndDescribe(() => ws.close(code, reason));
+			record(section, `ws.close with ${label} on the server`, call);
+			try {
+				const evt = await closed;
+				record(
+					section,
+					`client close event after the ${label}`,
+					JSON.stringify({
+						code: evt.code,
+						reasonBytes: new TextEncoder().encode(evt.reason).length,
+						wasClean: evt.wasClean
+					})
+				);
+			} catch (err) {
+				record(section, `client close event after the ${label}`, `NO CLOSE EVENT: ${err.message}`);
+			}
+		} finally { server.stop(true); }
+	}
 }
 
 async function probePublishBackpressure() {

@@ -285,14 +285,15 @@ export function POST({ platform }) {
 **The memory signal is off by default here, and that is the one pressure
 default that differs from svelte-adapter-uws.** `heapUsed / heapTotal` only
 measures saturation on an engine that over-allocates its heap. Bun does not:
-a freshly booted, completely idle server measures 0.90 to 0.94 (the live
-suite pins that it stays above 0.85), so the family's
-`memoryHeapUsedRatio: 0.85` would fire on a healthy process and never clear -
-`platform.pressure.active` would be `true` for the life of every app, and
-`onPressure` would announce `MEMORY` once after boot and never recover. The
+a freshly booted, completely idle server measures 0.90 to 0.94 on Bun 1.3.14
+and 0.81 on 1.4.0 (the live suite pins that it stays high), so the family's
+`memoryHeapUsedRatio: 0.85` would fire on a healthy 1.3 process and never
+clear, and flap on ordinary allocation churn on 1.4 - either way
+`platform.pressure.active` misreports for the life of every app, and
+`onPressure` announces `MEMORY` without meaning it. The
 same reading is kept out of the flow-control window sizing for the same
 reason: fed to a knee calibrated for an over-allocating heap, an idle server
-would hand out roughly a sixteenth of the intended window. Both are pinned by
+would hand out a fraction of the intended window. Both are pinned by
 `test/live/pressure-check.mjs` against a real server, so if the engine's
 accounting ever changes the divergence is revisited rather than kept out of
 habit.

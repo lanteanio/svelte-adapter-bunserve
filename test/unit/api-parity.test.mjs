@@ -316,10 +316,10 @@ function weAcceptValue(key, value) {
  * reason each difference exists.
  *
  * Every entry here is forced by Bun, not chosen: Bun.serve validates these
- * three itself and throws on a value uws would take. Widening any of them to
- * match uws would move a build-time refusal into a server that fails to start,
- * which is worse than the difference. The measured errors are quoted so the
- * next reader can re-run them rather than trust this list.
+ * options itself and throws on a value uws would take. Widening any of them
+ * to match uws would move a build-time refusal into a server that fails to
+ * start, which is worse than the difference. The measured errors are quoted
+ * so the next reader can re-run them rather than trust this list.
  *
  * The list is EXACT in both directions - an unrecorded difference fails, and so
  * does an entry that no longer describes one.
