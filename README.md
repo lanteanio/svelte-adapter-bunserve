@@ -427,6 +427,45 @@ happens either - `precompress: 'no'` is refused rather than read as truthy,
 which is the shape of typo that otherwise turns an option ON when its author
 plainly meant OFF.
 
+The top-level options, with their defaults:
+
+```js
+adapter: bunserve({
+	out: 'build',                    // build output directory
+	precompress: true,               // write .br and .gz siblings for static and prerendered files
+	envPrefix: '',                   // prefix for the runtime env vars this adapter reads
+	healthCheckPath: '/healthz',     // liveness probe; false disables it
+	readinessCheckPath: '/readyz',   // readiness probe; 503 once a drain begins. false disables it
+	staticCacheMaxFileSize: 4194304, // files above this are served from disk with Bun.file
+	staticDotfiles: false,           // see Static files
+	staticHeaders: undefined,        // extra response headers for static and prerendered files
+	websocket: undefined             // the realtime endpoint; see below
+})
+```
+
+`healthCheckPath` answers liveness and `readinessCheckPath` answers readiness -
+two distinct probes, so they must differ, and the build fails if they do not. A
+readiness 503 during a drain is a signal to stop routing new traffic; if a
+liveness probe read the same route, that drain would be answered with a restart
+instead. Neither may collide with `websocket.path` or `websocket.authPath`: the
+probe routes are matched first, so the endpoint behind the collision would never
+be reached, and that fails the build rather than going quiet.
+
+`staticCacheMaxFileSize` is a positive integer byte count. Files at or below it
+are held in the in-memory static index; larger ones are streamed from disk
+through `Bun.file`, which uses the kernel's own send path.
+
+`staticHeaders` is an object of string header values applied to static and
+prerendered responses, merged once while the index is built rather than per
+request. Names must be RFC 7230 tokens and values single-line printable text -
+a control character in a value would otherwise throw on every static request, so
+it fails the build instead. Nine keys are reserved and dropped with a warning
+naming each one, because they decide transfer, caching and conditional-request
+correctness: `content-type`, `content-encoding`, `content-range`,
+`content-length`, `date`, `etag`, `vary`, `cache-control` and `accept-ranges`. A
+non-reserved key that the adapter already sets, such as `x-content-type-options`,
+is replaced by yours.
+
 ```js
 adapter: bunserve({
 	websocket: {
@@ -732,7 +771,7 @@ client:
 | `{"type":"welcome","sessionId":"..."}` | on open |
 | `{"type":"wire-id","topic":"t","id":N}` | the numeric topic id for `0x03` frames, announced on the same socket before the first binary frame for its topic |
 | `{"type":"resumed"}` | the `resume` frame's gap-fill RAN and flushed - or the app exports no `resume` hook, so there was nothing to serve; switch to live. Sent only then: every other outcome is an `error` carrying a `code`, so a client that does not receive this must not treat itself as caught up |
-| `{"topic":"__replay:t","event":"truncated","data":null}` | the gap-fill for `t` is INCOMPLETE - the buffered window overflowed its cap, or a frame was refused past the backpressure limit. Drop the stored per-topic offset and cold-resync; do not trust the partial flush |
+| `{"topic":"__replay:t","event":"truncated","data":null}` | the gap-fill for `t` is INCOMPLETE - the buffered window overflowed its cap, or a frame was refused past the backpressure limit. Drop the stored per-topic offset and cold-resync; do not trust the partial flush. A socket that refuses this marker twice is closed with **1013** instead of being acked, since there is no way left to tell it |
 | binary `[0x03][schemaVersion:u8][topicId:varint][seq:varint][codec payload]` | a codec frame, for connections that declared the codec's capability in `hello` |
 | `{"type":"subscribed","topic":"t","ref":N,"epoch":E}` | a subscription took |
 | `{"type":"subscribe-denied","topic":"t","ref":N,"reason":"..."}` | it did not |
@@ -796,6 +835,14 @@ topic: a hook that throws there emits
 ack, so the ack never implies a gap-fill that did not happen. That is the same
 signal the lane already sends for an overflowed window or a refused gap-fill
 frame, and the same one the family clients already act on.
+
+The marker is the one frame on this channel whose delivery is checked, because
+the state that produces it - a socket at or over its backpressure limit - is
+also the state that refuses it. A refused marker is retried once; if the socket
+will not take the retry either, the connection is closed with **1013** rather
+than acked, and no `subscribed` follows. The reconnect resumes from the last seq
+the client actually received, so the tail it missed is re-delivered. 1013 is
+retry-class for the family clients, unlike 1008, which they treat as terminal.
 
 The `resume` hook's RETURN VALUE is the dedup boundary for the gap-fill, so it
 is part of the contract rather than an ignored result. Return the highest seq
@@ -1032,6 +1079,44 @@ and registry cooldowns are the usual real-world cause. The schema itself ships
 in the package as `protocol.schema.json` (the family contract's vendored copy,
 held byte-identical to svelte-adapter-uws's by the parity gate).
 
+## Environment variables
+
+Read by the built server at boot, not at build time. The `envPrefix` adapter
+option prefixes every name below, so `envPrefix: 'MY_'` makes the port
+`MY_PORT`; the server warns when it sees an unprefixed name it would otherwise
+have read, since that is a variable someone expected to take effect.
+
+| variable | default | what it does |
+|---|---|---|
+| `HOST` | `0.0.0.0` | listen address |
+| `PORT` | `3000` | listen port |
+| `ORIGIN` | unset | the public origin, e.g. `https://example.com`. Set it behind a proxy so redirects and the CSRF check use the address clients actually used |
+| `PROTOCOL_HEADER` | unset | header carrying the client's protocol, e.g. `x-forwarded-proto` |
+| `HOST_HEADER` | unset | header carrying the client's host, e.g. `x-forwarded-host` |
+| `PORT_HEADER` | unset | header carrying the client's port |
+| `ADDRESS_HEADER` | unset | header carrying the client address, e.g. `x-forwarded-for` |
+| `XFF_DEPTH` | `1` | which entry of the forwarded chain to trust, counted from the right - `1` is the rightmost, the address your nearest proxy appended. Read only when `ADDRESS_HEADER` is set; a value that cannot select a hop throws at boot where it would be read, and warns where it would not |
+| `TRUSTED_PROXIES` | unset | comma-separated IPs and CIDR ranges, IPv4 and IPv6. When set, an address claim is honoured only from a peer in this set, and one from anywhere else is ignored in favour of the socket address, once with a warning. Unset trusts the header verbatim |
+| `BODY_SIZE_LIMIT` | `512K` | largest request body accepted, with `K`/`M`/`G` suffixes and an optional trailing `B`. `0` disables the cap; a negative or non-finite value such as `Infinity` is refused rather than read as "no limit" |
+| `IDLE_TIMEOUT` | `120` | seconds a connection may go idle before Bun closes it. See Timeouts |
+| `SHUTDOWN_TIMEOUT` | `30` | seconds to wait for in-flight work during a graceful shutdown before closing anyway |
+| `SHUTDOWN_DELAY_MS` | `0` | milliseconds to keep serving after the signal arrives, so a load balancer notices the readiness 503 before connections are cut |
+| `SHUTDOWN_RECONNECT_WINDOW_MS` | `3000` | the window advertised in the `reconnect` frame sent to WebSocket clients before the drain closes them |
+| `SSL_CERT` | unset | path to a TLS certificate. TLS is enabled only when both this and `SSL_KEY` are set |
+| `SSL_KEY` | unset | path to the matching TLS private key |
+
+`PROTOCOL_HEADER`, `HOST_HEADER` and `PORT_HEADER` are trusted as given. Set
+them only behind a proxy that overwrites those headers on every request;
+otherwise a client can choose its own origin by sending them.
+
+`CLUSTER_WORKERS` is accepted and ignored, with a warning naming it. This
+adapter runs single-process on purpose: multi-node scale-out rides the
+transport-agnostic extensions bus rather than in-process clustering. Bun's
+`node:cluster` does share a listening socket across workers, but a `publish()`
+reaches only the subscribers held by the worker that ran it, and a
+`SharedArrayBuffer` sent over IPC arrives as a dead copy - so workers would each
+serve a private slice of every topic, which is worse than one process.
+
 ## Timeouts
 
 `IDLE_TIMEOUT` is the number of seconds a connection may go idle before Bun
@@ -1057,10 +1142,11 @@ adapter options (Bun caps that one at 960).
 
 ## Development
 
-Requires [Bun](https://bun.com) installed. Current facts baseline: **Bun
-1.3.14** (the version the committed probe report was generated against). After
-upgrading Bun, re-run the probe and review the report diff before trusting the
-upgrade.
+Requires [Bun](https://bun.com) installed. The supported floor is **Bun 1.3.14**
+(`engines.bun`), which is also the version the committed probe report was
+generated against. CI runs every suite twice, on 1.3.14 and on 1.4.0, because
+1.4 changed several behaviours this adapter reads. After upgrading Bun, re-run
+the probe and review the report diff before trusting the upgrade.
 
 ```sh
 bun run probe   # runs the API probe and writes probe/bun-api-facts.report.md
