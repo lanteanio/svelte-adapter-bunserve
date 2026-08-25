@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A shed upgrade's `Retry-After` jitter produces the spread its shape always
+  suggested. The band arithmetic gains svelte-adapter-uws's two-value floor -
+  `base + floor(random() * max(2, ceil(base * spread)))` - so at the shared
+  base of 2 a refusal answers 2..3 where it used to answer exactly 2 on every
+  draw: `floor(random() * 1)` is 0 for every draw below 1, so a refused fleet
+  was told the same second and returned together into the same full gate. The
+  primitive is the exported `jitterRetryAfter`, every capacity refusal
+  (cursor lane included) draws from it, and both edges of the band are pinned
+  through an injected RNG - a range assertion alone passes against a constant.
+
 ### Changed
 
 - The build-injected specifiers are package imports now. The runtime's bridge

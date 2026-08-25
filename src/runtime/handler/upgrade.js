@@ -21,7 +21,7 @@ import { wsModule } from '../ws-handler-bridge.js';
 import { isUpgradeOriginAllowed } from '../utils/ws-origin.js';
 import { resolveRequestId } from '../utils/request-id.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
-import { clearTimer, processMonotonicNow, randomFloat, randomUuid, setTimer } from '../runtime.js';
+import { clearTimer, processMonotonicNow, randomUuid, setTimer } from '../runtime.js';
 import { WS_REQUEST_ID_KEY, isDraining, recordUpgradeRejection, wsCounters } from './ws-state.js';
 import { get_origin, origin, upgrade_timeout_ms, ws_options, ws_path } from './config.js';
 import { WS_CONNECTION_PERMIT, awaitAdmissionSlot, upgradeAdmission } from './admission.js';
@@ -33,7 +33,11 @@ import {
 	warnRateLimitProxyCollapse,
 	UPGRADE_DOOR
 } from './rate-limit.js';
-import { isCursorLaneUpgrade } from '../utils/upgrade-admission.js';
+import {
+	REFUSAL_RETRY_AFTER_SECONDS,
+	isCursorLaneUpgrade,
+	jitterRetryAfter
+} from '../utils/upgrade-admission.js';
 
 /** Upgrade-hook throws, throttled with decay. */
 const upgradeThrewThrottle = createLogThrottle(() => processMonotonicNow());
@@ -226,39 +230,25 @@ function drainingResponse(req) {
 }
 
 /**
- * The base every refusal backs off from: what svelte-adapter-uws derives from
- * its holding page's poll interval. This adapter serves no page, so the number
- * is carried across rather than re-derived - a client that waits half as long
- * against one adapter as the other is a difference an operator only finds under
- * load.
- */
-const RETRY_AFTER_BASE_SECONDS = 2;
-
-/**
  * What a shed upgrade gets: a bare 503 telling the client how long to wait.
  *
- * The spread is uws's, arithmetic included, and at the base both adapters use
- * it currently resolves to the base every time: `floor(rand * 2 * 0.5)` is
- * `floor(rand * 1)`, which is 0 for every draw below 1. So a refused fleet does
- * all come back in the same second today, in BOTH adapters - the anti-herd
- * property the shape suggests is not one either of them delivers, and it would
- * take a larger base or a wider spread to become real.
- *
- * It is written as the expression rather than as the constant 2 anyway: the
- * value has to track uws's, and hardcoding the answer to today's arithmetic is
- * how the two silently diverge the moment uws widens either number. Reading the
- * runtime's RNG seam also keeps a simulated run reproducible.
+ * The number is `jitterRetryAfter`'s - svelte-adapter-uws's arithmetic, base
+ * and band floor included, so at the shared base 2 both adapters answer 2..3
+ * and a refused fleet is split across at least two seconds instead of
+ * returning together into the same full gate. The primitive reads the
+ * runtime's RNG seam, which keeps a simulated run reproducible.
  *
  * uws answers with a holding page instead when its `waitingRoom` is left on,
  * and that page is the one part of its admission surface not implemented here;
  * `ws-options.js` names the gap when a config asks for it.
  */
 function shedResponse() {
-	const retryAfter = RETRY_AFTER_BASE_SECONDS
-		+ Math.floor(randomFloat() * RETRY_AFTER_BASE_SECONDS * 0.5);
 	return new Response('Server is at upgrade capacity, please retry', {
 		status: 503,
-		headers: { 'retry-after': String(retryAfter), 'content-type': 'text/plain' }
+		headers: {
+			'retry-after': String(jitterRetryAfter(REFUSAL_RETRY_AFTER_SECONDS)),
+			'content-type': 'text/plain'
+		}
 	});
 }
 

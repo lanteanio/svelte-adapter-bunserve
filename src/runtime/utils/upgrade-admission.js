@@ -11,7 +11,7 @@
 // The counters themselves are transport-agnostic; only the code that calls
 // them knows what a socket is.
 
-import { monotonicNow, setImmediateTimer } from '../runtime.js';
+import { monotonicNow, randomFloat, setImmediateTimer } from '../runtime.js';
 
 const DEFAULT_MAX_DEFERRED = 1024;
 
@@ -40,6 +40,48 @@ export function isCursorLaneUpgrade(secProtocol) {
 		if (offered[i].trim() === CURSOR_LANE_SUBPROTOCOL) return true;
 	}
 	return false;
+}
+
+/**
+ * The `Retry-After` base a capacity refusal answers, in whole seconds. The
+ * same value svelte-adapter-uws uses when no waiting room supplies a
+ * configured one, so the two adapters answer the same numbers for the same
+ * condition.
+ */
+export const REFUSAL_RETRY_AFTER_SECONDS = 2;
+
+/**
+ * One jittered `Retry-After` in whole seconds: the base plus a uniform draw
+ * over a band of at least two values.
+ *
+ * The band floor is the point of this function. `Retry-After` carries whole
+ * seconds, so a band that rounds below two values collapses to a constant -
+ * at the default base of 2 a half-base spread is `floor(random() * 1)`,
+ * which is 0 on every draw - and a constant answers every member of a
+ * refused fleet with the same second, so the whole fleet returns together
+ * into the same full gate and the jitter's anti-herd purpose is not served.
+ * The floor guarantees at least two distinct answers at every base, which
+ * splits any herd; what it costs is one extra second for at most half the
+ * refused clients, on a path that is already shedding. Above the floor the
+ * band is `ceil(base * spread)`, so a widened spread still widens the band
+ * at every base and the growth with `spread` stays monotone.
+ *
+ * The arithmetic is svelte-adapter-uws's `jitterRetryAfter`, carried across
+ * verbatim: at the shared base 2 both adapters answer 2..3. uws widens
+ * `spread` with its protection posture (elevated 2..3, siege 2..4); this
+ * adapter has no posture machine yet, so its callers pass no spread and the
+ * default half-base band applies - but the parameter is here so the day a
+ * posture arrives, the widening lands in the arithmetic both adapters
+ * already share.
+ *
+ * @param {number} baseSeconds - whole-second base (the minimum answered)
+ * @param {number} [spread] - fraction of the base the band covers (default `0.5`)
+ * @returns {number}
+ */
+export function jitterRetryAfter(baseSeconds, spread) {
+	const s = typeof spread === 'number' && spread > 0 ? spread : 0.5;
+	const band = Math.max(2, Math.ceil(baseSeconds * s));
+	return baseSeconds + Math.floor(randomFloat() * band);
 }
 
 /**

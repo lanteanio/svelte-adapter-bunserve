@@ -28,6 +28,7 @@ globalThis.WS_OPTIONS = {
 
 
 const { tryUpgrade } = await import('../../src/runtime/handler/upgrade.js');
+const { resetRuntimeEnv, setRuntimeEnv } = await import('../../src/runtime/runtime.js');
 const { upgradeAdmission } = await import('../../src/runtime/handler/admission.js');
 const { beginDraining } = await import('../../src/runtime/handler/ws-state.js');
 const { CURSOR_LANE_SUBPROTOCOL } = await import('../../src/runtime/utils/upgrade-admission.js');
@@ -79,12 +80,11 @@ test('a plain upgrade and a cursor upgrade are both admitted on an idle server',
 });
 
 test('a crossed connection ceiling sheds with the retry-after uws sends', async () => {
-	// Deliberately NOT asserting that the value varies. uws computes
-	// `base + floor(rand * base * 0.5)`, and at base 2 that is `floor(rand * 1)`
-	// - zero for every draw - so the value is 2 on every refusal in both
-	// adapters. A test demanding variation would be demanding a property
-	// neither has; what is worth pinning is that this adapter answers what uws
-	// answers, whatever that turns out to be.
+	// The band is real, and both of its edges are reachable: the arithmetic is
+	// uws's jitterRetryAfter, whose two-value floor turned the old constant 2
+	// into 2..3 at the shared base. Each edge is pinned through an injected
+	// RNG, because twenty draws of a real RNG can legally answer the same
+	// second twenty times - a green that proves nothing.
 	const srv = fakeServer();
 	// Filled by admitting until one is refused, rather than by counting up to
 	// `maxConnections`: the controller is a module singleton, so sockets opened
@@ -99,14 +99,26 @@ test('a crossed connection ceiling sheds with the retry-after uws sends', async 
 		assert.ok(admitted <= upgradeAdmission.maxConnections, 'the ceiling must bind eventually');
 	}
 	assert.equal(srv.taken, admitted, 'nothing past the ceiling reached the server');
+	assert.ok(first && first.status === 503, 'past the ceiling the upgrade is shed');
+	const firstValue = Number(first.headers.get('retry-after'));
+	assert.ok(firstValue >= 2 && firstValue <= 3, `retry-after out of band: ${firstValue}`);
 
-	for (let i = 0; i < 20; i++) {
-		const res = i === 0 ? first : await attempt(srv);
-		assert.ok(res && res.status === 503, 'past the ceiling every upgrade is shed');
-		const value = Number(res.headers.get('retry-after'));
-		assert.ok(value >= 2 && value <= 3, `retry-after out of range: ${value}`);
+	try {
+		setRuntimeEnv({ rng: { float: () => 0 } });
+		const floor = await attempt(srv);
+		assert.equal(floor.headers.get('retry-after'), '2', 'the band floor is the base');
+		setRuntimeEnv({ rng: { float: () => 0.999 } });
+		const top = await attempt(srv);
+		assert.equal(top.headers.get('retry-after'), '3', 'and the top of the band is reachable');
+		// The cursor lane sheds through the same funnel and answers the same
+		// band - the lane a herd of reconnecting workers actually hits.
+		const cursorTop = await attempt(srv, { cursor: true });
+		assert.equal(cursorTop.status, 503);
+		assert.equal(cursorTop.headers.get('retry-after'), '3', 'the cursor lane draws the same band');
+	} finally {
+		resetRuntimeEnv();
 	}
-	assert.equal(srv.taken, admitted, 'and it stayed that way across every refusal');
+	assert.equal(srv.taken, admitted, 'and nothing past the ceiling reached the server');
 });
 
 test('a handshake parked by pacing is refused if a drain begins while it waits', async () => {
