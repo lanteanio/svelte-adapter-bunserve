@@ -1,11 +1,13 @@
 # svelte-adapter-bunserve
 
-> **Status: pre-1.0.** The HTTP half and the realtime half both work and are
-> covered by unit, live and leak suites. What is not done: the public API is not
-> frozen, multi-node fan-out through the extensions package does not work yet,
-> the package ships no TypeScript types, and it runs single-process. Usable for
-> a single-node app on Bun 1.3.14 or newer; not yet something to build a fleet
-> on.
+> **Status: early, and behind the adapter it follows.** svelte-adapter-uws is
+> the lead and is several minor versions ahead. Both halves work here - HTTP and
+> single-node realtime, covered by a unit suite plus live and leak lanes, the
+> latter two run against Bun 1.3.14 and 1.4.0 - and the `platform.*` surface it
+> does implement matches the lead's. It is behind on: multi-node fan-out (the
+> extensions package throws against it), per-key send coalescing and socket RPC,
+> TypeScript types, and multi-process. Fine for a single-node app; pick
+> svelte-adapter-uws if you need any of that.
 
 A SvelteKit adapter for [Bun](https://bun.com), built on `Bun.serve`: it follows
 [svelte-adapter-uws](https://github.com/lanteanio/svelte-adapter-uws) and works
@@ -44,7 +46,9 @@ uWebSockets.js, `ws` is the ws library, `bunserve` is `Bun.serve`.
 ## Current state
 
 Every step of the build order below is done. What remains is listed as
-known-open under the step that owns it, and the API is not frozen until 1.0.
+known-open under the step that owns it. The public surface is not settled here
+in any case: svelte-adapter-uws leads it, and this adapter follows what that one
+declares.
 
 1. **API probe** (done): `probe/bun-api-facts.mjs` empirically verifies every
    Bun server API behavior the adapter design relies on - send-result
