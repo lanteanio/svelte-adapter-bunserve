@@ -1,6 +1,6 @@
 {
 	"name": "svelte-adapter-bunserve",
-	"version": "0.0.1",
+	"version": "0.0.2",
 	"description": "SvelteKit adapter for Bun - Bun.serve HTTP with the svelte-adapter-uws realtime DX, no native addon",
 	"author": "Kevin Radziszewski",
 	"license": "MIT",

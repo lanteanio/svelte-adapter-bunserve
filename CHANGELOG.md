@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-08-25
+
+Still pre-alpha, and the public contract is still not stable. What changed since
+0.0.1 is the realtime half: the binary wire members, the codec registry, cohort
+split and the resume/seq buffers are implemented now, as is the
+pressure/protection surface. The WebSocket contract is exercised by unit, live
+and leak suites in CI rather than by a smoke test nothing ran. The upgrade path
+gained admission control, per-address rate limiting and an auth preflight
+endpoint. Every suite runs on Bun 1.3.14 and on 1.4.0.
+
 ### Changed
+
+- The adapter's own build-time options and the environment variables its server
+  reads are documented. `envPrefix`, `healthCheckPath`, `readinessCheckPath`,
+  `staticCacheMaxFileSize` and `staticHeaders` had no README entry at all, and
+  neither did `HOST`, `PORT`, the forwarded-header set, the body-size cap, the
+  shutdown knobs or the TLS pair.
 
 - A close code or reason the runtime refuses to put on the wire no longer
   turns a graceful close into a crash. uWS sends any `(code, reason)` a hook
