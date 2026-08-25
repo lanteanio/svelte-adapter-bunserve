@@ -86,6 +86,10 @@ await run('static-dotfiles-check', [process.execPath, suite('static-dotfiles-che
 // case fetch() cannot construct and the one where the Bun generations differ.
 await run('xff-duplicate-check', [process.execPath, suite('xff-duplicate-check.mjs')]);
 
+// The boot banner against the built server: version and protocol revision
+// read from the deployed meta files, sibling resolution answered honestly.
+await run('version-banner-check', [process.execPath, suite('version-banner-check.mjs')]);
+
 const builtNoWs = await run('build fixture (NO_WS)', [process.execPath, 'run', 'build'], {
 	cwd: fixtureDir,
 	env: { ...buildEnv, NO_WS: '1' }
