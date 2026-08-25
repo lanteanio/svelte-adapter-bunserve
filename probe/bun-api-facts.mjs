@@ -12,6 +12,7 @@
 //   is recorded as MANUAL so the report stays a complete checklist.
 
 import { writeFileSync } from 'node:fs';
+import { connect } from 'node:net';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -968,6 +969,64 @@ async function probeServeOptionAcceptance() {
 	record(section, 'TLS surface (SNI, multiple certs, passphrase)', 'MANUAL - needs real certificates; probe before claiming TLS parity');
 }
 
+async function probeConnectionClose() {
+	// Whether Bun honours a request's `Connection: close`. A live suite drives
+	// the server over a raw socket precisely because fetch() cannot construct
+	// the header shapes it needs, and such a suite has to know when the
+	// response is over. Reading until the peer hangs up is the obvious answer
+	// and the wrong one if this does not hold, so the adapter's test lanes need
+	// the measured behaviour rather than the RFC's requirement.
+	const section = 'connection-close';
+
+	// Short enough that a connection Bun declines to close still ends inside
+	// this probe, which is what tells "never closed" apart from "closed late".
+	const IDLE = 3;
+	const WINDOW_MS = IDLE * 1000 + 2000;
+
+	/**
+	 * Send one `Connection: close` request and report when the socket ended.
+	 */
+	const closeCase = async (label, fetchFn) => {
+		const server = Bun.serve({ hostname: HOST, port: 0, idleTimeout: IDLE, fetch: fetchFn });
+		try {
+			const observed = await new Promise((resolve) => {
+				const t0 = performance.now();
+				const socket = connect(server.port, HOST);
+				const at = () => Math.round(performance.now() - t0);
+				// Prompt means "when the response ended"; anything slower is the
+				// idle sweep collecting a connection the server chose to keep.
+				const verdict = () => (at() < 250 ? `closed after ${at()}ms` : `HELD past the response, closed after ${at()}ms (idleTimeout ${IDLE}s)`);
+				const timer = setTimeout(() => { socket.destroy(); resolve(`still open after ${at()}ms`); }, WINDOW_MS);
+				socket.on('data', () => {});
+				socket.on('error', (err) => { clearTimeout(timer); resolve(`socket error ${err.code}`); });
+				socket.on('close', () => { clearTimeout(timer); resolve(verdict()); });
+				socket.on('connect', () => socket.write(
+					`GET / HTTP/1.1\r\nHost: ${HOST}:${server.port}\r\nConnection: close\r\n\r\n`
+				));
+			});
+			record(section, label, observed);
+		} finally {
+			server.stop(true);
+		}
+	};
+
+	await closeCase('handler returns a Response synchronously', () => new Response('body'));
+	await closeCase('handler is async but settles without yielding', async () => new Response('body'));
+	// THE ONE THAT DECIDES IT: every SSR response goes through at least one
+	// macrotask before it is returned, so if this differs from the two above,
+	// it is the case that describes the adapter's own traffic.
+	await closeCase('handler awaits a macrotask first', async () => {
+		await sleep(1);
+		return new Response('body');
+	});
+	await closeCase('handler awaits a macrotask, response body is bytes', async () => {
+		await sleep(1);
+		return new Response(new TextEncoder().encode('body'), {
+			headers: new Headers({ 'content-type': 'text/plain' })
+		});
+	});
+}
+
 async function probeBodyReadScheduling() {
 	const section = 'body-read-scheduling';
 
@@ -1043,6 +1102,7 @@ const probes = [
 	probePrototypePatch,
 	probeIdleTimeoutCap,
 	probeHttpIdleTimeout,
+	probeConnectionClose,
 	probeMaxPayloadEnforcement,
 	probeMessageBufferLifetime,
 	probeUpgradeFlow,
