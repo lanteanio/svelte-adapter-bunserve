@@ -58,3 +58,29 @@ test('reserved set covers the transfer/caching surface the handler owns', () => 
 		assert.ok(RESERVED_STATIC_HEADER_KEYS.has(key), key);
 	}
 });
+
+test('a staticHeaders value that refuses to be read is refused by name', () => {
+	// The shape gate asked Array.isArray before it could refuse, and a revoked
+	// Proxy answers that with a native TypeError naming nothing. The copy
+	// happens first now, and a value that cannot be copied takes the gate's
+	// own message.
+	const p = Proxy.revocable({}, {});
+	p.revoke();
+	assert.throws(
+		() => normalizeStaticHeaders(p.proxy),
+		(err) => {
+			assert.match(err.message, /`staticHeaders` must be an object of string header values/);
+			assert.ok(!/proxy that has been revoked/.test(err.message), 'the native error does not escape');
+			return true;
+		}
+	);
+	const bomb = { get 'x-frame-options'() { throw new Error('header boom'); } };
+	assert.throws(
+		() => normalizeStaticHeaders(bomb),
+		(err) => {
+			assert.match(err.message, /`staticHeaders` must be an object of string header values/);
+			assert.ok(!/header boom/.test(err.message), 'the getter error does not escape');
+			return true;
+		}
+	);
+});

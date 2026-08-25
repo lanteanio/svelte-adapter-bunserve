@@ -157,6 +157,42 @@ export const INERT_WS_OPTION_KEYS = new Set(['metrics']);
  * @param {unknown} value
  * @returns {string}
  */
+/**
+ * Read an app-supplied object ONCE into a plain shallow copy, or answer `null`
+ * for a value that cannot be read at all.
+ *
+ * Every shape gate below inspects the values it refuses - `Array.isArray`,
+ * `Object.keys`, property reads - and each of those inspections can execute
+ * code the value brought with it: a revoked Proxy answers all three by
+ * throwing, and a live one can throw from any trap, as can an ordinary
+ * getter. A throw there escapes BEFORE the gate's own refusal runs, so the
+ * build fails with a native TypeError naming neither the option nor what it
+ * accepts - the exact failure the total renderer in {@link describeValue}
+ * exists to prevent, reachable one step earlier.
+ *
+ * So every read of such a value happens here, exactly once, inside the guard.
+ * What comes back is a plain object or array the gates can inspect freely,
+ * and `null` means the value refused to be read - which no option accepts,
+ * so the caller's ordinary refusal fires and the renderer (which survives
+ * these values) names it. Shallow on purpose: a nested option object gets the
+ * same treatment from its own gate.
+ *
+ * Own enumerable properties only, like the unknown-key warnings that already
+ * iterate `Object.keys`. A config supplying options through a prototype chain
+ * was already invisible to those warnings; now the reads agree with them.
+ *
+ * @param {unknown} value - anything claiming to be an object or array
+ * @returns {Record<string, unknown> | unknown[] | null}
+ */
+export function readableCopy(value) {
+	try {
+		if (Array.isArray(value)) return value.slice();
+		return { .../** @type {Record<string, unknown>} */ (value) };
+	} catch {
+		return null;
+	}
+}
+
 export function describeValue(value) {
 	// Every renderer here except the last line can execute code the VALUE
 	// brought with it: `JSON.stringify` calls toJSON and enumerable getters,
@@ -341,13 +377,17 @@ const ADMISSION_KEYS = new Set([
  * @returns {{ maxConcurrent?: number, maxConnections?: number, perTickBudget?: number, maxDeferred?: number, cursorLane?: { fraction?: number } }}
  */
 function requireUpgradeAdmission(value, warnings) {
-	if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+	// The copy comes FIRST: Array.isArray on a revoked Proxy throws before the
+	// refusal below could name the option. A copy of `null` and an array copy
+	// are both refused; everything after reads the copy.
+	const copied = value !== null && typeof value === 'object' ? readableCopy(value) : null;
+	if (copied === null || Array.isArray(copied)) {
 		throw new Error(
 			'adapter option `websocket.upgradeAdmission` must be an object, e.g. ' +
-			'{ maxConcurrent: 1000, maxConnections: 50000, perTickBudget: 64 }.'
+			`{ maxConcurrent: 1000, maxConnections: 50000, perTickBudget: 64 } - got ${describeValue(value)}.`
 		);
 	}
-	const raw = /** @type {Record<string, unknown>} */ (value);
+	const raw = copied;
 	for (const key of Object.keys(raw)) {
 		if (!ADMISSION_KEYS.has(key)) {
 			warnings.push(
@@ -367,12 +407,17 @@ function requireUpgradeAdmission(value, warnings) {
 		if (raw[key] !== undefined) out[key] = requireAdmissionCount(raw[key], key);
 	}
 	if (raw.cursorLane !== undefined) {
-		if (raw.cursorLane === null || typeof raw.cursorLane !== 'object' || Array.isArray(raw.cursorLane)) {
+		const laneCopy =
+			raw.cursorLane !== null && typeof raw.cursorLane === 'object'
+				? readableCopy(raw.cursorLane)
+				: null;
+		if (laneCopy === null || Array.isArray(laneCopy)) {
 			throw new Error(
-				'adapter option `websocket.upgradeAdmission.cursorLane` must be an object, e.g. { fraction: 0.25 }.'
+				'adapter option `websocket.upgradeAdmission.cursorLane` must be an object, e.g. ' +
+				`{ fraction: 0.25 } - got ${describeValue(raw.cursorLane)}.`
 			);
 		}
-		const lane = /** @type {Record<string, unknown>} */ (raw.cursorLane);
+		const lane = laneCopy;
 		for (const key of Object.keys(lane)) {
 			if (key !== 'fraction') {
 				warnings.push(
@@ -471,13 +516,14 @@ function requirePressureThresholds(value, warnings) {
 	// disabled section that way, and the sampler is not optional here (it is
 	// what platform.pressure reads), so both resolve to plain defaults.
 	if (value === false || value === null) return undefined;
-	if (typeof value !== 'object' || Array.isArray(value)) {
+	const copied = typeof value === 'object' ? readableCopy(value) : null;
+	if (copied === null || Array.isArray(copied)) {
 		throw new Error(
 			'adapter option `websocket.pressure` must be an object of thresholds (or `false`), e.g. ' +
 			'{ publishRatePerSec: 5000, sampleIntervalMs: 1000 }, got ' + describeValue(value) + '.'
 		);
 	}
-	const raw = /** @type {Record<string, unknown>} */ (value);
+	const raw = copied;
 	/** @type {Record<string, unknown>} */
 	const out = {};
 
@@ -560,13 +606,14 @@ function requirePressureThresholds(value, warnings) {
  * @returns {NormalizedWsOptions}
  */
 export function normalizeWsOptions(input) {
-	if (input != null && (typeof input !== 'object' || Array.isArray(input))) {
+	const copied = input != null && typeof input === 'object' ? readableCopy(input) : null;
+	if (input != null && (typeof input !== 'object' || copied === null || Array.isArray(copied))) {
 		throw new Error(
 			'adapter option `websocket` must be an object, e.g. ' +
-			"{ maxPayloadLength: 1048576, idleTimeout: 120 }."
+			`{ maxPayloadLength: 1048576, idleTimeout: 120 } - got ${describeValue(input)}.`
 		);
 	}
-	const raw = /** @type {Record<string, unknown>} */ (input || {});
+	const raw = /** @type {Record<string, unknown>} */ (copied || {});
 	/** @type {string[]} */
 	const warnings = [];
 	const options = { ...DEFAULTS };
@@ -864,18 +911,30 @@ export function normalizeWsOptions(input) {
 			);
 		} else if (typeof c === 'boolean') {
 			options.compression = c;
-		} else if (c && typeof c === 'object' && !Array.isArray(c)) {
-			// Bun accepts { compress, decompress } verbatim (probed: accepted).
-			options.compression = /** @type {any} */ (c);
 		} else {
-			throw new Error(
-				'adapter option `websocket.compression` must be a boolean, a { compress, decompress } object, ' +
-				`or a numeric uWS compressor constant, got ${describeValue(c)}.`
-			);
+			// Bun accepts { compress, decompress } verbatim (probed: accepted).
+			// The COPY goes forward, read once here, so a getter on the app's
+			// object cannot fire again whenever Bun reads the setting - and a
+			// value that cannot be read at all copies to null and is refused
+			// below with the message that names the option.
+			const cc = c && typeof c === 'object' ? readableCopy(c) : null;
+			if (cc === null || Array.isArray(cc)) {
+				throw new Error(
+					'adapter option `websocket.compression` must be a boolean, a { compress, decompress } object, ' +
+					`or a numeric uWS compressor constant, got ${describeValue(c)}.`
+				);
+			}
+			options.compression = /** @type {any} */ (cc);
 		}
 	}
 	if (raw.allowedOrigins !== undefined) {
-		const a = raw.allowedOrigins;
+		// The copy, before any inspection: Array.isArray on a revoked Proxy
+		// throws ahead of the refusal that would name the option, and copying
+		// also reads every element exactly once, so a hostile element getter
+		// lands in the guarded copy rather than inside `.every`.
+		const a = typeof raw.allowedOrigins === 'object' && raw.allowedOrigins !== null
+			? readableCopy(raw.allowedOrigins)
+			: raw.allowedOrigins;
 		// '*' is what the rest of the adapter family spells this, and the whole
 		// point of keeping the uWS-shaped names is that one svelte.config.js
 		// moves across. Rejecting the family's own documented value at BUILD
@@ -884,9 +943,11 @@ export function normalizeWsOptions(input) {
 		const ok = a === 'same-origin' || a === 'any' || a === '*' ||
 			(Array.isArray(a) && a.every((o) => typeof o === 'string' && o.length > 0));
 		if (!ok) {
+			// Described from the ORIGINAL, not the copy: an unreadable value
+			// copies to null, and "got null" would blame a value nobody wrote.
 			throw new Error(
 				"adapter option `websocket.allowedOrigins` must be 'same-origin', 'any' (or its family " +
-				`spelling '*'), or an array of origin strings, got ${describeValue(a)}.`
+				`spelling '*'), or an array of origin strings, got ${describeValue(raw.allowedOrigins)}.`
 			);
 		}
 		// `['*']` is a silent deny-all: inside the array the token is compared

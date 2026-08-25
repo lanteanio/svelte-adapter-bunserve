@@ -254,3 +254,32 @@ test('options the adapter never received are not invented', () => {
 	assert.doesNotThrow(() => assertScalarOptions({}));
 	assert.doesNotThrow(() => assertScalarOptions(undefined));
 });
+
+test('an options bag that refuses to be read is refused, not crashed on', () => {
+	// The factory reads the bag before anything validates it, and a revoked
+	// Proxy answers every one of those reads with a native TypeError that
+	// names nothing. The bag is copied once at the door instead, and one that
+	// cannot be copied is refused in the adapter's own words.
+	const p = Proxy.revocable({}, {});
+	p.revoke();
+	assert.throws(
+		() => adapter(/** @type {any} */ (p.proxy)),
+		(err) => {
+			assert.match(err.message, /adapter options must be a plain object/);
+			assert.ok(!/proxy that has been revoked/.test(err.message), 'the native error does not escape');
+			return true;
+		}
+	);
+});
+
+test('a throwing getter on the bag lands in the refusal, not in the walk', () => {
+	const bomb = { get precompress() { throw new Error('boom from the bag'); } };
+	assert.throws(
+		() => adapter(/** @type {any} */ (bomb)),
+		(err) => {
+			assert.match(err.message, /adapter options must be a plain object/);
+			assert.ok(!/boom from the bag/.test(err.message), 'the getter error does not escape');
+			return true;
+		}
+	);
+});

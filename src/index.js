@@ -8,7 +8,7 @@ import json from '@rollup/plugin-json';
 import { normalizeStaticHeaders } from './build-config.js';
 import { listExcludedDotPaths } from './static-scan.js';
 import { assertScalarOptions, unknownOptionWarnings } from './adapter-options.js';
-import { describeValue, normalizeWsOptions } from './runtime/utils/ws-options.js';
+import { describeValue, normalizeWsOptions, readableCopy } from './runtime/utils/ws-options.js';
 
 const runtimeDir = fileURLToPath(new URL('./runtime', import.meta.url).href);
 
@@ -28,6 +28,21 @@ const DEFAULT_STATIC_CACHE_MAX_FILE_SIZE = 4 * 1024 * 1024;
 
 /** @type {import('./index.js').default} */
 export default function (opts = {}) {
+	// The whole bag is read ONCE into a plain copy before anything inspects
+	// it. Every check below reads properties and asks Array.isArray, and both
+	// throw natively on a value that will not be read - a revoked Proxy, a
+	// throwing getter - naming neither the option nor what it accepts. The
+	// copy makes every later read plain; a bag that cannot be read is refused
+	// here, by name.
+	if (opts !== null && typeof opts === 'object') {
+		const copied = readableCopy(opts);
+		if (copied === null || Array.isArray(copied)) {
+			throw new Error(
+				`adapter options must be a plain object of options, got ${describeValue(opts)}.`
+			);
+		}
+		opts = /** @type {any} */ (copied);
+	}
 	// Unusable VALUES fail here, before any option is read: an option the
 	// adapter cannot honour is not a forward-compatibility question, and the
 	// factory is the closest point to the config that set it. Unknown KEYS are

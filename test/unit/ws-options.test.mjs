@@ -444,6 +444,81 @@ test('the message about a bad value does not fail with a different error', () =>
 	}
 });
 
+test('a value that refuses to be read is refused by the option it names', () => {
+	// The renderer being total is not enough on its own: the SHAPE tests run
+	// first, and Array.isArray, Object.keys and every property read throw
+	// natively on a revoked Proxy - so the build failed with "Cannot perform
+	// 'IsArray' on a proxy that has been revoked", naming neither the option
+	// nor what it accepts, one step before the guarded renderer ever ran. The
+	// same escape existed at every object-shaped gate.
+	const revoked = () => {
+		const p = Proxy.revocable([], {});
+		p.revoke();
+		return p.proxy;
+	};
+	const cases = [
+		['websocket', () => normalizeWsOptions(revoked())],
+		['websocket.allowedOrigins', () => normalizeWsOptions({ allowedOrigins: revoked() })],
+		['websocket.upgradeAdmission', () => normalizeWsOptions({ upgradeAdmission: revoked() })],
+		[
+			'websocket.upgradeAdmission.cursorLane',
+			() => normalizeWsOptions({ upgradeAdmission: { cursorLane: revoked() } })
+		],
+		['websocket.pressure', () => normalizeWsOptions({ pressure: revoked() })],
+		['websocket.compression', () => normalizeWsOptions({ compression: revoked() })]
+	];
+	for (const [name, run] of cases) {
+		assert.throws(run, (err) => {
+			assert.ok(
+				err.message.includes(`\`${name}\``),
+				`${name}: named the option, not the proxy - got: ${err.message.slice(0, 90)}`
+			);
+			assert.ok(
+				!/proxy that has been revoked/.test(err.message),
+				`${name}: the native TypeError does not escape`
+			);
+			return true;
+		});
+	}
+});
+
+test('a throwing getter inside an option object is read once, into the refusal', () => {
+	// The plainer spelling of the same escape: no Proxy required. An object
+	// whose property throws on read took the build down from inside the shape
+	// walk, with the getter's own error.
+	const bomb = { get maxConcurrent() { throw new Error('boom from a getter'); } };
+	assert.throws(
+		() => normalizeWsOptions({ upgradeAdmission: bomb }),
+		(err) => {
+			assert.ok(
+				err.message.includes('`websocket.upgradeAdmission`'),
+				`named the option - got: ${err.message.slice(0, 90)}`
+			);
+			assert.ok(!/boom from a getter/.test(err.message), 'the getter error does not escape');
+			return true;
+		}
+	);
+});
+
+test('a hostile allowedOrigins element cannot throw out of the origin walk', () => {
+	// The array form reads every element. An element getter that throws used
+	// to fire inside `.every`; the copy reads it exactly once, under guard,
+	// and an unreadable array is refused with the option's own message.
+	const arr = ['https://ok.example'];
+	Object.defineProperty(arr, 1, { get() { throw new Error('element boom'); }, enumerable: true });
+	assert.throws(
+		() => normalizeWsOptions({ allowedOrigins: arr }),
+		(err) => {
+			assert.ok(
+				err.message.includes('`websocket.allowedOrigins`'),
+				`named the option - got: ${err.message.slice(0, 90)}`
+			);
+			assert.ok(!/element boom/.test(err.message), 'the element getter does not escape');
+			return true;
+		}
+	);
+});
+
 test('and renders the shapes JSON has no answer for', () => {
 	// Each of these either throws inside `JSON.stringify` or renders as the bare
 	// word "undefined" pasted into the sentence. None of them should be able to

@@ -4,6 +4,7 @@
 // into the placeholder replace map.
 
 import { RESERVED_STATIC_HEADER_KEYS } from './runtime/utils/static-headers.js';
+import { readableCopy } from './runtime/utils/ws-options.js';
 
 // RFC 7230 token charset - the legal alphabet for a header NAME.
 const HEADER_NAME_TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
@@ -44,12 +45,18 @@ function hasControlChar(value) {
  */
 export function normalizeStaticHeaders(input) {
 	if (input == null) return { headers: null, dropped: [] };
-	if (typeof input !== 'object' || Array.isArray(input)) {
+	// The copy comes before any inspection: Array.isArray and every key read
+	// throw natively on a value that will not be read - a revoked Proxy, a
+	// throwing getter - before the refusal below could name the option. A
+	// value that cannot be read copies to null and is refused the same way.
+	const copied = typeof input === 'object' ? readableCopy(input) : null;
+	if (copied === null || Array.isArray(copied)) {
 		throw new Error(
 			"adapter option `staticHeaders` must be an object of string header values, " +
 			"e.g. { 'x-frame-options': 'DENY', 'referrer-policy': 'strict-origin-when-cross-origin' }."
 		);
 	}
+	input = copied;
 	/** @type {Record<string, string>} */
 	const headers = {};
 	/** @type {string[]} */
