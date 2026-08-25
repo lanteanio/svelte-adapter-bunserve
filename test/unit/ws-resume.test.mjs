@@ -19,6 +19,7 @@ const {
 	CONTROL_FLOOD_CLOSE_CODE,
 	MAX_BATCH_TOPICS,
 	RESUME_FAILED_FRAME,
+	RESUME_INCOMPLETE_CLOSE_CODE,
 	RESUME_RATE_LIMITED_FRAME
 } = await import('../../src/runtime/utils/control-frame.js');
 const {
@@ -44,10 +45,33 @@ const { captureResumeFrame, MAX_RESUME_BUFFERED_FRAMES } = await import(
 const { __setHooks } = await import('../helpers/ws-handler-stub.mjs');
 const { SEND_DROPPED } = await import('../../src/runtime/utils/send-result.js');
 
-/** A socket whose send results are scripted; anything past the script succeeds. */
+/**
+ * A socket whose send results are scripted; anything past the script succeeds.
+ *
+ * It records what it was closed with. The flush's last resort, when a socket
+ * refuses even the truncation marker, is to close the connection - and a fake
+ * without `end` turns that close into a TypeError the flush catches, so the
+ * escalation would read as a dead socket instead of being observed.
+ */
 function scriptedWs(script) {
 	const sent = [];
-	return { sent, send(p) { sent.push(p); return script.length ? script.shift() : 1; } };
+	const closed = [];
+	return {
+		sent,
+		closed,
+		send(p) { sent.push(p); return script.length ? script.shift() : 1; },
+		end(code, reason) { closed.push({ code, reason }); }
+	};
+}
+
+/** A socket that is already gone: every send throws, the way the facade does. */
+function deadWs() {
+	const closed = [];
+	return {
+		closed,
+		send() { throw new Error('Invalid access of closed socket'); },
+		end(code, reason) { closed.push({ code, reason }); }
+	};
 }
 
 /**
@@ -84,10 +108,12 @@ function captureLive(topic, seq, envelope, authoritative = true, excludeWs = nul
 
 function rawSocket() {
 	const sent = [];
+	const closes = [];
 	const subscribed = new Set();
 	return {
 		data: {},
 		sent,
+		closes,
 		subscribed,
 		readyState: 1,
 		send(payload) {
@@ -102,7 +128,7 @@ function rawSocket() {
 			return subscribed.delete(topic);
 		},
 		isSubscribed: (topic) => subscribed.has(topic),
-		close() {},
+		close(code, reason) { closes.push({ code, reason }); },
 		terminate() {},
 		getBufferedAmount: () => 0,
 		cork: (fn) => fn()
@@ -251,6 +277,94 @@ test('an overflowed window that also drops signals exactly once', () => {
 	// marker, one accepted frame, one refused frame - and then nothing.
 	assert.equal(ws.sent.length, 3, 'the tail stopped at the refusal');
 	maxAuthoritativeSeq.clear();
+});
+
+test('a marker the socket refuses is retried, because a refused marker told nobody', () => {
+	// The marker is most likely to be refused in exactly the case it exists for:
+	// the socket is at or over its limit, which is why the flush gave up. Taking
+	// the first attempt as proof the client was told is how the one window that
+	// most needs the signal becomes the one window that skips it.
+	const ws = scriptedWs([SEND_DROPPED]);
+	const cap = beginResumeCapture(['room'], ws);
+	markResumeTruncated(cap, 'room');
+	const unusable = flushResumeTopic(cap, 'room', undefined);
+	assert.equal(ws.sent.length, 2, 'attempted twice, because the first attempt arrived nowhere');
+	assert.ok(ws.sent[1].includes('"truncated"'), 'and the retry is the same marker');
+	assert.equal(ws.closed.length, 0, 'a client that got it needs no closing');
+	assert.equal(unusable, false, 'so the caller carries on and acks');
+});
+
+test('a truncation the socket will not take at all closes the connection', () => {
+	// The end of the line. There is no way left to tell this client its history
+	// has a hole, and staying connected is the one outcome that leaves it
+	// silently wrong: the `subscribed` ack would follow and it would go live
+	// trusting a gap-fill it never received. The reconnect resumes from the last
+	// seq it actually got, so the missed tail is re-delivered rather than lost.
+	const ws = scriptedWs([SEND_DROPPED, SEND_DROPPED]);
+	const cap = beginResumeCapture(['room'], ws);
+	markResumeTruncated(cap, 'room');
+	const unusable = flushResumeTopic(cap, 'room', undefined);
+	assert.equal(ws.closed.length, 1, 'the connection was closed');
+	assert.equal(ws.closed[0].code, RESUME_INCOMPLETE_CLOSE_CODE, 'with the retry-class code');
+	assert.equal(unusable, true, 'and the caller is told to stop');
+	assert.equal(resumeBuffers.size, 0, 'the buffer still closed');
+});
+
+test('a window with nothing left to flush still escalates its own marker', () => {
+	// The edge a frame-driven escalation cannot see. Every held frame is already
+	// covered by the resume, so the flush sends nothing and learns nothing about
+	// the socket - yet the window overflowed, so the client still has a hole. The
+	// marker carries that on its own, and its refusal escalates on its own.
+	const ws = scriptedWs([SEND_DROPPED, SEND_DROPPED]);
+	const cap = beginResumeCapture(['room'], ws);
+	for (let i = 1; i <= MAX_RESUME_BUFFERED_FRAMES + 10; i++) captureLive('room', i, 'E' + i);
+	const unusable = flushResumeTopic(cap, 'room', MAX_RESUME_BUFFERED_FRAMES + 10);
+	assert.ok(
+		ws.sent.every((f) => f.includes('"truncated"')),
+		'nothing but markers went out - every frame was already covered'
+	);
+	assert.equal(ws.closed[0] && ws.closed[0].code, RESUME_INCOMPLETE_CLOSE_CODE, 'and it closed');
+	assert.equal(unusable, true);
+	maxAuthoritativeSeq.clear();
+});
+
+test('a refused frame whose marker is also refused closes the connection', () => {
+	// The mid-flush half of the same rule: the hole is discovered by a frame the
+	// socket would not take, and the marker announcing it fares no better.
+	const ws = scriptedWs([1, SEND_DROPPED, SEND_DROPPED]);
+	const cap = beginResumeCapture(['room'], ws);
+	captureResumeFrame('room', 1, 'ENV1', false, null, true);
+	captureResumeFrame('room', 2, 'ENV2', false, null, true);
+	captureResumeFrame('room', 3, 'ENV3', false, null, true);
+	const unusable = flushResumeTopic(cap, 'room', 0);
+	assert.equal(ws.sent.length, 3, 'one frame out, one refused, one marker - then nothing');
+	assert.ok(ws.sent[2].includes('"truncated"'), 'the marker was attempted');
+	assert.equal(ws.closed[0] && ws.closed[0].code, RESUME_INCOMPLETE_CLOSE_CODE, 'then the close');
+	assert.equal(unusable, true);
+});
+
+test('a socket that is already gone is not closed a second time', () => {
+	// A throw means the connection is finished, not that it is refusing: there is
+	// nothing to signal to and nothing to close. Treating the two the same would
+	// call end() on a corpse and book the close as our own.
+	const ws = deadWs();
+	const cap = beginResumeCapture(['room'], ws);
+	markResumeTruncated(cap, 'room');
+	const unusable = flushResumeTopic(cap, 'room', undefined);
+	assert.equal(ws.closed.length, 0, 'nothing was closed');
+	assert.equal(unusable, true, 'but the caller still stops');
+	assert.equal(resumeBuffers.size, 0, 'and the buffer still closed');
+});
+
+test('a healthy flush neither signals nor closes', () => {
+	const ws = scriptedWs([]);
+	const cap = beginResumeCapture(['room'], ws);
+	captureResumeFrame('room', 1, 'ENV1', false, null, true);
+	captureResumeFrame('room', 2, 'ENV2', false, null, true);
+	const unusable = flushResumeTopic(cap, 'room', 0);
+	assert.deepEqual(ws.sent, ['ENV1', 'ENV2'], 'the window went out and nothing else');
+	assert.equal(ws.closed.length, 0);
+	assert.equal(unusable, false);
 });
 
 test('a truncation marker is charged to the control-egress budget', () => {
@@ -1202,6 +1316,36 @@ test('a recover hook that throws signals truncation instead of claiming coverage
 		assert.ok(markerAt !== -1, 'the client is told this gap-fill is incomplete');
 		assert.ok(ackAt !== -1, 'the subscription still took - a failed gap-fill is not a denial');
 		assert.ok(markerAt < ackAt, 'and the marker arrives BEFORE the ack that says go live');
+		cleanup(raw);
+	} finally {
+		console.error = realError;
+	}
+});
+
+test('a recover the client cannot be told about is closed, not acked', async () => {
+	// The whole point of the escalation, driven through the lane the family
+	// client uses. Everything this socket is handed is refused, so the marker
+	// cannot land - and the `subscribed` ack is exactly what must NOT follow,
+	// because it is the frame that tells the client to go live.
+	setServer({ publish: () => 0, subscriberCount: () => 0 });
+	const realError = console.error;
+	console.error = () => {};
+	try {
+		__setHooks({
+			subscribe: () => null,
+			resume: () => { throw new Error('backend down'); }
+		});
+		const raw = rawSocket();
+		// Bun's "rejected", which the facade maps to the drop sentinel.
+		raw.send = (payload) => { raw.sent.push(payload); return 0; };
+		websocketHandlers.open(raw);
+		await send(raw, { type: 'subscribe', topic: 'room', ref: 1, recover: { offset: 5 } });
+		assert.ok(
+			!frames(raw).some((f) => f.type === 'subscribed'),
+			'no ack for a gap-fill the client was never told was incomplete'
+		);
+		assert.equal(raw.closes.length, 1, 'the connection was closed instead');
+		assert.equal(raw.closes[0].code, RESUME_INCOMPLETE_CLOSE_CODE);
 		cleanup(raw);
 	} finally {
 		console.error = realError;

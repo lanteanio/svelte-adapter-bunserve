@@ -191,6 +191,21 @@ export function controlFrameTooLargeFrame(size) {
 export const CONTROL_FLOOD_CLOSE_CODE = 4429;
 
 /**
+ * Close code for a connection whose gap-fill could not be completed AND could
+ * not be told so.
+ *
+ * 1013 (Try Again Later), which both family clients classify as RETRY: they
+ * reconnect on the ordinary backoff curve, and the reconnect resumes from the
+ * last seq the client actually received, so the tail it missed is re-delivered
+ * rather than lost. That is why closing here is a repair and not a punishment -
+ * the alternative is a client that stays connected and silently wrong.
+ *
+ * Not 4429: this is not throttling, and the accelerated backoff that code
+ * selects would be the wrong curve for a socket that needs time to drain.
+ */
+export const RESUME_INCOMPLETE_CLOSE_CODE = 1013;
+
+/**
  * The oversized-batch refusal.
  *
  * An `error` frame rather than a `subscribe-denied`, and deliberately: a denial

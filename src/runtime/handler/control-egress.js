@@ -19,11 +19,38 @@ import { bumpOut } from './ws-stats.js';
 import { MAX_CONTROL_EGRESS_BYTES, chargeControlEgress, wsCounters } from './ws-state.js';
 
 /**
+ * The control frame reached the client - written to the socket, or queued
+ * behind backpressure, which delivers in order.
+ */
+export const CONTROL_DELIVERED = 0;
+
+/**
+ * The socket refused it past its backpressure limit. The connection is still
+ * open, and nothing on it was told.
+ */
+export const CONTROL_REFUSED = 1;
+
+/**
+ * There is no connection left to answer: the send threw, or the frame blew the
+ * budget and the connection was cut. Nothing more may be sent on it, and it
+ * must not be closed a second time.
+ */
+export const CONTROL_GONE = 2;
+
+/**
  * Send a control frame, charging a closed socket to the closed lane. Control
  * frames are never compressed: they are short, and deflating them costs more
  * than it saves.
+ *
+ * The answer matters to one caller. Most senders here have nothing to do about
+ * a frame the client did not get - a refused ack is re-driven by the client's
+ * own retry - but the resume lane escalates on it: a truncation marker that
+ * does not arrive is the difference between a client that cold-resyncs and one
+ * that goes live believing it received a gap-fill it never got.
+ *
  * @param {any} ws
  * @param {string} payload
+ * @returns {0 | 1 | 2} one of CONTROL_DELIVERED, CONTROL_REFUSED, CONTROL_GONE
  */
 export function sendControl(ws, payload) {
 	// Per-connection egress budget for the ACK CHANNEL. Per-entry acks are
@@ -37,18 +64,20 @@ export function sendControl(ws, payload) {
 	// measures the worst-shaped legal frame as well as the ordinary one.
 	if (!chargeControlEgress(ws, Buffer.byteLength(payload))) {
 		refuseControlFlood(ws);
-		return;
+		return CONTROL_GONE;
 	}
 	let result;
 	try {
 		result = ws.send(payload, false, false);
 	} catch {
 		wsCounters.closedWsAborts++;
-		return;
+		return CONTROL_GONE;
 	}
 	// Only bytes that reached the wire, like platform.send. A frame refused
 	// past the backpressure limit never went out.
-	if (result !== SEND_DROPPED) bumpOut(ws, payload);
+	if (result === SEND_DROPPED) return CONTROL_REFUSED;
+	bumpOut(ws, payload);
+	return CONTROL_DELIVERED;
 }
 
 /**

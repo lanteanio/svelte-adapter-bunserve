@@ -2300,7 +2300,18 @@ export async function subscribeWithVerdict(ws, topic, options, verdict) {
 	// Live membership is installed: flush any frames held during the resume
 	// window, in order, skipping what the resume already covered, before the
 	// caller sends the ack.
-	if (recoverCapture) flushResumeTopic(recoverCapture, topic, coveredSeqFor(recoverCovered, topic));
+	//
+	// The flush closes the connection when a gap-fill it could not complete is
+	// also one it could not report. `CLOSED` is what the ack lane already
+	// understands as "there is nobody left to answer", so it sends nothing - and
+	// the cohort join below is skipped, which would otherwise take a shared
+	// wire-id reference for a connection that is on its way out.
+	if (
+		recoverCapture &&
+		flushResumeTopic(recoverCapture, topic, coveredSeqFor(recoverCovered, topic))
+	) {
+		return 'CLOSED';
+	}
 	// A topic already running shared binary fan-out cohorts its joiners at
 	// subscribe time; the first shared publish cohorted whoever preceded it.
 	const sharedCap = sharedTopics.get(topic);

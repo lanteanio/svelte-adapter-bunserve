@@ -625,6 +625,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A gap-fill the client could not be told about no longer ends in a `subscribed`
+  ack. The replay truncation marker was pushed into the socket that had just
+  refused a frame, and its send result was discarded. A connection at or over
+  its backpressure limit is the only state that produces the marker, and it is
+  also the state that refuses the marker - so the window that most needed the
+  signal was the one window that skipped it. The ack followed, the client went
+  live, and the hole in its history was undetectable.
+
+  The marker is retried once when the socket refuses it, and a socket that will
+  not take the retry either is closed with 1013. The reconnect resumes from the
+  last seq the client actually received, so the missed tail is re-delivered
+  rather than lost; 1013 is retry-class for the family client, not one of the
+  codes it stops reconnecting on. A connection the flush closed is no longer
+  acked or joined to a shared fan-out cohort.
+
 - The four `websocket.upgradeAdmission` bounds are checked at build time. They
   were passed through unexamined on the grounds that the gate applies uws's own
   rules, which is true of `maxConnections` and `maxDeferred` and false of the

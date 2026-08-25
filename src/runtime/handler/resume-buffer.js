@@ -15,7 +15,8 @@
 
 import { ws_compression_on } from './config.js';
 import { SEND_DROPPED } from '../utils/send-result.js';
-import { sendControl } from './control-egress.js';
+import { CONTROL_DELIVERED, CONTROL_GONE, sendControl } from './control-egress.js';
+import { RESUME_INCOMPLETE_CLOSE_CODE } from '../utils/control-frame.js';
 import { bumpOut } from './ws-stats.js';
 import { maxAuthoritativeSeq, resumeBuffers, wsCounters } from './ws-state.js';
 
@@ -115,10 +116,6 @@ export function discardResumeCapture(handle) {
  * the same marker a replay backend emits for an uncoverable range. The client
  * drops its stale per-topic offset and cold-resyncs.
  *
- * Best effort by nature: a socket already past its backpressure limit refuses
- * this frame too. It gets through for a transient or borderline drop, which is
- * the common case, and costs one short frame when it does not.
- *
  * Charged to the connection's control-egress budget like every other frame the
  * client's own input buys. It is not an ack, but it shares the property the
  * budget exists for: a client names topics in a few bytes and is answered with a
@@ -129,11 +126,18 @@ export function discardResumeCapture(handle) {
  * the marker was going to tell it to do anyway. Dropping it silently is the one
  * outcome that would reintroduce the gap this signal exists to close.
  *
+ * The answer is returned rather than discarded. This frame is most likely to be
+ * refused in exactly the case it exists for - the socket is at or over its
+ * limit, which is why the flush gave up - so a caller that records having SENT
+ * it rather than having DELIVERED it skips the escalation precisely when the
+ * client most needs it.
+ *
  * @param {any} ws
  * @param {string} topic
+ * @returns {0 | 1 | 2} one of CONTROL_DELIVERED, CONTROL_REFUSED, CONTROL_GONE
  */
 function sendTruncated(ws, topic) {
-	sendControl(
+	return sendControl(
 		ws,
 		'{"topic":' + JSON.stringify('__replay:' + topic) + ',"event":"truncated","data":null}'
 	);
@@ -152,23 +156,40 @@ function sendTruncated(ws, topic) {
  * @param {ResumeCaptureHandle} handle
  * @param {string} topic
  * @param {number | undefined} coveredSeq
+ * @returns {boolean} True when this connection is no longer usable - the flush
+ * closed it, or a send revealed it was already gone. The caller must stop:
+ * there is nobody left to ack, and a cohort join would take a shared wire-id
+ * reference only to hand it straight back.
  */
 export function flushResumeTopic(handle, topic, coveredSeq) {
 	const entry = handle.entries.find((e) => e.topic === topic);
-	if (entry === undefined) return;
+	if (entry === undefined) return false;
 	const ws = handle.ws;
-	if (entry.buffer.overflow || entry.buffer.truncated) {
-		// Either the window overflowed the frame cap - the tail past the cap was
-		// never captured - or the caller marked this gap-fill incomplete because
-		// the resume hook did not finish. Both mean the same thing to the client,
-		// which has no gap detection: what follows is not the whole story, and
-		// trusting a partial flush would leave a silent hole. Signal the
-		// truncation on the replay channel FIRST - the same marker a replay backend emits
-		// for an uncoverable range - so this critical resync signal is not
-		// itself lost behind the backpressure the partial flush below would
-		// build. The client drops its stale per-topic offset and
-		// cold-resyncs; the partial frames are then a best-effort extra.
-		sendTruncated(ws, topic);
+	// Every send below asks one question - did these bytes reach the client -
+	// and `gone` is what separates "refused" from "there is no socket any more".
+	// Only a refusal is worth signalling to, and only a dead socket must stop us
+	// closing the connection at the end.
+	let gone = false;
+	// Either the window overflowed the frame cap - the tail past the cap was
+	// never captured - or the caller marked this gap-fill incomplete because
+	// the resume hook did not finish. Both mean the same thing to the client,
+	// which has no gap detection: what follows is not the whole story, and
+	// trusting a partial flush would leave a silent hole. Signal the
+	// truncation on the replay channel FIRST - the same marker a replay backend emits
+	// for an uncoverable range - so this critical resync signal is not
+	// itself lost behind the backpressure the partial flush below would
+	// build. The client drops its stale per-topic offset and
+	// cold-resyncs; the partial frames are then a best-effort extra.
+	//
+	// `signalled` records that the marker was TAKEN, not that it was attempted.
+	// A window whose marker is itself refused has told the client nothing, and
+	// is escalated below like any other untold truncation.
+	let needsSignal = entry.buffer.overflow || entry.buffer.truncated;
+	let signalled = false;
+	if (needsSignal) {
+		const answer = sendTruncated(ws, topic);
+		signalled = answer === CONTROL_DELIVERED;
+		gone = answer === CONTROL_GONE;
 	}
 	// The dedup floor. A reported watermark is trusted only up to what this
 	// server has actually stamped for the topic: the floor is the hook's RETURN,
@@ -207,8 +228,8 @@ export function flushResumeTopic(handle, topic, coveredSeq) {
 	const ceiling = typeof seen === 'number' && seen > entry.before ? seen : entry.before;
 	const floor =
 		coveredSeq === undefined || coveredSeq > ceiling ? entry.before : coveredSeq;
-	let dropped = false;
 	for (const f of entry.buffer.frames) {
+		if (gone) break;
 		// Dedup ONLY explicit-seq frames against the floor: they share the
 		// floor's seq space. A counter-stamped live frame is always newer than
 		// the window, so comparing it to an explicit floor could only ever
@@ -220,6 +241,7 @@ export function flushResumeTopic(handle, topic, coveredSeq) {
 			result = ws.send(f.envelope, false, compress);
 		} catch {
 			wsCounters.closedWsAborts++;
+			gone = true;
 			break;
 		}
 		if (result === SEND_DROPPED) {
@@ -227,19 +249,43 @@ export function flushResumeTopic(handle, topic, coveredSeq) {
 			// branch guards against: the ack that follows tells the client to
 			// go live, with this frame missing and nothing to make it notice.
 			// Stop pushing frames the socket is refusing, and signal.
-			dropped = true;
+			needsSignal = true;
 			break;
 		}
 		bumpOut(ws, f.envelope);
 	}
-	// Not when this window already signalled up front, for overflow or for a
-	// gap-fill the caller marked incomplete: one marker per topic, not two.
-	if (dropped && !entry.buffer.overflow && !entry.buffer.truncated) sendTruncated(ws, topic);
+	let closed = false;
+	// One marker per topic, not two: this is the up-front marker retried
+	// because it was refused, or the first one for a window that only turned
+	// out to be incomplete partway through the flush.
+	if (needsSignal && !signalled && !gone) {
+		const answer = sendTruncated(ws, topic);
+		signalled = answer === CONTROL_DELIVERED;
+		gone = answer === CONTROL_GONE;
+		if (!signalled && !gone) {
+			// The socket is refusing even this. There is no way left to tell the
+			// client it has a hole, and staying connected is the one outcome
+			// that leaves it silently wrong - the `subscribed` ack would follow
+			// and it would go live trusting a gap-fill it never received.
+			// Closing forces a reconnect, whose resume starts from the last seq
+			// the client actually received, so the missed tail is re-delivered
+			// rather than lost. 1013 is retry-class for the family client, not
+			// one of the codes it treats as terminal.
+			try {
+				ws.end(RESUME_INCOMPLETE_CLOSE_CODE, 'resume incomplete');
+				closed = true;
+			} catch {
+				wsCounters.closedWsAborts++;
+				gone = true;
+			}
+		}
+	}
 	unregister(handle, entry);
 	// Drop the entry from the handle too, so a repeat flush for this topic is
 	// a no-op and a final-sweep discard only touches un-flushed topics.
 	const ei = handle.entries.indexOf(entry);
 	if (ei !== -1) handle.entries.splice(ei, 1);
+	return closed || gone;
 }
 
 /**
