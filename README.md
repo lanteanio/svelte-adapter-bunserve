@@ -2,8 +2,8 @@
 
 > **Status: early, and behind the adapter it follows.** svelte-adapter-uws is
 > the lead and is several minor versions ahead. Both halves work here - HTTP and
-> single-node realtime, covered by a unit suite plus live and leak lanes, the
-> latter two run against Bun 1.3.14 and 1.4.0 - and the `platform.*` surface it
+> single-node realtime, covered by unit, sim, live and leak lanes, all run
+> against Bun 1.3.14 and 1.4.0 - and the `platform.*` surface it
 > does implement matches the lead's. It is behind on: multi-node fan-out (the
 > extensions package throws against it), per-key send coalescing and socket RPC,
 > TypeScript types, and multi-process. Fine for a single-node app; pick
@@ -1157,12 +1157,14 @@ adapter options (Bun caps that one at 960).
 
 Requires [Bun](https://bun.com) installed. The supported floor is **Bun 1.3.14**
 (`engines.bun`), which is also the version the committed probe report was
-generated against. CI runs the Bun-driven lanes - the API probe, the live suite and the leak
-suite - twice, on 1.3.14 and on 1.4.0, because 1.4 changed several behaviours
-this adapter reads. The unit suite, both golden corpora and the determinism
-check run under Node, so they do not yet cover either Bun generation. After
-upgrading Bun, re-run the probe and review the report diff before trusting the
-upgrade.
+generated against. CI runs every gate on both Bun generations - 1.3.14 and 1.4.0 - because 1.4
+changed several behaviours this adapter reads: the API probe, the live and leak
+suites, the unit and sim lanes (one process per file, via
+`scripts/bun-test-lane.mjs`), both golden corpora and the determinism scan. The
+corpora are blessed under Node and must match fingerprint-for-fingerprint under
+Bun, which makes that gate a cross-engine determinism check rather than a
+pass/fail. After upgrading Bun, re-run the probe and review the report diff
+before trusting the upgrade.
 
 ```sh
 bun run probe   # runs the API probe and writes probe/bun-api-facts.report.md

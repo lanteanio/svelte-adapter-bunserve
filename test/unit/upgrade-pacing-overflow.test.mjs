@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // THE FOURTH WAY AN UPGRADE IS SHED: the pacing queue is full.
 //
@@ -22,7 +21,6 @@ globalThis.WS_OPTIONS = {
 	upgradeAdmission: { perTickBudget: 1, maxDeferred: 0 }
 };
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { tryUpgrade } = await import('../../src/runtime/handler/upgrade.js');
 const { upgradeAdmission } = await import('../../src/runtime/handler/admission.js');

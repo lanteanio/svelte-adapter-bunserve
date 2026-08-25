@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // AN `open` HOOK THAT CLOSES ITS SOCKET, which is where the permit accounting
 // gets its ordering wrong if it trusts the shape of the code rather than the
@@ -37,7 +36,6 @@ globalThis.WS_OPTIONS = {
 	upgradeAdmission: { maxConnections: 4 }
 };
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { tryUpgrade } = await import('../../src/runtime/handler/upgrade.js');
 const { upgradeAdmission } = await import('../../src/runtime/handler/admission.js');

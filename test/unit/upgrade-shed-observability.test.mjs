@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // WHAT A SHED UPGRADE LEAVES BEHIND, driven through `tryUpgrade`.
 //
@@ -26,7 +25,6 @@ globalThis.WS_OPTIONS = {
 	upgradeAdmission: { maxConcurrent: 4, maxConnections: 6, cursorLane: { fraction: 0.25 } }
 };
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { tryUpgrade } = await import('../../src/runtime/handler/upgrade.js');
 const { upgradeAdmission } = await import('../../src/runtime/handler/admission.js');

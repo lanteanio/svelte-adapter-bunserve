@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 import { normalizeWsOptions } from '../../src/runtime/utils/ws-options.js';
 
 // The auth preflight endpoint: the POST a client makes before it opens a
@@ -25,7 +24,6 @@ globalThis.WS_OPTIONS = normalizeWsOptions({
 	authPathRateLimit: 0
 }).options;
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { tryAuthEndpoint, authEndpointMounted } = await import('../../src/runtime/handler/auth.js');
 const { __setHooks } = await import('../helpers/ws-handler-stub.mjs');

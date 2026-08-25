@@ -43,8 +43,6 @@ import {
 globalThis.ENV_PREFIX ??= '';
 globalThis.WS_OPTIONS ??= null;
 globalThis.WS_PATH ??= '/ws';
-const { register } = await import('node:module');
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 const { resolvePressureThresholds } = await import('../../src/runtime/handler/pressure-metrics.js');
 
 // Baseline thresholds for reason/value tests: every process-local signal

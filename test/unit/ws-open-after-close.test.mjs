@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // THE WELCOME FRAME CAN CLOSE THE CONNECTION, and what happens next is the
 // app's lifecycle contract.
@@ -26,7 +25,6 @@ globalThis.WS_OPTIONS = {
 	maxControlEgressBytes: 1
 };
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { websocketHandlers } = await import('../../src/runtime/handler/ws.js');
 const { wsConnections } = await import('../../src/runtime/handler/ws-state.js');

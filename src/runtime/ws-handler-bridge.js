@@ -2,11 +2,14 @@
 // runtime/-root module, so handler/* submodules can import it via
 // ../ws-handler-bridge.js.
 //
-// The build's replace map rewrites the import specifier below to a path
-// relative to the OUTPUT ROOT. That path only resolves correctly from a file
-// sitting at the root (this bridge), not from the deeper handler/ directory -
-// which is the whole reason this indirection exists rather than importing the
-// handler where it is used.
-import * as wsModule from 'WS_HANDLER';
+// The `#ws-handler` specifier is a package import, resolved by the NEAREST
+// package.json in every world this module runs in: the build writes one into
+// the output root mapping it to the generated handler chunk, and this repo's
+// own package.json maps it - under the `bunserve-test` and `bunserve-sim`
+// conditions - to the unit-test stub and the simulator hooks. One mechanism,
+// resolved natively by Node and Bun alike; the loader-hook spelling it
+// replaces was a silent no-op under Bun, which left every source-level suite
+// unable to run there.
+import * as wsModule from '#ws-handler';
 
 export { wsModule };

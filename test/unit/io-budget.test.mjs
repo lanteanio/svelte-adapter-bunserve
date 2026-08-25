@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // I/O BUDGETS. Performance gates that can actually run on every change.
 //
@@ -27,7 +26,6 @@ globalThis.ENV_PREFIX = '';
 globalThis.WS_OPTIONS = null;
 globalThis.WS_PATH = '/ws';
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { platform } = await import('../../src/runtime/handler/platform.js');
 const { WS_CAPS, WS_SUBSCRIPTIONS, capCounts, maxAuthoritativeSeq, sharedTopics, setServer, topicSeqs, wsConnections } =

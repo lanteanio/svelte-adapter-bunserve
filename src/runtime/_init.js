@@ -13,8 +13,8 @@
 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Server } from 'SERVER';
-import { manifest, base } from 'MANIFEST';
+import { Server } from '#server';
+import { manifest, base } from '#manifest';
 import { processMonotonicNow } from './runtime.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));

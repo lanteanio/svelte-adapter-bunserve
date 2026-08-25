@@ -15,8 +15,6 @@ import assert from 'node:assert/strict';
 globalThis.ENV_PREFIX ??= '';
 globalThis.WS_OPTIONS ??= null;
 globalThis.WS_PATH ??= '/ws';
-const { register } = await import('node:module');
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const {
 	grantSizeFor, resolvePressureThresholds, startPressureSampling, stopPressureSampling

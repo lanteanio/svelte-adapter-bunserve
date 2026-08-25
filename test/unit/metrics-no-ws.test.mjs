@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // THE DOCUMENT A BUILD WITH NO REALTIME TIER SERVES.
 //
@@ -25,7 +24,6 @@ globalThis.WS_OPTIONS = null;
 // it, exactly as every other unit file that imports the platform does. A build
 // with no handler compiles a module that exports no hooks, which is what the
 // stub is with none set.
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { metricsSnapshot } = await import('../../src/runtime/handler/metrics.js');
 const { httpPlatform, requestPlatform } = await import('../../src/runtime/handler/platform.js');

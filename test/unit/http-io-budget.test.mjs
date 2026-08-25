@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -54,7 +53,6 @@ globalThis.STATIC_CACHE_MAX = 1024;
 globalThis.STATIC_DOTFILES = false;
 globalThis.ENV_PREFIX = '';
 
-register('../helpers/manifest-loader.mjs', import.meta.url);
 
 const counts = { response: 0, headers: 0, bunFile: 0, decode: 0 };
 /** Every path handed to Bun.file, in order. */
@@ -87,14 +85,21 @@ globalThis.decodeURIComponent = (s) => {
 // The path is recorded because the COUNT cannot tell br from identity: a disk
 // lane that ignored negotiation would open the wrong file the right number of
 // times.
-globalThis.Bun = {
-	/** @param {string} p */
-	file: (p) => {
-		counts.bunFile++;
-		opened.push(String(p));
-		return 'FAKE-FILE-BODY';
-	}
+/** @param {string} p */
+const countingFile = (p) => {
+	counts.bunFile++;
+	opened.push(String(p));
+	return 'FAKE-FILE-BODY';
 };
+if (typeof Bun === 'undefined') {
+	globalThis.Bun = { file: countingFile };
+} else {
+	// Under real Bun the global binding is frozen (writable: false), but the
+	// `file` property on the Bun object itself is assignable - so the same
+	// instrumentation lands either way, and the budget below counts real
+	// runtime calls rather than being skipped where Bun actually exists.
+	Bun.file = countingFile;
+}
 
 const { cacheDir, serveStatic, tryPrerendered, DECODE_CACHE_MAX } = await import(
 	'../../src/runtime/handler/static-assets.js'

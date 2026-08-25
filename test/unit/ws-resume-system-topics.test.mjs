@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // The ONE configuration where `__`-prefixed topics clear the system-topic
 // guard, and therefore the only place the resume lane's `__proto__` refusal is
@@ -12,7 +11,6 @@ globalThis.ENV_PREFIX = '';
 globalThis.WS_OPTIONS = { allowSystemTopicSubscribe: true };
 globalThis.WS_PATH = '/ws';
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { websocketHandlers } = await import('../../src/runtime/handler/ws.js');
 const { __setHooks } = await import('../helpers/ws-handler-stub.mjs');

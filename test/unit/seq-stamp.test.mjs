@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // WHAT A PUBLISH STAMPS WHEN NOBODY SAID. The exotic seq VALUES are pinned in
 // publish-seq.test.mjs; this file pins the option being ABSENT, which is the
@@ -25,7 +24,6 @@ globalThis.ENV_PREFIX = '';
 globalThis.WS_OPTIONS = null;
 globalThis.WS_PATH = '/ws';
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { platform } = await import('../../src/runtime/handler/platform.js');
 const {

@@ -31,7 +31,14 @@ const SCRIPT = fileURLToPath(new URL('../../scripts/sim-golden.js', import.meta.
 /** @param {string[]} args */
 function run(args) {
 	try {
-		const stdout = execFileSync(process.execPath, [SCRIPT, ...args], {
+		// The child resolves #ws-handler to the sim hooks the same way the
+		// parent lane does: by condition, passed explicitly because a spawned
+		// argv inherits nothing from the parent's flags. The spelling differs
+		// per engine - node takes -C, bun only the long form - and execPath is
+		// whichever engine is running this test.
+		const conditionArgs =
+			typeof Bun === 'undefined' ? ['-C', 'bunserve-sim'] : ['--conditions=bunserve-sim'];
+		const stdout = execFileSync(process.execPath, [...conditionArgs, SCRIPT, ...args], {
 			encoding: 'utf8',
 			stdio: ['ignore', 'pipe', 'pipe'],
 			timeout: 30_000

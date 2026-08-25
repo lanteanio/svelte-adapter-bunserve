@@ -8,13 +8,13 @@
 // like svelte-adapter-uws's, so the two adapters' golden corpora are built and
 // checked by one rule. Where uws's sim drives its testing-server MIRROR of the
 // production dispatch, this one drives the production modules themselves,
-// loaded through the sim-loader hook - strictly the more honest arrangement.
-//
-// Node-only (module-resolution hook + node:test lane, like every unit gate).
+// with `#ws-handler` resolved to sim-hooks.js under the `bunserve-sim`
+// condition - strictly the more honest arrangement. Run with
+// `node -C bunserve-sim` or `bun --conditions=bunserve-sim`; without the
+// condition, importing the handler graph fails at `#ws-handler` resolution.
 // Internal for now: reached by path from scripts/ and test/, not exported as a
 // package subpath.
 
-import { register } from 'node:module';
 import { normalizeWsOptions } from './runtime/utils/ws-options.js';
 import { CURSOR_LANE_SUBPROTOCOL } from './runtime/utils/upgrade-admission.js';
 import {
@@ -29,7 +29,7 @@ import { runSteadyState, faultClasses } from './runtime/steadystate.js';
 export { createScheduler, createSeededRng, createFaultEngine, DEFAULT_SEED, FIXED_EPOCH };
 
 // The handler graph reads its build-injected config from globals at module
-// load, and the WS_HANDLER specifier resolves through the sim loader - both
+// load, and the #ws-handler specifier resolves to sim-hooks - both
 // must be in place BEFORE the graph is imported, which is why the imports
 // below are dynamic and this module has a top-level await. Defaults are only
 // installed when a test has not already set its own.
@@ -50,8 +50,6 @@ globalThis.WS_OPTIONS ??= normalizeWsOptions({ allowUnauthenticatedSubscribe: tr
 // above: an ambient ORIGIN in the shell would win a `??=`, turn every sim
 // upgrade cross-origin, and drift the corpus for reasons outside the run.
 process.env.ORIGIN = SIM_ORIGIN;
-
-register('./runtime/sim-loader.mjs', import.meta.url);
 
 const { __setSimHooks } = await import('./runtime/sim-hooks.js');
 const { websocketHandlers } = await import('./runtime/handler/ws.js');

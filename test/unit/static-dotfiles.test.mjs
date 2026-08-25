@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -34,7 +33,6 @@ globalThis.STATIC_CACHE_MAX = 1024 * 1024;
 globalThis.STATIC_DOTFILES = false;
 globalThis.ENV_PREFIX = '';
 
-register('../helpers/manifest-loader.mjs', import.meta.url);
 
 const { cacheDir } = await import('../../src/runtime/handler/static-assets.js');
 const { staticCache } = await import('../../src/runtime/handler/state.js');

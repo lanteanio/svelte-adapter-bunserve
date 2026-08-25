@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // THE METERED DOOR ON ITS SOCKET-PEER BRANCH.
 //
@@ -28,7 +27,6 @@ globalThis.WS_OPTIONS = {
 	upgradeRateLimitWindow: 10
 };
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const {
 	createScheduler, createSeededRng, createFaultEngine, DEFAULT_SEED, FIXED_EPOCH

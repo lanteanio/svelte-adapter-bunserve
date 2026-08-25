@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 import { normalizeWsOptions } from '../../src/runtime/utils/ws-options.js';
 
 // A server where both metered doors are turned off.
@@ -23,7 +22,6 @@ globalThis.WS_OPTIONS = normalizeWsOptions({
 	authPathRateLimit: 0
 }).options;
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { metricsSnapshot } = await import('../../src/runtime/handler/metrics.js');
 const { upgradeRateLimiter, authRateLimiter } = await import('../../src/runtime/handler/rate-limit.js');

@@ -44,7 +44,7 @@ jobs:
         run: npm run sim:golden
 
   bun-matrix:
-    name: Bun API facts (pinned Bun)
+    name: Bun runtime gates (pinned Bun)
     runs-on: ubuntu-latest
     strategy:
       # 1.3.14 is the engines floor; 1.4.0 is the first release of the
@@ -74,6 +74,21 @@ jobs:
             grep -n "FAILED" probe/bun-api-facts.report.md
             exit 1
           fi
+      # The source-level gates, on the Bun runtime itself. Unit and sim run
+      # one process per file (scripts/bun-test-lane.mjs says why), the two
+      # corpora must match the committed Node-blessed fingerprints - which
+      # makes this a cross-engine determinism check, not just a pass/fail -
+      # and the determinism scan runs the same scanner Node runs.
+      - name: Unit lane
+        run: bun scripts/bun-test-lane.mjs unit
+      - name: Sim lane
+        run: bun scripts/bun-test-lane.mjs sim
+      - name: Golden corpora
+        run: |
+          bun --conditions=bunserve-sim scripts/sim-golden.js --corpus adapter-single
+          bun --conditions=bunserve-sim scripts/sim-golden.js --corpus adapter-admission
+      - name: Determinism scan
+        run: bun scripts/check-determinism.js
 
   publish-hygiene:
     name: Publishing hygiene (publint + attw)

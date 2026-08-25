@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // THE ABORT PATH, driven through `tryUpgrade` rather than through the counters.
 //
@@ -28,7 +27,6 @@ globalThis.WS_OPTIONS = {
 	upgradeAdmission: { maxConcurrent: 2, maxConnections: 2 }
 };
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { tryUpgrade } = await import('../../src/runtime/handler/upgrade.js');
 const { upgradeAdmission } = await import('../../src/runtime/handler/admission.js');

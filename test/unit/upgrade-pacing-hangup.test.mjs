@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // A CLIENT THAT LEAVES WHILE ITS HANDSHAKE IS PARKED IN THE PACING QUEUE.
 //
@@ -26,7 +25,6 @@ globalThis.WS_OPTIONS = {
 	upgradeAdmission: { perTickBudget: 1, maxDeferred: 4 }
 };
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { tryUpgrade } = await import('../../src/runtime/handler/upgrade.js');
 const { upgradeAdmission } = await import('../../src/runtime/handler/admission.js');

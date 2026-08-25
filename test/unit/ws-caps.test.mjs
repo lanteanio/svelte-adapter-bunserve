@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // The capability handshake: `{"type":"hello","caps":[...]}` is what arms every
 // opt-in feature, and the live per-capability counts it maintains are the gate
@@ -11,7 +10,6 @@ globalThis.ENV_PREFIX = '';
 globalThis.WS_OPTIONS = null;
 globalThis.WS_PATH = '/ws';
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { websocketHandlers } = await import('../../src/runtime/handler/ws.js');
 const { WS_CAPS, capCounts } = await import('../../src/runtime/handler/ws-state.js');

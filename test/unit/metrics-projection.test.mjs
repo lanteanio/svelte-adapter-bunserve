@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 import { normalizeWsOptions } from '../../src/runtime/utils/ws-options.js';
 
 // What the scrape actually says about a running server.
@@ -18,7 +17,6 @@ globalThis.WS_OPTIONS = normalizeWsOptions({
 	allowUnauthenticatedSubscribe: true
 }).options;
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { metricsSnapshot, metricsRegistry } = await import('../../src/runtime/handler/metrics.js');
 const { SIGNALS } = await import('../../src/runtime/observability-manifest.js');

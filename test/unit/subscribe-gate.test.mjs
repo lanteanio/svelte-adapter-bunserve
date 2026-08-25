@@ -1,17 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // Same bootstrap as ws-state.test.mjs: the handler modules read values the build
 // freezes into the bundle, so setting them here is what lets the gate be tested
 // without a build, a server, or a socket. The loader additionally resolves the
-// build-injected WS_HANDLER specifier to a stub, which is what makes the
+// build-resolved #ws-handler specifier to a stub, which is what makes the
 // authorization gate reachable from a unit test at all.
 globalThis.ENV_PREFIX = '';
 globalThis.WS_OPTIONS = null;
 globalThis.WS_PATH = '/ws';
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { platform, subscribeWithVerdict } = await import(
 	'../../src/runtime/handler/platform.js'

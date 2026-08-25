@@ -18,6 +18,15 @@
 			"default": "./src/index.js"
 		}
 	},
+	"imports": {
+		"#ws-handler": {
+			"bunserve-test": "./test/helpers/ws-handler-stub.mjs",
+			"bunserve-sim": "./src/runtime/sim-hooks.js"
+		},
+		"#manifest": {
+			"bunserve-test": "./test/helpers/manifest-stub.mjs"
+		}
+	},
 	"files": [
 		"src",
 		"protocol.schema.json",
@@ -27,12 +36,12 @@
 	],
 	"scripts": {
 		"probe": "bun probe/bun-api-facts.mjs",
-		"test": "node --test \"test/unit/*.test.mjs\"",
+		"test": "node -C bunserve-test --test \"test/unit/*.test.mjs\" && node -C bunserve-sim --test \"test/sim/*.test.mjs\"",
 		"test:live": "bun test/live/run.mjs",
 		"test:leak": "bun test/leak/run.mjs",
 		"check:publish": "publint && attw --pack . --profile esm-only",
 		"check:determinism": "node scripts/check-determinism.js",
-		"sim:golden": "node scripts/sim-golden.js --corpus adapter-single && node scripts/sim-golden.js --corpus adapter-admission",
+		"sim:golden": "node -C bunserve-sim scripts/sim-golden.js --corpus adapter-single && node -C bunserve-sim scripts/sim-golden.js --corpus adapter-admission",
 		"probe:uws": "node probe/uws-surface.mjs"
 	},
 	"dependencies": {

@@ -1,6 +1,5 @@
 import { beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // The resume barrier and its two entry points. The barrier's job is exactly
 // one thing: a publish that lands while an async resume hook is reading the
@@ -11,7 +10,6 @@ globalThis.ENV_PREFIX = '';
 globalThis.WS_OPTIONS = null;
 globalThis.WS_PATH = '/ws';
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { websocketHandlers } = await import('../../src/runtime/handler/ws.js');
 const { platform } = await import('../../src/runtime/handler/platform.js');

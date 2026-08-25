@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 import { normalizeWsOptions } from '../../src/runtime/utils/ws-options.js';
 
 // `websocket.authPathRateLimit`, wired: the second door on the shared limiter.
@@ -27,7 +26,6 @@ globalThis.WS_OPTIONS = normalizeWsOptions({
 	upgradeRateLimit: 1
 }).options;
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { tryAuthEndpoint } = await import('../../src/runtime/handler/auth.js');
 const { __setHooks } = await import('../helpers/ws-handler-stub.mjs');

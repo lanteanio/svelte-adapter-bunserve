@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // THE WIRING, not the counters.
 //
@@ -27,7 +26,6 @@ globalThis.WS_OPTIONS = {
 	upgradeAdmission: { maxConnections: 4, perTickBudget: 1, maxDeferred: 8, cursorLane: { fraction: 0.25 } }
 };
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { tryUpgrade } = await import('../../src/runtime/handler/upgrade.js');
 const { upgradeAdmission } = await import('../../src/runtime/handler/admission.js');

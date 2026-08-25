@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // THE SHED LINE'S THROTTLE, which is the difference between a diagnostic and an
 // amplifier. A refusal costs an attacker one packet, so a line per refusal is
@@ -24,7 +23,6 @@ globalThis.WS_OPTIONS = {
 	upgradeAdmission: { maxConcurrent: 1, cursorLane: { fraction: 1 } }
 };
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { tryUpgrade } = await import('../../src/runtime/handler/upgrade.js');
 const { upgradeAdmission } = await import('../../src/runtime/handler/admission.js');

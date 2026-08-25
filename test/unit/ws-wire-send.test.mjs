@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // The single-target wire senders and the per-connection codec lifecycle:
 // announce-before-first-frame, caps/poison gating, degrade-to-JSON, and the
@@ -11,7 +10,6 @@ globalThis.ENV_PREFIX = '';
 globalThis.WS_OPTIONS = null;
 globalThis.WS_PATH = '/ws';
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { platform } = await import('../../src/runtime/handler/platform.js');
 const { WS_CAPS, WS_SUBSCRIPTIONS, wsCounters } = await import(

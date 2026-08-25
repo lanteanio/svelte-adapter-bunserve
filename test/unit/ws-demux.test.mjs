@@ -1,10 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // The demux in handler/ws.js is the part of the realtime tier a client talks to
 // directly, and until this file existed nothing imported it: it reaches the
-// app's hooks through the build-injected WS_HANDLER specifier, so it could not
+// app's hooks through the build-resolved #ws-handler specifier, so it could not
 // be loaded without a build. Every defect in it was therefore found by reading
 // rather than by a failing test. The resolver hook that makes the gate testable
 // makes this testable too.
@@ -12,7 +11,6 @@ globalThis.ENV_PREFIX = '';
 globalThis.WS_OPTIONS = null;
 globalThis.WS_PATH = '/ws';
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { websocketHandlers } = await import('../../src/runtime/handler/ws.js');
 const { WS_SUBSCRIPTIONS, pendingReleaseTopics } = await import(

@@ -1,7 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { register } from 'node:module';
 
 // svelte-adapter-uws LEADS this adapter, and the two are meant to be drop-in
 // replacements for each other. That claim is worth exactly as much as the
@@ -27,7 +26,6 @@ globalThis.ENV_PREFIX = '';
 globalThis.WS_OPTIONS = null;
 globalThis.WS_PATH = '/ws';
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { platform } = await import('../../src/runtime/handler/platform.js');
 const { KNOWN_ADAPTER_OPTIONS } = await import('../../src/adapter-options.js');

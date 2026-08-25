@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The build-injected specifiers are package imports now. The runtime's bridge
+  modules import `#server`, `#manifest` and `#ws-handler`, and the build writes
+  a `package.json` into the output root that maps them to the generated chunks
+  (and pins `"type": "module"`, so the output stays ESM whatever the app's own
+  package.json says). They were bare tokens rewritten during the copy, which
+  replaced the token anywhere it appeared - a comment reading "MANIFEST ORDER
+  FIRST" shipped mangled - and which meant tests could only reach the handler
+  graph through a Node resolver hook that Bun silently ignores, so no
+  source-level suite could run on the runtime this adapter targets.
+
+- Every gate now runs on Bun 1.3.14 and 1.4.0 in CI, not only the Bun-driven
+  lanes: the unit and sim suites (one process per file, restoring the isolation
+  `node --test` provides and `bun test` does not), both golden corpora - which
+  must match the Node-blessed fingerprints, making that gate a cross-engine
+  determinism check - and the determinism scan. Measured on both generations
+  before wiring: unit 70/70 files, sim 8/8, corpora 2x40/40, all green on each.
+
 ## [0.0.2] - 2026-08-25
 
 Still pre-alpha, and the public contract is still not stable. What changed since

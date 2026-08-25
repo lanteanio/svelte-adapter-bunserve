@@ -17,7 +17,7 @@ const runtimeDir = fileURLToPath(new URL('./runtime', import.meta.url).href);
 // production server imports resolves any of these. Copying them into every
 // build output would be dead weight, so the copy filters them out.
 const SIM_LANE_FILES = new Set([
-	'sim-core.js', 'sim-inmemory.js', 'sim-hooks.js', 'sim-loader.mjs',
+	'sim-core.js', 'sim-inmemory.js', 'sim-hooks.js',
 	'invariants.js', 'auditor.js', 'steadystate.js'
 ]);
 
@@ -347,8 +347,6 @@ export default function (opts = {}) {
 			builder.copy(runtimeDir, out, {
 				filter: (file) => !SIM_LANE_FILES.has(path.basename(file)),
 				replace: {
-					MANIFEST: './server/manifest.js',
-					SERVER: './server/index.js',
 					ENV_PREFIX: JSON.stringify(envPrefix),
 					PRECOMPRESS: JSON.stringify(precompress),
 					HEALTH_CHECK_PATH: JSON.stringify(healthCheckPath),
@@ -359,7 +357,6 @@ export default function (opts = {}) {
 					HTTP_OPTIONS: JSON.stringify({
 						compressCredentialedResponses: compressCredentialedResponses === true
 					}),
-					WS_HANDLER: './server/ws-handler.js',
 					WS_PATH: JSON.stringify(websocketPath),
 					// null switches the whole WebSocket surface off at runtime:
 					// no upgrade lane, no websocket option set on Bun.serve, no
@@ -378,6 +375,32 @@ export default function (opts = {}) {
 						: 'null'
 				}
 			});
+
+			// The output root's own package.json. `"type": "module"` makes the
+			// output ESM regardless of what the app's package.json says, and
+			// `"imports"` is what resolves the runtime's `#server`,
+			// `#manifest` and `#ws-handler` specifiers to the generated
+			// chunks - package imports, resolved by the nearest package.json,
+			// which this file is for everything in the output. The
+			// alternative, rewriting bare tokens during the copy, replaced
+			// the token ANYWHERE it appeared (a comment reading "MANIFEST
+			// ORDER FIRST" shipped mangled), and stubbing those tokens for
+			// tests needed a resolver hook that Bun does not implement.
+			writeFileSync(
+				`${out}/package.json`,
+				JSON.stringify(
+					{
+						type: 'module',
+						imports: {
+							'#server': './server/index.js',
+							'#manifest': './server/manifest.js',
+							'#ws-handler': './server/ws-handler.js'
+						}
+					},
+					null,
+					'\t'
+				) + '\n'
+			);
 
 			// The exact metadata that produced this server, for the boot
 			// banner and diagnostics: the runtime reads its version and the

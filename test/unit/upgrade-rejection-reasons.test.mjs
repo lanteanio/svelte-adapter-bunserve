@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
 
 // REFUSALS THAT ARE NOT CAPACITY, on a server with NO admission block at all.
 //
@@ -29,7 +28,6 @@ globalThis.WS_OPTIONS = {
 	handler: 'src/ws-handler.js'
 };
 
-register('../helpers/ws-handler-loader.mjs', import.meta.url);
 
 const { tryUpgrade } = await import('../../src/runtime/handler/upgrade.js');
 const { upgradeAdmission } = await import('../../src/runtime/handler/admission.js');
