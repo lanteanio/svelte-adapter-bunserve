@@ -114,19 +114,16 @@ const WS_OPTION_GAPS = {
 	protection: 'pressure/protection observability',
 	// The socket-sharing primitive is no longer the blocker: node:cluster can
 	// share a listen socket between processes on this runtime. What blocks
-	// these two is that uws's contract for them is THREAD-shaped, and the
-	// process shape cannot carry it - measured on Bun 1.4.0. primaryInit
-	// promises every worker the same SharedArrayBuffer, and a SAB sent over
-	// cluster IPC arrives as a dead structured-clone copy in each worker.
-	// uws relays publish() across workers, and Bun.serve's topic registry is
-	// per-process: a subscriber hears only its own worker's publishes. On top
-	// of both, every protective ceiling here - admission, both rate limiters -
-	// is per-process state that would silently become N times looser per
-	// worker. Cross-worker fanout and shared accounting on this runtime are
-	// what the extensions bus already provides for multi-node, so the honest
+	// these two is that uws's contract for them is THREAD-shaped and the
+	// process shape cannot carry it - measured, with the committed probe and
+	// transcript in probe/cluster-probe.mjs and probe/cluster-facts.report.md.
+	// On top of that, every protective ceiling here - admission, both rate
+	// limiters - is per-process state that would silently become N times
+	// looser per worker. Cross-worker fanout and shared accounting are what
+	// the extensions bus already provides for multi-node, so the honest
 	// answer stays: single process per instance, scale out by instances.
-	primaryInit: 'multi-worker clustering',
-	workers: 'multi-worker clustering',
+	primaryInit: 'cluster IPC delivers a dead SharedArrayBuffer copy, not the shared init buffer the contract promises (probe/cluster-facts.report.md)',
+	workers: 'each worker publishes into a per-process topic registry, so N workers serve N disjoint audiences (probe/cluster-facts.report.md)',
 	unsafeSameOriginWithoutHostPin: 'origin pinning escape hatch'
 };
 
