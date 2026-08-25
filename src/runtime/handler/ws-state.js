@@ -614,6 +614,29 @@ export const wsCounters = {
 	/** The window drained by the previous sampler tick (introspection). */
 	lastPublishCount: 0,
 
+	/**
+	 * Publish-egress accounting for the current pressure window, drained into
+	 * `pressureSnapshot.egress` each sampler tick and reset: local deliveries
+	 * and wire bytes charged, and publishes refused by a configured
+	 * `websocket.egress` ceiling, per scope. Charged by
+	 * handler/publish-egress.js, the one charge point every publish-family
+	 * fan-out calls.
+	 */
+	egressDeliveriesWindow: 0,
+	egressBytesWindow: 0,
+	egressRefusedTopicWindow: 0,
+	egressRefusedTenantWindow: 0,
+
+	/**
+	 * Monotonic egress totals, projected at scrape time as
+	 * `egress_refused_total{scope}` and `egress_window_evicted_total{scope}`.
+	 * Seeded with the whole scope vocabulary so both series exist as zeroes
+	 * from the first scrape - a flat line reads as "nothing refused", a gap
+	 * reads as a missing exporter.
+	 */
+	egressRefusedByScope: { topic: 0, tenant: 0 },
+	egressEvictedByScope: { topic: 0, tenant: 0 },
+
 	/** Connection count at the previous sampler tick. */
 	lastConnections: 0,
 
@@ -745,6 +768,11 @@ export const pressureSnapshot = {
 	backpressuredConnections: 0,
 	psi: null,
 	cpuThrottle: null,
+	// Publish-egress figures for the last sample window: local deliveries and
+	// wire bytes charged, and publishes refused by a configured
+	// `websocket.egress` ceiling, per scope - the same fields the sibling
+	// adapter's snapshot carries, so an app reading them is portable.
+	egress: { deliveries: 0, bytes: 0, refusedTopic: 0, refusedTenant: 0 },
 	topPublishers: []
 };
 

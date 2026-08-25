@@ -116,6 +116,19 @@ function samplePressure(thresholds) {
 	wsCounters.lastPublishCount = wsCounters.publishCountWindow;
 	wsCounters.publishCountWindow = 0;
 
+	// Drain the egress window into the snapshot the same way: the counters
+	// accumulate between ticks, the snapshot carries the last whole window.
+	pressureSnapshot.egress = {
+		deliveries: wsCounters.egressDeliveriesWindow,
+		bytes: wsCounters.egressBytesWindow,
+		refusedTopic: wsCounters.egressRefusedTopicWindow,
+		refusedTenant: wsCounters.egressRefusedTenantWindow
+	};
+	wsCounters.egressDeliveriesWindow = 0;
+	wsCounters.egressBytesWindow = 0;
+	wsCounters.egressRefusedTopicWindow = 0;
+	wsCounters.egressRefusedTenantWindow = 0;
+
 	const connections = wsConnections.size;
 	wsCounters.lastConnections = connections;
 	const subscriberRatio = connections > 0 ? wsCounters.totalSubscriptions / connections : 0;

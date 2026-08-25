@@ -78,6 +78,7 @@ const { upgradeAdmission } = await import('./runtime/handler/admission.js');
 const { upgradeRateLimiter, authRateLimiter, _resetRateLimitForSim } =
 	await import('./runtime/handler/rate-limit.js');
 const { _resetWireCodecRegistry } = await import('./runtime/handler/codec-registry.js');
+const { _resetEgressForSim } = await import('./runtime/handler/publish-egress.js');
 const { _resetSharedWireIds } = await import('./runtime/utils/shared-wire-id.js');
 const { stopPressureSampling } = await import('./runtime/handler/pressure-metrics.js');
 
@@ -115,6 +116,10 @@ function resetSimState() {
 	// exactly the contamination this reset exists to prevent.
 	stopPressureSampling();
 	_resetWireCodecRegistry();
+	// The egress windows and warn throttles, for the same reason as every
+	// reset above: a seed inheriting another seed's refusals is a fingerprint
+	// that depends on swarm order.
+	_resetEgressForSim();
 	_resetSharedWireIds();
 	// The upgrade ceiling, on the servers that have one. It is built once per
 	// PROCESS from the options, and the sim runs a corpus of servers in one

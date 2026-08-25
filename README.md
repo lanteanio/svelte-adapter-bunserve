@@ -522,6 +522,16 @@ adapter: bunserve({
 			maxDeferred: 1024,                // finite queue behind the budget
 			cursorLane: { fraction: 0.25 }    // omit to disable the lane
 		},
+		// Publish-egress ceilings, per topic and per tenant over a rotation
+		// window. Every ceiling is a non-negative safe integer; 0 (or omitted)
+		// disables it deliberately. Omit the whole section for no ceilings.
+		egress: {
+			windowMs: 1000,                   // accounting window, rotated lazily
+			maxKeys: 4096,                    // keys per scope ledger (rounded up to a power of two)
+			evictionSample: 8,                // entries an at-cap eviction inspects
+			topic: { messages: 0, bytes: 0, deliveries: 0 },
+			tenant: { messages: 0, bytes: 0, deliveries: 0 }
+		},
 		// Pressure-sampler thresholds; each signal accepts `false` to
 		// disable it. The sampler always runs - this only tunes it.
 		pressure: {
@@ -710,6 +720,42 @@ as per client. A peer that reconnects after being cut gets a fresh budget, so
 none of them bounds an attacker who can open sockets in a loop; nothing here
 limits connections per IP or handshake rate, and that belongs upstream, in the
 load balancer or ingress, the way connection limiting normally does.
+
+`egress` is the outbound half of what the admission ceilings bound on the way
+in: what a single publisher can cost the whole process. Each scope (`topic`,
+`tenant`) takes up to three per-window ceilings - `messages` (logical
+publishes), `deliveries` (local recipients times messages, an excluded socket
+deducted), and `bytes` (serialized frame bytes summed over recipients,
+pre-compression). A refused publish delivers nothing, stamps no sequence, and
+returns `false`; the refusal is counted in `egress_refused_total{scope}` and
+said out loud at most once a minute per topic. The semantics worth knowing
+before sizing one:
+
+- A batch (`publishWireBatch`) is N logical publishes sharing ONE decision:
+  admitted whole or refused whole. Size a ceiling above the largest single
+  batch it must admit - a 10-entry batch under `messages: 5` can never fit any
+  window and is refused on every attempt, reported every time.
+- The `bytes` ceiling refuses once the window's charge has REACHED it: a
+  publish's byte weight exists only after serialization, which must not happen
+  before admission, so the publish that crosses the line is delivered and the
+  next is refused. Overshoot is bounded by one publish's bytes.
+- Ceilings are held per key in a ledger bounded per scope (`maxKeys`, default
+  4096, rounded up to a power of two). Lapsed windows are reclaimed before the
+  ledger fills, so the bound is on keys LIVE at once; above it the
+  least-active key in a bounded sample (`evictionSample`) loses its ceiling
+  for the rest of its window, counted in
+  `egress_window_evicted_total{scope}`. A `tenant` ceiling stays the durable
+  one for a high-cardinality topic space: tenant ids have to outnumber the
+  ledger before that scope is affected at all.
+- Tenant attribution comes from the WebSocket handler module: export
+  `egressTenantOf(topic)` returning a tenant id (1..64 chars of
+  `[a-zA-Z0-9_-]`) or null for an unattributed topic, which `topic` ceilings
+  still cover. The resolver cannot be configured in `svelte.config.js` - a
+  function would not survive the JSON round trip into the build.
+
+The section is spelled as `svelte-adapter-uws` spells it, same defaults, same
+disabled-on-zero rule, so a config carried between the adapters bounds the
+same quantities in both.
 
 `SHUTDOWN_RECONNECT_WINDOW_MS` (default 3000) sets the window over which
 draining clients spread their reconnect; 0 closes them immediately with no

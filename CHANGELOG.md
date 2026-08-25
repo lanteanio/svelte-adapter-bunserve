@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `websocket.egress`: publish-egress ceilings, the outbound half of message
+  admission - per-window `messages`, `deliveries` and `bytes` bounds held per
+  topic and per tenant in a bounded, lazily-rotated ledger, spelled and
+  defaulted exactly as svelte-adapter-uws declares them. A refused publish
+  delivers nothing, stamps no sequence and returns `false`; a batch is
+  admitted whole or refused whole; a publish heavier than a whole window's
+  allowance is refused on every attempt and reported every time; the `bytes`
+  ceiling delivers the crossing publish and refuses the next, because byte
+  weight exists only after serialization. Ledger keys are bounded to what is
+  live at once (lapsed windows reclaimed amortized), and an eviction that
+  costs enforcement is counted in `egress_window_evicted_total{scope}` beside
+  `egress_refused_total{scope}`. Tenants resolve through the handler module's
+  `egressTenantOf(topic)` export. The pressure snapshot gains the sibling's
+  `egress` figures and `topPublishers` gains `deliveriesPerSec`; the `egress`
+  entry leaves the parity gap list, so the oracle now checks it by name.
+
 - The static lane answers the full RFC 9110 precondition set. Mutable assets
   carry `Last-Modified` beside the ETag, `If-Modified-Since` answers 304 for a
   cache that lost the validator, and `If-Match` / `If-Unmodified-Since` answer

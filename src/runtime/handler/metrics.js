@@ -172,6 +172,16 @@ export function projectMetrics() {
 	setOptional('ws_subscriptions', wsCounters.totalSubscriptions);
 	metricsRegistry.projectCounter('ws_publishes_total', undefined, wsCounters.publishCount);
 	metricsRegistry.projectCounter('ws_closed_socket_aborts_total', undefined, wsCounters.closedWsAborts);
+	// Publish-egress enforcement, under the names the sibling gives them so an
+	// alert written there evaluates here. Both scopes from the first scrape,
+	// zeroes included: a flat line reads as "nothing refused", a gap as a
+	// missing exporter.
+	for (const [scope, count] of Object.entries(wsCounters.egressRefusedByScope)) {
+		metricsRegistry.projectCounter('egress_refused_total', { scope }, count);
+	}
+	for (const [scope, count] of Object.entries(wsCounters.egressEvictedByScope)) {
+		metricsRegistry.projectCounter('egress_window_evicted_total', { scope }, count);
+	}
 
 	// - Pressure ---------------------------------------------------------------
 	//

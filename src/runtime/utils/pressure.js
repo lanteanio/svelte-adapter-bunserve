@@ -287,7 +287,11 @@ export function computeTopPublishers(stats, intervalSec, thresholds) {
 	for (const [topic, s] of stats) {
 		const messagesPerSec = intervalSec > 0 ? s.m / intervalSec : 0;
 		const bytesPerSec = intervalSec > 0 ? s.b / intervalSec : 0;
-		const entry = { topic, messagesPerSec, bytesPerSec };
+		// `d` is additive: stats recorded before the deliveries dimension
+		// existed carry none, and a missing field reads as zero rather than
+		// NaN in the rate.
+		const deliveriesPerSec = intervalSec > 0 ? (s.d || 0) / intervalSec : 0;
+		const entry = { topic, messagesPerSec, bytesPerSec, deliveriesPerSec };
 		topicRates.push(entry);
 		const tooManyMsg = msgThreshold !== false && messagesPerSec >= msgThreshold;
 		const tooManyBytes = byteThreshold !== false && bytesPerSec >= byteThreshold;

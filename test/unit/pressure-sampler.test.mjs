@@ -89,12 +89,14 @@ test('the window is drained into a per-second rate and zeroed for the next sampl
 test('per-topic stats become rates, feed topPublishers, and are cleared each window', () => {
 	const s = sampler({ ...QUIET, sampleIntervalMs: 1000 });
 	try {
-		topicPublishStats.set('busy', { m: 30, b: 3000 });
+		topicPublishStats.set('busy', { m: 30, b: 3000, d: 60 });
 		topicPublishStats.set('quiet', { m: 1, b: 10 });
 		s.tick();
+		// 'quiet' carries no d field, the shape of a stat recorded before the
+		// deliveries dimension existed - it reads as zero, never NaN.
 		assert.deepEqual(pressureSnapshot.topPublishers, [
-			{ topic: 'busy', messagesPerSec: 30, bytesPerSec: 3000 },
-			{ topic: 'quiet', messagesPerSec: 1, bytesPerSec: 10 }
+			{ topic: 'busy', messagesPerSec: 30, bytesPerSec: 3000, deliveriesPerSec: 60 },
+			{ topic: 'quiet', messagesPerSec: 1, bytesPerSec: 10, deliveriesPerSec: 0 }
 		], 'sorted by message rate, per second');
 		assert.equal(topicPublishStats.size, 0, 'the source map is cleared, so counts cannot compound');
 		s.tick();
@@ -157,7 +159,7 @@ test('an onPublishRate listener replaces the default runaway warning', () => {
 		s.tick();
 		assert.equal(warned, 1, 'a registered listener SUPPRESSES the console warning');
 		assert.equal(reports.length, 1);
-		assert.deepEqual(reports[0], [{ topic: 'runaway', messagesPerSec: 50, bytesPerSec: 100 }]);
+		assert.deepEqual(reports[0], [{ topic: 'runaway', messagesPerSec: 50, bytesPerSec: 100, deliveriesPerSec: 0 }]);
 	} finally { console.warn = realWarn; done(); }
 });
 

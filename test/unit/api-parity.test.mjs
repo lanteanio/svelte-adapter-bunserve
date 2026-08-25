@@ -101,10 +101,6 @@ const WS_OPTION_GAPS = {
 	adminPath: 'admin endpoint',
 	maxTopicSeqEntries: 'bounded topic-seq registry',
 	messageAdmission: 'inbound message admission',
-	// The outbound half of what `messageAdmission` bounds on the way in:
-	// per-window publish ceilings held per scope in a bounded ledger. Arrived
-	// with the 0.6.0-next.92 cut.
-	egress: 'publish-egress ceilings',
 	adminAuthAcknowledged: 'admin endpoint',
 	authorizeWireSubscribe: 'wire-subscribe authorization',
 	consistencyAuditIntervalMs: 'background audits',

@@ -59,6 +59,10 @@ export function createSharedWireIdTable() {
 			const entry = byTopic.get(topic);
 			return entry === undefined ? undefined : entry.id;
 		},
+		refs(topic) {
+			const entry = byTopic.get(topic);
+			return entry === undefined ? 0 : entry.refs;
+		},
 		reset() {
 			byTopic.clear();
 			nextId = SHARED_WIRE_ID_BASE;
@@ -94,6 +98,15 @@ export const releaseSharedWireId = _default.release;
  * @returns {number | undefined}
  */
 export const getSharedWireId = _default.get;
+
+/**
+ * The binary cohort's size for a shared topic: one reference per cohorted
+ * socket. The egress charge reads it to split a shared publish's bytes
+ * between the 0x03 frame and the JSON envelope without a walk.
+ * @param {string} topic
+ * @returns {number}
+ */
+export const sharedWireIdRefs = _default.refs;
 
 /** Test seam: clear the default table and reset its allocator. @internal */
 export const _resetSharedWireIds = _default.reset;

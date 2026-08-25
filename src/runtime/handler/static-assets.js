@@ -101,7 +101,7 @@ export function cacheDir(dir, urlPrefix, immutable, staticHeaders = null) {
 			headers.push(
 				['cache-control', 'no-cache'],
 				['etag', etag],
-				['last-modified', new Date(mtimeSec * 1000).toUTCString()]
+				['last-modified', new Date(mtimeSec * 1000).toUTCString()] // determinism-allow: renders the file's own mtime, an input read from disk at index time - no clock is consulted
 			);
 		}
 

@@ -86,6 +86,13 @@ const DEFAULTS = {
 	// utils/upgrade-admission.js; the block is spelled exactly as uws spells it
 	// so a config carried between the adapters gates the same way in both.
 	upgradeAdmission: undefined,
+	// Publish-egress ceilings: the outbound half of message admission, per
+	// topic and per tenant over a rotation window. undefined means every
+	// ceiling is off - the uws default and the backward-compatible one. See
+	// utils/egress-account.js for the charge law; the section is spelled
+	// exactly as uws spells it so a config carried between the adapters
+	// bounds the same quantities in both.
+	egress: undefined,
 	// The path to an operator's metrics module, as uws declares it. ACCEPTED so a
 	// carried config builds, and NOT LOADED - see the validator for why a module
 	// cannot own the registry on this runtime.
@@ -460,6 +467,122 @@ function requireUpgradeAdmission(value, warnings) {
 	return out;
 }
 
+/** The section and ceiling keys `websocket.egress` declares, as uws declares them. */
+const EGRESS_KEYS = new Set(['windowMs', 'maxKeys', 'evictionSample', 'topic', 'tenant']);
+const EGRESS_CEILING_KEYS = new Set(['messages', 'bytes', 'deliveries']);
+
+/**
+ * Validate the `websocket.egress` section: publish-egress ceilings per topic
+ * and per tenant over a rotation window, spelled exactly as svelte-adapter-uws
+ * spells them so a config carried between the adapters bounds the same
+ * quantities in both. Every bound here is duplicated in the ledger
+ * (utils/egress-account.js), which treats anything outside them as absent -
+ * this guard exists so a misshaped value refuses the build instead of being
+ * silently replaced by a default.
+ *
+ * @param {unknown} value
+ * @param {string[]} warnings
+ * @returns {Record<string, unknown>}
+ */
+function requireEgress(value, warnings) {
+	const copied = value !== null && typeof value === 'object' ? readableCopy(value) : null;
+	if (copied === null || Array.isArray(copied)) {
+		throw new Error(
+			'adapter option `websocket.egress` must be an object of publish-egress ceilings ' +
+			'(or omitted), e.g. { topic: { messages: 500 } } - got ' + describeValue(value) + '. ' +
+			'Omit the option to leave every ceiling disabled deliberately.'
+		);
+	}
+	const raw = copied;
+	if ('tenantOf' in raw) {
+		throw new Error(
+			'adapter option `websocket.egress.tenantOf` cannot be configured here: the section ' +
+			'survives a JSON round trip into the build, so a function would be silently dropped and ' +
+			'every tenant ceiling would silently enforce nothing. Export egressTenantOf(topic) from ' +
+			'the WebSocket handler module instead.'
+		);
+	}
+	for (const key of Object.keys(raw)) {
+		if (!EGRESS_KEYS.has(key) && key !== 'tenantOf') {
+			warnings.push(
+				`unknown adapter option \`websocket.egress.${key}\` is ignored, so the bound it was ` +
+				`meant to set is not applied. Known keys are ${[...EGRESS_KEYS].join(', ')}.`
+			);
+		}
+	}
+	const windowMs = raw.windowMs;
+	if (windowMs !== undefined && windowMs !== null) {
+		if (typeof windowMs !== 'number' || !Number.isFinite(windowMs) || windowMs < 100 || windowMs > 0x7fffffff) {
+			throw new Error(
+				'adapter option `websocket.egress.windowMs` must be a number >= 100 (milliseconds per ' +
+				`accounting window, below the 32-bit timer ceiling) - got ${describeValue(windowMs)}. ` +
+				'A misshaped window would be silently replaced by the 1000 ms default, so the cadence ' +
+				'that was configured would never apply.'
+			);
+		}
+	}
+	const maxKeys = raw.maxKeys;
+	if (maxKeys !== undefined && maxKeys !== null) {
+		// The ceiling is V8's own Map limit: a bound past 2^24 could never be
+		// reached - the Map throws on the insert first, on the publish path.
+		// There is deliberately no `0 disables`: an unbounded ledger turns
+		// topic cardinality into that same crash, behind unbounded memory
+		// first.
+		if (!Number.isSafeInteger(maxKeys) || maxKeys < 1024 || maxKeys > 2 ** 24) {
+			throw new Error(
+				'adapter option `websocket.egress.maxKeys` must be a safe integer between 1024 and 2^24 ' +
+				'(keys per scope ledger; rounded up to the next power of two, which holds no fewer keys ' +
+				`in the same memory) - got ${describeValue(maxKeys)}. The cap cannot be disabled: omit ` +
+				'the option for the 4096 default, and size it to live key cardinality at ~56 bytes per key.'
+			);
+		}
+	}
+	const evictionSample = raw.evictionSample;
+	if (evictionSample !== undefined && evictionSample !== null) {
+		if (!Number.isSafeInteger(evictionSample) || evictionSample < 1) {
+			throw new Error(
+				'adapter option `websocket.egress.evictionSample` must be a safe integer >= 1 (entries ' +
+				'an at-cap eviction inspects before taking the least-active one; the default is 8) - ' +
+				`got ${describeValue(evictionSample)}.`
+			);
+		}
+	}
+	for (const scope of ['topic', 'tenant']) {
+		const section = raw[scope];
+		if (section === undefined || section === null) continue;
+		const scopeCopy = typeof section === 'object' ? readableCopy(section) : null;
+		if (scopeCopy === null || Array.isArray(scopeCopy)) {
+			throw new Error(
+				`adapter option \`websocket.egress.${scope}\` must be an object of ceilings ` +
+				`({ messages?, bytes?, deliveries? }) - got ${describeValue(section)}. Any other value ` +
+				`leaves every ${scope} ceiling silently unset.`
+			);
+		}
+		for (const key of Object.keys(scopeCopy)) {
+			if (!EGRESS_CEILING_KEYS.has(key)) {
+				warnings.push(
+					`unknown adapter option \`websocket.egress.${scope}.${key}\` is ignored; the ` +
+					`ceilings are ${[...EGRESS_CEILING_KEYS].join(', ')}.`
+				);
+			}
+		}
+		for (const ceiling of EGRESS_CEILING_KEYS) {
+			const v = scopeCopy[ceiling];
+			if (v === undefined || v === null) continue;
+			if (!Number.isSafeInteger(v) || v < 0) {
+				throw new Error(
+					`adapter option \`websocket.egress.${scope}.${ceiling}\` must be a non-negative safe ` +
+					`integer per window (0 disables this ceiling deliberately) - got ${describeValue(v)}. ` +
+					'A misshaped ceiling would be silently read as disabled, so the bound that was ' +
+					'configured would never apply.'
+				);
+			}
+		}
+		raw[scope] = scopeCopy;
+	}
+	return raw;
+}
+
 /**
  * @param {unknown} value
  * @param {string} key
@@ -782,6 +905,9 @@ export function normalizeWsOptions(input) {
 	}
 	if (raw.upgradeAdmission !== undefined) {
 		options.upgradeAdmission = requireUpgradeAdmission(raw.upgradeAdmission, warnings);
+	}
+	if (raw.egress !== undefined) {
+		options.egress = requireEgress(raw.egress, warnings);
 	}
 	if (raw.compressCredentialedResponses !== undefined) {
 		options.compressCredentialedResponses = requireBoolean(
