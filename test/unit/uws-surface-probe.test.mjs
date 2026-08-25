@@ -207,8 +207,58 @@ test('a return no recognised branch governs fails the extractor', () => {
 	);
 	assert.throws(
 		() => protectiveNumberRanges(index, elseReturn),
-		/no recognised branch governs/,
+		/construct this extractor does not walk \("else"\)/,
 		'a refusing branch that accepts everything else is refused too'
+	);
+});
+
+test('a guard that refuses before its branches run fails the extractor', () => {
+	// Reachability, not token order. An unconditional throw ahead of the
+	// branches refuses every value, while each branch stays letter-perfect and
+	// the body still ends in a throw - so a walk that only checks the LAST
+	// throw ends the body records ranges for branches nothing reaches.
+	const dead = PINNED_GUARD.replace(
+		'if (value === undefined || value === null) return;',
+		"throw new Error('always');\n\tif (value === undefined || value === null) return;"
+	);
+	const index = "assertProtectiveNumber(websocket, 'w', 'websocket.w', { allowZero: false });";
+	assert.throws(
+		() => protectiveNumberRanges(index, dead),
+		/refuses unconditionally before its branches have run/,
+		'an unconditional refusal is not walked past'
+	);
+});
+
+test('a recognised branch nested inside another owns nothing', () => {
+	// Lexical ownership. A recognised condition sitting INSIDE another branch's
+	// block is not the guard's own branch: here the zero branch carries a
+	// letter-perfect unset check after its throw, and a flat token scan
+	// credited that nested return as sanctioned. The zero branch no longer
+	// governs exactly one throw, and that is what fails.
+	const nested = PINNED_GUARD.replace(
+		"if (typeof value === 'number'",
+		"if (!allowZero && value === 0) { throw new Error('zero'); if (value === undefined || value === null) return; }\n" +
+		"\tif (typeof value === 'number'"
+	);
+	const index = "assertProtectiveNumber(websocket, 'w', 'websocket.w', { allowZero: false });";
+	assert.throws(
+		() => protectiveNumberRanges(index, nested),
+		/no longer governs a throw/,
+		'a branch owns exactly its consequent, nothing beyond it'
+	);
+});
+
+test('the same recognised condition stated twice is not the pinned shape', () => {
+	const doubled = PINNED_GUARD.replace(
+		'if (value === undefined || value === null) return;',
+		'if (value === undefined || value === null) return;\n' +
+		'\tif (value === undefined || value === null) return;'
+	);
+	const index = "assertProtectiveNumber(websocket, 'w', 'websocket.w', { allowZero: false });";
+	assert.throws(
+		() => protectiveNumberRanges(index, doubled),
+		/states the same recognised condition twice/,
+		'a duplicated branch is a shape change, not a formality'
 	);
 });
 

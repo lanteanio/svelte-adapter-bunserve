@@ -562,82 +562,178 @@ function guardEnforcesCeiling(body, bodyRaw) {
 		return out;
 	};
 
-	let acceptTail = -1;
+	// The body is walked as a SEQUENCE OF TOP-LEVEL STATEMENTS, each one owning
+	// exactly the text it lexically governs. A flat scan for `if (` tokens read
+	// every branch as the guard's own whatever block it sat in, credited a
+	// return by its token position rather than by what governs it, and demanded
+	// only that the LAST throw ends the body - so an unconditional throw ahead
+	// of the branches, which refuses everything the recorded ranges say is
+	// accepted, walked straight past it. Here every statement is one of five
+	// things - a declaration, an expression statement (which cannot return and
+	// so cannot widen what the guard accepts), a recognised branch owning
+	// exactly its consequent, the single final throw, or a shape that fails
+	// the extractor.
+	const openBrace = body.indexOf('{');
+	const closeBrace = body.lastIndexOf('}');
+
+	/** The `;` ending the statement at `from`, at bracket depth 0. */
+	const statementEnd = (from) => {
+		let depth = 0;
+		for (let p = from; p < closeBrace; p++) {
+			const c = body[p];
+			if (c === '(' || c === '[' || c === '{') depth++;
+			else if (c === ')' || c === ']' || c === '}') depth--;
+			else if (c === ';' && depth === 0) return p;
+		}
+		throw new Error(
+			'assertProtectiveNumber carries a statement this extractor cannot find the end of: ' +
+			`"${bodyRaw.slice(from, from + 60).replace(/\s+/g, ' ').trim()}". Fix the extractor ` +
+			'against the new guard shape rather than recording rules it cannot verify.'
+		);
+	};
+
+	/** The `}` closing the block opened at `from`. */
+	const blockEnd = (from) => {
+		let depth = 0;
+		for (let p = from; p < closeBrace; p++) {
+			if (body[p] === '{') depth++;
+			else if (body[p] === '}' && --depth === 0) return p;
+		}
+		throw new Error('assertProtectiveNumber carries an unclosed block; fix the extractor against the new shape.');
+	};
+
+	let acceptAt = -1;
 	let ceilingAt = -1;
-	/** The `return` tokens a recognised branch governs; any other is refused. */
-	const sanctioned = new Set();
-	const branch = /\bif\s*\(/g;
-	let f;
-	while ((f = branch.exec(body)) !== null) {
-		const open = body.indexOf('(', f.index);
-		const condition = callArgs(body, open);
-		const stated = canonical(condition, bodyRaw.slice(open + 1, open + 1 + condition.length));
-		const close = open + 1 + condition.length;
-		const tail = body.slice(close + 1);
-		if (stated === UNSET || stated === ACCEPT) {
-			if (!/^\s*\{?\s*return\b/.test(tail)) {
+	let endedInThrow = false;
+	const seen = new Set();
+	let i = openBrace + 1;
+	while (i < closeBrace) {
+		while (i < closeBrace && (/\s/.test(body[i]) || body[i] === ';')) i++;
+		if (i >= closeBrace) break;
+		const rest = body.slice(i, closeBrace);
+		if (/^if\s*\(/.test(rest)) {
+			const open = body.indexOf('(', i);
+			const condition = callArgs(body, open);
+			const stated = canonical(condition, bodyRaw.slice(open + 1, open + 1 + condition.length));
+			// The consequent this branch OWNS: its braced block, or its single
+			// statement. Anything a branch does beyond that single owned
+			// statement - a nested branch, a second statement - is a shape the
+			// four recognised branches do not have.
+			let j = open + 1 + condition.length + 1;
+			while (j < closeBrace && /\s/.test(body[j])) j++;
+			let consFrom, consTo;
+			if (body[j] === '{') {
+				const bEnd = blockEnd(j);
+				consFrom = j + 1;
+				consTo = bEnd;
+				j = bEnd + 1;
+			} else {
+				consFrom = j;
+				consTo = statementEnd(j);
+				j = consTo + 1;
+			}
+			const cons = body.slice(consFrom, consTo);
+			let k = j;
+			while (k < closeBrace && /\s/.test(body[k])) k++;
+			if (/^else\b/.test(body.slice(k, closeBrace))) {
 				throw new Error(
-					`assertProtectiveNumber's "${stated === ACCEPT ? 'acceptance' : 'unset'}" condition no ` +
-					'longer governs a return, so what the guard accepts cannot be read from it. Fix the ' +
-					'extractor against the new shape rather than recording the old rule.'
+					'assertProtectiveNumber carries a construct this extractor does not walk ("else"), ' +
+					'which can reroute or swallow the control flow the recorded ranges depend on. Fix ' +
+					'the extractor against the new guard shape rather than recording rules it cannot verify.'
 				);
 			}
-			const at = close + 1 + tail.indexOf('return');
-			sanctioned.add(at);
-			if (stated === ACCEPT) acceptTail = at + 'return'.length;
-		} else if (stated === CEILING || stated === ZERO) {
-			if (!/^\s*\{?\s*throw\b/.test(tail)) {
+			if (stated === UNSET || stated === ACCEPT) {
+				if (!/^\s*return\s*;?\s*$/.test(cons)) {
+					throw new Error(
+						`assertProtectiveNumber's "${stated === ACCEPT ? 'acceptance' : 'unset'}" condition no ` +
+						'longer governs a return, so what the guard accepts cannot be read from it. Fix the ' +
+						'extractor against the new shape rather than recording the old rule.'
+					);
+				}
+				if (stated === ACCEPT) acceptAt = i;
+			} else if (stated === CEILING || stated === ZERO) {
+				const t = /^\s*throw\s+new\s+Error\s*\(/.exec(cons);
+				const tOpen = t ? cons.indexOf('(', t.index) : -1;
+				if (
+					tOpen === -1 ||
+					!/^\s*;?\s*$/.test(cons.slice(tOpen + 1 + callArgs(cons, tOpen).length + 1))
+				) {
+					throw new Error(
+						`assertProtectiveNumber's "${stated === CEILING ? 'ceiling' : 'zero'}" condition no ` +
+						'longer governs a throw, so it refuses nothing. Fix the extractor against the new ' +
+						'shape rather than recording a bound nothing enforces.'
+					);
+				}
+				if (stated === CEILING) ceilingAt = i;
+			} else {
 				throw new Error(
-					`assertProtectiveNumber's "${stated === CEILING ? 'ceiling' : 'zero'}" condition no ` +
-					'longer governs a throw, so it refuses nothing. Fix the extractor against the new ' +
-					'shape rather than recording a bound nothing enforces.'
+					'assertProtectiveNumber carries a condition this extractor does not read: ' +
+					`"${bodyRaw.slice(open + 1, open + 1 + condition.length).replace(/\s+/g, ' ').trim().slice(0, 160)}". ` +
+					'Read the new rule from it rather than recording the old one - an unread branch can be ' +
+					'the one that decides what the guard accepts.'
 				);
 			}
-			if (stated === CEILING) ceilingAt = f.index;
-		} else {
+			if (seen.has(stated)) {
+				throw new Error(
+					'assertProtectiveNumber states the same recognised condition twice, which is not the ' +
+					'shape the recorded ranges were read from. Fix the extractor against the new guard shape.'
+				);
+			}
+			seen.add(stated);
+			i = j;
+		} else if (/^throw\b/.test(rest)) {
+			// Only the FINAL statement may refuse unconditionally. A top-level
+			// throw with anything after it refuses before the branches have
+			// run, so every recorded range would describe branches nothing
+			// reaches.
+			const t = /^throw\s+new\s+Error\s*\(/.exec(rest);
+			const tOpen = t ? body.indexOf('(', i) : -1;
+			if (tOpen === -1) {
+				throw new Error(
+					'assertProtectiveNumber throws something this extractor does not read; fix the ' +
+					'extractor against the new guard shape rather than recording rules it cannot verify.'
+				);
+			}
+			const after = body.slice(tOpen + 1 + callArgs(body, tOpen).length + 1, closeBrace);
+			if (!/^\s*;?\s*$/.test(after)) {
+				throw new Error(
+					'assertProtectiveNumber refuses unconditionally before its branches have run, so ' +
+					'every recorded range would describe branches nothing reaches. Fix the extractor ' +
+					'against the new shape rather than recording rules the guard does not enforce.'
+				);
+			}
+			endedInThrow = true;
+			i = closeBrace;
+		} else if (/^return\b/.test(rest)) {
 			throw new Error(
-				'assertProtectiveNumber carries a condition this extractor does not read: ' +
-				`"${bodyRaw.slice(open + 1, open + 1 + condition.length).replace(/\s+/g, ' ').trim().slice(0, 160)}". ` +
-				'Read the new rule from it rather than recording the old one - an unread branch can be ' +
-				'the one that decides what the guard accepts.'
+				'assertProtectiveNumber returns somewhere no recognised branch governs, so it can ' +
+				'accept a value the recorded ranges say it refuses. Fix the extractor against the ' +
+				'new shape rather than recording rules the guard does not enforce.'
 			);
+		} else {
+			// A declaration or an expression statement. Neither can RETURN, so
+			// neither can widen what the guard accepts - the direction the
+			// manifest must never be wrong in - and the foreign-construct
+			// refusal above has already excluded everything that could reroute
+			// control flow around a verified branch.
+			i = statementEnd(i) + 1;
 		}
 	}
-	if (acceptTail === -1) {
+	if (acceptAt === -1) {
 		throw new Error(
 			'assertProtectiveNumber no longer accepts a value through the floor comparison this ' +
 			'extractor reads, so the recorded floors would describe a rule nothing runs. Fix the ' +
 			'extractor against the new guard shape.'
 		);
 	}
-	if (ceilingAt > acceptTail) {
+	if (ceilingAt > acceptAt) {
 		throw new Error(
 			'assertProtectiveNumber compares against its ceiling only AFTER acceptance has returned, ' +
 			'so the comparison is unreachable for every accepted value. One of the two moved - fix ' +
 			'the extractor against the new shape rather than recording a bound nothing reaches.'
 		);
 	}
-	// EVERY return must be one a recognised branch governs. Only refusing a
-	// return after the acceptance branch would miss the plainer relaxation: a
-	// bare `return;` (or an `else return`) BEFORE it accepts every value
-	// unconditionally while each recognised branch stays letter-perfect.
-	for (const r of body.matchAll(/\breturn\b/g)) {
-		if (!sanctioned.has(r.index)) {
-			throw new Error(
-				'assertProtectiveNumber returns somewhere no recognised branch governs, so it can ' +
-				'accept a value the recorded ranges say it refuses. Fix the extractor against the ' +
-				'new shape rather than recording rules the guard does not enforce.'
-			);
-		}
-	}
-	const throws = [...body.matchAll(/\bthrow\b/g)];
-	const last = throws.length ? throws[throws.length - 1].index : -1;
-	const finalThrow = last === -1 ? null : /^throw\s+new\s+Error\s*\(/.exec(body.slice(last));
-	const finalOpen = finalThrow ? body.indexOf('(', last) : -1;
-	if (
-		finalOpen === -1 ||
-		!/^\s*;?\s*\}\s*$/.test(body.slice(finalOpen + 1 + callArgs(body, finalOpen).length + 1))
-	) {
+	if (!endedInThrow) {
 		throw new Error(
 			'assertProtectiveNumber no longer ends by throwing, so a value its branches do not ' +
 			'accept falls through and is accepted silently. Fix the extractor against the new shape ' +
