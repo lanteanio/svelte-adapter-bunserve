@@ -86,11 +86,23 @@ export function cacheDir(dir, urlPrefix, immutable, staticHeaders = null) {
 			['accept-ranges', 'bytes']
 		];
 		let etag = '';
+		let mtimeSec;
 		if (immutable && relPath.startsWith(`${manifest.appPath}/immutable/`)) {
 			headers.push(['cache-control', 'public, max-age=31536000, immutable']);
 		} else {
 			etag = `W/"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}"`;
-			headers.push(['cache-control', 'no-cache'], ['etag', etag]);
+			// Last-Modified rides beside the ETag, at the whole-second
+			// precision HTTP dates carry: a cache that lost the ETag
+			// revalidates by date, and without this header it re-downloads the
+			// full body on every visit. Immutable assets skip it for the same
+			// reason they skip the ETag - the versioned filename IS the
+			// validator.
+			mtimeSec = Math.floor(stat.mtimeMs / 1000);
+			headers.push(
+				['cache-control', 'no-cache'],
+				['etag', etag],
+				['last-modified', new Date(mtimeSec * 1000).toUTCString()]
+			);
 		}
 
 		const ext = path.extname(relPath).toLowerCase();
@@ -109,7 +121,7 @@ export function cacheDir(dir, urlPrefix, immutable, staticHeaders = null) {
 			// steer a disk read. Precompressed variants stay on disk too and are
 			// recorded by path + size so content negotiation works identically
 			// in both lanes.
-			entry = { file: absPath, size: stat.size, etag, headers: mergeStaticHeaders(headers, staticHeaders) };
+			entry = { file: absPath, size: stat.size, etag, mtimeSec, headers: mergeStaticHeaders(headers, staticHeaders) };
 			if (PRECOMPRESS) {
 				const brPath = absPath + '.br';
 				const gzPath = absPath + '.gz';
@@ -124,7 +136,7 @@ export function cacheDir(dir, urlPrefix, immutable, staticHeaders = null) {
 			}
 		} else {
 			const buffer = fs.readFileSync(absPath);
-			entry = { buffer, etag, headers: mergeStaticHeaders(headers, staticHeaders) };
+			entry = { buffer, etag, mtimeSec, headers: mergeStaticHeaders(headers, staticHeaders) };
 
 			if (PRECOMPRESS) {
 				const brPath = absPath + '.br';
@@ -266,11 +278,18 @@ export function serveStatic(entry, requestHeaders, headOnly = false) {
 		requestHeaders.get('range') || '',
 		requestHeaders.get('if-range') || '',
 		requestHeaders.get('if-none-match') || '',
-		requestHeaders.get('accept-encoding') || ''
+		requestHeaders.get('accept-encoding') || '',
+		requestHeaders.get('if-match') || '',
+		requestHeaders.get('if-unmodified-since') || '',
+		requestHeaders.get('if-modified-since') || ''
 	);
 
 	if (plan.status === 304) {
 		return new Response(null, { status: 304 });
+	}
+
+	if (plan.status === 412) {
+		return new Response(null, { status: 412 });
 	}
 
 	if (plan.status === 416) {

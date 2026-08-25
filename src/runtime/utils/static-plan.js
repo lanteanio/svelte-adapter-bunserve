@@ -27,11 +27,12 @@ import { negotiateEncoding } from './static-negotiate.js';
  *   etag: string,
  *   brEtag?: string,
  *   gzEtag?: string,
+ *   mtimeSec?: number,
  *   hasBr?: boolean,
  *   hasGz?: boolean
  * }} PlanEntry
  *
- * @typedef {{ status: 200 | 304 | 416, encoding: '' | 'br' | 'gzip' }
+ * @typedef {{ status: 200 | 304 | 412 | 416, encoding: '' | 'br' | 'gzip' }
  *   | { status: 206, encoding: '', start: number, end: number }} StaticPlan
  *
  * @param {PlanEntry} entry - the asset's precomputed identity facts
@@ -40,9 +41,58 @@ import { negotiateEncoding } from './static-negotiate.js';
  * @param {string} ifRange
  * @param {string} ifNoneMatch
  * @param {string} acceptEncoding
+ * @param {string} [ifMatch]
+ * @param {string} [ifUnmodifiedSince]
+ * @param {string} [ifModifiedSince]
  * @returns {StaticPlan}
  */
-export function planStaticResponse(entry, size, rangeHeader, ifRange, ifNoneMatch, acceptEncoding) {
+export function planStaticResponse(
+	entry,
+	size,
+	rangeHeader,
+	ifRange,
+	ifNoneMatch,
+	acceptEncoding,
+	ifMatch = '',
+	ifUnmodifiedSince = '',
+	ifModifiedSince = ''
+) {
+	// The 412 preconditions come first - RFC 9110's evaluation order, and the
+	// only order that cannot lie: a failed If-Match must not be converted into
+	// a 304 by an If-None-Match that happens to match, because the client that
+	// sent both is asking "is my version still the current one" and the answer
+	// is no.
+	//
+	// If-Match is compared as OPAQUE EQUALITY against any of the entry's
+	// validators, not with the strong comparison RFC 9110 prescribes. Every
+	// validator this lane issues is weak by construction (mtime + size), and a
+	// weak validator never strong-matches ANYTHING - so the strict reading
+	// answers 412 to every client that echoes the exact validator this server
+	// handed it, for a byte-identical resource. Matching what we issued is
+	// what the precondition is for. The list form is split because a wrong
+	// answer here refuses a request that should have succeeded, which is the
+	// opposite of If-None-Match's safe direction (a needless 200).
+	if (ifMatch) {
+		let matched = false;
+		for (const token of ifMatch.split(',')) {
+			const t = token.trim();
+			if (t === '*' || (t !== '' && (t === entry.etag || t === entry.brEtag || t === entry.gzEtag))) {
+				matched = true;
+				break;
+			}
+		}
+		if (!matched) return { status: 412, encoding: '' };
+	} else if (ifUnmodifiedSince && entry.mtimeSec !== undefined) {
+		// Evaluated only when If-Match is absent (RFC 9110 s13.2.2), at the
+		// whole-second precision HTTP dates carry. An unparseable date is an
+		// ignored header, not a refusal - the client said nothing intelligible
+		// about time, and 412 on garbage would refuse requests a proxy
+		// mangled.
+		const t = Date.parse(ifUnmodifiedSince);
+		if (!Number.isNaN(t) && entry.mtimeSec > Math.floor(t / 1000)) {
+			return { status: 412, encoding: '' };
+		}
+	}
 	// Ranges apply only to assets carrying a validator (immutable versioned
 	// assets never need them), are single-range only (RFC 7233 permits
 	// ignoring multiple ranges), and are honoured only when If-Range matches
@@ -78,6 +128,16 @@ export function planStaticResponse(entry, size, rangeHeader, ifRange, ifNoneMatc
 	// rare on the GET traffic this path serves.
 	if (repEtag && ifNoneMatch === repEtag) {
 		return { status: 304, encoding: '' };
+	}
+	// Date revalidation is the fallback for a cache that lost the validator,
+	// and RFC 9110 says to ignore it entirely when If-None-Match was sent -
+	// the client that sent both wants the etag answer, and a date-based 304
+	// after an etag MISmatch would claim freshness the validator just denied.
+	if (!ifNoneMatch && ifModifiedSince && entry.mtimeSec !== undefined) {
+		const t = Date.parse(ifModifiedSince);
+		if (!Number.isNaN(t) && entry.mtimeSec <= Math.floor(t / 1000)) {
+			return { status: 304, encoding: '' };
+		}
 	}
 	if (range === null) {
 		// Syntactically valid but the start position is beyond EOF

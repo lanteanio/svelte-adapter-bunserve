@@ -21,10 +21,11 @@ const asset = Object.freeze({
 // An immutable versioned asset: no validator, so no conditionals and no ranges.
 const immutable = Object.freeze({ etag: '', hasBr: true, hasGz: true });
 
-/** plan(entry, {range, ifRange, ifNoneMatch, accept}) */
+/** plan(entry, {range, ifRange, ifNoneMatch, accept, ifMatch, ifUnmodifiedSince, ifModifiedSince}) */
 function plan(entry, o = {}) {
 	return planStaticResponse(
-		entry, SIZE, o.range || '', o.ifRange || '', o.ifNoneMatch || '', o.accept || ''
+		entry, SIZE, o.range || '', o.ifRange || '', o.ifNoneMatch || '', o.accept || '',
+		o.ifMatch || '', o.ifUnmodifiedSince || '', o.ifModifiedSince || ''
 	);
 }
 
@@ -134,4 +135,75 @@ test('the plan never selects a coding the entry does not advertise', () => {
 			if (p.encoding === 'gzip') assert.ok(entry.hasGz, 'gzip only when advertised');
 		}
 	}
+});
+
+// --- the RFC 9110 preconditions -------------------------------------------
+//
+// A fixed mtime keeps every date computable by eye: the file changed at
+// t = 1_700_000_000 (Tue, 14 Nov 2023 22:13:20 GMT).
+const MTIME = 1_700_000_000;
+const dated = Object.freeze({ ...asset, mtimeSec: MTIME });
+const BEFORE = new Date((MTIME - 100) * 1000).toUTCString();
+const AT = new Date(MTIME * 1000).toUTCString();
+const AFTER = new Date((MTIME + 100) * 1000).toUTCString();
+
+test('If-Match with a stale validator answers 412, not a fresh body', () => {
+	assert.deepEqual(plan(dated, { ifMatch: 'W/"old-etag"' }), { status: 412, encoding: '' });
+});
+
+test('If-Match matches any validator this lane issued, and the wildcard', () => {
+	// Opaque equality on purpose: every validator here is weak by
+	// construction, and RFC strong comparison would 412 a client echoing the
+	// exact validator this server handed it. The comment in the planner
+	// carries the reasoning.
+	assert.equal(plan(dated, { ifMatch: ETAG }).status, 200);
+	assert.equal(plan(dated, { ifMatch: dated.brEtag }).status, 200);
+	assert.equal(plan(dated, { ifMatch: '*' }).status, 200);
+	assert.equal(plan(dated, { ifMatch: `W/"other", ${ETAG}` }).status, 200, 'the list form is split');
+});
+
+test('a failed If-Match wins over a matching If-None-Match', () => {
+	// RFC 9110 evaluation order: the client asked "is my version current" and
+	// the answer is no - a 304 would claim freshness the validator denied.
+	assert.equal(plan(dated, { ifMatch: 'W/"old"', ifNoneMatch: ETAG }).status, 412);
+});
+
+test('If-Unmodified-Since answers 412 only for a file modified after the date', () => {
+	assert.deepEqual(plan(dated, { ifUnmodifiedSince: BEFORE }), { status: 412, encoding: '' });
+	assert.equal(plan(dated, { ifUnmodifiedSince: AT }).status, 200);
+	assert.equal(plan(dated, { ifUnmodifiedSince: AFTER }).status, 200);
+});
+
+test('If-Match present means If-Unmodified-Since is not evaluated', () => {
+	// RFC 9110 s13.2.2: the validator precondition owns the decision when both
+	// are sent.
+	assert.equal(plan(dated, { ifMatch: ETAG, ifUnmodifiedSince: BEFORE }).status, 200);
+});
+
+test('If-Modified-Since answers 304 for an unchanged file', () => {
+	assert.deepEqual(plan(dated, { ifModifiedSince: AT }), { status: 304, encoding: '' });
+	assert.deepEqual(plan(dated, { ifModifiedSince: AFTER }), { status: 304, encoding: '' });
+	assert.equal(plan(dated, { ifModifiedSince: BEFORE }).status, 200);
+});
+
+test('If-None-Match present means If-Modified-Since is ignored', () => {
+	// A date-based 304 after an etag MISmatch would claim freshness the
+	// validator just denied.
+	assert.equal(plan(dated, { ifNoneMatch: 'W/"other"', ifModifiedSince: AFTER }).status, 200);
+});
+
+test('an unparseable date is an ignored header, never a refusal', () => {
+	assert.equal(plan(dated, { ifUnmodifiedSince: 'not a date' }).status, 200);
+	assert.equal(plan(dated, { ifModifiedSince: 'not a date' }).status, 200);
+});
+
+test('an entry with no recorded mtime answers no date precondition', () => {
+	// The immutable lane and any entry built before the mtime was captured:
+	// date preconditions fall through to a full response rather than guessing.
+	assert.equal(plan(asset, { ifUnmodifiedSince: BEFORE }).status, 200);
+	assert.equal(plan(asset, { ifModifiedSince: AFTER }).status, 200);
+});
+
+test('a 412 outranks a satisfiable range', () => {
+	assert.equal(plan(dated, { ifMatch: 'W/"old"', range: 'bytes=0-99' }).status, 412);
 });

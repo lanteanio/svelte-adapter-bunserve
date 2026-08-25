@@ -30,6 +30,7 @@
  *   etag: string,
  *   brEtag?: string,
  *   gzEtag?: string,
+ *   mtimeSec?: number,
  *   hasBr?: boolean,
  *   hasGz?: boolean,
  *   headers: [string, string][],

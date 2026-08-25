@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The static lane answers the full RFC 9110 precondition set. Mutable assets
+  carry `Last-Modified` beside the ETag, `If-Modified-Since` answers 304 for a
+  cache that lost the validator, and `If-Match` / `If-Unmodified-Since` answer
+  412 - evaluated in the RFC's order, so a failed `If-Match` is never converted
+  into a 304 by a matching `If-None-Match`. `If-Match` is compared as opaque
+  equality against any validator this lane issued rather than with strict
+  strong comparison, because every validator here is weak by construction and
+  the strict reading would answer 412 to a client echoing the exact validator
+  this server handed it. `last-modified` joins the reserved `staticHeaders`
+  keys: the preconditions answer from the file's real date, so an app-chosen
+  value would make them lie.
+
 ### Fixed
 
 - A shed upgrade's `Retry-After` jitter produces the spread its shape always

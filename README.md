@@ -60,8 +60,11 @@ declares.
    serves under `bun build/index.js`. SSR goes straight through
    `server.respond()` (real web Request in, Response out, Bun's own
    backpressure on streams); static assets come from an in-memory
-   precompressed cache with ETag/304, RFC 7233 ranges, and trailing-slash
-   canonicalization, with a `Bun.file()` kernel-sendfile lane for large files;
+   precompressed cache with ETag/304, `Last-Modified` with the full RFC 9110
+   precondition set (`If-Match` / `If-Unmodified-Since` answer 412,
+   `If-Modified-Since` answers 304 for caches that lost the validator), RFC
+   7233 ranges, and trailing-slash canonicalization, with a `Bun.file()`
+   kernel-sendfile lane for large files;
    SSR dedup and the BREACH-aware compression gate are carried over, and a
    response is compressed whole whenever its body completes without waiting,
    so a streaming render reaches the client as it is produced; `/healthz` +
@@ -472,10 +475,11 @@ through `Bun.file`, which uses the kernel's own send path.
 prerendered responses, merged once while the index is built rather than per
 request. Names must be RFC 7230 tokens and values single-line printable text -
 a control character in a value would otherwise throw on every static request, so
-it fails the build instead. Nine keys are reserved and dropped with a warning
+it fails the build instead. Ten keys are reserved and dropped with a warning
 naming each one, because they decide transfer, caching and conditional-request
 correctness: `content-type`, `content-encoding`, `content-range`,
-`content-length`, `date`, `etag`, `vary`, `cache-control` and `accept-ranges`. A
+`content-length`, `date`, `etag`, `last-modified`, `vary`, `cache-control` and
+`accept-ranges`. A
 non-reserved key that the adapter already sets, such as `x-content-type-options`,
 is replaced by yours.
 

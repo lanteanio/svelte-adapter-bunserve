@@ -3,7 +3,9 @@
  * must not override. These are written per-response by serveStatic
  * (`content-type`, `content-encoding`, `content-range`), set by the server
  * from the body (`content-length`, `date`), a conditional-request validator
- * (`etag`), or correctness-sensitive caching/negotiation headers whose value
+ * (`etag`, `last-modified` - both drive 304/412 evaluation, so an app-chosen
+ * value would make the preconditions answer for a date the file does not
+ * have), or correctness-sensitive caching/negotiation headers whose value
  * depends on the specific asset (`cache-control` differs for immutable vs
  * mutable assets; `vary` must keep `Accept-Encoding` so compressed variants
  * cache correctly; `accept-ranges` advertises the range support the handler
@@ -19,6 +21,7 @@ export const RESERVED_STATIC_HEADER_KEYS = new Set([
 	'content-length',
 	'date',
 	'etag',
+	'last-modified',
 	'vary',
 	'cache-control',
 	'accept-ranges'
