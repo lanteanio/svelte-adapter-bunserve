@@ -1144,9 +1144,12 @@ adapter options (Bun caps that one at 960).
 
 Requires [Bun](https://bun.com) installed. The supported floor is **Bun 1.3.14**
 (`engines.bun`), which is also the version the committed probe report was
-generated against. CI runs every suite twice, on 1.3.14 and on 1.4.0, because
-1.4 changed several behaviours this adapter reads. After upgrading Bun, re-run
-the probe and review the report diff before trusting the upgrade.
+generated against. CI runs the Bun-driven lanes - the API probe, the live suite and the leak
+suite - twice, on 1.3.14 and on 1.4.0, because 1.4 changed several behaviours
+this adapter reads. The unit suite, both golden corpora and the determinism
+check run under Node, so they do not yet cover either Bun generation. After
+upgrading Bun, re-run the probe and review the report diff before trusting the
+upgrade.
 
 ```sh
 bun run probe   # runs the API probe and writes probe/bun-api-facts.report.md
