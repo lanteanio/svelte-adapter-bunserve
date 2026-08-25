@@ -1,6 +1,11 @@
 # svelte-adapter-bunserve
 
-> **Status: pre-alpha prototype. Nothing here is usable yet. Do not install.**
+> **Status: pre-1.0.** The HTTP half and the realtime half both work and are
+> covered by unit, live and leak suites. What is not done: the public API is not
+> frozen, multi-node fan-out through the extensions package does not work yet,
+> the package ships no TypeScript types, and it runs single-process. Usable for
+> a single-node app on Bun 1.3.14 or newer; not yet something to build a fleet
+> on.
 
 A SvelteKit adapter for [Bun](https://bun.com), built on `Bun.serve`: it follows
 [svelte-adapter-uws](https://github.com/lanteanio/svelte-adapter-uws) and works
@@ -12,8 +17,8 @@ for clustering, presence and cursors. Same `platform.*` surface, same plugins,
 same client. The adapter swap is one line in `svelte.config.js`; app code is
 unchanged.
 
-(One caveat while this is pre-alpha: the extensions package does not work
-against this adapter yet - see [Current state](#current-state).)
+(One caveat: the extensions package does not work against this adapter yet, so
+multi-node fan-out is not available - see [Current state](#current-state).)
 
 ## Why this exists
 
@@ -38,7 +43,8 @@ uWebSockets.js, `ws` is the ws library, `bunserve` is `Bun.serve`.
 
 ## Current state
 
-Prototype phase. The build order:
+Every step of the build order below is done. What remains is listed as
+known-open under the step that owns it, and the API is not frozen until 1.0.
 
 1. **API probe** (done): `probe/bun-api-facts.mjs` empirically verifies every
    Bun server API behavior the adapter design relies on - send-result
@@ -95,7 +101,10 @@ Prototype phase. The build order:
    simulation goldens (done: `npm run sim:golden`, whose cross-adapter corpus
    is fingerprint-identical to the sibling's at the pin).
 
-Single-process at launch; a multi-process mode is planned.
+Single-process, and not provisionally so. Bun's `node:cluster` does share a
+listening socket across workers, but a `publish()` reaches only the subscribers
+held by the worker that ran it, so each worker would serve a private slice of
+every topic. Scale-out is the extensions bus, not in-process workers.
 
 **Multi-node fan-out does not work yet.**
 [svelte-adapter-uws-extensions](https://github.com/lanteanio/svelte-adapter-uws-extensions)
