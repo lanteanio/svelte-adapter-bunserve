@@ -82,6 +82,10 @@ if (built) {
 // the build PRINTED, which only a captured build gives it.
 await run('static-dotfiles-check', [process.execPath, suite('static-dotfiles-check.mjs')]);
 
+// Raw-socket requests carrying literally duplicated forwarded headers - the
+// case fetch() cannot construct and the one where the Bun generations differ.
+await run('xff-duplicate-check', [process.execPath, suite('xff-duplicate-check.mjs')]);
+
 const builtNoWs = await run('build fixture (NO_WS)', [process.execPath, 'run', 'build'], {
 	cwd: fixtureDir,
 	env: { ...buildEnv, NO_WS: '1' }
