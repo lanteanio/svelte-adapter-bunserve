@@ -152,7 +152,7 @@ test('ceiling tokens that govern no throw do not become a ceiling', () => {
 		'const floor = allowZero ? 0 : 1;',
 		'const floor = allowZero ? 0 : 1;\n' +
 		'\tconst audited = ceiling > 0 && (!Number.isSafeInteger(value) || value > ceiling);\n' +
-		'\tvoid audited;'
+		'\tconst alsoAudited = audited;'
 	);
 	const index = "assertProtectiveNumber(websocket, 'x', 'websocket.x', { allowZero: false, ceiling: 100 });";
 	const range = protectiveNumberRanges(index, observedInConst).x;
@@ -165,6 +165,51 @@ test('ceiling tokens that govern no throw do not become a ceiling', () => {
 		/no longer governs a throw/,
 		'a ceiling condition that stops refusing fails the extractor'
 	);
+});
+
+test('only a const may be read past; anything that can rebind fails the walk', () => {
+	// Not returning is not the same as being harmless. Each of these leaves the
+	// branches the extractor verifies exactly where they were and changes what
+	// those branches COMPARE, so the recorded range would go on describing a
+	// rule the guard stopped enforcing - in the direction that matters, more
+	// accepted than the manifest says.
+	const index = "assertProtectiveNumber(websocket, 'w', 'websocket.w', { allowZero: false });";
+
+	// The one that survived the statement walk. The floor comparison is
+	// untouched and now reads a coerced value, so the guard takes the string
+	// '5' while the manifest says numbers at or above 1.
+	const coerced = PINNED_GUARD.replace(
+		'const value = bag?.[key];',
+		'let value = bag?.[key];\n\tvalue = Number(value);'
+	);
+	assert.throws(() => protectiveNumberRanges(index, coerced), /will not treat as harmless/,
+		'a value coerced before the branch');
+
+	// A parameter is assignable, so an expression statement can rewrite the
+	// bound the CALL SITE declared - which is the number the manifest reads.
+	const rebound = PINNED_GUARD.replace(
+		'const floor = allowZero ? 0 : 1;',
+		'const floor = allowZero ? 0 : 1;\n\tceiling = 100;'
+	);
+	assert.throws(() => protectiveNumberRanges(index, rebound), /will not treat as harmless/,
+		'a parameter reassigned mid-body');
+
+	// The same rewrite smuggled into a declaration's initializer.
+	const smuggled = PINNED_GUARD.replace(
+		'const floor = allowZero ? 0 : 1;',
+		'const floor = allowZero ? 0 : 1;\n\tconst x = (ceiling = 100);'
+	);
+	assert.throws(() => protectiveNumberRanges(index, smuggled), /initializer assigns/,
+		'an assignment inside a const initializer');
+
+	// A plain const still reads past, or the extractor could not read the real
+	// guard - which opens with two of them.
+	const plain = PINNED_GUARD.replace(
+		'const floor = allowZero ? 0 : 1;',
+		'const floor = allowZero ? 0 : 1;\n\tconst spare = floor + 1;'
+	);
+	assert.equal(protectiveNumberRanges(index, plain).w.floor, 1,
+		'an ordinary const declaration is still harmless');
 });
 
 test('a ceiling branch behind the acceptance return enforces nothing', () => {

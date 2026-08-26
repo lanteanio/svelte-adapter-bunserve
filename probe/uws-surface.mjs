@@ -711,12 +711,44 @@ function guardEnforcesCeiling(body, bodyRaw) {
 				'new shape rather than recording rules the guard does not enforce.'
 			);
 		} else {
-			// A declaration or an expression statement. Neither can RETURN, so
-			// neither can widen what the guard accepts - the direction the
-			// manifest must never be wrong in - and the foreign-construct
-			// refusal above has already excluded everything that could reroute
-			// control flow around a verified branch.
-			i = statementEnd(i) + 1;
+			// A `const` DECLARATION, and nothing else. Not returning is not the
+			// same as being harmless: a statement that rebinds or mutates
+			// changes what the verified branches compare, without ever handing
+			// control back. `let value = bag?.[key]; value = Number(value);`
+			// leaves the floor comparison intact and reading a coerced value, so
+			// the recorded range says "numbers at or above the floor" while the
+			// guard takes the string '5'. A parameter is assignable too, so
+			// `ceiling = 100;` would rewrite the bound the call site declared.
+			//
+			// `const` cannot do either. Anything else fails the extractor by
+			// name, which is the same answer this walker gives every other shape
+			// it cannot verify.
+			const end = statementEnd(i);
+			const statement = body.slice(i, end);
+			if (!/^const\s/.test(statement)) {
+				throw new Error(
+					'assertProtectiveNumber carries a statement this extractor will not treat as ' +
+					`harmless: "${bodyRaw.slice(i, Math.min(end, i + 60)).replace(/\s+/g, ' ').trim()}". ` +
+					'Only a `const` declaration can be read past - a binding that can be reassigned, ' +
+					'or an expression that assigns, changes what the verified branches compare while ' +
+					'the recorded ranges go on describing the old rule. Fix the extractor against the ' +
+					'new guard shape rather than recording rules it cannot verify.'
+				);
+			}
+			// And the initializer must not assign either: `const x = (ceiling = 100);`
+			// is a declaration that rewrites a bound on its way past. Every `=`
+			// after the binding's own is a comparison or an arrow, or this
+			// cannot be read.
+			const initializer = statement.slice(statement.indexOf('=') + 1);
+			if (/[^=!<>]=(?!=|>)/.test(initializer)) {
+				throw new Error(
+					'assertProtectiveNumber declares a constant whose initializer assigns: ' +
+					`"${bodyRaw.slice(i, Math.min(end, i + 60)).replace(/\s+/g, ' ').trim()}". ` +
+					'That can rewrite a bound the call site declared while the recorded ranges ' +
+					'describe the old one. Fix the extractor against the new guard shape.'
+				);
+			}
+			i = end + 1;
 		}
 	}
 	if (acceptAt === -1) {
