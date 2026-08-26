@@ -43,6 +43,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A config value that refuses to be read is refused by option name even when it
+  is callable. `typeof` reports `function` for a revoked Proxy built over a
+  callable target, so `websocket.allowedOrigins` handed one straight to
+  `Array.isArray` and the build stopped with `Cannot perform 'IsArray' on a
+  proxy that has been revoked` - naming neither the option nor what it accepts.
+  The options bag itself had the same hole. A function passed as the whole bag
+  is refused too, rather than copied to `{}` and built on silent defaults.
+
 - A `304` now carries `ETag`, `Cache-Control`, `Vary` and `Last-Modified`, per
   RFC 9110 s15.4.5. It carried none of them, so every revalidating cache got a
   response it could not use to extend what it had stored. The fields are baked

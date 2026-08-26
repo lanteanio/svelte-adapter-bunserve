@@ -34,6 +34,16 @@ export default function (opts = {}) {
 	// throwing getter - naming neither the option nor what it accepts. The
 	// copy makes every later read plain; a bag that cannot be read is refused
 	// here, by name.
+	// A CALLABLE is refused here rather than copied. `typeof` reports 'function'
+	// for a revoked Proxy built over one, so the object-only branch below lets
+	// it through untouched and the first property read is a native throw naming
+	// nothing; an ordinary function would copy to `{}` and build an adapter on
+	// silent defaults, which is worse than saying so.
+	if (typeof opts === 'function') {
+		throw new Error(
+			`adapter options must be a plain object of options, got ${describeValue(opts)}.`
+		);
+	}
 	if (opts !== null && typeof opts === 'object') {
 		const copied = readableCopy(opts);
 		if (copied === null || Array.isArray(copied)) {

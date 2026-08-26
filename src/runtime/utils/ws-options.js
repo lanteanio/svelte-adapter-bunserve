@@ -188,7 +188,11 @@ export const INERT_WS_OPTION_KEYS = new Set(['metrics']);
  * iterate `Object.keys`. A config supplying options through a prototype chain
  * was already invisible to those warnings; now the reads agree with them.
  *
- * @param {unknown} value - anything claiming to be an object or array
+ * Callables come here too. A revoked Proxy over a function reports
+ * `typeof 'function'`, so a gate that only routes objects through this hands
+ * the raw value to whatever inspects it next.
+ *
+ * @param {unknown} value - anything claiming to be an object, array or callable
  * @returns {Record<string, unknown> | unknown[] | null}
  */
 export function readableCopy(value) {
@@ -1058,7 +1062,15 @@ export function normalizeWsOptions(input) {
 		// throws ahead of the refusal that would name the option, and copying
 		// also reads every element exactly once, so a hostile element getter
 		// lands in the guarded copy rather than inside `.every`.
-		const a = typeof raw.allowedOrigins === 'object' && raw.allowedOrigins !== null
+		//
+		// FUNCTIONS TAKE THE SAME ROUTE, which is not a formality: a revoked
+		// Proxy built over a callable target reports `typeof 'function'`, so an
+		// object-only guard hands it straight to `Array.isArray` below and the
+		// native throw arrives instead of this option's name. An ordinary
+		// function copies to `{}` and is refused by the same line that refuses
+		// every other wrong shape.
+		const a = raw.allowedOrigins !== null &&
+			(typeof raw.allowedOrigins === 'object' || typeof raw.allowedOrigins === 'function')
 			? readableCopy(raw.allowedOrigins)
 			: raw.allowedOrigins;
 		// '*' is what the rest of the adapter family spells this, and the whole

@@ -272,6 +272,85 @@ test('an options bag that refuses to be read is refused, not crashed on', () => 
 	);
 });
 
+test('a CALLABLE value that refuses to be read is refused by name, everywhere', () => {
+	// The gap this closes, and the reason it is a sweep rather than two cases:
+	// `typeof` reports 'function' for a revoked Proxy built over a callable
+	// target, so every gate that routes only `typeof === 'object'` through the
+	// guarded copy hands such a value straight to whatever inspects it next.
+	// One gate did - `Array.isArray` on it threw "Cannot perform 'IsArray' on a
+	// proxy that has been revoked", naming neither the option nor what it
+	// accepts - and so did the options bag itself. A gate added later would
+	// have the same hole for the same reason, which is what this walks.
+	const revokedCallable = () => {
+		const { proxy, revoke } = Proxy.revocable(function noop() {}, {});
+		revoke();
+		return /** @type {any} */ (proxy);
+	};
+	const nativeThrow = /Cannot perform|proxy that has been revoked/;
+
+	/** @type {[string, (v: any) => any][]} */
+	const PLACES = [
+		['out', (v) => ({ out: v })],
+		['precompress', (v) => ({ precompress: v })],
+		['envPrefix', (v) => ({ envPrefix: v })],
+		['healthCheckPath', (v) => ({ healthCheckPath: v })],
+		['readinessCheckPath', (v) => ({ readinessCheckPath: v })],
+		['staticCacheMaxFileSize', (v) => ({ staticCacheMaxFileSize: v })],
+		['staticDotfiles', (v) => ({ staticDotfiles: v })],
+		['staticHeaders', (v) => ({ staticHeaders: v })],
+		["staticHeaders['x-a']", (v) => ({ staticHeaders: { 'x-a': v } })],
+		['websocket', (v) => ({ websocket: v })],
+		['websocket.allowedOrigins', (v) => ({ websocket: { allowedOrigins: v } })],
+		['websocket.allowedOrigins[0]', (v) => ({ websocket: { allowedOrigins: [v] } })],
+		['websocket.path', (v) => ({ websocket: { path: v } })],
+		['websocket.handler', (v) => ({ websocket: { handler: v } })],
+		['websocket.maxPayloadLength', (v) => ({ websocket: { maxPayloadLength: v } })],
+		['websocket.idleTimeout', (v) => ({ websocket: { idleTimeout: v } })],
+		['websocket.maxBackpressure', (v) => ({ websocket: { maxBackpressure: v } })],
+		['websocket.compression', (v) => ({ websocket: { compression: v } })],
+		['websocket.pressure', (v) => ({ websocket: { pressure: v } })],
+		['websocket.upgradeAdmission', (v) => ({ websocket: { upgradeAdmission: v } })],
+		['websocket.upgradeAdmission.maxConcurrent', (v) => ({ websocket: { upgradeAdmission: { maxConcurrent: v } } })],
+		['websocket.upgradeAdmission.cursorLane', (v) => ({ websocket: { upgradeAdmission: { cursorLane: v } } })],
+		['websocket.upgradeAdmission.cursorLane.fraction', (v) => ({ websocket: { upgradeAdmission: { cursorLane: { fraction: v } } } })],
+		['websocket.egress', (v) => ({ websocket: { egress: v } })],
+		['websocket.egress.windowMs', (v) => ({ websocket: { egress: { windowMs: v } } })],
+		['websocket.egress.topic', (v) => ({ websocket: { egress: { topic: v } } })],
+		['websocket.egress.topic.messages', (v) => ({ websocket: { egress: { topic: { messages: v } } } })]
+	];
+
+	for (const [label, make] of PLACES) {
+		assert.throws(
+			() => adapter(make(revokedCallable())),
+			(err) => {
+				assert.doesNotMatch(err.message, nativeThrow,
+					`${label}: the proxy machinery reached the user`);
+				return true;
+			},
+			`${label}: a value that refuses to be read must be refused`
+		);
+	}
+});
+
+test('a callable options bag is refused rather than read as an empty config', () => {
+	// Both flavours, and for two different reasons. A revoked callable answers
+	// every read with a native throw; an ordinary function answers them all
+	// with undefined, so the copy would be `{}` and the build would proceed on
+	// silent defaults - the worse of the two, because nothing says anything.
+	const { proxy, revoke } = Proxy.revocable(function noop() {}, {});
+	revoke();
+	for (const bag of [proxy, function config() {}]) {
+		assert.throws(
+			() => adapter(/** @type {any} */ (bag)),
+			(err) => {
+				assert.match(err.message, /adapter options must be a plain object/);
+				assert.doesNotMatch(err.message, /proxy that has been revoked/);
+				return true;
+			}
+		);
+	}
+});
+
 test('a throwing getter on the bag lands in the refusal, not in the walk', () => {
 	const bomb = { get precompress() { throw new Error('boom from the bag'); } };
 	assert.throws(
