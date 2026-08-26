@@ -834,7 +834,7 @@ client:
 | `{"type":"welcome","sessionId":"..."}` | on open |
 | `{"type":"wire-id","topic":"t","id":N}` | the numeric topic id for `0x03` frames, announced on the same socket before the first binary frame for its topic |
 | `{"type":"resumed"}` | the `resume` frame's gap-fill RAN and flushed - or the app exports no `resume` hook, so there was nothing to serve; switch to live. Sent only then: every other outcome is an `error` carrying a `code`, so a client that does not receive this must not treat itself as caught up |
-| `{"topic":"__replay:t","event":"truncated","data":null}` | the gap-fill for `t` is INCOMPLETE - the buffered window overflowed its cap, or a frame was refused past the backpressure limit. Drop the stored per-topic offset and cold-resync; do not trust the partial flush. A socket that refuses this marker twice is closed with **1013** instead of being acked, since there is no way left to tell it |
+| `{"topic":"__replay:t","event":"truncated","data":null}` | the gap-fill for `t` is INCOMPLETE - the buffered window overflowed its cap, or a frame was refused past the backpressure limit. Drop the stored per-topic offset and cold-resync; do not trust the partial flush. A socket that refuses this marker twice is closed instead of being acked, since there is no way left to tell it |
 | binary `[0x03][schemaVersion:u8][topicId:varint][seq:varint][codec payload]` | a codec frame, for connections that declared the codec's capability in `hello` |
 | `{"type":"subscribed","topic":"t","ref":N,"epoch":E}` | a subscription took |
 | `{"type":"subscribe-denied","topic":"t","ref":N,"reason":"..."}` | it did not |
@@ -902,10 +902,19 @@ frame, and the same one the family clients already act on.
 The marker is the one frame on this channel whose delivery is checked, because
 the state that produces it - a socket at or over its backpressure limit - is
 also the state that refuses it. A refused marker is retried once; if the socket
-will not take the retry either, the connection is closed with **1013** rather
-than acked, and no `subscribed` follows. The reconnect resumes from the last seq
-the client actually received, so the tail it missed is re-delivered. 1013 is
-retry-class for the family clients, unlike 1008, which they treat as terminal.
+will not take the retry either, the connection is closed rather than acked, and
+no `subscribed` follows. The reconnect resumes from the last seq the client
+actually received, so the tail it missed is re-delivered.
+
+The close is asked for with **1013**, which is retry-class for the family
+clients where 1008 is terminal - but do not write a client that depends on
+reading that code here. A socket saturated enough to refuse the marker is torn
+down before the close frame reaches it, and the client observes an abnormal
+close (1006) instead; both supported Bun generations behave that way, and the
+measurement is in `probe/bun-api-facts.report.md` under
+`close-under-backpressure`. What this lane guarantees is the part that does not
+have to travel over a full socket: no `subscribed` ack, and a connection that
+ends. The family clients reconnect from either code.
 
 The `resume` hook's RETURN VALUE is the dedup boundary for the gap-fill, so it
 is part of the contract rather than an ignored result. Return the highest seq

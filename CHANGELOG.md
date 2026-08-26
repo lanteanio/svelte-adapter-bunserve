@@ -68,6 +68,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   determinism check - and the determinism scan. Measured on both generations
   before wiring: unit 70/70 files, sim 8/8, corpora 2x40/40, all green on each.
 
+- The resume lane's close contract now documents what a client actually
+  observes. A socket that refuses the truncation marker twice is still closed
+  instead of acked, and the close is still asked for with 1013 - but a socket
+  saturated enough to refuse that marker is torn down before the close frame
+  reaches the client, which sees an abnormal 1006 instead. Both supported Bun
+  generations behave that way, and the probe records the measurement. What a
+  client can build on is the absent `subscribed` ack and the ended connection,
+  not the code; the family clients reconnect from either one.
+
 ## [0.0.2] - 2026-08-25
 
 Still pre-alpha, and the public contract is still not stable. What changed since

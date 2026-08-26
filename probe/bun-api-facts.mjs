@@ -969,6 +969,69 @@ async function probeServeOptionAcceptance() {
 	record(section, 'TLS surface (SNI, multiple certs, passphrase)', 'MANUAL - needs real certificates; probe before claiming TLS parity');
 }
 
+async function probeCloseUnderBackpressure() {
+	// The close-vs-terminate section above closes a HEALTHY socket. This one
+	// asks the question the adapter actually depends on: does a close code
+	// survive a socket that is past its backpressure limit? The resume lane
+	// closes with a specific code exactly when a control frame was refused,
+	// and a refusal means saturation - so if the code does not survive that
+	// state, the code is not what the client classifies on and no
+	// documentation may promise that it is.
+	const section = 'close-under-backpressure';
+	const CODE = 1013;
+	const FRAME = new Uint8Array(1024 * 1024);
+
+	/**
+	 * Close one socket with CODE, optionally after filling it, and report what
+	 * the client's close event carried.
+	 *
+	 * @param {boolean} saturate
+	 */
+	const closeCase = (saturate) => new Promise((resolve) => {
+		/** @type {any} */
+		let observed = {};
+		const server = Bun.serve({
+			hostname: HOST, port: 0,
+			fetch: (req, srv) => (srv.upgrade(req) ? undefined : new Response('no')),
+			websocket: {
+				maxBackpressure: 64 * 1024,
+				open(ws) {
+					/** @type {number[]} */
+					const codes = [];
+					// Bounded: a socket that will not saturate must end the probe
+					// rather than push until something else gives.
+					for (let i = 0; saturate && i < 64; i++) {
+						const r = ws.send(FRAME, true);
+						if (!codes.includes(r)) codes.push(r);
+						if (codes.includes(0) && codes.includes(-1)) break;
+					}
+					observed.sendResults = codes;
+					observed.buffered = ws.getBufferedAmount();
+					ws.close(CODE, 'probe-close');
+				},
+				message() {}
+			}
+		});
+		const ws = new WebSocket(`ws://${HOST}:${server.port}/`);
+		ws.binaryType = 'arraybuffer';
+		ws.addEventListener('close', (e) => {
+			const label = saturate
+				? `client close event after ws.close(${CODE}) on a socket past its backpressure limit`
+				: `client close event after ws.close(${CODE}) on a healthy socket`;
+			const detail = saturate
+				? `, send() returned ${JSON.stringify(observed.sendResults)}, ${observed.buffered} bytes buffered`
+				: '';
+			record(section, label,
+				`{"code":${e.code},"reason":${JSON.stringify(e.reason)},"wasClean":${e.wasClean}}${detail}`);
+			server.stop(true);
+			resolve();
+		});
+	});
+
+	await closeCase(false);
+	await closeCase(true);
+}
+
 async function probeConnectionClose() {
 	// Whether Bun honours a request's `Connection: close`. A live suite drives
 	// the server over a raw socket precisely because fetch() cannot construct
@@ -1102,6 +1165,7 @@ const probes = [
 	probePrototypePatch,
 	probeIdleTimeoutCap,
 	probeHttpIdleTimeout,
+	probeCloseUnderBackpressure,
 	probeConnectionClose,
 	probeMaxPayloadEnforcement,
 	probeMessageBufferLifetime,

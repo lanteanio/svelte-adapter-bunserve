@@ -1,6 +1,6 @@
 # Bun server API facts
 
-Generated 2026-08-25T22:32:10.795Z by `probe/bun-api-facts.mjs`.
+Generated 2026-08-26T00:23:33.849Z by `probe/bun-api-facts.mjs`.
 
 - Bun version: **1.3.14** (revision 0d9b296af33f2b851fcbf4df3e9ec89751734ba4)
 - Platform: win32/x64
@@ -190,16 +190,23 @@ Re-run after every Bun upgrade; review any diff before trusting the upgrade.
 - Bun.serve accepts idleTimeout=256
   - THREW: Bun.serve expects idleTimeout to be 255 or less
 
+## close-under-backpressure
+
+- client close event after ws.close(1013) on a healthy socket
+  - {"code":1013,"reason":"probe-close","wasClean":false}
+- client close event after ws.close(1013) on a socket past its backpressure limit
+  - {"code":1006,"reason":"Connection ended","wasClean":false}, send() returned [1048576,-1,0], 16777376 bytes buffered
+
 ## connection-close
 
 - handler returns a Response synchronously
-  - closed after 4ms
+  - closed after 6ms
 - handler is async but settles without yielding
-  - closed after 3ms
+  - closed after 1ms
 - handler awaits a macrotask first
-  - HELD past the response, closed after 2027ms (idleTimeout 3s)
+  - HELD past the response, closed after 1974ms (idleTimeout 3s)
 - handler awaits a macrotask, response body is bytes
-  - HELD past the response, closed after 4008ms (idleTimeout 3s)
+  - HELD past the response, closed after 4002ms (idleTimeout 3s)
 
 ## max-payload
 
@@ -220,7 +227,7 @@ Re-run after every Bun upgrade; review any diff before trusting the upgrade.
 - custom upgrade header present on the 101 response
   - true
 - raw 101 status line + headers
-  - HTTP/1.1 101 Switching Protocols | x-probe-upgrade: yes | Upgrade: websocket | Connection: Upgrade | Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo= | Date: Tue, 25 Aug 2026 22:32:04 GMT
+  - HTTP/1.1 101 Switching Protocols | x-probe-upgrade: yes | Upgrade: websocket | Connection: Upgrade | Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo= | Date: Wed, 26 Aug 2026 00:23:28 GMT
 
 ## upgrade-abort
 

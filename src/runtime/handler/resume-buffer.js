@@ -270,7 +270,12 @@ export function flushResumeTopic(handle, topic, coveredSeq) {
 			// Closing forces a reconnect, whose resume starts from the last seq
 			// the client actually received, so the missed tail is re-delivered
 			// rather than lost. 1013 is retry-class for the family client, not
-			// one of the codes it treats as terminal.
+			// one of the codes it treats as terminal - but the client usually
+			// never reads it: a socket this saturated is torn down before the
+			// close frame gets out, and 1006 is what arrives (measured on both
+			// generations, probe/bun-api-facts.report.md
+			// close-under-backpressure). The guarantee here is the absent ack
+			// and the ended connection, not the number.
 			try {
 				ws.end(RESUME_INCOMPLETE_CLOSE_CODE, 'resume incomplete');
 				closed = true;
