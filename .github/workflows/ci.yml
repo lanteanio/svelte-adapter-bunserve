@@ -15,6 +15,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      # The suite reaches the adapter entry (test/unit/adapter-options.test.mjs
+      # imports src/index.js to read the real option destructure), and that
+      # entry imports rollup. Without this the job dies on a clean checkout with
+      # ERR_MODULE_NOT_FOUND and every later step is skipped.
+      - name: Install the adapter's dependencies
+        run: npm install --no-audit --no-fund
       - name: Run the unit suite
         run: npm test
       # The determinism ratchet: every clock/rng/timer read under src/ goes
@@ -61,6 +67,12 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ matrix.bun-version }}
+      # Same reason the Node unit job installs: the unit lane below runs those
+      # same files, one of which imports the rollup-importing adapter entry.
+      # Installed with Bun here, so the job also proves the package installs on
+      # the runtime it is testing.
+      - name: Install the adapter's dependencies
+        run: bun install
       # The probe RECORDS observed Bun behavior; this job holds a Bun upgrade
       # to two hard rules: the probe itself must complete, and no probe may
       # record a FAILED observation. The committed report's diff review stays
