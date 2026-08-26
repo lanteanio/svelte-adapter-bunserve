@@ -62,7 +62,11 @@ declares.
    backpressure on streams); static assets come from an in-memory
    precompressed cache with ETag/304, `Last-Modified` with the full RFC 9110
    precondition set (`If-Match` / `If-Unmodified-Since` answer 412,
-   `If-Modified-Since` answers 304 for caches that lost the validator), RFC
+   `If-Modified-Since` answers 304 for caches that lost the validator, `*` and
+   the list form on both validator preconditions, weak comparison, and only
+   the three HTTP-date formats accepted as dates), every precondition answered
+   against the representation content negotiation actually selected, 304s
+   carrying the validator and freshness fields a cache needs, RFC
    7233 ranges, and trailing-slash canonicalization, with a `Bun.file()`
    kernel-sendfile lane for large files;
    SSR dedup and the BREACH-aware compression gate are carried over, and a
@@ -81,9 +85,7 @@ declares.
    resolving an already-available stream read as a microtask - pinned by the
    probe's `body-read-scheduling` group, so a Bun upgrade that changes it
    surfaces as a report diff rather than a silent loss of compression and
-   deduplication. `If-None-Match` is matched exactly, so neither `*` nor a
-   list of validators produces a 304 (a needless full response rather than a
-   wrong one, matching svelte-adapter-uws).
+   deduplication.
 3. **JSON realtime** (done): the upgrade path, the per-connection platform, and
    topic pub/sub over real WebSockets. See [WebSockets](#websockets) below.
 4. **Binary wire protocol** (done): `0x03` codec frames over

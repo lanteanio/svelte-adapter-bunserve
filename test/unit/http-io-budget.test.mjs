@@ -358,6 +358,36 @@ test('a 304 costs one Response and no header build at all', () => {
 	assert.deepEqual(costAtScale(() => serveStatic(small, CONDITIONAL)), scaled(per));
 });
 
+test('a 304 carries what a cache needs, and nothing that describes a body', () => {
+	// RFC 9110 s15.4.5. A cache that revalidates and gets a bare 304 has
+	// nothing to extend its stored response with: no validator to confirm, no
+	// freshness directive, and no Vary to say which stored response was even
+	// being answered. The fields it does need are compared against the 200
+	// rather than spelled out, so a change to the served headers cannot leave
+	// the 304 quietly behind.
+	const full = serveStatic(small, NO_HEADERS);
+	const res = serveStatic(small, CONDITIONAL);
+	assert.equal(res.status, 304);
+	for (const name of ['etag', 'cache-control', 'vary', 'last-modified']) {
+		assert.equal(res.headers.get(name), full.headers.get(name), name);
+	}
+	for (const name of ['content-type', 'content-encoding', 'accept-ranges', 'content-length']) {
+		assert.equal(res.headers.get(name), null, `${name} describes a body this response has not got`);
+	}
+});
+
+test('and the validator it carries is the one for the negotiated coding', () => {
+	// A cache holding the brotli copy revalidates with the brotli validator and
+	// must be told to keep THAT one. Announcing the identity tag would have it
+	// store a validator for bytes it does not hold.
+	const res = serveStatic(small, new Headers({
+		'if-none-match': /** @type {string} */ (small.brEtag),
+		'accept-encoding': 'br'
+	}));
+	assert.equal(res.status, 304);
+	assert.equal(res.headers.get('etag'), small.brEtag);
+});
+
 test('a memory-lane range is one Headers, one Response and zero disk', async () => {
 	// The 206 path builds its headers from the identity tuples and then sets
 	// content-range on the SAME object - one build, not two.

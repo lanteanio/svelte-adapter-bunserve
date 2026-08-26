@@ -151,15 +151,63 @@ test('If-Match with a stale validator answers 412, not a fresh body', () => {
 	assert.deepEqual(plan(dated, { ifMatch: 'W/"old-etag"' }), { status: 412, encoding: '' });
 });
 
-test('If-Match matches any validator this lane issued, and the wildcard', () => {
+test('If-Match matches the validator of the representation being served', () => {
 	// Opaque equality on purpose: every validator here is weak by
 	// construction, and RFC strong comparison would 412 a client echoing the
 	// exact validator this server handed it. The comment in the planner
-	// carries the reasoning.
+	// carries the reasoning. What it is NOT is coding-blind - the precondition
+	// is defined against the SELECTED representation.
 	assert.equal(plan(dated, { ifMatch: ETAG }).status, 200);
-	assert.equal(plan(dated, { ifMatch: dated.brEtag }).status, 200);
+	assert.equal(plan(dated, { ifMatch: dated.brEtag, accept: 'br' }).status, 200);
 	assert.equal(plan(dated, { ifMatch: '*' }).status, 200);
 	assert.equal(plan(dated, { ifMatch: `W/"other", ${ETAG}` }).status, 200, 'the list form is split');
+});
+
+test('If-Match holding another representation validator is 412, not a fresh body', () => {
+	// The client says "only if my copy is the one you would serve". Its copy is
+	// the gzip representation; identity is what this request selects. Answering
+	// 200 hands it bytes it did not ask about, and the old planner did exactly
+	// that because it compared before negotiating.
+	assert.equal(plan(dated, { ifMatch: dated.gzEtag }).status, 412);
+	assert.equal(plan(dated, { ifMatch: ETAG, accept: 'br' }).status, 412);
+	assert.equal(plan(dated, { ifMatch: dated.brEtag, accept: 'gzip' }).status, 412);
+});
+
+test('If-None-Match takes the wildcard and the list form', () => {
+	assert.equal(plan(dated, { ifNoneMatch: '*' }).status, 304);
+	assert.equal(plan(dated, { ifNoneMatch: `W/"other", ${ETAG}` }).status, 304);
+	assert.equal(plan(dated, { ifNoneMatch: 'W/"one", W/"two"' }).status, 200);
+	// Per coding, like every other conditional here.
+	assert.equal(plan(dated, { ifNoneMatch: `W/"other", ${dated.brEtag}`, accept: 'br' }).status, 304);
+	assert.equal(plan(dated, { ifNoneMatch: `W/"other", ${ETAG}`, accept: 'br' }).status, 200);
+});
+
+test('entity-tags compare weakly, so the W/ prefix is not load-bearing', () => {
+	// RFC 9110 s13.1.2: If-None-Match uses weak comparison. Every validator
+	// this lane issues is weak, and a cache that stored the opaque tag without
+	// the prefix is asking about the same representation.
+	assert.equal(plan(dated, { ifNoneMatch: '"abc-123"' }).status, 304);
+	assert.equal(plan(dated, { ifMatch: '"abc-123"' }).status, 200);
+});
+
+test('a 304 carries the coding that was negotiated, not identity', () => {
+	// The caller reads this to pick which baked validator the 304 announces.
+	assert.deepEqual(plan(dated, { ifNoneMatch: dated.brEtag, accept: 'br' }),
+		{ status: 304, encoding: 'br' });
+	assert.deepEqual(plan(dated, { ifModifiedSince: AT, accept: 'gzip' }),
+		{ status: 304, encoding: 'gzip' });
+});
+
+test('only an HTTP-date is a date', () => {
+	// Date.parse would take all of these. RFC 9110 s5.6.7 defines three
+	// formats and an ISO 8601 string is none of them - honouring one lets a
+	// header no HTTP sender may write decide a 304 or a 412.
+	assert.equal(plan(dated, { ifModifiedSince: '2023-11-14T22:13:20Z' }).status, 200);
+	assert.equal(plan(dated, { ifModifiedSince: '14 Nov 2023' }).status, 200);
+	assert.equal(plan(dated, { ifUnmodifiedSince: '2000-01-01' }).status, 200);
+	// The two obsolete formats a recipient MUST still accept.
+	assert.equal(plan(dated, { ifModifiedSince: 'Tuesday, 14-Nov-23 22:13:20 GMT' }).status, 304);
+	assert.equal(plan(dated, { ifModifiedSince: 'Tue Nov 14 22:13:20 2023' }).status, 304);
 });
 
 test('a failed If-Match wins over a matching If-None-Match', () => {

@@ -158,13 +158,16 @@ export function cacheDir(dir, urlPrefix, immutable, staticHeaders = null) {
 		// `hasBr`/`hasGz` are set here, together with the headers and validator
 		// they gate, so negotiation can never select a coding whose response
 		// was never baked - one place decides a coding exists.
+		entry.notModified = notModifiedHeaders(entry.headers);
 		if (entry.brBuffer || entry.brFile) {
 			entry.brHeaders = variantHeaders(entry.headers, etag, 'br');
+			entry.brNotModified = notModifiedHeaders(entry.brHeaders);
 			entry.brEtag = representationEtag(etag, 'br');
 			entry.hasBr = true;
 		}
 		if (entry.gzBuffer || entry.gzFile) {
 			entry.gzHeaders = variantHeaders(entry.headers, etag, 'gzip');
+			entry.gzNotModified = notModifiedHeaders(entry.gzHeaders);
 			entry.gzEtag = representationEtag(etag, 'gzip');
 			entry.hasGz = true;
 		}
@@ -232,6 +235,27 @@ function variantHeaders(base, etag, encoding) {
 	return out;
 }
 
+// What a 304 carries. RFC 9110 s15.4.5 asks for the fields a 200 would have
+// sent that a cache needs to keep its stored response usable: the validator,
+// the freshness directives, and the Vary that says which stored response is
+// even being answered. A bare 304 quietly downgrades every cache that gets one
+// - nothing to confirm the validator against, no freshness to extend, and no
+// sign the answer was negotiated. The representation headers (type, length,
+// coding) stay out: there is no body for them to describe.
+//
+// Baked per coding at index time for the same reason the coding's own headers
+// are: a revalidating cache is the most repetitive request this lane serves,
+// and it must not pay to rebuild a fixed tuple list.
+const NOT_MODIFIED_HEADERS = new Set(['etag', 'cache-control', 'vary', 'last-modified']);
+
+/**
+ * @param {[string, string][]} base - one representation's full response headers
+ * @returns {[string, string][]}
+ */
+function notModifiedHeaders(base) {
+	return base.filter(([key]) => NOT_MODIFIED_HEADERS.has(key));
+}
+
 export const clientDir = path.join(__dirname, 'client');
 
 export const prerenderedDir = path.join(__dirname, 'prerendered');
@@ -285,7 +309,14 @@ export function serveStatic(entry, requestHeaders, headOnly = false) {
 	);
 
 	if (plan.status === 304) {
-		return new Response(null, { status: 304 });
+		// The baked tuple list for the representation this request selected, so
+		// the validator the client is told to keep is the one it holds.
+		const headers = plan.encoding === 'br'
+			? entry.brNotModified
+			: plan.encoding === 'gzip'
+				? entry.gzNotModified
+				: entry.notModified;
+		return new Response(null, { status: 304, headers });
 	}
 
 	if (plan.status === 412) {

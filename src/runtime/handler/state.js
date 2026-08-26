@@ -15,7 +15,8 @@
  *
  * `headers` holds the identity representation's response headers; `brHeaders`
  * / `gzHeaders` hold each coding's, precomputed at index time (own validator,
- * no `accept-ranges` - see variantHeaders).
+ * no `accept-ranges` - see variantHeaders). The `*NotModified` lists are the
+ * subset a 304 for that representation carries, baked alongside them.
  *
  * @typedef {{
  *   buffer?: Buffer,
@@ -35,7 +36,10 @@
  *   hasGz?: boolean,
  *   headers: [string, string][],
  *   brHeaders?: [string, string][],
- *   gzHeaders?: [string, string][]
+ *   gzHeaders?: [string, string][],
+ *   notModified?: [string, string][],
+ *   brNotModified?: [string, string][],
+ *   gzNotModified?: [string, string][]
  * }} StaticEntry
  * @type {Map<string, StaticEntry>}
  */
