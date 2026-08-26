@@ -90,12 +90,14 @@ function completeBody(buf, closed) {
  * repeats. Returns the parsed JSON body of the response.
  *
  * The socket is dropped as soon as the response is complete rather than waited
- * on. Bun leaves a connection open past the request's `Connection: close`
- * whenever the handler yielded to the macrotask queue before returning
- * (probe/bun-api-facts.report.md, connection-close), and every SSR response
- * does - so the close arrives when the server's 120s idle timeout fires, not
- * when the response ends. Reading until hangup costs two minutes a request,
- * which puts the four here well past the lane's step timeout.
+ * on. On the engines floor, Bun leaves a connection open past the request's
+ * `Connection: close` whenever the handler yielded to the macrotask queue
+ * before returning - which every SSR response does - so the close arrives when
+ * the server's 120s idle timeout fires rather than when the response ends, and
+ * reading until hangup costs two minutes a request. 1.4.0 closes promptly in
+ * every case; both measurements are in probe/bun-api-facts.report.md under
+ * connection-close, so this reads the response either way rather than being
+ * correct only on the generation that happens to be installed.
  *
  * @param {string[]} headerLines
  * @returns {Promise<{ address: string | null, error: string | null }>}
