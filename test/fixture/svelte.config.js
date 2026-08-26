@@ -20,6 +20,7 @@ const dotfiles = process.env.STATIC_DOTFILES === '1' || process.env.STATIC_DOTFI
 const admission = process.env.WS_ADMISSION === '1' || process.env.WS_ADMISSION === 'true';
 const upgradeTimeout = process.env.WS_UPGRADE_TIMEOUT === '1' || process.env.WS_UPGRADE_TIMEOUT === 'true';
 const rateLimit = process.env.WS_RATE_LIMIT === '1' || process.env.WS_RATE_LIMIT === 'true';
+const backpressure = process.env.WS_BACKPRESSURE === '1' || process.env.WS_BACKPRESSURE === 'true';
 
 let adapter;
 if (which === 'bunserve' && dotfiles) {
@@ -62,6 +63,17 @@ if (which === 'bunserve' && dotfiles) {
 			authPathRateLimit: 3,
 			authPathRateLimitWindow: 10
 		}
+	});
+} else if (which === 'bunserve' && backpressure) {
+	// The build for test/live/resume-backpressure-check.mjs. A backpressure
+	// limit small enough that a resume flush can actually fill it, which is the
+	// only way to reach the branch where the truncation marker itself is
+	// refused and the connection is closed instead of acked. The default is a
+	// megabyte, and no test is going to push a megabyte through every other
+	// suite's server to get there.
+	adapter = bunserve({
+		out: 'build-backpressure',
+		websocket: { maxBackpressure: 64 * 1024 }
 	});
 } else if (which === 'bunserve' && upgradeTimeout) {
 	// The build for test/live/upgrade-timeout-check.mjs. Its own, because the

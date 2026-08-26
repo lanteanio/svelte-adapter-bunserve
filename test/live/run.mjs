@@ -54,6 +54,7 @@ const buildEnv = {
 	WS_ADMISSION: '',
 	WS_UPGRADE_TIMEOUT: '',
 	WS_RATE_LIMIT: '',
+	WS_BACKPRESSURE: '',
 	NODE_ENV: 'production'
 };
 
@@ -138,6 +139,18 @@ if (builtRateLimit) {
 	// the per-door advisory latch can be observed: one latch for the process
 	// would leave the second door silent there and nowhere else.
 	await run('auth-rate-limit-check', [process.execPath, suite('auth-rate-limit-check.mjs')]);
+}
+
+// Its own build for the same shape of reason as the others: the resume flush
+// can only be made to refuse a frame by filling the socket, and a backpressure
+// limit low enough for a test to fill would change what every other suite's
+// server does with a client that reads slowly.
+const builtBackpressure = await run('build fixture (WS_BACKPRESSURE)', [process.execPath, 'run', 'build'], {
+	cwd: fixtureDir,
+	env: { ...buildEnv, WS_BACKPRESSURE: '1' }
+});
+if (builtBackpressure) {
+	await run('resume-backpressure-check', [process.execPath, suite('resume-backpressure-check.mjs')]);
 }
 
 if (failures.length) {

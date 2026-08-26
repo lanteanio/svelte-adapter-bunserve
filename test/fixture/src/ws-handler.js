@@ -101,7 +101,7 @@ let fixtureOpens = null;
  * A script arms ONE window and is consumed by it, so a later resume of the same
  * topic falls back to the default hook.
  *
- * @type {Map<string, { report: number, publish: number[] }>}
+ * @type {Map<string, { report: number, publish: number[], pad: number }>}
  */
 const resumeScripts = new Map();
 
@@ -132,7 +132,14 @@ export async function resume(ws, { sessionId, lastSeenSeqs, platform }) {
 		// exists for. Deterministic by construction: no second connection has
 		// to race the 30 ms above.
 		for (const seq of script.publish) {
-			platform.publish(topic, 'said', { inWindow: seq }, { seq });
+			// `pad` exists for the backpressure lane: the flush can only be made
+			// to refuse a frame by giving it frames big enough to fill a socket,
+			// and the payload is the only dial the fixture has. Zero for every
+			// other caller, so their frames stay small enough to read in a log.
+			const data = script.pad > 0
+				? { inWindow: seq, pad: 'x'.repeat(script.pad) }
+				: { inWindow: seq };
+			platform.publish(topic, 'said', data, { seq });
 		}
 		// Now DELIVER everything the report is about to claim. Derived from
 		// `report` rather than listed separately on the script so the fixture
@@ -284,7 +291,11 @@ export function message(ws, { data, isBinary, msg, platform }) {
 		return;
 	}
 	if (msg && msg.type === 'fixture-resume-script') {
-		resumeScripts.set(msg.topic, { report: msg.report, publish: msg.publish });
+		resumeScripts.set(msg.topic, {
+			report: msg.report,
+			publish: msg.publish,
+			pad: typeof msg.pad === 'number' ? msg.pad : 0
+		});
 		platform.send(ws, '__fixture', 'resume-scripted', { topic: msg.topic });
 		return;
 	}
