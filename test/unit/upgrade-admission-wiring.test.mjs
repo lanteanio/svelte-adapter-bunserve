@@ -30,7 +30,7 @@ globalThis.WS_OPTIONS = {
 const { tryUpgrade } = await import('../../src/runtime/handler/upgrade.js');
 const { resetRuntimeEnv, setRuntimeEnv } = await import('../../src/runtime/runtime.js');
 const { upgradeAdmission } = await import('../../src/runtime/handler/admission.js');
-const { beginDraining } = await import('../../src/runtime/handler/ws-state.js');
+const { beginDraining, wsCounters } = await import('../../src/runtime/handler/ws-state.js');
 const { CURSOR_LANE_SUBPROTOCOL } = await import('../../src/runtime/utils/upgrade-admission.js');
 
 /** A server that accepts every upgrade and remembers how many it took. */
@@ -116,6 +116,60 @@ test('a crossed connection ceiling sheds with the retry-after uws sends', async 
 		assert.equal(cursorTop.status, 503);
 		assert.equal(cursorTop.headers.get('retry-after'), '3', 'the cursor lane draws the same band');
 	} finally {
+		resetRuntimeEnv();
+	}
+	assert.equal(srv.taken, admitted, 'and nothing past the ceiling reached the server');
+});
+
+test('an escalated posture widens the band, on every lane that sheds', async () => {
+	// A server at siege is refusing a bigger herd per second than one at
+	// normal, so telling that herd to come back inside the same two seconds is
+	// the thing the jitter exists to prevent. uws widens the spread with the
+	// posture; this pins that the widening reaches a REFUSAL rather than only
+	// the arithmetic - the shed lane read no posture at all and answered the
+	// normal band under every level.
+	const srv = fakeServer();
+	let admitted = 0;
+	let refused;
+	for (;;) {
+		refused = await attempt(srv);
+		if (refused !== undefined) break;
+		admitted++;
+		assert.ok(admitted <= upgradeAdmission.maxConnections, 'the ceiling must bind eventually');
+	}
+	assert.equal(refused.status, 503);
+
+	try {
+		// Both edges at every posture, through an injected RNG: a real one can
+		// legally draw the same second every time, which is a green proving
+		// nothing. `elevated` reads the same as `normal` at this base on
+		// purpose - ceil(2 * 1) and the floor of 2 agree at 2 - and the value
+		// is pinned rather than skipped so a spread table that stopped
+		// distinguishing them elsewhere still has to say so here.
+		for (const [level, top] of [['normal', '3'], ['elevated', '3'], ['siege', '4']]) {
+			wsCounters.activePosture = /** @type {any} */ ({ level });
+
+			setRuntimeEnv({ rng: { float: () => 0 } });
+			assert.equal((await attempt(srv)).headers.get('retry-after'), '2',
+				`${level}: the floor is the base`);
+			assert.equal((await attempt(srv, { cursor: true })).headers.get('retry-after'), '2',
+				`${level}: the cursor lane floor is the base too`);
+
+			setRuntimeEnv({ rng: { float: () => 0.999 } });
+			assert.equal((await attempt(srv)).headers.get('retry-after'), top,
+				`${level}: the top of the band`);
+			assert.equal((await attempt(srv, { cursor: true })).headers.get('retry-after'), top,
+				`${level}: the cursor lane draws the same band`);
+		}
+
+		// No posture machine running at all is the zero-config server, and it
+		// answers the normal band rather than throwing on a missing level.
+		wsCounters.activePosture = null;
+		setRuntimeEnv({ rng: { float: () => 0.999 } });
+		assert.equal((await attempt(srv)).headers.get('retry-after'), '3',
+			'an unposted server answers the normal band');
+	} finally {
+		wsCounters.activePosture = null;
 		resetRuntimeEnv();
 	}
 	assert.equal(srv.taken, admitted, 'and nothing past the ceiling reached the server');

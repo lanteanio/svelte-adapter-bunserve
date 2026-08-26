@@ -67,17 +67,31 @@ export const REFUSAL_RETRY_AFTER_SECONDS = 2;
  * at every base and the growth with `spread` stays monotone.
  *
  * The arithmetic is svelte-adapter-uws's `jitterRetryAfter`, carried across
- * verbatim: at the shared base 2 both adapters answer 2..3. uws widens
- * `spread` with its protection posture (elevated 2..3, siege 2..4); this
- * adapter has no posture machine yet, so its callers pass no spread and the
- * default half-base band applies - but the parameter is here so the day a
- * posture arrives, the widening lands in the arithmetic both adapters
- * already share.
+ * verbatim, and so is the widening: `POSTURE_RETRY_SPREAD` below is the spread
+ * each protection level passes, so at the shared base 2 both adapters answer
+ * 2..3 at normal and elevated and 2..4 under siege. A server that has escalated
+ * is refusing more clients per second than one that has not, and telling that
+ * larger herd to come back inside the same two seconds is what the jitter
+ * exists to avoid.
  *
  * @param {number} baseSeconds - whole-second base (the minimum answered)
  * @param {number} [spread] - fraction of the base the band covers (default `0.5`)
  * @returns {number}
  */
+/**
+ * The spread each protection posture answers with, matching svelte-adapter-uws.
+ * At the shared base of 2 that is 2..3, 2..3 and 2..4 - elevated reads the same
+ * as normal because `ceil(2 * 1)` and the floor of 2 agree there, and the two
+ * separate at any larger base.
+ *
+ * @type {Readonly<Record<'normal' | 'elevated' | 'siege', number>>}
+ */
+export const POSTURE_RETRY_SPREAD = Object.freeze({
+	normal: 0.5,
+	elevated: 1,
+	siege: 1.5
+});
+
 export function jitterRetryAfter(baseSeconds, spread) {
 	const s = typeof spread === 'number' && spread > 0 ? spread : 0.5;
 	const band = Math.max(2, Math.ceil(baseSeconds * s));

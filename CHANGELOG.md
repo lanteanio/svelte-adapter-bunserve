@@ -53,6 +53,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `W/` prefix is asking about the same representation and now gets the 304 it
   asked for.
 
+- A shed upgrade's `Retry-After` widens with the live protection posture, which
+  is the half of the carried contract that never reached a refusal: the shed
+  lane passed no spread at all, so an escalated server answered the normal band
+  and told a bigger herd to come back inside the same two seconds. Every
+  capacity refusal - the ceiling, the cursor lane, the pacing overflow - reads
+  the posture per refusal, and at the shared base of 2 that is 2..3 normally
+  and 2..4 under siege, matching svelte-adapter-uws value for value.
+
 - A shed upgrade's `Retry-After` jitter produces the spread its shape always
   suggested. The band arithmetic gains svelte-adapter-uws's two-value floor -
   `base + floor(random() * max(2, ceil(base * spread)))` - so at the shared

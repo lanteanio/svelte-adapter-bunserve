@@ -36,7 +36,8 @@ import {
 import {
 	REFUSAL_RETRY_AFTER_SECONDS,
 	isCursorLaneUpgrade,
-	jitterRetryAfter
+	jitterRetryAfter,
+	POSTURE_RETRY_SPREAD
 } from '../utils/upgrade-admission.js';
 
 /** Upgrade-hook throws, throttled with decay. */
@@ -233,20 +234,28 @@ function drainingResponse(req) {
  * What a shed upgrade gets: a bare 503 telling the client how long to wait.
  *
  * The number is `jitterRetryAfter`'s - svelte-adapter-uws's arithmetic, base
- * and band floor included, so at the shared base 2 both adapters answer 2..3
- * and a refused fleet is split across at least two seconds instead of
- * returning together into the same full gate. The primitive reads the
- * runtime's RNG seam, which keeps a simulated run reproducible.
+ * and band floor included - widened by the LIVE protection posture, so at the
+ * shared base 2 both adapters answer 2..3 normally and 2..4 under siege. A
+ * refused fleet is split across at least two seconds instead of returning
+ * together into the same full gate, and an escalated server, which is refusing
+ * a larger herd per second, spreads it wider. The primitive reads the runtime's
+ * RNG seam, which keeps a simulated run reproducible.
+ *
+ * The posture is read per refusal rather than captured once: it moves while the
+ * server is shedding, which is exactly when this is called.
  *
  * uws answers with a holding page instead when its `waitingRoom` is left on,
  * and that page is the one part of its admission surface not implemented here;
  * `ws-options.js` names the gap when a config asks for it.
  */
 function shedResponse() {
+	const level = wsCounters.activePosture !== null ? wsCounters.activePosture.level : 'normal';
 	return new Response('Server is at upgrade capacity, please retry', {
 		status: 503,
 		headers: {
-			'retry-after': String(jitterRetryAfter(REFUSAL_RETRY_AFTER_SECONDS)),
+			'retry-after': String(
+				jitterRetryAfter(REFUSAL_RETRY_AFTER_SECONDS, POSTURE_RETRY_SPREAD[level])
+			),
 			'content-type': 'text/plain'
 		}
 	});

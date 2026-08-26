@@ -197,12 +197,10 @@ try {
 	});
 	check('a crossed ceiling answers 503', shed.status === 503, `got ${shed.status}`);
 	// A RANGE, not a value, because the expression is uws's and the range is
-	// what the two adapters have to agree on. The spread does not actually
-	// widen it today: `base + floor(rand * base * 0.5)` at base 2 is
-	// `floor(rand * 1)`, zero for every draw, so both adapters answer exactly 2
-	// and a refused fleet does return in the same second. Pinning the range
-	// rather than the constant is what keeps this passing when uws widens
-	// either number, which is the moment the two must move together.
+	// what the two adapters have to agree on. This server runs at the normal
+	// posture, so the band is 2..3; the widening to 2..4 under siege is pinned
+	// in the unit lane, where an injected RNG can put the draw on a band edge
+	// instead of hoping a real one lands there.
 	const retryAfter = Number(shed.headers.get('retry-after'));
 	check(
 		'and says how long to wait, jittered as uws jitters it',

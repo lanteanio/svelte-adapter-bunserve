@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 // values are reachable and which are not - and no number of real draws can
 // prove an edge exists.
 
-const { jitterRetryAfter, REFUSAL_RETRY_AFTER_SECONDS } = await import(
+const { jitterRetryAfter, POSTURE_RETRY_SPREAD, REFUSAL_RETRY_AFTER_SECONDS } = await import(
 	'../../src/runtime/utils/upgrade-admission.js'
 );
 const { resetRuntimeEnv, setRuntimeEnv } = await import('../../src/runtime/runtime.js');
@@ -26,7 +26,8 @@ test('the shared base is the one uws refuses with', () => {
 });
 
 test('the band floor is always the base, at every posture spread', () => {
-	// uws's postures pass 0.5 (normal), 1.0 (elevated), 1.5 (siege). The
+	// The postures pass 0.5 (normal), 1.0 (elevated), 1.5 (siege), which is
+	// POSTURE_RETRY_SPREAD and matches uws value for value. The
 	// minimum a refused client is told to wait never moves with the posture.
 	withDraw(0);
 	for (const spread of [0.5, 1.0, 1.5]) {
@@ -59,10 +60,21 @@ test('a draw in the middle lands inside the band, not on an edge', () => {
 	assert.equal(jitterRetryAfter(2, 1.5), 3, 'floor(0.5 * 3) is 1');
 });
 
+test('the posture table is the one the refusal lanes draw from', () => {
+	// The values, not just their shape: these are what svelte-adapter-uws
+	// passes, and a table that drifted would give the two adapters different
+	// answers for the same condition without any assertion here noticing.
+	assert.deepEqual({ ...POSTURE_RETRY_SPREAD }, { normal: 0.5, elevated: 1, siege: 1.5 });
+	withDraw(0.999);
+	assert.equal(jitterRetryAfter(2, POSTURE_RETRY_SPREAD.normal), 3);
+	assert.equal(jitterRetryAfter(2, POSTURE_RETRY_SPREAD.elevated), 3);
+	assert.equal(jitterRetryAfter(2, POSTURE_RETRY_SPREAD.siege), 4);
+});
+
 test('an absent or unusable spread is the default half-base band', () => {
-	// The callers here pass no spread today - this adapter has no posture
-	// machine - so the default IS the shipped behaviour, and a nonsense value
-	// must not turn the band into NaN arithmetic.
+	// The callers pass a posture spread, so the default is the fallback rather
+	// than the shipped path - but a level the table does not name reaches it,
+	// and a nonsense value must not turn the band into NaN arithmetic.
 	withDraw(0.999);
 	for (const spread of [undefined, 0, -1, NaN]) {
 		assert.equal(jitterRetryAfter(2, spread), 3);

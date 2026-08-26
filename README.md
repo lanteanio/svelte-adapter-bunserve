@@ -671,7 +671,10 @@ without a promise never arms a timer at all.
 `upgradeAdmission` is separate from all of those: they bound what one
 established connection may do, and this bounds whether a connection is
 established at all. Every layer is opt-in, and a crossed ceiling answers `503`
-with `retry-after: 2` rather than accepting a socket it cannot serve.
+with a jittered `retry-after` rather than accepting a socket it cannot serve -
+`2..3` seconds normally, widening to `2..4` while the protection posture is at
+siege, so a refused fleet comes back spread out instead of returning together
+into the same full gate.
 
 - `maxConcurrent` caps handshakes IN FLIGHT. It is checked before the origin
   comparison and before your `upgrade` hook, so a connection storm is shed
