@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-08-28
+
+Still pre-alpha, and the public contract is still not stable. Message admission
+gains its outbound half: `websocket.egress` bounds what a single publisher can
+cost the process, per topic and per tenant. The static lane answers the full RFC
+9110 precondition set instead of ETag alone, and a 304 carries the fields a
+revalidating cache needs to use it. A shed upgrade's `Retry-After` spreads
+across a band that widens with the protection posture, so a refused fleet does
+not come back in one second. An option value that refuses to be read is refused
+by option name rather than failing the build with its own error.
+
 ### Added
 
 - `websocket.egress`: publish-egress ceilings, the outbound half of message
@@ -106,8 +117,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lanes: the unit and sim suites (one process per file, restoring the isolation
   `node --test` provides and `bun test` does not), both golden corpora - which
   must match the Node-blessed fingerprints, making that gate a cross-engine
-  determinism check - and the determinism scan. Measured on both generations
-  before wiring: unit 70/70 files, sim 8/8, corpora 2x40/40, all green on each.
+  determinism check - and the determinism scan.
 
 - The resume lane's close contract now documents what a client actually
   observes. A socket that refuses the truncation marker twice is still closed
