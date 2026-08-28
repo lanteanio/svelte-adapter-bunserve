@@ -43,6 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An option value that refuses to be read is refused by option name at every
+  object gate. `Array.isArray`, `Object.keys` and a plain property read all
+  throw natively on a revoked Proxy or a throwing getter, so the build stopped
+  with the value's own error, naming neither the option nor what it accepts -
+  at the options bag itself and at `websocket`, `upgradeAdmission` and its
+  `cursorLane`, `pressure`, `compression`, `allowedOrigins` and
+  `staticHeaders`. Each gate reads such a value exactly once inside a guard
+  and works from a plain copy of its own enumerable keys, and that copy is
+  what goes forward: a getter on a `compression` object runs once at
+  validation rather than whenever Bun reads the setting.
+
 - A config value that refuses to be read is refused by option name even when it
   is callable. `typeof` reports `function` for a revoked Proxy built over a
   callable target, so `websocket.allowedOrigins` handed one straight to
