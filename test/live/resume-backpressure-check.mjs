@@ -28,12 +28,17 @@ const PORT = 8816;
 const BUILD = buildPath('build-backpressure');
 const TOPIC = 'bp:resume';
 
-// 24 frames of a quarter megabyte each against a 64 KiB limit. The margin is
-// deliberate: the flush has to cross the limit and STAY over it while the
-// marker and its retry are attempted, on a client that is draining the whole
-// time.
-const PAD_BYTES = 256 * 1024;
-const FRAMES = 24;
+// 32 frames of a megabyte each against a 64 KiB limit. Both numbers are a
+// floor, not decoration. A client on loopback drains as fast as the flush
+// writes, so a small burst is taken by the kernel whole and nothing is ever
+// buffered for the socket to refuse - the frames arrive, the window completes
+// and this branch is never reached. The shape that does fill a socket is the
+// one the probe measures: a synchronous burst of megabyte frames crosses a
+// 64 KiB limit within sixteen of them (probe/bun-api-facts.report.md,
+// backpressure-limit). Double that, so the refusal lands with the window still
+// running and the marker is attempted while the socket is still over.
+const PAD_BYTES = 1024 * 1024;
+const FRAMES = 32;
 
 let passed = 0, failed = 0;
 const failures = [];
@@ -128,6 +133,10 @@ try {
 	// The flush must have got far enough to be refused rather than dying on
 	// something else: the client should have received SOME of the gap-fill.
 	const delivered = texts.filter((t) => t.event === 'said' && t.data?.inWindow !== undefined).length;
+	// Recorded next to the assertion, because how far the flush got IS the
+	// margin the frame count buys: a run that lands near the end of the window
+	// is one kernel buffer away from never being refused at all.
+	console.log(`      (window: ${delivered} of ${FRAMES} frames reached the client)`);
 	check('the flush delivered part of the window before it was refused',
 		delivered > 0 && delivered < FRAMES, `delivered ${delivered} of ${FRAMES}`);
 } catch (err) {
