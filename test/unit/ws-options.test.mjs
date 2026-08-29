@@ -28,22 +28,21 @@ test('the bounds the README documents are the bounds an app gets', () => {
 	// deployment against the documented number would be sizing against a
 	// number the server no longer enforces.
 	//
-	// These are not the parity defaults above. This adapter deliberately caps
-	// where the family historically did not, so the numbers are its own.
+	// The per-connection bounds this adapter enforces are NOT here: uws declares
+	// no option for any of them, so they are constants in handler/ws-state.js
+	// and an app cannot set them from a config that has to travel between the
+	// two adapters.
 	const { options } = normalizeWsOptions(undefined);
-	assert.equal(options.maxSubscriptionsPerConnection, 10_000);
-	assert.equal(options.maxConcurrentSubscribeGates, 64);
-	assert.equal(options.maxConcurrentUnsubscribeHooks, 64);
-	assert.equal(options.maxQueuedUnsubscribeHooks, 1024);
-	assert.equal(options.maxControlEgressBytes, 4 * 1024 * 1024);
+	assert.equal(options.maxSubscriptionsPerConnection, undefined);
+	assert.equal(options.maxControlEgressBytes, undefined);
 	// The three defaults that decide what a client may reach. Each is
 	// documented as false, and each is a widening if it flips.
 	assert.equal(options.allowNonAsciiTopics, false);
 	assert.equal(options.allowSystemTopicSubscribe, false);
 	assert.equal(options.allowUnauthenticatedSubscribe, false);
-	// Echo policy rather than access control - whether a publisher is sent its
-	// own message - but documented as false and pinned for the same reason.
-	assert.equal(options.publishToSelf, false);
+	// Echo policy is not an option either: the native projection pins it, so a
+	// connection-level publish excludes its own socket the way uWS does.
+	assert.equal(options.publishToSelf, undefined);
 });
 
 test('the upgrade rate limit defaults to the uws figures', () => {

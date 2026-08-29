@@ -31,33 +31,10 @@ const DEFAULTS = {
 	sendPingsAutomatically: true,
 	compression: false,
 	allowedOrigins: 'same-origin',
-	publishToSelf: false,
 	// Both default to the restrictive answer: a topic namespace is easier to
 	// widen later than to claw back once clients depend on it.
 	allowNonAsciiTopics: false,
 	allowSystemTopicSubscribe: false,
-	// A real bound on what one connection can pin, not a formality. See
-	// handler/ws-state.js for why a cap high enough to never fire is worse than
-	// no cap at all.
-	maxSubscriptionsPerConnection: 10_000,
-	// Authorization gates one connection may have running at once. A SECOND
-	// bound, separate from the subscription cap: the cap counts distinct pending
-	// topics (so N concurrent subscribes to one topic cost 1, which is right for
-	// what can install) and that leaves concurrent APP WORK unbounded. The gate
-	// is where an app does its DB round-trip.
-	maxConcurrentSubscribeGates: 64,
-	// Unsubscribe hooks one connection may have running at once, and how many may
-	// WAIT behind them. A THIRD bound rather than a share of the gate counter,
-	// because the two lanes have different rights: a subscribe gate may be
-	// refused, an unsubscribe hook may only be deferred - dropping it leaks the
-	// plugin state the app releases in it. See utils/hook-queue.js.
-	maxConcurrentUnsubscribeHooks: 64,
-	maxQueuedUnsubscribeHooks: 1024,
-	// Control-frame bytes one connection may be sent per 10s window, after
-	// which it is closed. The ack channel is inherently amplifying - a client
-	// names a topic in a few bytes and is answered with a whole frame - and the
-	// acks cannot be collapsed without breaking the family client.
-	maxControlEgressBytes: 4 * 1024 * 1024,
 	// When no `subscribe` hook is exported, every topic is readable by every
 	// client. That has to be opted into rather than arrived at by omission.
 	allowUnauthenticatedSubscribe: false,
@@ -892,9 +869,6 @@ export function normalizeWsOptions(input) {
 	if (raw.sendPingsAutomatically !== undefined) {
 		options.sendPingsAutomatically = requireBoolean(raw.sendPingsAutomatically, 'sendPingsAutomatically');
 	}
-	if (raw.publishToSelf !== undefined) {
-		options.publishToSelf = requireBoolean(raw.publishToSelf, 'publishToSelf');
-	}
 	if (raw.allowNonAsciiTopics !== undefined) {
 		options.allowNonAsciiTopics = requireBoolean(raw.allowNonAsciiTopics, 'allowNonAsciiTopics');
 	}
@@ -993,36 +967,6 @@ export function normalizeWsOptions(input) {
 	}
 	if (raw.authPathRequireOrigin !== undefined) {
 		options.authPathRequireOrigin = requireBoolean(raw.authPathRequireOrigin, 'authPathRequireOrigin');
-	}
-	if (raw.maxSubscriptionsPerConnection !== undefined) {
-		options.maxSubscriptionsPerConnection = requirePositiveInt(
-			raw.maxSubscriptionsPerConnection,
-			'maxSubscriptionsPerConnection'
-		);
-	}
-	if (raw.maxConcurrentSubscribeGates !== undefined) {
-		options.maxConcurrentSubscribeGates = requirePositiveInt(
-			raw.maxConcurrentSubscribeGates,
-			'maxConcurrentSubscribeGates'
-		);
-	}
-	if (raw.maxConcurrentUnsubscribeHooks !== undefined) {
-		options.maxConcurrentUnsubscribeHooks = requirePositiveInt(
-			raw.maxConcurrentUnsubscribeHooks,
-			'maxConcurrentUnsubscribeHooks'
-		);
-	}
-	if (raw.maxQueuedUnsubscribeHooks !== undefined) {
-		options.maxQueuedUnsubscribeHooks = requirePositiveInt(
-			raw.maxQueuedUnsubscribeHooks,
-			'maxQueuedUnsubscribeHooks'
-		);
-	}
-	if (raw.maxControlEgressBytes !== undefined) {
-		options.maxControlEgressBytes = requirePositiveInt(
-			raw.maxControlEgressBytes,
-			'maxControlEgressBytes'
-		);
 	}
 	if (raw.compression !== undefined) {
 		const c = raw.compression;
@@ -1134,6 +1078,9 @@ export function toBunWebsocketOptions(options) {
 		// Rename only: uWS calls this sendPingsAutomatically.
 		sendPings: options.sendPingsAutomatically,
 		perMessageDeflate: options.compression,
-		publishToSelf: options.publishToSelf
+		// Pinned, not configurable: a connection-level publish excludes its own
+		// socket in uWS, and false is what makes Bun answer the same way. uws
+		// declares no option for it, so neither do we.
+		publishToSelf: false
 	};
 }

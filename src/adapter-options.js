@@ -26,7 +26,6 @@ export const KNOWN_ADAPTER_OPTIONS = [
 	'envPrefix',
 	'healthCheckPath',
 	'readinessCheckPath',
-	'staticCacheMaxFileSize',
 	'staticDotfiles',
 	'staticHeaders',
 	'websocket'

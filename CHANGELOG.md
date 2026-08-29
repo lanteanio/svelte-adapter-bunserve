@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **BREAKING** Seven option keys svelte-adapter-uws does not declare:
+  `websocket.publishToSelf`, `websocket.maxSubscriptionsPerConnection`,
+  `websocket.maxConcurrentSubscribeGates`,
+  `websocket.maxConcurrentUnsubscribeHooks`,
+  `websocket.maxQueuedUnsubscribeHooks`, `websocket.maxControlEgressBytes` and
+  the top-level `staticCacheMaxFileSize`. Every bound they set is unchanged and
+  now a constant at its former default, so behaviour is identical; what goes is
+  the ability to set them from a config that has to mean the same thing on both
+  adapters. `publishToSelf` is pinned to `false`, which is what makes a
+  connection-level publish exclude its own socket the way uWS does. A build
+  that still passes one of these keys warns about an unknown option rather than
+  failing.
+
 - **BREAKING** `platform.totalSubscriptions`, `platform.publishCount` and
   `platform.droppedReleaseRecords`. svelte-adapter-uws declares none of them:
   its platform carries `metrics` and `metricsSnapshot()` and reports counters

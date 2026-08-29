@@ -452,7 +452,6 @@ adapter: bunserve({
 	envPrefix: '',                   // prefix for the runtime env vars this adapter reads
 	healthCheckPath: '/healthz',     // liveness probe; false disables it
 	readinessCheckPath: '/readyz',   // readiness probe; 503 once a drain begins. false disables it
-	staticCacheMaxFileSize: 4194304, // files above this are served from disk with Bun.file
 	staticDotfiles: false,           // see Static files
 	staticHeaders: undefined,        // extra response headers for static and prerendered files
 	websocket: undefined             // the realtime endpoint; see below
@@ -467,9 +466,10 @@ instead. Neither may collide with `websocket.path` or `websocket.authPath`: the
 probe routes are matched first, so the endpoint behind the collision would never
 be reached, and that fails the build rather than going quiet.
 
-`staticCacheMaxFileSize` is a positive integer byte count. Files at or below it
-are held in the in-memory static index; larger ones are streamed from disk
-through `Bun.file`, which uses the kernel's own send path.
+Files at or below 4 MiB are held in the in-memory static index; larger ones are
+streamed from disk through `Bun.file`, which uses the kernel's own send path.
+The threshold is fixed rather than an option, because the adapter this one
+mirrors declares none.
 
 `staticHeaders` is an object of string header values applied to static and
 prerendered responses, merged once while the index is built rather than per
@@ -501,15 +501,9 @@ adapter: bunserve({
 		sendPingsAutomatically: true,
 		compression: false,                 // true, or { compress, decompress }
 		allowedOrigins: 'same-origin',      // 'any' | '*' | ['https://app.example']
-		publishToSelf: false,
 		allowNonAsciiTopics: false,
 		allowSystemTopicSubscribe: false,
 		allowUnauthenticatedSubscribe: false,
-		maxSubscriptionsPerConnection: 10_000,
-		maxConcurrentSubscribeGates: 64,
-		maxConcurrentUnsubscribeHooks: 64,
-		maxQueuedUnsubscribeHooks: 1024,
-		maxControlEgressBytes: 4 * 1024 * 1024,
 		upgradeRateLimit: 10,               // upgrades per client address per window; 0 disables
 		upgradeRateLimitWindow: 10,         // that window, in seconds
 		upgradeTimeout: 10,                 // seconds the `upgrade` hook may take; 0 waits forever
@@ -552,8 +546,10 @@ adapter: bunserve({
 })
 ```
 
-The last five are per-connection bounds this adapter enforces itself, and they
-are different jobs rather than different sizes of the same one:
+This adapter also enforces five per-connection bounds that are not options -
+the adapter it mirrors declares none of them, so they are fixed constants and a
+config carried between the two means the same thing in both. They are different
+jobs rather than different sizes of the same one:
 
 - `maxSubscriptionsPerConnection` bounds what can INSTALL. It counts installed
   plus DISTINCT pending topics, because N concurrent subscribes to one topic can

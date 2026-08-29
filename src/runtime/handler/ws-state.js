@@ -491,11 +491,11 @@ export function resetDraining() {
  * subscribe-batch lets a client add hundreds per frame - so a cap set high
  * enough to never fire (the family's historical 1,000,000) bounds nothing and
  * leaves single-connection memory exhaustion available to any unauthenticated
- * client. Apps that legitimately need more raise it explicitly, which is also a
- * prompt to think about whether per-connection fan-in is the right design.
+ * client. Fixed rather than configurable, because the adapter this one mirrors
+ * declares no option for it; a design needing more per-connection fan-in is the
+ * thing to revisit.
  */
-export const MAX_SUBSCRIPTIONS_PER_CONNECTION =
-	ws_options?.maxSubscriptionsPerConnection ?? 10_000;
+export const MAX_SUBSCRIPTIONS_PER_CONNECTION = 10_000;
 
 /**
  * Topics whose per-topic seq state is retained - the cap on `topicSeqs` and on
@@ -907,7 +907,7 @@ const EMPTY_SUBSCRIPTIONS = new Set();
  * part that makes it mean anything: a gate is counted for as long as it is
  * SUSPENDED, not just while it is being called.
  */
-const MAX_CONCURRENT_GATES = ws_options?.maxConcurrentSubscribeGates ?? 64;
+const MAX_CONCURRENT_GATES = 64;
 
 /** Per-connection count of gates currently running. */
 const WS_GATES = Symbol('inflightGates');
@@ -930,7 +930,7 @@ const WS_GATES = Symbol('inflightGates');
  * gate may be REFUSED (the client is told, and its own frame caused it), while
  * an unsubscribe hook may only be DEFERRED - see utils/hook-queue.js.
  */
-const MAX_CONCURRENT_UNSUBSCRIBE_HOOKS = ws_options?.maxConcurrentUnsubscribeHooks ?? 64;
+const MAX_CONCURRENT_UNSUBSCRIBE_HOOKS = 64;
 
 /**
  * The queue is what makes deferral safe rather than unbounded. Each waiting
@@ -939,7 +939,7 @@ const MAX_CONCURRENT_UNSUBSCRIBE_HOOKS = ws_options?.maxConcurrentUnsubscribeHoo
  * worst, against an unbounded number of concurrent database round-trips without
  * it.
  */
-const MAX_QUEUED_UNSUBSCRIBE_HOOKS = ws_options?.maxQueuedUnsubscribeHooks ?? 1024;
+const MAX_QUEUED_UNSUBSCRIBE_HOOKS = 1024;
 
 const WS_UNSUB_QUEUE = Symbol('unsubscribeHookQueue');
 
@@ -1122,7 +1122,7 @@ export function clearPendingReleases(ud) {
  * reconnect. So the CHANNEL is bounded instead of the protocol. Generous by
  * design: a reconnect resubscribing a thousand topics spends roughly 60KB.
  */
-export const MAX_CONTROL_EGRESS_BYTES = ws_options?.maxControlEgressBytes ?? 4 * 1024 * 1024;
+export const MAX_CONTROL_EGRESS_BYTES = 4 * 1024 * 1024;
 
 /** Window over which the budget above is measured. */
 const CONTROL_EGRESS_WINDOW_MS = 10_000;

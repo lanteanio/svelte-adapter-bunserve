@@ -94,7 +94,6 @@ test('a BigInt is refused by the option it names, not by the message builder', (
 	// wrote precisely BECAUSE they meant a large integer. The value that is
 	// hardest to render is the one most likely to be written here.
 	const cases = [
-		['staticCacheMaxFileSize', /positive integer byte count/],
 		['readinessCheckPath', /absolute path string/],
 		['healthCheckPath', /absolute path string/],
 		['precompress', /must be true or false/],
@@ -150,10 +149,10 @@ test('a value that fails every renderer is still refused by the option it names'
 	revoke();
 	for (const value of [twoRenderersDeep, revoked]) {
 		assert.throws(
-			() => adapter({ staticCacheMaxFileSize: value }),
+			() => adapter({ healthCheckPath: value }),
 			(err) => {
-				assert.match(err.message, /staticCacheMaxFileSize/, 'the message names the option');
-				assert.match(err.message, /positive integer byte count/, 'and what it accepts');
+				assert.match(err.message, /healthCheckPath/, 'the message names the option');
+				assert.match(err.message, /absolute path string/, 'and what it accepts');
 				assert.doesNotMatch(err.message, /tag getter|enumerable getter/, 'a throwing getter does not become the message');
 				assert.doesNotMatch(err.message, /revoked/i, 'nor does the proxy machinery');
 				return true;
@@ -169,9 +168,9 @@ test('an ordinary Symbol.toStringTag still renders, through the tag it declares'
 	const config = { [Symbol.toStringTag]: 'Config' };
 	config.self = config;
 	assert.throws(
-		() => adapter({ staticCacheMaxFileSize: config }),
+		() => adapter({ healthCheckPath: config }),
 		(err) => {
-			assert.match(err.message, /staticCacheMaxFileSize/);
+			assert.match(err.message, /healthCheckPath/);
 			assert.match(err.message, /\[object Config\]/, 'the tag the value declares is the rendering');
 			return true;
 		}
@@ -295,7 +294,6 @@ test('a CALLABLE value that refuses to be read is refused by name, everywhere', 
 		['envPrefix', (v) => ({ envPrefix: v })],
 		['healthCheckPath', (v) => ({ healthCheckPath: v })],
 		['readinessCheckPath', (v) => ({ readinessCheckPath: v })],
-		['staticCacheMaxFileSize', (v) => ({ staticCacheMaxFileSize: v })],
 		['staticDotfiles', (v) => ({ staticDotfiles: v })],
 		['staticHeaders', (v) => ({ staticHeaders: v })],
 		["staticHeaders['x-a']", (v) => ({ staticHeaders: { 'x-a': v } })],

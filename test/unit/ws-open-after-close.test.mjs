@@ -17,17 +17,19 @@ import assert from 'node:assert/strict';
 
 globalThis.ENV_PREFIX = '';
 globalThis.WS_PATH = '/ws';
-// One byte of control egress, which the welcome frame cannot fit in.
+// The budget is a fixed constant, so the test spends it rather than shrinking
+// it: a connection charged its whole window has nothing left for the welcome
+// frame, which is the state this exercises.
 globalThis.WS_OPTIONS = {
 	allowedOrigins: 'any',
 	path: '/ws',
-	handler: 'src/ws-handler.js',
-	maxControlEgressBytes: 1
+	handler: 'src/ws-handler.js'
 };
 
 
 const { websocketHandlers } = await import('../../src/runtime/handler/ws.js');
-const { wsConnections } = await import('../../src/runtime/handler/ws-state.js');
+const { MAX_CONTROL_EGRESS_BYTES, chargeControlEgress, wsConnections } =
+	await import('../../src/runtime/handler/ws-state.js');
 const { __setHooks } = await import('../helpers/ws-handler-stub.mjs');
 
 /** The minimum of Bun's ServerWebSocket the open and close paths touch. */
@@ -70,6 +72,11 @@ test('an open hook is not called for a connection the welcome frame already clos
 	});
 	try {
 		const raw = rawSocket();
+		// Spend the window before the handler runs, so the welcome frame is the
+		// send that finds nothing left.
+		// The budget lives on userData, which the runtime reaches through its
+		// facade; the stub is the raw socket, so hand the charge the same object.
+		chargeControlEgress({ getUserData: () => raw.data }, MAX_CONTROL_EGRESS_BYTES);
 		websocketHandlers.open(raw);
 
 		assert.equal(raw.closedWith?.code, 4429, 'the welcome frame was refused and cut the socket');

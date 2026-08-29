@@ -89,7 +89,8 @@ const ADAPTER_OPTION_GAPS = {
 
 /** Top-level adapter options this adapter accepts that uws does not declare. */
 const ADAPTER_OPTION_EXTRAS = {
-	staticCacheMaxFileSize: 'drift: no equivalent in the pinned uws release'
+	// Empty, and it stays empty: an option only this adapter accepts cannot
+	// travel back to the one it mirrors.
 };
 
 /** `websocket.*` keys uws declares and this adapter does not accept. */
@@ -170,13 +171,11 @@ const EXPORT_EXTRAS = {};
 
 /** `websocket.*` keys this adapter accepts that uws does not declare. */
 const WS_OPTION_EXTRAS = {
-	allowUnauthenticatedSubscribe: 'drift: uws gates this differently',
-	publishToSelf: 'drift: no uws equivalent',
-	maxSubscriptionsPerConnection: 'drift: no uws equivalent',
-	maxControlEgressBytes: 'drift: no uws equivalent',
-	maxConcurrentSubscribeGates: 'drift: no uws equivalent',
-	maxConcurrentUnsubscribeHooks: 'drift: no uws equivalent',
-	maxQueuedUnsubscribeHooks: 'drift: no uws equivalent'
+	// The bounds that used to sit here are internal constants now, at the same
+	// values. This one is the last: uws decides the no-hook subscribe case
+	// through `authorizeWireSubscribe`, which this adapter does not have yet, so
+	// the key stays until that gap closes and takes the stand-in with it.
+	allowUnauthenticatedSubscribe: 'stand-in for the authorizeWireSubscribe gap'
 };
 
 /**

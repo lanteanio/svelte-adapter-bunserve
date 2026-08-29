@@ -23,8 +23,9 @@ const SIM_LANE_FILES = new Set([
 
 // Files larger than this stay out of the in-memory static cache and are
 // served from disk via Bun.file (kernel sendfile). See the runtime's
-// static-assets module; overridable via the `staticCacheMaxFileSize` option.
-const DEFAULT_STATIC_CACHE_MAX_FILE_SIZE = 4 * 1024 * 1024;
+// static-assets module. Fixed: the adapter this one mirrors declares no
+// option for it, and an app that set one here could not carry its config back.
+const STATIC_CACHE_MAX_FILE_SIZE = 4 * 1024 * 1024;
 
 /** @type {import('./index.js').default} */
 export default function (opts = {}) {
@@ -66,7 +67,6 @@ export default function (opts = {}) {
 		envPrefix = '',
 		healthCheckPath = '/healthz',
 		readinessCheckPath = '/readyz',
-		staticCacheMaxFileSize = DEFAULT_STATIC_CACHE_MAX_FILE_SIZE,
 		staticDotfiles = false,
 		websocket
 	} = opts;
@@ -127,14 +127,6 @@ export default function (opts = {}) {
 				`liveness and readiness are distinct probes (a readiness 503 during drain must not trip a liveness restart).`
 			);
 		}
-	}
-
-	if (!Number.isInteger(staticCacheMaxFileSize) || staticCacheMaxFileSize <= 0) {
-		throw new Error(
-			`staticCacheMaxFileSize must be a positive integer byte count ` +
-			`(files larger than this are served from disk via Bun.file instead of the in-memory cache) - ` +
-			`got ${describeValue(staticCacheMaxFileSize)}.`
-		);
 	}
 
 	// Validate `staticHeaders` eagerly so a misshaped value fails before any
@@ -377,7 +369,7 @@ export default function (opts = {}) {
 					HEALTH_CHECK_PATH: JSON.stringify(healthCheckPath),
 					READINESS_CHECK_PATH: JSON.stringify(readinessCheckPath),
 					STATIC_HEADERS: JSON.stringify(staticHeadersResult.headers),
-					STATIC_CACHE_MAX: JSON.stringify(staticCacheMaxFileSize),
+					STATIC_CACHE_MAX: JSON.stringify(STATIC_CACHE_MAX_FILE_SIZE),
 					STATIC_DOTFILES: JSON.stringify(staticDotfiles),
 					HTTP_OPTIONS: JSON.stringify({
 						compressCredentialedResponses: compressCredentialedResponses === true

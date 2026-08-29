@@ -183,8 +183,7 @@ function warnUnsubscribeOverflow() {
 	console.warn(
 		`[ws] a connection queued more unsubscribe hooks than it may hold and was closed${suffix}. ` +
 		'Its close hook still runs with the full subscription set, so the app can release ' +
-		'everything there. Raise `websocket: { maxConcurrentUnsubscribeHooks }` if the hook is ' +
-		'legitimately slow, or make it cheaper.'
+		'everything there. A hook this slow is the thing to make cheaper - the bound is fixed.'
 	);
 }
 
