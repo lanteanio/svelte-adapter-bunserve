@@ -1378,3 +1378,86 @@ test('a nullish wire falls back to a plain publish rather than crashing', () => 
 		assert.equal(JSON.parse(server.published[0].payload).topic, 'room');
 	});
 });
+
+// A CALL-LEVEL EXCLUSION, WHICH ONLY ONE LANE USED TO HONOUR. The stateless
+// reroute forwards the call options to publishWire per entry, which reads
+// excludeWs; the stateful lane read the per-entry field alone. So the same call
+// excluded the author through a stateless codec and delivered to it through a
+// stateful one - and adding `state` to a codec is the documented way to opt
+// into batch framing, so an app could lose its exclusion by upgrading a codec
+// it had already got working, with no error and no log.
+
+test('a call-level excludeWs withholds the whole batch on the stateful lane', () => {
+	setServer(fakeServer());
+	const author = fakeWs({ topics: ['room'] });
+	const other = fakeWs({ topics: ['room'] });
+	const wire = {
+		capability: CAP,
+		schemaVersion: 3,
+		encode: () => new Uint8Array([1]),
+		state: { onAttach: () => ({}) }
+	};
+	withConnections([author, other], () => {
+		platform.publishWireBatch(
+			'room',
+			'moved',
+			[{ data: { x: 1 } }, { data: { x: 2 } }],
+			wire,
+			{ excludeWs: author }
+		);
+		assert.equal(author.sent.length, 0, 'every entry withheld');
+		assert.equal(other.sent.length, 2);
+	});
+});
+
+test('the stateless lane answers the identical call identically', () => {
+	setServer(fakeServer());
+	const author = fakeWs({ topics: ['room'] });
+	const other = fakeWs({ topics: ['room'] });
+	withConnections([author, other], () => {
+		platform.publishWireBatch(
+			'room',
+			'moved',
+			[{ data: { x: 1 } }, { data: { x: 2 } }],
+			statelessCodec(),
+			{ excludeWs: author }
+		);
+		assert.equal(author.sent.length, 0, 'the two lanes agree now');
+		assert.equal(other.sent.length, 2);
+	});
+});
+
+test('an entry excludeWs overrides the call-level one, null included', () => {
+	setServer(fakeServer());
+	const author = fakeWs({ topics: ['room'] });
+	const other = fakeWs({ topics: ['room'] });
+	const wire = {
+		capability: CAP,
+		schemaVersion: 3,
+		encode: () => new Uint8Array([1]),
+		state: { onAttach: () => ({}) }
+	};
+	withConnections([author, other], () => {
+		platform.publishWireBatch(
+			'room',
+			'moved',
+			[
+				{ data: { x: 1 } },
+				{ data: { x: 2 }, excludeWs: null },
+				{ data: { x: 3 }, excludeWs: other }
+			],
+			wire,
+			{ excludeWs: author }
+		);
+		// Entry 2 opts the author back in; entry 3 names someone else, which
+		// replaces the call-level exclusion rather than adding to it.
+		assert.deepEqual(
+			author.sent.map((s) => JSON.parse(s.payload).data),
+			[{ x: 2 }, { x: 3 }]
+		);
+		assert.deepEqual(
+			other.sent.map((s) => JSON.parse(s.payload).data),
+			[{ x: 1 }, { x: 2 }]
+		);
+	});
+});

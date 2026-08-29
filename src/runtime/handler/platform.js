@@ -1186,6 +1186,13 @@ export const platform = {
 	 * may carry its own `excludeWs` (per-entry author suppression); an entry
 	 * is withheld from its excluded socket on every delivery path.
 	 *
+	 * A call-level `{ excludeWs }` withholds the WHOLE batch from that socket,
+	 * on this lane and on the stateless reroute alike. An entry that names its
+	 * own overrides it for that entry, `null` included - which is how a single
+	 * entry opts back in to a batch the rest of which the socket is excluded
+	 * from. Unlike a call-level seq, one exclusion IS one-per-entry: it says
+	 * the same thing about every entry, so it is honoured rather than refused.
+	 *
 	 * Sequencing and accounting match N publishWire calls exactly: one seq
 	 * per entry. The binary batch frame's header seq slot carries the
 	 * subset's LAST entry seq (batch consumers order by the codec's own
@@ -1223,9 +1230,11 @@ export const platform = {
 	 *   form is looked up as `<event>-batch` with `{ updates }` data.
 	 * @param {Array<{ data: any, excludeWs?: any, seq?: number }>} entries
 	 * @param {{ capability: string, schemaVersion: number, encode: Function, state?: any }} wire
-	 * @param {{ seq?: boolean, compress?: boolean }} [options] - the counter is
-	 *   the default, here as everywhere: absent options stamp one per entry,
-	 *   `false` stamps none, and a number is the refused batch-level form.
+	 * @param {{ seq?: boolean, compress?: boolean, excludeWs?: any }} [options] -
+	 *   the counter is the default, here as everywhere: absent options stamp one
+	 *   per entry, `false` stamps none, and a number is the refused batch-level
+	 *   form. `excludeWs` withholds every entry from that socket unless the
+	 *   entry names its own.
 	 * @returns {boolean}
 	 * @throws {TypeError} on a batch-level explicit seq, or an entry seq the
 	 *   wire cannot carry
@@ -1284,11 +1293,22 @@ export const platform = {
 		const n = entries.length;
 		{
 			const records = new Array(n);
+			// The call-level exclusion, read once with the other options above.
+			// An entry that names its own overrides it - including with null,
+			// which is how one entry opts back IN to a batch-wide exclusion -
+			// and an entry that says nothing inherits it. The stateful lane used
+			// to read the per-entry field alone, so the same call excluded the
+			// socket through a stateless codec and delivered to it through a
+			// stateful one: the author got its own update back, in a frame it
+			// could not tell apart, on an upgrade that changed no publish code.
+			const optionExclude = options ? options.excludeWs : undefined;
 			for (let i = 0; i < n; i++) {
 				const e = entries[i];
+				const ownExclude = e.excludeWs !== undefined;
 				records[i] = {
 					data: e.data,
-					excludeWs: e.excludeWs,
+					excludeWs: ownExclude ? e.excludeWs : optionExclude,
+					ownExclude,
 					// An entry seq is a number or it is not this entry's to decide:
 					// absent and null both defer to the batch's own option, which
 					// is what a nullable authority column reads as per row. A
@@ -1348,7 +1368,10 @@ export const platform = {
 				// Allocate a per-entry options object only when the entry
 				// actually overrides something, as the exclude-only form did.
 				let per = options;
-				if (entry.excludeWs !== undefined || entry.seq !== undefined) {
+				// ownExclude, not the effective value: an entry that inherited
+				// the call-level exclusion already gets it from `options`, so the
+				// per-entry object is allocated only for a real override.
+				if (entry.ownExclude || entry.seq !== undefined) {
 					per = { ...(options || {}) };
 					if (entry.excludeWs !== undefined) per.excludeWs = entry.excludeWs;
 					if (entry.seq !== undefined) per.seq = entry.seq;

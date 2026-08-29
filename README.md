@@ -1041,6 +1041,13 @@ a batch with no seq option, or with `{ seq: true }`, does. The call is
 refused even when the batch is empty, because the seq is a property of the
 call rather than of that tick's data.
 
+A call-level `{ excludeWs }` withholds every entry from that socket, on the
+stateful lane and on the stateless reroute alike. An entry that names its own
+overrides it for that entry - `null` included, which is how one entry opts a
+socket back in to a batch it is otherwise excluded from. One exclusion says the
+same thing about every entry, which is why it is honoured here where a
+call-level seq is refused.
+
 An ENTRY seq is a number or it is absent: `null` defers to whatever the batch
 options ask for, which is what a per-row authority column reads as when the
 row has none, and anything else is refused naming the entry's position. The

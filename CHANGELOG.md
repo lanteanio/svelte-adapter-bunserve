@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `publishWireBatch` honours a call-level `{ excludeWs }` on the stateful lane,
+  which read the per-entry field alone and so delivered every entry to the
+  socket the caller asked to exclude. The stateless reroute always honoured it,
+  so the same call behaved differently on either side of a codec gaining
+  `state` - the documented way to opt into batch framing - and what the author
+  got back was its own update, in a frame a stateful codec gives it no way to
+  tell apart. An entry that names its own `excludeWs` still overrides the
+  call-level one, `null` included, which opts that entry back in.
+
 ### Changed
 
 - **BREAKING** A `seq` option that is not a number, a boolean or `null` is now
