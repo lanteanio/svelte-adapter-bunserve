@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING** A `seq` option that is not a number, a boolean or `null` is now
+  refused with a `TypeError` naming the four spellings, on `publish`,
+  `publishWire` and `publishWireBatch` alike. It used to fall through to the
+  local counter, which is the one answer that is always wrong for it: a seq
+  arriving as a string - from a JSON column, a Redis reply, a header, a form
+  field - was MEANT as the cluster-authoritative value, and stamping a counter
+  for it publishes a value from a different sequence space, leaves the topic
+  unmarked and silently degrades the client's resume dedup. `{ seq: null }`
+  now publishes without a seq, the way `{ seq: false }` does, since a nullable
+  authority column reads as "no seq I know of" rather than as a request for the
+  counter. In `publishWireBatch`, an entry seq of `null` defers to the batch's
+  own option and any other non-number entry seq is refused naming the entry's
+  position.
+
 ## [0.0.3] - 2026-08-28
 
 Still pre-alpha, and the public contract is still not stable. Message admission

@@ -941,9 +941,10 @@ re-delivers.
 with no options draws the per-topic counter, exactly as `{ seq: true }` does,
 and svelte-adapter-uws answers the same call the same way - the two adapters
 are drop-in replacements, so the same app has to put the same bytes on the
-wire under both. `{ seq: false }` is the one spelling that publishes without:
-the envelope then omits the field entirely, and the opt-out consumes no
-counter value, so the run continues where it left off.
+wire under both. `{ seq: false }` and `{ seq: null }` are the spellings that
+publish without: the envelope then omits the field entirely, and the opt-out
+consumes no counter value, so the run continues where it left off. `null` is
+there for the nullable authority column that reads as "no seq I know of".
 
 A counter seq is not a MARK: it is a process-local space, it never writes
 a value into the authoritative marks above, and only an explicit numeric
@@ -985,12 +986,16 @@ its own first eviction:
   there is no publish-side opt-out here: scoping the topics that carry
   explicit seqs is the only lever.
 
-One publish therefore WRITES A SEQ into at most one of the two maps, and there
-are only two guards deciding which: an explicit number goes to the marks,
-`{ seq: false }` writes nothing anywhere, and everything else - a bare publish,
-`{}`, `{ seq: true }` - draws the counter. Not a list of five shapes but two
-tests, which is why a `{ seq: '5' }` that was meant as a cluster seq draws the
-counter rather than being refused.
+One publish therefore WRITES A SEQ into at most one of the two maps: an
+explicit number goes to the marks, `{ seq: false }` and `{ seq: null }` write
+nothing anywhere, and a bare publish, `{}` or `{ seq: true }` draws the
+counter. Those four spellings are the whole option - anything else THROWS,
+naming them. A `{ seq: '742' }` that was meant as a cluster seq is the case
+that rule exists for: a seq arrives as a string from JSON, a Redis reply, a
+header or a form field often enough that the counter would answer it silently,
+publishing a value from a different sequence space, leaving the topic unmarked
+and costing the client its resume dedup with nothing on the wire to notice by.
+Convert at the boundary with `Number()`.
 
 The maps still overlap: a topic published both ways is in both, and the
 recency touch described above means "writes no seq into a map" is not the same
@@ -1035,6 +1040,13 @@ seq to the local counter, which already increments per entry - that is what
 a batch with no seq option, or with `{ seq: true }`, does. The call is
 refused even when the batch is empty, because the seq is a property of the
 call rather than of that tick's data.
+
+An ENTRY seq is a number or it is absent: `null` defers to whatever the batch
+options ask for, which is what a per-row authority column reads as when the
+row has none, and anything else is refused naming the entry's position. The
+batch-level option follows the same four spellings as every other publish
+lane, so a `{ seq: '742' }` there is refused before the first entry is
+stamped rather than drawing the counter for all of them.
 
 Only explicit-seq frames are measured against the boundary at all. A counter
 frame - the default, and equally `{ seq: true }` - draws from this process's

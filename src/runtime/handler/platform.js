@@ -169,6 +169,45 @@ function wireJsonSend(ws, topic, event, data, compress) {
  * @returns {never}
  * @throws {TypeError} always
  */
+/**
+ * Refuse a batch-level `seq` that is not a seq option at all, with the message
+ * every other lane gives for the same value. publishWireBatch reads the option
+ * once and stamps per entry, so without this the refusal would land on the
+ * first counter-lane entry with earlier entries already recorded.
+ *
+ * @param {unknown} seqOption
+ * @param {string} topic
+ */
+function assertSeqOption(seqOption, topic) {
+	if (seqOption === undefined || seqOption === null) return;
+	if (typeof seqOption === 'boolean' || typeof seqOption === 'number') return;
+	stampSeqValue(seqOption, topic);
+}
+
+/**
+ * The seq an entry carries in its own right: a validated number, or undefined
+ * when the entry defers to the batch. Absent and null defer - a per-row
+ * authority column that is null means this row has no cluster seq, not that the
+ * batch was called wrong. Anything else is refused by position, because an
+ * entry that says `seq: true` or `seq: '42'` was trying to say something about
+ * this entry and the counter would answer with a value from another space.
+ *
+ * @param {unknown} seq
+ * @param {string} topic
+ * @param {number} index
+ * @returns {number | undefined}
+ */
+function entrySeq(seq, topic, index) {
+	if (seq === undefined || seq === null) return undefined;
+	if (typeof seq === 'number') return stampExplicitSeq(seq, topic);
+	throw new TypeError(
+		`publishWireBatch entry ${index} carries a seq that is not a number ` +
+		`(${typeof seq === 'string' ? JSON.stringify(seq) : String(seq)}, topic "${topic}"). An ` +
+		'entry seq is the cluster-authoritative value for that entry and must be an integer ' +
+		'>= 1; leave it out (or pass null) to take the seq the batch options ask for.'
+	);
+}
+
 function throwBatchExplicitSeq(topic, seq) {
 	throw new TypeError(
 		`publishWireBatch was given a batch-level { seq: ${String(seq)} } (topic "${topic}"): one ` +
@@ -1213,6 +1252,10 @@ export const platform = {
 		// and surfaces later under load, which is what fail-fast exists to
 		// prevent.
 		if (options && typeof options.seq === 'number') throwBatchExplicitSeq(topic, options.seq);
+		// And the same fail-fast for a batch-level seq that is not a seq option
+		// at all. Refused here rather than on the first entry that reaches the
+		// counter lane, so a batch is whole or nothing in this direction too.
+		if (options) assertSeqOption(options.seq, topic);
 		if (!Array.isArray(entries) || entries.length === 0) return false;
 		// Every per-entry seq is checked AND CAPTURED before anything is
 		// stamped or sent. stampExplicitSeq throws on a seq the wire cannot
@@ -1246,7 +1289,12 @@ export const platform = {
 				records[i] = {
 					data: e.data,
 					excludeWs: e.excludeWs,
-					seq: typeof e.seq === 'number' ? stampExplicitSeq(e.seq, topic) : undefined
+					// An entry seq is a number or it is not this entry's to decide:
+					// absent and null both defer to the batch's own option, which
+					// is what a nullable authority column reads as per row. A
+					// string or a boolean is refused rather than quietly deferred,
+					// because both were meant to say something about THIS entry.
+					seq: entrySeq(e.seq, topic, i)
 				};
 			}
 			entries = records;

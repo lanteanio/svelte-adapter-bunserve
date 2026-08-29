@@ -1236,6 +1236,28 @@ export function tombstonePendingSubscribe(ud, topic) {
  * @returns {number}
  * @throws {TypeError} when the seq cannot be represented on both wires
  */
+/**
+ * Refuse a `seq` option that is none of the four spellings the lanes accept.
+ * Named separately from stampExplicitSeq because the two say different things:
+ * that one is about a number the wire cannot carry, this one about a value that
+ * was never a seq option at all.
+ *
+ * @param {unknown} seqOption
+ * @param {string} topic
+ * @returns {never}
+ * @throws {TypeError} always
+ */
+function throwSeqOption(seqOption, topic) {
+	throw new TypeError(
+		`publish seq must be a number, true, false or null, received ${typeof seqOption === 'string' ? JSON.stringify(seqOption) : String(seqOption)} ` +
+		`(topic "${topic}"). A number is a cluster-authoritative seq, true draws the local ` +
+		'counter (as an absent option does), and false or null publish without a seq. A seq that ' +
+		'arrives as a string - from JSON, a Redis reply, a header, a form field - is the case this ' +
+		'refuses: drawing the counter for it would publish a value from a different sequence ' +
+		'space and leave the topic unmarked, so convert it with Number() at the boundary.'
+	);
+}
+
 export function stampExplicitSeq(seq, topic) {
 	if (isValidPublishSeq(seq)) return seq;
 	throw new TypeError(
@@ -1254,7 +1276,7 @@ export function stampExplicitSeq(seq, topic) {
  * cluster-authoritative value, taken as given once it is one the wire can
  * carry; absent options and `{ seq: true }` alike draw from the local counter.
  *
- * @param {{ seq?: boolean | number } | undefined} options
+ * @param {{ seq?: unknown } | undefined} options
  * @param {string} topic
  * @returns {number | null}
  */
@@ -1269,7 +1291,7 @@ export function stampSeq(options, topic) {
  * value stamped here is by construction the value recorded there, whatever a
  * payload's toJSON does to the caller's options in between.
  *
- * @param {boolean | number | undefined} seqOption - the one read of `options.seq`
+ * @param {unknown} seqOption - the one read of `options.seq`
  * @param {string} topic
  * @returns {number | null}
  */
@@ -1280,8 +1302,16 @@ export function stampSeqValue(seqOption, topic) {
 	// seq-less envelope here made the same app emit different bytes on the
 	// two adapters, silently, on the call every app makes. `false` keeps
 	// meaning "no seq": that is the spelling an app uses to say so.
-	if (seqOption === false) return null;
+	if (seqOption === false || seqOption === null) return null;
 	if (typeof seqOption === 'number') return stampExplicitSeq(seqOption, topic);
+	// Everything that is not one of the four legal spellings is a bug in the
+	// calling app, and the counter is the worst possible place to put it: a
+	// `{ seq: '742' }` read off a JSON column or a Redis reply was MEANT as the
+	// cluster seq, and drawing the counter for it publishes a value from a
+	// different sequence space, leaves the topic unmarked, and degrades resume
+	// dedup to nothing with no signal at all. The same misuse already throws
+	// when the number is one the wire cannot carry.
+	if (seqOption !== undefined && seqOption !== true) throwSeqOption(seqOption, topic);
 	const current = topicSeqs.get(topic);
 	if (current !== undefined) {
 		// The stamp of an existing topic is the hottest primitive in the

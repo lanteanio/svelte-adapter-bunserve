@@ -1430,3 +1430,57 @@ test('maxAuthoritativeSeq is bounded so unique-topic publishes do not leak', () 
 	topicSeqs.clear();
 	maxAuthoritativeSeq.clear();
 });
+
+test('a batch-level seq that is not a seq option is refused before any entry', () => {
+	// The counter is what a string used to reach, per entry, on a call whose
+	// whole point was one authoritative seq each. Refused up front so the batch
+	// is whole or nothing in this direction too, exactly as the numeric
+	// batch-level form is.
+	setServer({ publish: () => 0, subscriberCount: () => 0 });
+	const ws = collectingWs();
+	const cap = beginResumeCapture(['room'], ws);
+	const entries = [{ data: { x: 1 } }, { data: { x: 2 } }];
+	assert.throws(
+		() => platform.publishWireBatch('room', 'moved', entries, statefulCodec(), { seq: '1234' }),
+		(err) => err instanceof TypeError && err.message.includes('publish seq must be a number'),
+		'threw naming the legal spellings'
+	);
+	flushResumeTopic(cap, 'room', 0);
+	assert.deepEqual(ws.sent, [], 'and nothing was published on the way out');
+	maxAuthoritativeSeq.clear();
+});
+
+test('an entry seq that is not a number is refused by position', () => {
+	setServer({ publish: () => 0, subscriberCount: () => 0 });
+	const entries = [{ data: { x: 1 } }, { data: { x: 2 }, seq: '9' }];
+	assert.throws(
+		() => platform.publishWireBatch('room', 'moved', entries, statefulCodec()),
+		(err) => err instanceof TypeError && err.message.includes('entry 1'),
+		'named the entry that carried it'
+	);
+	maxAuthoritativeSeq.clear();
+});
+
+test('an entry seq of null defers to the batch, the way an absent one does', () => {
+	// What a nullable authority column reads as, per row: this row has no
+	// cluster seq of its own, not that the call was written wrong.
+	setServer({ publish: () => 0, subscriberCount: () => 0 });
+	const ws = collectingWs();
+	const cap = beginResumeCapture(['room'], ws);
+	platform.publishWireBatch(
+		'room',
+		'moved',
+		[{ data: { x: 1 }, seq: null }, { data: { x: 2 } }],
+		statefulCodec()
+	);
+	flushResumeTopic(cap, 'room', 0);
+	assert.equal(ws.sent.length, 2, 'both entries went out');
+	assert.ok(ws.sent[0].includes('"seq":1'), 'drawing the counter, as the batch asked');
+	assert.ok(ws.sent[1].includes('"seq":2'));
+	assert.equal(
+		maxAuthoritativeSeq.get('room'),
+		undefined,
+		'and a counter seq marks nothing'
+	);
+	maxAuthoritativeSeq.clear();
+});

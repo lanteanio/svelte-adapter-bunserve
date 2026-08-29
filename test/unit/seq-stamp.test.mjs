@@ -448,3 +448,70 @@ test('platform.publish with an explicit seq marks the topic authoritative', () =
 		reset();
 	}
 });
+
+// A SEQ THAT IS NOT ONE OF THE FOUR SPELLINGS. The rows above are what an app
+// means to write; these are what it writes by accident, and they used to reach
+// the counter lane through the same fallthrough that serves `{ seq: true }`.
+// The counter is the one answer that is always wrong here: a '742' read off a
+// JSON column was MEANT as the cluster seq, so drawing a local counter for it
+// publishes a value from another sequence space, leaves the topic unmarked, and
+// costs the client its resume dedup with nothing on the wire to notice it by.
+
+test('a seq that is not a number, a boolean or null is refused by option name', () => {
+	assert.throws(() => stampSeqValue('742', 'room'), /publish seq must be a number/);
+	assert.throws(() => stampSeqValue({}, 'room'), /publish seq must be a number/);
+	assert.throws(() => stampSeqValue([5], 'room'), /publish seq must be a number/);
+	assert.throws(() => stampSeq({ seq: '742' }, 'room'), /publish seq must be a number/);
+});
+
+test('the refusal quotes the string it was given, so the log names the value', () => {
+	assert.throws(
+		() => stampSeqValue('742', 'room'),
+		(err) => err instanceof TypeError && err.message.includes('"742"') && err.message.includes('room')
+	);
+});
+
+test('a refused seq draws no counter value, so the topic is untouched', () => {
+	try {
+		assert.throws(() => stampSeqValue('742', 'quiet'));
+		assert.equal(topicSeqs.has('quiet'), false, 'nothing was stamped for it');
+		assert.equal(maxAuthoritativeSeq.has('quiet'), false, 'and nothing was marked');
+	} finally {
+		reset();
+	}
+});
+
+test('null publishes without a seq, the way false does', () => {
+	try {
+		assert.equal(stampSeqValue(null, 'room'), null);
+		assert.equal(topicSeqs.has('room'), false, 'and consumes no counter value');
+	} finally {
+		reset();
+	}
+});
+
+test('platform.publish refuses a string seq instead of publishing a counter', () => {
+	const srv = fakeServer();
+	setServer(srv);
+	try {
+		assert.throws(
+			() => platform.publish('room', 'said', { n: 1 }, { seq: '742' }),
+			/publish seq must be a number/
+		);
+		assert.equal(srv.published.length, 0, 'refused before anything reached the socket');
+	} finally {
+		reset();
+	}
+});
+
+test('platform.publish with { seq: null } sends the envelope without the field', () => {
+	const srv = fakeServer();
+	setServer(srv);
+	try {
+		platform.publish('room', 'said', { n: 1 }, { seq: null });
+		const envelope = JSON.parse(srv.published[0].payload);
+		assert.equal('seq' in envelope, false);
+	} finally {
+		reset();
+	}
+});
