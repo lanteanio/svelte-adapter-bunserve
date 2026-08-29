@@ -580,20 +580,21 @@ export const wsCounters = {
 	 * the connection's pending-release record was full. Non-zero means an
 	 * `unsubscribe` hook has been failing persistently, and those releases lost
 	 * the close-hook fallback: nothing covers them if their own hook does not
-	 * perform the teardown. Exposed as `platform.droppedReleaseRecords`.
+	 * perform the teardown. Internal: the operator signal is the console error
+	 * this raises, and uws exposes no counter for it.
 	 */
 	droppedReleaseRecords: 0,
 
 	/**
 	 * Topic publishes since boot. Monotonic and never reset, so the name says
 	 * exactly that rather than implying a sampling window. Exposed as
-	 * `platform.publishCount`.
+	 * the `ws_publishes_total` metric.
 	 */
 	publishCount: 0,
 
 	/**
 	 * Sum of every connection's subscription count, across the instance.
-	 * Exposed as `platform.totalSubscriptions`.
+	 * Read out through the `ws_subscriptions` metric.
 	 */
 	totalSubscriptions: 0,
 
@@ -1020,7 +1021,7 @@ function warnPendingReleaseFull() {
 		'  succeeded yet, so further releases are no longer recorded for the close hook and their teardown\n' +
 		'  is not guaranteed. The usual cause is an `unsubscribe` hook that throws or rejects on every\n' +
 		'  call - fix that, and check the errors logged above it. The running total is\n' +
-		'  platform.droppedReleaseRecords.'
+		'  is logged once per process, and every further drop is silent.'
 	);
 }
 

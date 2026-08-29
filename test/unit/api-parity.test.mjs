@@ -70,9 +70,9 @@ const PLATFORM_GAPS = {
  * move back to uws, which is half of "drop-in replacement".
  */
 const PLATFORM_EXTRAS = {
-	publishCount: 'drift: uws keeps an internal publishCountWindow and exposes no counter',
-	totalSubscriptions: 'drift: uws reports this through its metrics registry, not on platform',
-	droppedReleaseRecords: 'drift: no uws equivalent'
+	// Empty, and it stays empty. The three counters that lived here are read
+	// through the metrics registry now, which is where uws reports them: its
+	// platform carries `metrics` and `metricsSnapshot` and no counter getters.
 };
 
 /**

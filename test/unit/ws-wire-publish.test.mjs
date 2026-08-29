@@ -12,7 +12,7 @@ globalThis.WS_PATH = '/ws';
 
 
 const { platform } = await import('../../src/runtime/handler/platform.js');
-const { WS_CAPS, WS_SUBSCRIPTIONS, capCounts, maxAuthoritativeSeq, sharedTopics, setServer, topicSeqs, wsConnections } =
+const { WS_CAPS, WS_SUBSCRIPTIONS, capCounts, maxAuthoritativeSeq, sharedTopics, setServer, topicSeqs, wsConnections, wsCounters } =
 	await import('../../src/runtime/handler/ws-state.js');
 const { wireStatePoisoned } = await import('../../src/runtime/handler/wire-state.js');
 const { leaveSharedCohort } = await import('../../src/runtime/handler/cohort.js');
@@ -848,12 +848,12 @@ test('a publish refused on a PAYLOAD leaves no mark, on every atomic lane', () =
 		setServer(srv);
 		const capable = fakeWs({ topics: ['room'], caps: [CAP] });
 		try {
-			const before = platform.publishCount;
+			const before = wsCounters.publishCount;
 			withConnections([capable], () => {
 				assert.throws(run, TypeError, lane);
 			});
 			assert.equal(maxAuthoritativeSeq.get('room'), undefined, lane + ': marked nothing');
-			assert.equal(platform.publishCount, before, lane + ': counted nothing');
+			assert.equal(wsCounters.publishCount, before, lane + ': counted nothing');
 			// Both delivery routes: publish() reaches sockets only through the
 			// native fan-out, the wire lanes through the walk - asserting one
 			// of them would leave the other lane's assertion vacuous.
@@ -906,7 +906,7 @@ test('the stateless batch reroute keeps what already went out, and marks no more
 	setServer(fakeServer());
 	const capable = fakeWs({ topics: ['room'], caps: [CAP] });
 	try {
-		const before = platform.publishCount;
+		const before = wsCounters.publishCount;
 		withConnections([capable], () => {
 			assert.throws(
 				() =>
@@ -924,7 +924,7 @@ test('the stateless batch reroute keeps what already went out, and marks no more
 			);
 		});
 		assert.equal(maxAuthoritativeSeq.get('room'), 40, 'the entry that DID publish kept its mark');
-		assert.equal(platform.publishCount, before + 1, 'and its count');
+		assert.equal(wsCounters.publishCount, before + 1, 'and its count');
 		assert.notEqual(maxAuthoritativeSeq.get('room'), 41, 'the entry that threw marked nothing');
 		assert.equal(
 			capable.sent.length,
@@ -947,7 +947,7 @@ test('a refused publish is not counted in publishCount, on any lane', () => {
 	setServer(fakeServer());
 	const statefulCodec = { capability: CAP, schemaVersion: 2, encode: () => null, state: {} };
 	try {
-		const before = platform.publishCount;
+		const before = wsCounters.publishCount;
 		// Refused on the seq.
 		assert.throws(() => platform.publish('room', 'said', { x: 1 }, { seq: 0 }), TypeError);
 		assert.throws(
@@ -971,23 +971,23 @@ test('a refused publish is not counted in publishCount, on any lane', () => {
 			() => platform.publishWireBatch('room', 'moved', [{ data: { n: 1n } }], statefulCodec),
 			TypeError
 		);
-		assert.equal(platform.publishCount, before, 'not one refused publish was counted');
+		assert.equal(wsCounters.publishCount, before, 'not one refused publish was counted');
 		// One control PER LANE. With a single control, deleting any one of the
 		// three increments leaves every assertion above passing while that lane
 		// silently stops counting - the dead-assertion shape this suite exists to
 		// avoid. The batch control also pins that it counts per entry, not per
 		// call.
 		platform.publish('room', 'said', { x: 1 }, { seq: 5 });
-		assert.equal(platform.publishCount, before + 1, 'publish counts the one it made');
+		assert.equal(wsCounters.publishCount, before + 1, 'publish counts the one it made');
 		platform.publishWire('room', 'moved', { x: 1 }, statelessCodec(), { seq: 6 });
-		assert.equal(platform.publishCount, before + 2, 'publishWire counts the one it made');
+		assert.equal(wsCounters.publishCount, before + 2, 'publishWire counts the one it made');
 		platform.publishWireBatch(
 			'room',
 			'moved',
 			[{ data: { x: 1 }, seq: 7 }, { data: { x: 2 }, seq: 8 }],
 			statefulCodec
 		);
-		assert.equal(platform.publishCount, before + 4, 'publishWireBatch counts one per entry');
+		assert.equal(wsCounters.publishCount, before + 4, 'publishWireBatch counts one per entry');
 	} finally {
 		maxAuthoritativeSeq.clear();
 		topicSeqs.clear();

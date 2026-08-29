@@ -284,9 +284,7 @@ export function POST({ platform }) {
 | `metricsSnapshot()` | `Promise<string>` - the whole Prometheus document, adapter families first |
 | `adviseReconnect(options?)` | jittered reconnect advice, then drain |
 | `connections` / `subscribers(topic)` / `forEachSubscriber(topic, fn)` | live counts and the per-subscriber walk |
-| `totalSubscriptions` / `publishCount` | instance-wide subscription total, and publishes since boot |
 | `maxPayloadLength` / `bufferedAmount(ws)` / `closedWsAborts` | limits and backpressure telemetry |
-| `droppedReleaseRecords` | instance-wide; non-zero means an `unsubscribe` hook failed often enough that some releases are no longer covered by the close-hook fallback |
 | `pressure` | the LIVE 1 Hz sample (mutated in place, never copied): `{ active, value, reason, subscriberRatio, publishRate, memoryMB, maxBufferedBytes, backpressuredConnections, psi, cpuThrottle, topPublishers }`; `reason` precedence is MEMORY > CAPACITY > CPU_QUOTA > PSI > PUBLISH_RATE > SUBSCRIBERS > NONE; kernel readings are `null` off-Linux |
 | `protection` | `'normal' \| 'elevated' \| 'siege'`; `'normal'` today (the posture machine's option is not yet accepted here) |
 | `onPressure(cb)` | fires on `reason` TRANSITIONS with the live snapshot; throwing callbacks are contained; returns unsubscribe |
@@ -596,8 +594,7 @@ are different jobs rather than different sizes of the same one:
   ordinary concurrency reaches - getting there takes that many different topics
   on one connection whose hook never resolved, and releasing the same topic
   repeatedly does not grow it. Past that the release is not recorded, the
-  adapter says so once, and the instance-wide
-  `platform.droppedReleaseRecords` counts it.) The
+  adapter says so once and every further drop is silent.) The
   cost is that a hook which was mid-await when the connection died can finish
   AND have its topic named there, so a teardown that is not idempotent (a bare
   `roster.decr(topic)`) can run twice. The alternative is dropping the release

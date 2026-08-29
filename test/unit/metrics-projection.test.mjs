@@ -88,8 +88,9 @@ test('an admitted upgrade is counted, so the refusals have a denominator', async
 });
 
 test('the counters follow the runtime rather than a parallel tally', async () => {
-	// The projection reads the authoritative state, so nothing can drift: these
-	// are the same fields platform.publishCount and platform.closedWsAborts read.
+	// The projection reads the authoritative state, so nothing can drift: the
+	// registry is the only way out for these counters, which is how uws reports
+	// them too - platform carries the registry, not a getter per counter.
 	wsCounters.publishCount = 12;
 	wsCounters.closedWsAborts = 3;
 	wsCounters.totalSubscriptions = 40;
@@ -97,7 +98,6 @@ test('the counters follow the runtime rather than a parallel tally', async () =>
 	assert.equal(value(text, 'ws_publishes_total'), '12');
 	assert.equal(value(text, 'ws_closed_socket_aborts_total'), '3');
 	assert.equal(value(text, 'ws_subscriptions'), '40');
-	assert.equal(value(text, 'ws_publishes_total'), String(platform.publishCount));
 });
 
 test('a later scrape reflects the newer value, not the sum of the two', async () => {

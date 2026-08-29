@@ -2092,21 +2092,6 @@ export const platform = {
 	},
 
 	/**
-	 * Sum of every live connection's subscription count on this instance.
-	 *
-	 * Maintained on the subscribe/unsubscribe/close paths - hot-path work that
-	 * only earns its keep because this getter exposes it.
-	 */
-	get totalSubscriptions() {
-		return wsCounters.totalSubscriptions;
-	},
-
-	/** Topic publishes since boot on this instance. Monotonic. */
-	get publishCount() {
-		return wsCounters.publishCount;
-	},
-
-	/**
 	 * Clients subscribed to a topic on this instance. This reads Bun's native
 	 * membership count, so it also sees subscriptions made by a direct
 	 * `ws.subscribe` that never went through `platform.subscribe`.
@@ -2174,18 +2159,6 @@ export const platform = {
 	/** Sends/subscribes refused because the socket had already closed. */
 	get closedWsAborts() {
 		return wsCounters.closedWsAborts;
-	},
-
-	/**
-	 * Releases whose teardown could not be recorded for the close hook. Any
-	 * non-zero value means an `unsubscribe` hook has been failing persistently
-	 * enough to fill a connection's record, so those releases lost the
-	 * close-hook fallback. Their own hook is then the only thing that could
-	 * have torn them down - and if the deferral queue was also full, it did not
-	 * run either.
-	 */
-	get droppedReleaseRecords() {
-		return wsCounters.droppedReleaseRecords;
 	},
 
 	/**

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **BREAKING** `platform.totalSubscriptions`, `platform.publishCount` and
+  `platform.droppedReleaseRecords`. svelte-adapter-uws declares none of them:
+  its platform carries `metrics` and `metricsSnapshot()` and reports counters
+  through the registry, so an app reading these three here could not move back
+  to the adapter this one mirrors. The counters themselves are unchanged - the
+  first two are the `ws_subscriptions` and `ws_publishes_total` metrics, and a
+  dropped release record still logs once per process.
+
 ### Fixed
 
 - `publishWireBatch` honours a call-level `{ excludeWs }` on the stateful lane,
