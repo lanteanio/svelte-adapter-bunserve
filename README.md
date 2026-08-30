@@ -849,7 +849,15 @@ client:
 | `{topic, event, data, seq?, j?}` | the data envelopes. On the PUBLISH lanes `seq` is present unless the call said `{ seq: false }`; the single-target lanes (`send`, `sendTo`, and the JSON fallbacks of `sendWire`/`sendWireBatch`) never carry one and have no seq option, so an absent `seq` does not by itself mean a publisher opted out. `j` is the per-subscriber jitter in ms, present only when `publish` was given `jitterMs` |
 
 Acks are sent only when the client supplied a `ref`; a `ref` over 128 BYTES is
-treated as absent. Every subscribe / unsubscribe reply names the topic it
+treated as absent. DENIALS follow the same rule, which is the sharp edge of it:
+a subscribe sent without a `ref` that the gate refuses - or that the concurrent
+gate ceiling sheds - installs nothing and is answered with nothing, so a client
+that omits `ref` must treat every subscribe as unconfirmed rather than assuming
+it took. On a subscribe carrying `recover` that also means the gap-fill it asked
+for silently did not happen. The standalone `resume` frame is the exception: it
+carries no `ref` at all, so its refusals are unconditional. Send a `ref`.
+
+Every subscribe / unsubscribe reply names the topic it
 answers for - a denial a client cannot correlate is one it discards, which is
 why the frames that answer for no single topic (`BATCH_TOO_LARGE`,
 `RESUME_TOO_LARGE`, `INVALID_SESSION_ID`, `RESUME_RATE_LIMITED`,
