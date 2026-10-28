@@ -47,7 +47,7 @@ const base = `http://127.0.0.1:${PORT}`;
  *
  * @param {string} label
  * @param {string} path
- * @param {{ deterministic?: boolean }} [opts]
+ * @param {{ deterministic?: boolean, unknownHeadLength?: boolean }} [opts]
  */
 async function assertHeadMatchesGet(label, path, opts = {}) {
 	const get = await fetch(base + path);
@@ -69,7 +69,9 @@ async function assertHeadMatchesGet(label, path, opts = {}) {
 	// whole point of a HEAD probe.
 	const getLen = get.headers.get('content-length');
 	const headLen = head.headers.get('content-length');
-	if (opts.deterministic && getLen !== null) {
+	if (opts.unknownHeadLength) {
+		check(`${label}: HEAD does not read the body to infer its length`, headLen === null, `got ${headLen}`);
+	} else if (opts.deterministic && getLen !== null) {
 		check(`${label}: HEAD Content-Length describes the GET body`, headLen === getLen,
 			`GET ${getLen} vs HEAD ${headLen} (body was ${getBody.length} chars)`);
 	} else if (getLen !== null) {
@@ -87,6 +89,7 @@ try {
 	await assertHeadMatchesGet('static asset', '/test.txt', { deterministic: true });
 	await assertHeadMatchesGet('prerendered page', '/about/', { deterministic: true });
 	await assertHeadMatchesGet('SSR route', '/');
+	await assertHeadMatchesGet('buffered SSR endpoint', '/target?value=head-length', { unknownHeadLength: true });
 	await assertHeadMatchesGet('health probe', '/healthz', { deterministic: true });
 	await assertHeadMatchesGet('readiness probe', '/readyz', { deterministic: true });
 

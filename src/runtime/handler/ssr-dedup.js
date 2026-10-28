@@ -6,12 +6,9 @@
  * forever - parking the leader and every concurrent anonymous waiter on the
  * same in-flight promise until the connection drops. Those must stream.
  *
- * Everything else is a finite render we buffer and share. Note we deliberately
- * do NOT require a `content-length`: SvelteKit's dynamically-rendered pages
- * carry none, so gating on that header would silently disable dedup for the
- * exact thundering-herd workload it exists to protect. The never-ending
- * content-type is the only reliable signal, and `finalizeResponse` already
- * streams the excluded case without buffering it.
+ * Other bodies may be shared if they finish without a pending I/O read and
+ * remain within the byte cap. A deferred body falls back to streaming even
+ * without a content-length; ready dynamic pages still share their render.
  *
  * Kept in its own dependency-free module so it is unit-testable without pulling
  * in the build-time runtime init chain that `ssr.js` depends on.
@@ -22,4 +19,13 @@
 export function isDedupBufferable(response) {
 	const contentType = (response.headers.get('content-type') || '').toLowerCase();
 	return !contentType.startsWith('text/event-stream');
+}
+
+
+/** A known oversized response does not enter the bounded sharing collector. */
+export function declaresBodyPastCap(response, cap) {
+ const declared = response.headers.get('content-length');
+ if (declared === null) return false;
+ const length = Number(declared);
+ return Number.isFinite(length) && length > cap;
 }

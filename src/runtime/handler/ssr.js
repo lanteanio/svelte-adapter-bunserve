@@ -1,11 +1,15 @@
 import { brotliCompressSync, gzipSync, constants as zlibConstants } from 'node:zlib';
+import { openRequestLifetime } from './request-lifetime.js';
 import { server } from '../_init.js';
 import { resolveRequestId } from '../utils/request-id.js';
-import { clearTimer, randomUuid, setTimer } from '../runtime.js';
-import { response413, response500 } from './http-helpers.js';
-import { origin, address_header, xff_depth, body_size_limit, get_origin, trusted_proxies, warnUntrustedClaim, ws_options } from './config.js';
-import { isDedupBufferable } from './ssr-dedup.js';
+import { randomUuid } from '../runtime.js';
+import { collectImmediate } from './response-collect.js';
+import { response400, response413, response500 } from './http-helpers.js';
+import { requestTarget } from '../utils/request-target.js';
+import { origin, address_header, xff_depth, bodyLimitFor, get_origin, trusted_proxies, warnUntrustedClaim, ws_options } from './config.js';
+import { isDedupBufferable, declaresBodyPastCap } from './ssr-dedup.js';
 import { requestPlatform } from './platform.js';
+import { negotiateEncoding } from '../utils/static-negotiate.js';
 
 /* global ENV_PREFIX */
 /* global HTTP_OPTIONS */
@@ -21,122 +25,8 @@ const MAX_SSR_DEDUP_BODY = 512 * 1024;
  * @typedef {{ status: number, statusText: string, headers: [string, string][], body: Uint8Array }} SharedResponse
  */
 
-/**
- * Sentinel for "the next chunk did not arrive in this event-loop turn", which
- * is how a streaming body is told apart from a complete one (see
- * collectImmediate). A symbol so it can never collide with a read result.
- */
-const STILL_STREAMING = Symbol('still-streaming');
-
-// Ceiling on what collectImmediate will hold in memory before it gives up and
-// streams instead. Guards against a route that produces chunks without ever
-// yielding: without it, "complete in this turn" could mean an unbounded buffer.
-const COLLECT_MAX_BYTES = 8 * 1024 * 1024;
-
-/**
- * Read a body for as long as it keeps producing WITHOUT waiting on the
- * macrotask queue, and report whether it finished.
- *
- * This is the one probe that decides both of the things the SSR path does with
- * a body: whether it can be deduplicated (shared with concurrent waiters) and
- * whether it can be compressed whole. Both require the complete bytes, and
- * both are wrong to wait for: an already-rendered body settles its reads in
- * the same turn, while a genuinely streaming one (SvelteKit deferred data, a
- * route that emits a shell then awaits) does not - and blocking on it would
- * withhold the status line, the headers, and the shell until the deferred work
- * finishes, defeating the point of streaming.
- *
- * @param {ReadableStream<Uint8Array>} body
- * @returns {Promise<{ complete: true, bytes: Uint8Array }
- *   | { complete: false, stream: ReadableStream<Uint8Array> }>}
- */
-async function collectImmediate(body) {
-	const reader = body.getReader();
-	/** @type {Uint8Array[]} */
-	const chunks = [];
-	let total = 0;
-
-	// ONE deadline for the whole body, not one per chunk: the question is
-	// whether the body finishes before the event loop yields, so a body that
-	// arrives in several already-available chunks still counts as complete,
-	// and a response costs a single timer rather than one per read.
-	/** @type {ReturnType<typeof setTimeout>} */
-	let timer;
-	const deadline = new Promise((resolve) => {
-		timer = setTimer(() => resolve(STILL_STREAMING), 0);
-	});
-
-	try {
-		for (;;) {
-			const pending = reader.read();
-			const result = await Promise.race([pending, deadline]);
-
-			if (result === STILL_STREAMING) {
-				// The read is still in flight and is handed to the stream below,
-				// which awaits it on first pull. Attach a handler now so a
-				// rejection arriving before the consumer ever pulls is not
-				// reported as an unhandled rejection; pull() still observes it.
-				pending.catch(() => {});
-				return { complete: false, stream: resumeStream(reader, chunks, pending) };
-			}
-			if (result.done) {
-				return { complete: true, bytes: concatChunks(chunks, total) };
-			}
-
-			chunks.push(result.value);
-			total += result.value.byteLength;
-			if (total > COLLECT_MAX_BYTES) {
-				return { complete: false, stream: resumeStream(reader, chunks, null) };
-			}
-		}
-	} finally {
-		clearTimer(timer);
-	}
-}
-
-/**
- * Rebuild a stream from the chunks already consumed plus the remainder. Bun
- * applies its own backpressure to the result; cancellation propagates to the
- * app's reader.
- *
- * @param {ReadableStreamDefaultReader<Uint8Array>} reader
- * @param {Uint8Array[]} chunks - already read, replayed first
- * @param {Promise<ReadableStreamReadResult<Uint8Array>> | null} carried - a
- *   read already in flight, consumed before pulling further
- * @returns {ReadableStream<Uint8Array>}
- */
-function resumeStream(reader, chunks, carried) {
-	return new ReadableStream({
-		start(controller) {
-			for (const chunk of chunks) controller.enqueue(chunk);
-		},
-		async pull(controller) {
-			const result = carried ? await carried : await reader.read();
-			carried = null;
-			if (result.done) controller.close();
-			else controller.enqueue(result.value);
-		},
-		cancel(reason) {
-			return reader.cancel(reason);
-		}
-	});
-}
-
-/**
- * @param {Uint8Array[]} chunks
- * @param {number} total
- * @returns {Uint8Array}
- */
-function concatChunks(chunks, total) {
-	if (chunks.length === 1) return chunks[0];
-	const out = new Uint8Array(total);
-	let offset = 0;
-	for (const chunk of chunks) {
-		out.set(chunk, offset);
-		offset += chunk.byteLength;
-	}
-	return out;
-}
+// Only responses whose source has not reached EOF need consumption tracking.
+const streamingResponses = new WeakSet();
 
 /**
  * In-flight SSR dedup map. Key is "<METHOD>\0<origin>\0<url>".
@@ -181,32 +71,35 @@ const COMPRESSIBLE_TYPES = new Set([
  * @returns {Promise<Response>}
  */
 export async function handleSSR(request, direct) {
+	const bodyLimit = request.body === null ? Infinity : bodyLimitFor(request.method, requestTarget(request));
+	const lifetime = openRequestLifetime(request, bodyLimit);
 	try {
-		const base_origin = origin || get_origin(request.headers);
-		const reqUrl = new URL(request.url);
-		const url = reqUrl.pathname + reqUrl.search;
+		const response = await lifetime.guard(renderSSR(request, direct, lifetime));
+		return lifetime.response(response, !streamingResponses.has(response));
+	}
+	catch (error) {
+		if (lifetime.bodyLimitExceeded) return lifetime.response(response413(), true);
+		lifetime.abort(error); lifetime.finish(); throw error;
+	}
+}
+
+async function renderSSR(request, direct, lifetime) {
+	try {
+		let base_origin;
+		let kitRequest;
+		const url = requestTarget(request);
 		const method = request.method;
-
-		// Early 413 on a declared oversize body. Bodies without a Content-Length
-		// (chunked) are capped by Bun.serve's maxRequestBodySize, wired from the
-		// same BODY_SIZE_LIMIT in server.js.
 		if (method !== 'GET' && method !== 'HEAD') {
-			const cl = parseInt(request.headers.get('content-length') || '', 10);
-			if (!isNaN(cl) && body_size_limit > 0 && Number.isFinite(body_size_limit) && cl > body_size_limit) {
-				return response413();
-			}
+			const declared = Number(request.headers.get('content-length'));
+			if (declared > bodyLimitFor(method, url)) return response413();
 		}
-
-		// Bun derives request.url from the Host header with the transport scheme,
-		// which matches the zero-config origin. Rebuild the Request only when
-		// ORIGIN / PROTOCOL_HEADER / HOST_HEADER / PORT_HEADER produce something
-		// else - the copy constructor preserves method, headers, and body stream.
-		// The rebuild must stay AHEAD of anything that reads the body: copying a
-		// request whose body has been read throws on runtimes that enforce
-		// single-use bodies, so only headers may be consulted above this line.
-		const kitRequest = base_origin === reqUrl.origin
-			? request
-			: new Request(base_origin + url, request);
+		try {
+			base_origin = origin || get_origin(request.headers);
+			const resolved = new URL(base_origin + url).href;
+			kitRequest = lifetime.request(resolved);
+		} catch {
+			return response400();
+		}
 
 		// Branch at definition time on the module-level constant address_header.
 		// In the common case (no proxy), the closure captures only the socket
@@ -261,26 +154,26 @@ export async function handleSSR(request, direct) {
 		const requestId = resolveRequestId(request.headers.get('x-request-id')) || randomUuid();
 		const platform = requestPlatform(requestId);
 
-		// Dedup: for anonymous GET/HEAD requests that arrive concurrently for the
+		// Dedup: for anonymous GET requests that arrive concurrently for the
 		// same URL, only the first (the leader) calls server.respond(). Subsequent
 		// requests (waiters) await the leader's promise and reconstruct a Response
 		// from the shared buffer. This prevents redundant SSR work during traffic
 		// spikes on public pages.
 		//
 		// Dedup is skipped for:
-		//   - Non-GET/HEAD methods (mutations must not be coalesced)
+		//   - Non-GET methods (HEAD must not collect a body; mutations must not be coalesced)
 		//   - Authenticated requests (cookie or authorization header present)
 		//   - When the dedup map is at capacity (safety valve)
 		const isCredentialedRequest = !!(request.headers.get('cookie') || request.headers.get('authorization'));
 		const canDedup =
-			(method === 'GET' || method === 'HEAD') &&
+			method === 'GET' &&
 			!isCredentialedRequest &&
 			ssrInflight.size < MAX_SSR_DEDUP;
 		// BREACH defense: suppress the accept-encoding signal for credentialed
 		// requests so finalizeResponse() leaves the body uncompressed. Apps that
 		// have audited their reflected-input surface can opt back in via the
 		// COMPRESS_CREDENTIALED module flag.
-		const respAcceptEncoding = (isCredentialedRequest && !COMPRESS_CREDENTIALED)
+		const respAcceptEncoding = method === 'HEAD' || (isCredentialedRequest && !COMPRESS_CREDENTIALED)
 			? ''
 			: (request.headers.get('accept-encoding') || '');
 
@@ -303,7 +196,7 @@ export async function handleSSR(request, direct) {
 							statusText: shared.statusText,
 							headers: shared.headers
 						}),
-						respAcceptEncoding
+						respAcceptEncoding, false, lifetime
 					);
 				}
 				// Leader marked this non-shareable - fall through to our own call
@@ -327,7 +220,7 @@ export async function handleSSR(request, direct) {
 					// leader's content to waiters that may legitimately differ.
 					if (response.headers.has('set-cookie') || !response.body) {
 						resolveShared(null);
-						return finalizeResponse(response, respAcceptEncoding);
+						return finalizeResponse(response, respAcceptEncoding, false, lifetime);
 					}
 					const varyHeader = response.headers.get('vary');
 					if (varyHeader) {
@@ -336,16 +229,16 @@ export async function handleSSR(request, direct) {
 						);
 						if (personalized) {
 							resolveShared(null);
-							return finalizeResponse(response, respAcceptEncoding);
+							return finalizeResponse(response, respAcceptEncoding, false, lifetime);
 						}
 					}
 
 					// A never-ending SSE stream (see isDedupBufferable) must not be
 					// buffered: collecting it would await forever, parking this
 					// leader and every concurrent waiter on the same promise.
-					if (!isDedupBufferable(response)) {
+					if (!isDedupBufferable(response) || declaresBodyPastCap(response, MAX_SSR_DEDUP_BODY)) {
 						resolveShared(null);
-						return finalizeResponse(response, respAcceptEncoding);
+						return finalizeResponse(response, respAcceptEncoding, false, lifetime);
 					}
 
 					// Sharing requires the whole body, so only a body that is
@@ -354,15 +247,15 @@ export async function handleSSR(request, direct) {
 					// withhold its shell from this client and park every waiter
 					// behind work that is deliberately incremental.
 					const collected = await collectImmediate(
-						/** @type {ReadableStream<Uint8Array>} */ (response.body)
+						/** @type {ReadableStream<Uint8Array>} */ (response.body), lifetime, MAX_SSR_DEDUP_BODY
 					);
 					if (!collected.complete) {
 						resolveShared(null);
 						return streamedResponse(response, collected.stream);
 					}
 
-					// Responses above the size cap are served but not shared.
-					const shared = collected.bytes.byteLength <= MAX_SSR_DEDUP_BODY
+					// A disconnected leader cannot share a body truncated by cancellation.
+					const shared = !lifetime.signal.aborted && collected.bytes.byteLength <= MAX_SSR_DEDUP_BODY
 						? /** @type {SharedResponse} */ ({
 							status: response.status,
 							statusText: response.statusText,
@@ -384,8 +277,10 @@ export async function handleSSR(request, direct) {
 
 		// Normal (non-dedup) path
 		const response = await server.respond(kitRequest, { platform, getClientAddress });
-		return finalizeResponse(response, respAcceptEncoding);
+		return finalizeResponse(response, respAcceptEncoding, method === 'HEAD', lifetime);
 	} catch (err) {
+		if (lifetime.bodyLimitExceeded) return response413();
+		lifetime.abort(err);
 		console.error('SSR error:', err);
 		return response500();
 	}
@@ -412,6 +307,8 @@ export async function handleSSR(request, direct) {
  */
 function headersWithNosniff(response) {
 	const headers = new Headers(response.headers);
+	headers.delete('date');
+	headers.delete('transfer-encoding');
 	if (!headers.has('x-content-type-options')) {
 		headers.set('x-content-type-options', 'nosniff');
 	}
@@ -438,15 +335,14 @@ function bufferedResponse(response, bytes, acceptEncoding) {
 		const semi = ctRaw.indexOf(';');
 		const ct = semi === -1 ? ctRaw : ctRaw.slice(0, semi).trimEnd();
 		if (COMPRESSIBLE_TYPES.has(ct)) {
-			const useBr = acceptEncoding.includes('br');
-			const useGz = !useBr && acceptEncoding.includes('gzip');
-			if (useBr || useGz) {
-				const compressed = useBr
+			const selected = negotiateEncoding(acceptEncoding, true, true);
+			if (selected) {
+				const compressed = selected === 'br'
 					? brotliCompressSync(body, { params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 4 } })
 					: gzipSync(body, { level: 6 });
 				if (compressed.byteLength < body.byteLength) {
 					body = compressed;
-					encoding = useBr ? 'br' : 'gzip';
+					encoding = selected;
 				}
 			}
 		}
@@ -475,12 +371,16 @@ function bufferedResponse(response, bytes, acceptEncoding) {
  * @param {ReadableStream<Uint8Array>} stream
  * @returns {Response}
  */
-function streamedResponse(response, stream) {
-	return new Response(stream, {
+function streamedResponse(response, stream, headOnly = false) {
+	const headers = headersWithNosniff(response);
+	if (!headOnly) headers.delete('content-length');
+	const streamed = new Response(stream, {
 		status: response.status,
 		statusText: response.statusText,
-		headers: headersWithNosniff(response)
+		headers
 	});
+	streamingResponses.add(streamed);
+	return streamed;
 }
 
 /**
@@ -490,11 +390,12 @@ function streamedResponse(response, stream) {
  *
  * @param {Response} response
  * @param {string} acceptEncoding - '' suppresses compression (BREACH gate)
+ * @param {boolean} [headOnly] - preserve metadata without reading the body
  * @returns {Promise<Response>}
  */
-async function finalizeResponse(response, acceptEncoding) {
+async function finalizeResponse(response, acceptEncoding, headOnly = false, lifetime) {
 	if (!response.body) {
-		if (response.headers.has('x-content-type-options')) return response;
+		if (response.headers.has('x-content-type-options') && !response.headers.has('transfer-encoding') && !response.headers.has('date')) return response;
 		return new Response(null, {
 			status: response.status,
 			statusText: response.statusText,
@@ -510,15 +411,17 @@ async function finalizeResponse(response, acceptEncoding) {
 		);
 	}
 
-	// A never-ending stream (text/event-stream) passes through untouched, so
-	// the app's own stream reaches Bun directly and cancellation reaches the
-	// route. Collecting it would never terminate, and compression never
-	// applies to it anyway.
+	// HEAD preserves declared headers and lets the lifetime wrapper cancel the
+	// body. Even an immediately available body must not be read or compressed.
+	if (headOnly) return streamedResponse(response, response.body, true);
+
+	// A never-ending stream (text/event-stream) bypasses collection and
+	// compression. The request lifetime wrapper forwards cancellation to it.
 	if (!isDedupBufferable(response)) {
 		return streamedResponse(response, response.body);
 	}
 
-	const collected = await collectImmediate(response.body);
+	const collected = await collectImmediate(response.body, lifetime, Infinity, 2);
 	return collected.complete
 		? bufferedResponse(response, collected.bytes, acceptEncoding)
 		: streamedResponse(response, collected.stream);
