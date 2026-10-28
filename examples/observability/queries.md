@@ -110,3 +110,4 @@ All four ship as recording rules in `rules.yml` - `adapter:subscriber_ratio`,
 `adapter:http_request_duration_seconds:p95_by_method_5m` and
 `adapter:ws_message_duration_seconds:p95_5m`. Chart and alert on the recorded
 names; the dashboard already does.
+

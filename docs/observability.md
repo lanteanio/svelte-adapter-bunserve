@@ -176,3 +176,4 @@ not an adapter option or a way to hide a failed sampler. See the
 All metric labels are `operational`, bounded, and payload-free. The local
 registry may apply an operator prefix when serializing; cluster snapshots and
 this manifest always use the canonical unprefixed names.
+

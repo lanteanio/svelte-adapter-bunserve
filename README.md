@@ -1,14 +1,5 @@
 # svelte-adapter-bunserve
 
-> **Status: early, and behind the adapter it follows.** svelte-adapter-uws is
-> the lead and is several minor versions ahead. Both halves work here - HTTP and
-> single-node realtime, covered by unit, sim, live and leak lanes, all run
-> against Bun 1.3.14 and 1.4.0 - and the `platform.*` surface it
-> does implement matches the lead's. It is behind on: multi-node fan-out (the
-> extensions package throws against it), per-key send coalescing and socket RPC,
-> TypeScript types, and multi-process. Fine for a single-node app; pick
-> svelte-adapter-uws if you need any of that.
-
 A SvelteKit adapter for [Bun](https://bun.com), built on `Bun.serve`: it follows
 [svelte-adapter-uws](https://github.com/lanteanio/svelte-adapter-uws) and works
 with the same ecosystem around it -
@@ -19,8 +10,12 @@ for clustering, presence and cursors. Same `platform.*` surface, same plugins,
 same client. The adapter swap is one line in `svelte.config.js`; app code is
 unchanged.
 
-(One caveat: the extensions package does not work against this adapter yet, so
-multi-node fan-out is not available - see [Current state](#current-state).)
+The bundled [`./client` entrypoint](#client-store-api) also provides topic stores,
+automatic reconnection, and reversible offline controls directly.
+
+`platform.authorizeDelivery` installs an optional recipient policy for application
+deliveries, with ordered pending decisions, revocation checks, bounded buffering
+and graceful shutdown. See [delivery authorization](docs/delivery-authorization.md).
 
 ## Why this exists
 
@@ -37,121 +32,192 @@ The family, by tier:
 | package | transport | tier |
 |---|---|---|
 | `svelte-adapter-uws` | uWebSockets.js on Node | maximum performance |
-| `svelte-adapter-ws` (planned) | node:http + ws | maximum portability |
+| `svelte-adapter-ws` | node:http + ws | maximum portability |
 | `svelte-adapter-bunserve` (this repo) | Bun.serve | Bun, natively |
 
 The suffix names the transport, like every member of the family: `uws` is
 uWebSockets.js, `ws` is the ws library, `bunserve` is `Bun.serve`.
 
-## Current state
+## Runtime model
 
-Every step of the build order below is done. What remains is listed as
-known-open under the step that owns it. The public surface is not settled here
-in any case: svelte-adapter-uws leads it, and this adapter follows what that one
-declares.
+A built SvelteKit application runs with `bun build/index.js`. HTTP responses
+use web Requests and Responses with Bun's stream backpressure. Static files
+support precompression, validators and conditional requests. Immutable assets
+use their content-addressed URL as the cache identity; they omit ETags and
+byte ranges while retaining wildcard existence preconditions.
 
-1. **API probe** (done): `probe/bun-api-facts.mjs` empirically verifies every
-   Bun server API behavior the adapter design relies on - send-result
-   semantics, backpressure signals, closed-socket behavior, upgrade flow,
-   drain semantics - against a pinned Bun version, and writes a committed
-   facts report. The adapter is built against what Bun was measured to do,
-   not against what its documentation says.
-2. **HTTP half** (done): a built SvelteKit app
-   serves under `bun build/index.js`. SSR goes straight through
-   `server.respond()` (real web Request in, Response out, Bun's own
-   backpressure on streams); static assets come from an in-memory
-   precompressed cache with ETag/304, `Last-Modified` with the full RFC 9110
-   precondition set (`If-Match` / `If-Unmodified-Since` answer 412,
-   `If-Modified-Since` answers 304 for caches that lost the validator, `*` and
-   the list form on both validator preconditions, weak comparison, and only
-   the three HTTP-date formats accepted as dates), every precondition answered
-   against the representation content negotiation actually selected, 304s
-   carrying the validator and freshness fields a cache needs, RFC
-   7233 ranges, and trailing-slash canonicalization, with a `Bun.file()`
-   kernel-sendfile lane for large files;
-   SSR dedup and the BREACH-aware compression gate are carried over, and a
-   response is compressed whole whenever its body completes without waiting,
-   so a streaming render reaches the client as it is produced; `/healthz` +
-   `/readyz` and graceful drain round it out.
-   Known-open on the HTTP half: the graceful-drain signal path is asserted on
-   Linux only (`test/live/shutdown-check.mjs`, run in CI; Windows delivers no
-   real SIGTERM to exercise it, so the suite skips there);
-   the TLS surface remains unprobed (needs real certificates); a request body
-   sent without a Content-Length is capped by Bun rather than by the adapter's
-   own check, and that path has not been exercised; immutable assets carry
-   no ETag, so they answer no conditional or range requests (inherited from
-   svelte-adapter-uws, where versioned filenames make both redundant); and
-   telling a complete response body from a streaming one depends on Bun
-   resolving an already-available stream read as a microtask - pinned by the
-   probe's `body-read-scheduling` group, so a Bun upgrade that changes it
-   surfaces as a report diff rather than a silent loss of compression and
-   deduplication.
-3. **JSON realtime** (done): the upgrade path, the per-connection platform, and
-   topic pub/sub over real WebSockets. See [WebSockets](#websockets) below.
-4. **Binary wire protocol** (done): `0x03` codec frames over
-   `publishWire`/`sendWire` and their batch variants, capability negotiation
-   through the `hello` frame, the per-connection wire-id announce, the shared
-   cohort split for stateless `shared` codecs, degrade-to-JSON on a dropped
-   stateful frame or a failing stateful `encode` (a throw or a wrong-type
-   return poisons the capability for that connection; returning `null`
-   declines cleanly and keeps binary available), and resume gap-fill with a
-   live-frame barrier across the cutover.
-   Known-open on the realtime tier: the deferred JSON-tier members are
-   absent rather than stubbed, so nothing reports success while doing
-   nothing: `request` and `requestTopic` (server-initiated request/reply),
-   the coalescing and batching send variants (`sendCoalesced`, `batch`,
-   `publishBatched`), and `topicEpoch`. The protection POSTURE machine's
-   option is likewise not accepted yet - `platform.protection` reads
-   `'normal'` - while the pressure sampling, observability members and
-   LEASE/REQUEST_N flow control are live (step 5, done).
-5. Backpressure/flow-control parity (done: the pressure sampler,
-   `platform.pressure`/`onPressure`/`onPublishRate`, and the lease window
-   lane), and the conformance gate against the family's deterministic
-   simulation goldens (done: `npm run sim:golden`, whose cross-adapter corpus
-   is fingerprint-identical to the sibling's at the pin).
+WebSocket hooks expose JSON topic messaging, binary wire codecs, subscription
+recovery, pressure sampling and flow control. The API probe, unit tests,
+deterministic simulations, native socket tests and leak tests exercise these
+contracts against the supported Bun runtimes.
 
-Single-process, and not provisionally so. Bun's `node:cluster` does share a
-listening socket across workers, but a `publish()` reaches only the subscribers
-held by the worker that ran it, so each worker would serve a private slice of
-every topic. Scale-out is the extensions bus, not in-process workers.
+Each server process owns its subscriptions. A native topic publication reaches
+that process's connections, so sharing a listening socket across workers does
+not provide cross-worker fan-out. Applications that distribute connections
+across processes need a bus that forwards publications between them.
 
-**Multi-node fan-out does not work yet.**
-[svelte-adapter-uws-extensions](https://github.com/lanteanio/svelte-adapter-uws-extensions)
-(Redis/Valkey) is transport-agnostic and is the intended path, but its
-`bus.wrap(platform)` binds four members without feature-detecting them:
-`onPressure` and `onPublishRate` (now live here) plus `sendCoalesced` and
-`request`, which this adapter does not implement yet - so it still throws a
-`TypeError` at startup against this adapter, on those two. It needs either
-those members (step 4 above) or the same guards it already applies to its
-other optional members. Until one of those lands, treat this adapter as
-single-node.
+`svelte-adapter-uws-extensions@0.6.0-next.64` supports this through
+`createPubSubBus` from its `redis/pubsub` entry. Activate the bus with the local
+platform, then publish through `bus.wrap(platform)` to deliver locally and
+through Redis to the other processes. Each process needs its own activated
+subscriber and must call `bus.deactivate()` during shutdown. The wrapper
+preserves the platform's live getters and available methods.
+
+An HTTP response stream that fails after its first bytes closes the connection
+without a complete chunked terminator. Source errors and invalid response chunks
+therefore remain visible as truncated responses; invalid producers are cancelled
+and their readers released. `test/live/response-stream-failure-check.mjs` pins the
+raw TCP failure boundary on supported Bun runtimes.
+
+## Smoothing controls
+
+`createSmoothAuthority({ maxCommandsPerTick })` limits the commands applied to
+one entity during one tick. It must be a positive safe integer. Omit it to drain
+the entire available queue. A bounded drain preserves the ordered tail and
+acknowledges only the applied prefix; `inject()` remains unpaced.
+
+The client's `snapSpeedPerSec` also governs local authoritative corrections.
+With `'auto'`, correction speed over `smoothTimeMs` is compared with eight times
+the peak of the last 32 tick-like command intervals. Before two measured intervals
+exist, only an explicit numeric ceiling applies. A numeric value adds a world-units-
+per-second ceiling; `0` disables both automatic and numeric speed checks.
+Snapping clears old rendering offsets while preserving unacknowledged command
+replay. Full sync and reset clear the measured history.
+
+## Operational events
+
+Use the public observability entry to route structured runtime events to your
+logging system. Register the sink during application initialization:
+
+```js
+import { setOperationalEventSink } from 'svelte-adapter-bunserve/observability';
+
+setOperationalEventSink((event) => {
+  logger.write(event);
+});
+```
+
+Pass `null` to restore the console fallback. Events retain package identity,
+severity and bounded diagnostic attributes. Treat application diagnostic text
+according to your logging policy; identifier metadata does not expose raw topics.
+See [the signal and diagnostic contract](docs/observability.md).
+
+## Outbound URL policy
+
+The `svelte-adapter-bunserve/safe-url` entry validates outbound HTTP destinations
+before connecting. `classifyAddress` classifies addresses; `checkUrlResolved`
+checks the URL and every address returned by the supplied `resolve` callback. Resolve and validate every destination and redirect,
+then pin the validated address in the transport so a second DNS lookup cannot
+change it. The policy's resolver can supply your deployment's DNS implementation,
+and `nat64Prefix` identifies a deployment-specific NAT64 translation prefix.
+The default `strict` mode refuses private and special-purpose destinations.
+`allowlist` also requires a hostname in `allow`, while retaining address checks.
+`off` explicitly disables address checks but still requires HTTP or HTTPS.
+
+## TypeScript
+
+The package ships root declarations for the adapter and its `AdapterOptions`,
+`WebSocketOptions`, `WebSocketHandler`, hook contexts and `Platform` contracts.
+Import these types from `svelte-adapter-bunserve`. Every public export ships declarations.
+`UpgradeContext.traceContext` accepts the shared nullable trace-context shape;
+this runtime supplies `null`.
+
+Extend SvelteKit's application platform type in `src/app.d.ts`:
+
+```ts
+import type { Platform as RealtimePlatform } from 'svelte-adapter-bunserve';
+
+declare global {
+	namespace App {
+		interface Platform extends RealtimePlatform {}
+	}
+}
+export {};
+```
+
+The socket passed to WebSocket hooks exposes `publish(topic, message, isBinary?,
+compress?)` with a boolean result. `true` means a publication has an eligible peer;
+it does not guarantee delivery past that peer's backpressure limit. The publishing
+socket is excluded, including for empty text or binary frames. A socket that has
+released all its subscriptions can still publish to its peers. A socket that has
+never subscribed returns `false` without publishing. `send()`
+continues to return its numeric status: 0 buffered, 1 sent, or 2 dropped.
 
 ## WebSockets
 
-Zero-config: drop a `src/ws-handler.js` into the project and the realtime
-surface turns on. With no such file - and no `websocket` option in
-`svelte.config.js` - the adapter serves no WebSocket endpoint at all: no upgrade
-lane, no per-connection bookkeeping, nothing added to `Bun.serve`. Configuring
-`websocket` without a handler file DOES register the endpoint (on the assumption
-that you meant to have one), and since there is no `subscribe` hook to authorize
-against, every subscription is then denied `SUBSCRIBE_NOT_CONFIGURED`.
+Enable WebSockets in the SvelteKit adapter configuration:
 
 ```js
-// src/ws-handler.js - every hook is optional
-export async function upgrade(request, { platform, headers }) {
-	// Runs BEFORE the handshake and may await freely (Bun hands `fetch` a real
-	// Request, so nothing is stack-allocated the way it is under uWS).
-	// Return a Response to REJECT the upgrade with exactly that response.
-	const session = await lookupSession(request.headers.get('cookie'));
-	if (!session) return new Response('Unauthorized', { status: 401 });
-	// `return false` also rejects, with a plain 401.
-	// Handshake headers (subprotocol selection, a Set-Cookie) go on `headers`,
-	// which is applied to the 101 response.
-	headers['sec-websocket-protocol'] = 'v1';
-	// Everything RETURNED becomes this connection's userData.
+import bunserve from 'svelte-adapter-bunserve';
+export default { kit: { adapter: bunserve({ websocket: true }) } };
+```
+
+Add the plugin to Vite so WebSocket hooks and server routes
+share the same module instances, including `$lib` state and Vite transforms:
+
+```js
+import { sveltekit } from '@sveltejs/kit/vite';
+import bunserve from 'svelte-adapter-bunserve/vite';
+export default { plugins: [sveltekit(), bunserve()] };
+```
+
+With WebSockets enabled, the build discovers `src/hooks.ws.js`,
+`src/hooks.ws.ts`, then `src/hooks.ws.mjs`. An explicit `websocket.handler`
+wins. The Vite plugin uses that same option and resolves configured aliases;
+conflicting explicit paths fail the build. The plugin runs a WebSocket server
+during `vite dev` and adds the production SSR entry during builds. It inherits
+`websocket.path`, `websocket.authPath` and `envPrefix` from the adapter. Explicit
+plugin endpoint paths must agree with adapter paths. Security options such as
+`allowedOrigins` and `authorizeWireSubscribe` are flat plugin options; repeat
+them on the plugin when development must enforce the same policy.
+
+Omitting `websocket` or setting it to `false` disables the built endpoint, even when a
+hooks file exists. Set it to `true` or an options object to enable it. With no
+hooks file, the built-in subscription protocol still runs; subscriptions are
+allowed unless wire-subscribe authorization is armed.
+
+The old `src/ws-handler.js` filename is no longer discovered. Rename it to
+`src/hooks.ws.js` and enable `websocket: true`, or keep the file and configure
+`websocket: { handler: 'src/ws-handler.js' }` explicitly.
+
+A configured handler that cannot resolve fails the build. Missing relative
+`./` or `../` paths produce an error naming the file; other specifiers reach the
+bundler resolver, so another Vite plugin may supply a virtual module. To disable
+WebSockets, omit `websocket` or use `false` instead of a nonexistent handler.
+
+The endpoint takes a GET that tries to open a WebSocket - one carrying
+`Upgrade: websocket` or a `Sec-WebSocket-Key` - and nothing else, as on
+svelte-adapter-uws. One that no client could complete is refused before any
+capacity, origin or hook decision: `400` without exactly one `Upgrade:
+websocket` line, a `Connection` that lists `upgrade`, and exactly one key that
+is the base64 of 16 bytes, or with more than one version line or a `#` in its
+query, and `426` with `Sec-WebSocket-Version: 13` for any version but 13. Each
+refusal is counted as `upgrade_rejected_total{reason="malformed_handshake"}`.
+Browsers and the `ws` library send conforming handshakes.
+
+Bun hands the adapter a repeated `Upgrade`, `Connection`, `Sec-WebSocket-Key`,
+`Sec-WebSocket-Version` or `Accept` line joined into one value, where uWS reads
+the first line, so a single line that lists several values reads here as
+several lines. One `Sec-WebSocket-Version: 13, 8` line is refused `400` where
+uws answers `426`; one `Upgrade: websocket, h2c` line with no key is refused
+`400` where uws treats it as a request that is not a handshake; and two
+`Accept` or two `Upgrade` lines on a browser navigation at capacity (below) can
+get the page where uws sends the bare `503`, or the reverse.
+
+Any other request on the path - a plain GET, a HEAD, a POST, a GET asking to
+upgrade to another protocol - goes on to your routes, so a page or endpoint you
+put there answers it. With any `upgradeAdmission` limit configured
+(`maxConcurrent`, `maxConnections` or `perTickBudget`), a GET there that is not
+trying to open a WebSocket is the adapter's again: `426` while there is room
+and, at capacity, the `503` a shed upgrade gets (see below).
+
+```js
+// src/hooks.ws.js - every hook is optional
+export async function upgrade({ cookies, headers, url, remoteAddress, requestId }) {
+	const session = await lookupSession(cookies.session);
+	if (!session) return false;
 	return { userId: session.userId };
 }
-
 // Optional HTTP preflight, mounted at `websocket.authPath` (default
 // `/__ws/auth`) ONLY when this hook is exported. The family client store POSTs
 // here before opening a socket when `connect({ auth: true })` is used.
@@ -163,7 +229,7 @@ export async function upgrade(request, { platform, headers }) {
 //
 // Return nothing for 204, `false` for 401, or a Response to use verbatim.
 // Cookies set here are merged onto whichever of those you return.
-export async function authenticate(request, { cookies, platform, getClientAddress }) {
+export async function authenticate({ request, cookies, platform, getClientAddress }) {
 	const session = await refresh(cookies.get('sid'));
 	if (!session) return false;
 	cookies.set('sid', session.token, { path: '/', maxAge: 3600 });
@@ -173,11 +239,18 @@ export async function authenticate(request, { cookies, platform, getClientAddres
 // swallowed - boot failure should be loud). `shutdown` runs at graceful stop
 // BEFORE the sockets are drained, so it can still reach connected clients.
 export function init({ platform, workerData }) {}
-export function shutdown({ platform }) {}
+export function shutdown({ platform, reason, signal, deadline }) {}
 
 export function open(ws, { platform }) {}
 export function message(ws, { data, isBinary, msg, platform }) {}
 export function drain(ws, { platform }) {}
+// `close` also gets this connection's messagesIn/messagesOut and
+// bytesIn/bytesOut. The out counters cover frames sent to this connection
+// directly (control frames, directed platform sends, and a resume's replayed
+// frames), not live topic broadcasts. Queued and written frames count; dropped
+// and throwing sends add nothing. bytesIn is exact;
+// bytesOut counts binary frames in bytes and text frames in UTF-16 code units,
+// so non-ASCII text reads low.
 export function close(ws, { code, subscriptions, messagesIn, bytesOut, platform }) {}
 export function unsubscribe(ws, topic, { platform }) {}
 
@@ -204,20 +277,98 @@ export async function subscribeBatch(ws, topics, { platform }) {
 }
 ```
 
-**Exporting `subscribe` is effectively required.** Without it the adapter cannot
-tell an app-private topic from a public one, so it denies every subscription
-with `SUBSCRIBE_NOT_CONFIGURED` and prints how to resolve it. Allowing by
-default would mean any client that can name `user:<id>` receives it. If every
-topic in the app really is public, say so explicitly with
-`websocket: { allowUnauthenticatedSubscribe: true }`.
+**Authorize private topics.** Without a subscribe hook or wire-subscribe
+authorization, topics are public. Export a `subscribe` or `subscribeBatch`
+hook to decide access, or arm the grant gate below and grant membership from
+the server.
+```js
+export const subscribe = () => null; // every topic in this app is public
+```
 
-**Handshake headers come from the context, not the returned object.** The
-returned object is frequently built by spreading parsed client input
-(`return { ...JSON.parse(atob(jwt)), user }`), and an in-band `headers` key on
-that object is therefore attacker-settable - a crafted token claim could put an
-arbitrary `Set-Cookie` on the 101 response. The context channel cannot be named
-by client data. A returned `headers` key is ordinary userData, and the
-adapter warns once if it sees one.
+The handler may export synchronous `attribution(userData)`, returning
+`{ tenantId?, principalId?, entitlement? }` or `null`. Each provided value must
+contain 1-64 ASCII letters, digits, underscores or hyphens. The runtime freezes
+the result before `open` and shares it with plugins through the registered
+attribution slot. Invalid results close the connection with code 1008.
+
+Read that frozen attribution and the connection session ID through the public
+connection helpers, including from the `open` hook:
+
+```js
+import { attribution as getAttribution, connectionSessionId } from 'svelte-adapter-bunserve/connection';
+
+export function open(ws) {
+	const tenantId = getAttribution(ws)?.tenantId;
+	const sessionId = connectionSessionId(ws);
+}
+```
+
+Unavailable metadata returns `null` from `attribution` and `undefined` from
+`connectionSessionId`, including after the native connection handle is gone.
+
+### Wire-subscribe authorization
+
+A `subscribe` hook decides topics one at a time. When the server already knows
+which topics a connection may have - because it granted them itself - the gate
+can be the grant instead.
+
+Set `websocket: { authorizeWireSubscribe: true }` (or call
+`platform.authorizeWireSubscribe()` once at startup) and a client-initiated
+`subscribe` / `subscribe-batch` is honoured only for a topic the server already
+authorized for that connection through `platform.subscribe` - unless you export
+your own `subscribe` / `subscribeBatch` hook, which then decides every topic
+exactly as before.
+
+```js
+// hooks.ws.js - no subscribe hook at all: the server grants, the client asks.
+export async function open(ws, { platform }) {
+	const { rooms } = ws.getUserData();
+	for (const room of await db.roomsFor(rooms)) await platform.subscribe(ws, room);
+}
+```
+
+`'strict'` is the conjunctive form: the topic must be in that connection's
+grant set **and** the hook must allow it. A permissive hybrid hook therefore
+cannot stand in for a tenant or room grant, while a restrictive one can still
+narrow a grant. Strict is latched for the worker lifetime, and a later
+no-argument `platform.authorizeWireSubscribe()` cannot downgrade it.
+
+The arming only ever rises, and every lane reads it fresh: a subscribe parked in
+an app hook while the gate is armed underneath it is judged by the posture in
+force when it lands, not the one it started under. A value that is not `true`,
+`false` or `'strict'` is a build error rather than a silent "off", because
+`authorizeWireSubscribe: process.env.WS_AUTHZ` is a string when the variable is
+set and would otherwise arm nothing while the config reads as armed.
+
+`platform.checkSubscribe(ws, topic, { requireGrant: true })` asks the same
+question for an observer lane that wants to read what a connection already
+holds. With the gate unarmed it falls through to the ordinary hook. The grant is
+read again where the answer lands, so a revocation that arrives while your hook
+is awaiting is a refusal rather than a stale yes.
+
+The same grant decides the client-named `resume` frame, which yields a topic's
+message history. An armed gate filters that frame's `lastSeenSeqs` down to the
+topics this connection was granted before your `resume` hook sees it: a topic
+refused on the live-subscribe path is not served on the history path either.
+Filtered rather than refused whole, so a reconnect still fills the gaps it is
+entitled to.
+
+A hook that only observes a subscribe does not count as taking the decision
+over. A plugin marks its own exported `subscribe` with
+`Symbol.for('adapter-uws.hook.side-effect-only')`; a marked hook still runs, and
+the gate stays armed behind it. Without that distinction, importing a
+presence-style plugin and following its wiring would silently disarm the gate
+you had just armed. Your own hooks are unmarked, and a wrapper you write around
+a plugin's hook is your code - so it decides.
+
+**Handshake headers use an explicit response wrapper.** Return
+`upgradeResponse(userData, headers)` to attach headers to the 101 response.
+A `headers` property on ordinary returned userData remains application data.
+Return `false` from `upgrade` to refuse with 401. Returning a `Response` does
+not send a custom HTTP refusal; use the `authenticate` preflight when you need
+a custom HTTP response.
+The helper validates header names and values; the runtime snapshots and
+validates them again before handing them to Bun.
 
 **The auth preflight is guarded against CSRF by default.** It accepts session
 cookies and runs your credential check, so a page on any origin could otherwise
@@ -226,16 +377,19 @@ request is accepted when it carries `x-requested-with: XMLHttpRequest` (a
 cross-origin browser cannot set a custom header without a CORS preflight, and
 this endpoint approves none), or `sec-fetch-site: same-origin` (browsers stamp
 it and script cannot forge it), or an `Origin` your `allowedOrigins` allows. The
-family client stamps the first, so browser traffic is unaffected. A **missing**
-`Origin` is refused here, where the upgrade door allows it - that door has your
-`upgrade` hook behind it to authenticate a non-browser client, and this endpoint
-IS the authentication. Native clients that send none of the three are what
-`authPathRequireOrigin: false` is for.
+family client stamps the first. Custom middleware in front of this endpoint
+must accept the `XMLHttpRequest` value; the old `svelte-adapter-uws` value alone
+is refused. A request with none of these three origin signals is refused here,
+where the upgrade door allows a missing `Origin` and leaves authentication to
+your `upgrade` hook. Set `authPathRequireOrigin: false` for native clients that
+send none of the three.
 
 **The preflight is metered per client address**, at `authPathRateLimit` (30) per
 `authPathRateLimitWindow` (10) seconds, so a credential check against a database
 cannot be driven at raw server capacity from one address. Over the limit is
-`429` with a `retry-after` naming the window, and the hook is never called. The
+`429` with a `retry-after` of about one window, jittered (10 to 14 seconds at
+the default) so the clients behind one address do not all return in the same
+second, and the hook is never called. The
 budget is separate from `upgradeRateLimit`'s and deliberately higher: every
 reconnect that preflights also upgrades, so matching them 1:1 would make this
 door the binding constraint on both. The identity is resolved exactly as the
@@ -244,13 +398,36 @@ proxy - and the server says so once per door and per cause, on the first
 refusal that looks like one. Refusals are counted as
 `upgrade_rejected_total{reason: "auth_rate_limit"}`.
 
-**The hooks take `(request, context)` here, where svelte-adapter-uws takes a
-single event object.** Bun hands `fetch` a real `Request` that outlives an
-await, so passing it straight through is the honest shape rather than copying
-one field at a time into a synthetic event. A `hooks.ws` module moving between
-the two adapters needs its `upgrade` and `authenticate` signatures adjusted;
-everything the context carries (`platform`, `cookies`, `getClientAddress`) is
-the same information under the same names.
+Both hooks take the same single event object as svelte-adapter-uws.
+`authenticate` receives `request`, a plain `headers` object, `cookies`, the
+request target as `url`, `remoteAddress`, `getClientAddress`, and `platform`.
+`upgrade` receives plain `headers` and `cookies` objects, `url`,
+`remoteAddress`, `requestId`, and `traceContext` (always null in this adapter).
+`userData.remoteAddress` defaults to the resolved client address. The response
+helper has its own runtime import:
+
+```js
+import { upgradeResponse } from 'svelte-adapter-bunserve/upgrade-response';
+
+export function upgrade({ cookies }) {
+	return upgradeResponse({ sessionId: cookies.session }, {
+		'x-region': 'eu',
+		'set-cookie': ['first=1; Path=/; HttpOnly', 'second=2; Path=/; HttpOnly']
+	});
+}
+```
+
+Header values may be strings or arrays of strings; each `Set-Cookie` array
+entry is emitted separately. `Connection`, `Upgrade`, `Sec-WebSocket-Accept`,
+`Sec-WebSocket-Extensions`, and `Sec-WebSocket-Protocol` belong to the
+handshake and cannot be supplied by the hook. For cookie refresh behind a
+proxy that rejects cookies on a 101 response, use `authenticate` instead. The
+adapter warns once per worker when an upgrade attaches `Set-Cookie`.
+
+Accepted high-range header code points (U+0080 through U+00FF) are sent as
+UTF-8 bytes. Bun joins non-`Set-Cookie` arrays and case-duplicate names with
+commas and trims leading/trailing spaces and tabs; svelte-adapter-uws emits
+those values as separate, untrimmed lines.
 
 **`subscribe` is called with the per-connection `platform`**, the same one every
 other hook receives, so `platform.requestId` correlates across the whole
@@ -259,6 +436,34 @@ connection.
 A throwing `subscribe` hook denies with `INTERNAL_ERROR` rather than
 `FORBIDDEN`, so a client can retry a transient failure without retrying a
 deliberate refusal.
+
+**An `open`, `message` or `drain` hook that throws, or returns a promise that
+rejects, costs only its own connection**: it is closed with code 1011 and the
+reason `Open handler error`, `Message handler error` or `Drain handler error`,
+and the original error is printed server-side as `[ws] the open hook threw
+[ADAPTER-ERR-OPEN-HOOK]` (and the same for the other two). A failing `close`
+hook is only logged (`ADAPTER-ERR-CLOSE-HOOK`), and the adapter's own cleanup
+for the connection still runs. Every other connection keeps being served. A
+falsy `open` or `drain` export (`export const open = dev && fn`) is skipped;
+one that is set to something other than a function fails like a throwing hook,
+so a non-function `open` closes every connection.
+
+**The `ws` the hooks receive is uWS-shaped**, so a hook moves between the two
+adapters unchanged. Every method that sends, subscribes or closes throws a
+`WsClosedError` once the connection has closed; `getUserData()` stays readable
+through the `close` hook and `isSubscribed()` answers false. The two that
+close it:
+
+- `ws.end(code?, reason?)` - close with a close frame the client reads: `code`
+  must be 1000-1003, 1007-1014 or 3000-4999 (anything else throws a
+  `TypeError` and leaves the connection open, as does a reason without a code),
+  a reason is text or UTF-8 bytes, and one over 123 UTF-8 bytes is shortened at
+  a character boundary. With no code the frame carries no status, which the
+  client reads as 1005.
+- `ws.close()` drops the connection with no close frame, so the client reads
+  1006 and reconnects. It takes no arguments; the graceful close with a code is
+  `end`. (Bun's own API spells these the other way round, `close(code, reason)`
+  and `terminate()`.)
 
 The same `platform` reaches SSR, so a load function or form action publishes
 without holding a socket:
@@ -270,23 +475,73 @@ export function POST({ platform }) {
 }
 ```
 
+### Joining topics outside the wire protocol
+
+Code that joins or leaves a connection's topics on its own - a presence join, a
+snapshot handshake, a plugin in another package - does it through
+`trackedSubscribe(ws, topic)` and `trackedUnsubscribe(ws, topic)` from
+`svelte-adapter-bunserve/subscriptions`, the entry svelte-adapter-uws declares
+under the same name:
+
+```js
+import { trackedSubscribe, trackedUnsubscribe } from 'svelte-adapter-bunserve/subscriptions';
+
+export function message(ws, { msg }) {
+	if (msg?.type === 'join-lobby') trackedSubscribe(ws, 'lobby');
+	if (msg?.type === 'leave-lobby') trackedUnsubscribe(ws, 'lobby');
+}
+```
+
+They move native membership, the connection's subscription set, the
+per-connection cap (65,536 topics), a shared-codec topic's cohort and the
+instance's subscription total together. A bare `ws.subscribe`, or a registry
+entry written by hand, leaves the total behind: `ws_subscriptions` and the
+pressure reading never hear of it, and the close that releases it reports
+`subs.total-negative`. `trackedSubscribe` returns `false` for a closed socket
+or a new topic at the cap; `trackedUnsubscribe` returns `false` for a closed
+socket, and also cancels a subscribe for the same topic still waiting on its
+authorization hook. Neither runs the app's `subscribe` or `unsubscribe` hook:
+they change membership, they do not authorize it. A server-side subscribe that
+should go through the gate is `platform.subscribe`.
+
+Use `releaseSubscription(ws, topic)` from the same entry when an admitted
+framework loader or setup fails. It immediately removes physical and logical
+membership, registered derived subscriptions, the publish grant and shared-codec
+cohorts. It returns whether anything was removed and is safe to repeat or call
+after close. Independently pending admissions can still finish their own
+authorization; a prior explicit revocation remains effective.
+
+This releases physical membership, not an ownership reference. Coordinate
+already-completed concurrent admissions and perform framework-specific cleanup
+yourself; no application unsubscribe hook runs. Use `platform.unsubscribe` or
+`trackedUnsubscribe` when pending attempts must also be cancelled.
+
+Every slot they touch is a `Symbol.for` key or a global hook under
+svelte-adapter-uws's names, so a plugin that carries that adapter's own copy of
+these helpers moves this runtime's state the same way.
+
 ### Platform surface
 
 | member | notes |
 |---|---|
 | `publish(topic, event, data, options?)` | topic fan-out; `{ seq, jitterMs, compress }`. `seq` DEFAULTS to the per-topic counter - a call with no options stamps one; `{ seq: false }` is the only way to publish without |
+| `publishBatched(messages, options?)` | batches `{ topic, event, data, options?, coalesceKey? }` entries when every recipient supports batch frames and sees the same topics; otherwise publishes entries separately. `{ compress: true }` opts into compression. Shared batches serialize every payload before advancing any sequence |
+| `grantPublish(ws, topic)` / `revokePublish(ws)` / `publishGrant(ws)` | set, clear, or read a connection's single client-publish grant. Unsubscribing from the granted topic clears it. JSON `game` and binary `game:1` ingress resolve their topic from this grant |
+| `publishGame(senderWs, topic, event, data, id?)` | trusted server game fan-out, excluding the sender; returns `{ seq, delivered }`. Client input IDs are echoed to peers. Requires a single socket-owning I/O worker |
 | `send(ws, topic, event, data, options?)` | one connection; returns 0 enqueued / 1 sent / 2 dropped |
-| `sendTo(filter, topic, event, data, options?)` | filtered fan-out; the filter MUST be synchronous |
-| `subscribe(ws, topic, options?)` | server-side subscribe THROUGH the authorization hook; `null` on success, else a reason: `INVALID_TOPIC`, `SUBSCRIBE_NOT_CONFIGURED`, `INTERNAL_ERROR`, `FORBIDDEN` (what a hook returning `false` becomes), `RATE_LIMITED`, `CANCELLED`, `CLOSED`, or the hook's own string |
-| `checkSubscribe(ws, topic, options?)` | run the hook without subscribing; the same reasons except the last three, which only an install can produce |
-| `unsubscribe(ws, topic)` | unsubscribe and keep bookkeeping in step |
-| `metrics` | the instance's metrics registry: `counter(name, help, labelNames?)`, `gauge`, `histogram`, `projectCounter`, `serialize()`, `read()`, `reset()`. Register your own instruments on it; `serialize()` renders the same document `metricsSnapshot()` does, adapter families included |
-| `metricsSnapshot()` | `Promise<string>` - the whole Prometheus document, adapter families first |
-| `adviseReconnect(options?)` | jittered reconnect advice, then drain |
+| `sendTo(filter, topic, event, data, options?)` | filtered fan-out; the filter MUST be synchronous. Returns the number of non-throwing sends, including dropped frames |
+| `sendCoalesced(ws, { key, topic, event, data })` | one connection, coalesce-by-key: each `(connection, key)` holds at most one pending message and a newer value replaces it in place (latest wins, first insertion order kept), flushed at once and again on every drain, ahead of your `drain` hook. For latest-value streams (cursors, presence, price ticks): a backpressured client catches up to the latest value instead of every stale one. Immediate serialization failures preserve native Error identity; other failures become TypeErrors. Queued failures are dropped and reported as the `ws.send-coalesced.unserializable` operational event with `ADAPTER-ERR-COALESCED-UNSERIALIZABLE`, even if the reporter itself throws. Topic and event names are validated before replacing or evicting pending entries. Reentrant sends to the same connection only enqueue; superseded values are skipped and newer replacements survive backpressure. Repeated requeues yield to the event loop, and continuations stop after close. At most 1,000,000 keys per connection; a new key past that evicts the oldest pending one |
+| `subscribe(ws, topic)` | server-side subscribe THROUGH the authorization hook; `null` on success or a closed socket, else a reason: `INVALID_TOPIC`, `INTERNAL_ERROR`, `FORBIDDEN` (what a hook returning `false` becomes, and the answer for a subscribe a revocation cancelled while its hook was awaited), `RATE_LIMITED`, or the hook's own string |
+| `checkSubscribe(ws, topic, options?)` | run the hook without subscribing; the same reasons except `RATE_LIMITED`, which only an install can produce |
+| `unsubscribe(ws, topic)` | remove membership or cancel an in-flight subscribe; returns true for either, dispatches every removed membership's app hook, and releases derived topic subscriptions |
+| `metrics` | configured registry object, or `null`; `counter`, `gauge` and `histogram` factories follow `MetricsRegistry`. Serialize application metrics through that registry |
+| `metricsSnapshot()` | promise resolving to canonical adapter metrics, or `null` when unconfigured |
+| `adviseReconnect(options?)` | jittered reconnect advice, then drain. Returns completed advisory attempts, including dropped frames; a send or requested close that throws is not counted |
 | `connections` / `subscribers(topic)` / `forEachSubscriber(topic, fn)` | live counts and the per-subscriber walk |
 | `maxPayloadLength` / `bufferedAmount(ws)` / `closedWsAborts` | limits and backpressure telemetry |
+| `assertions` | per-category count of framework invariant violations in this process: the live `Map`, read it and do not modify it. Empty on a healthy server; see below. On every build, with or without a WebSocket handler |
 | `pressure` | the LIVE 1 Hz sample (mutated in place, never copied): `{ active, value, reason, subscriberRatio, publishRate, memoryMB, maxBufferedBytes, backpressuredConnections, psi, cpuThrottle, topPublishers }`; `reason` precedence is MEMORY > CAPACITY > CPU_QUOTA > PSI > PUBLISH_RATE > SUBSCRIBERS > NONE; kernel readings are `null` off-Linux |
-| `protection` | `'normal' \| 'elevated' \| 'siege'`; `'normal'` today (the posture machine's option is not yet accepted here) |
+| `protection` | `'normal'` for this process |
 | `onPressure(cb)` | fires on `reason` TRANSITIONS with the live snapshot; throwing callbacks are contained; returns unsubscribe |
 | `onPublishRate(cb)` | per-topic runaway-publisher reports `[{ topic, messagesPerSec, bytesPerSec }]` once per window; registering replaces the default throttled console warning; returns unsubscribe |
 | `topic(name)` | scoped publisher: `platform.topic('chat').created(data)` |
@@ -294,50 +549,134 @@ export function POST({ platform }) {
 | `now()` / `monotonic()` / `random.float()` `.u32()` `.uuid()` `.bytes(n)` | determinism seams |
 | `publishWire(topic, event, data, wire, options?)` | binary fan-out through a codec: capable clients get the `0x03` frame, everyone else the `publish()` envelope with the SAME seq; `{ seq, compress, excludeWs }` |
 | `publishWireBatch(topic, event, entries, wire, options?)` | one tick's updates as ONE batch frame per capable connection (the codec's `<event>-batch` form), per-entry envelopes and seqs for the rest; per-entry `excludeWs` and `seq` |
-| `sendWire(ws, topic, event, data, wire, options?)` | single-target codec frame (seq 0), or the JSON envelope for a caps-less / degraded connection; returns the send tri-state |
-| `sendWireBatch(ws, topic, event, entries, wire, options?)` | the per-subscriber twin of `publishWireBatch`, for culled per-viewer walks |
+| `sendWire(ws, topic, event, data, wire, options?)` | single-target codec frame (seq 0 unless an explicit seq is supplied), or the JSON envelope for a caps-less / degraded connection; returns the send tri-state; codec exceptions propagate |
+| `sendWireBatch(ws, topic, event, entries, wire, options?)` | the per-subscriber twin of `publishWireBatch`, for culled per-viewer walks; stateful codecs batch as binary, stateless codecs send per-entry JSON; codec errors propagate |
 | `registerWireCodec(wire)` | register a codec under its capability token; idempotent, last-wins |
 
-**The memory signal is off by default here, and that is the one pressure
-default that differs from svelte-adapter-uws.** `heapUsed / heapTotal` only
-measures saturation on an engine that over-allocates its heap. Bun does not:
-a freshly booted, completely idle server measures 0.90 to 0.94 on Bun 1.3.14
-and 0.81 on 1.4.0 (the live suite pins that it stays high), so the family's
-`memoryHeapUsedRatio: 0.85` would fire on a healthy 1.3 process and never
-clear, and flap on ordinary allocation churn on 1.4 - either way
-`platform.pressure.active` misreports for the life of every app, and
-`onPressure` announces `MEMORY` without meaning it. The
-same reading is kept out of the flow-control window sizing for the same
-reason: fed to a knee calibrated for an over-allocating heap, an idle server
-would hand out a fraction of the intended window. Both are pinned by
-`test/live/pressure-check.mjs` against a real server, so if the engine's
-accounting ever changes the divergence is revisited rather than kept out of
-habit.
+`publishWire`, `publishWireBatch`, `sendWire` and `sendWireBatch` propagate
+codec exceptions to the caller. An invalid non-null codec result throws
+`TypeError` before that encode sends a wire-id announce or payload; `Uint8Array`
+values from another JavaScript realm are accepted. A failed encode does not
+poison the connection or send a JSON fallback. A broadcast may already have
+reached earlier subscribers or entries when a later encode fails; it does not
+roll those deliveries back. Handle the exception where the application can recover. `sendWireBatch` uses JSON for
+stateless codecs and captures each stateful entry's data once before encoding.
 
-**What that costs you, stated plainly:** with the heap signal off, this
-adapter ships no memory pressure signal at all on a host without PSI - every
-non-Linux host, and Linux without PSI compiled in. A worker genuinely
-approaching OOM there reports `reason: 'NONE'` and `active: false`, so
-`onPressure` is not a memory alert on those hosts. On Linux, `psiMemoryFull`
-(default 15) is live and is the better memory signal anyway: it measures
-kernel-observed stall time, which fires meaningfully earlier than an
-OOM-adjacent heap ratio. Elsewhere, either opt back into the sibling's exact
-threshold with `websocket: { pressure: { memoryHeapUsedRatio: 0.85 } }` -
-accepting that it reads as permanently active - or watch RSS outside the
-process until the family settles a runtime-independent memory signal. Every
-other threshold, and the rest of the surface, is the family's.
+The close-hook counters `messagesOut` and `bytesOut` include directed frames
+accepted by the socket: both written and queued behind backpressure. Dropped
+and throwing sends add nothing. The same rule applies to control frames,
+coalesced sends and resume replay. These are local socket acceptance counters,
+not peer delivery receipts.
 
-`platform.subscribe` refuses the adapter's own `__`-prefixed namespace by
-default, because the documented advice is to route server-initiated subscribes
-through it - so an app implementing its own `join` verb would otherwise pass a
-client-supplied room straight into an internal channel. Pass
-`{ allowSystemTopic: true }` where that is genuinely intended.
+`sendTo` and reconnect advice retain dropped attempts in their return counts.
+`sendTo` charges non-throwing sends to egress; reconnect advice excludes attempts
+where either the send or requested close throws. Close-hook counters still record
+an accepted advisory when the subsequent close throws. `sendTo` admits the entire
+filtered target set before sending; sockets that throw during delivery do not
+consume the tenant budget.
 
-`checkSubscribe` applies the same guard and takes the same escape, so the two
-cannot disagree about a topic. A bare `ws.subscribe(topic)` applies neither, and
-it is not something the adapter can see - so in the family's
-check-then-subscribe pattern, the check is the only thing standing between
-client input and an internal channel:
+`adviseReconnect` snapshots and filters its targets before sending any advice.
+A missing, non-positive or sub-millisecond `windowMs` returns zero without
+sending or closing, even with `{ close: true }`. Replace close-only calls with
+a positive reconnect window when draining clients; use each socket's `end()`
+when no advisory is wanted.
+
+**The realtime tier checks its own invariants.** About twenty places verify
+state that should never be wrong - a connection with no platform, a
+subscription slot that is not a `Set`, a subscription total below zero, an
+empty envelope. A violation increments `platform.assertions` and
+`framework_assertion_violations_total{category,severity}` and logs one line,
+`[lantean/diagnostic source=svelte-adapter-bunserve component=runtime.assertion event=invariant.violated severity=warn] <category> {...}`,
+whose JSON names the category, plus what was found where the check records it
+(the subscription total, the stats field types). The check itself does not
+throw: a throw would abandon the socket callback it happened in. The few that
+mean state which cannot heal - a second `open` on one connection, a socket
+admitted without its connection permit, a message on a connection with no
+platform, a subscribe onto a broken subscription set, an empty envelope on a
+publish - are fatal: after the line (`severity=fatal`) the process exits with
+code 78 on the next microtask, so a supervisor restarts it rather than letting
+it run on. Under test
+(`NODE_ENV=test`, or `VITEST` set) every violation throws instead, so the test
+that caused it fails. The categories are svelte-adapter-uws's, so a report
+reads the same on either adapter, and a non-zero count is worth an issue with
+the category and the logged line.
+
+```js
+export function GET({ platform }) {
+	const assertions = Object.fromEntries(platform.assertions);
+	return Response.json({ healthy: Object.keys(assertions).length === 0, assertions });
+}
+```
+
+**The memory signal is the family's, and its basis is distance to the nearest
+memory wall.** `heapUsed / heapTotal` measures how tightly an engine keeps its
+arena fitted, which is not memory pressure: a freshly booted, completely idle
+server measures 0.90 to 0.94 on Bun 1.3.14 and 0.81 on 1.4.0 (the live suite
+pins that it stays high), so a 0.85 threshold on that reading fires on a healthy
+process and never clears. It also misses the death that actually happens - the
+kernel's OOM killer charges the whole resident set against the cgroup limit,
+which no heap ratio observes.
+
+The sample is therefore the worst of two walls, each measured with the quantity
+its wall kills on: `heapUsed` against the engine's reported allocation ceiling,
+and the resident set against the tightest cgroup memory limit that applies to
+the process (v2 `memory.max`, v1 `memory.limit_in_bytes`, on its own group and
+each ancestor that enforces on it). The limits are re-read every sample, so one
+changed on a running process is followed, and a limit file that fails to read
+holds its last value rather than dropping out. JavaScriptCore reports no
+allocation ceiling, so on this runtime the
+container arm carries the reading. `memoryHeapUsedRatio` keeps its name and its
+0.85 default, one reading feeds the `MEMORY` reason, the value fold, the gauge
+and the send-gate window sizing, and every signal stays disableable with
+`false`.
+
+If a finite cgroup limit becomes unlimited, its gauge sample disappears. It
+returns when a finite wall is known again.
+
+**What that costs you, stated plainly:** a process with no discoverable wall on
+either arm omits `heap_used_ratio` and contributes zero to memory pressure. On an uncontained host
+(no cgroup limit, and JavaScriptCore contributing no engine arm) the memory
+signal is silent, and a worker genuinely approaching OOM there reports
+`reason: 'NONE'`. The signal degrades to silence, never to a false alarm. On
+Linux, `psiMemoryFull` (default 15) is live and is the better memory signal
+anyway: it measures kernel-observed stall time, which fires meaningfully earlier
+than any OOM-adjacent ratio. In a limited container - the deployment this
+matters most for - the container arm is live and warns before the resident-set
+kill.
+
+Bun 1.4's [`memoryPressure` notifications](https://bun.com/blog/bun-v1.4)
+feed discovery on the next regular sampler tick. Both `warning` and `critical`
+set the same pending hint; a burst causes one cgroup membership refresh before
+that tick reads the walls. The notification starts no extra timer or sample and
+assigns no pressure level. Measured wall ratios and PSI still determine pressure,
+so a notification without a discoverable wall or measured PSI adds no saturation.
+Disabling `memoryHeapUsedRatio` leaves configured PSI thresholds independent.
+
+The listener is removed when the sampler stops. Runtimes that never emit the
+event retain the normal sampling behavior. Controlled environments never install
+a host memory-pressure listener.
+
+Every other threshold, and the rest of the surface, is the family's.
+
+`platform.subscribe(ws, topic)` and `platform.checkSubscribe(ws, topic)` pass
+server-selected topics, including `__`-prefixed plugin channels, through the
+application's subscribe hook. Registered plugin-owned channels retain their
+own authorization. Other client-selected system topics remain refused unless
+`allowSystemTopicSubscribe` enables them. An app that
+forwards client input through these server APIs must authorize that topic in its
+hook. `subscribe` takes no options argument; remove the former
+`allowSystemTopic` escape. `checkSubscribe` retains its `{ requireGrant: true }`
+observer mode. Observer checks follow the configured wire topic alphabet;
+ordinary server checks permit non-ASCII topics.
+
+Subscription topic names must contain valid UTF-16: unpaired high or low
+surrogates return `INVALID_TOPIC` from `platform.subscribe` and `checkSubscribe`,
+and from wire subscriptions when `allowNonAsciiTopics` is enabled. Replace those
+names before upgrading. Valid surrogate pairs are accepted on non-ASCII lanes;
+the 256-unit limit counts each astral symbol as two UTF-16 code units.
+
+A bare `ws.subscribe(topic)` bypasses application authorization. The
+check-then-subscribe pattern runs that authorization before loading data:
 
 ```js
 // Test against null, NOT truthiness: '' is a denial reason a hook produces
@@ -362,71 +701,86 @@ which frame asked for it.
 
 ### Metrics
 
-Every instance keeps a metrics registry and can render it as a Prometheus
-document - **including a build with no WebSocket handler**, which is why the
-members live on `platform` rather than on the realtime tier. Such a build
-publishes the process families (`resident_memory_bytes`, `heap_used_ratio`) and
-whatever your app registered, and none of the realtime ones: a server with no
-upgrade path has not admitted zero upgrades, it has no upgrade door to count.
-Register from the route itself there, since there is no `init` hook to do it
-from.
+Set `websocket.metrics` to a module that exports a registry as `default`,
+`metrics`, or `registry`. The adapter retains that object on `platform.metrics`.
+When no registry is configured, both `platform.metrics` and the awaited
+`platform.metricsSnapshot()` result are `null`.
 
-There is nothing to configure - serve it from an ordinary route:
+```js
+// src/lib/server/metrics.js
+import { createMetrics } from 'svelte-adapter-uws-extensions/prometheus';
+export const metrics = createMetrics();
+
+// svelte.config.js
+adapter({ websocket: { metrics: './src/lib/server/metrics.js' } });
+```
+
+Install `svelte-adapter-bunserve/vite` alongside the SvelteKit plugin to bundle
+that module into the app's SSR graph. Routes importing it and
+`platform.metrics` then use the same instance. Without the plugin the adapter
+bundles the registry separately and warns; use `platform.metrics` to reach
+that instance.
+
+The configured registry holds adapter and application instruments. Its own
+serializer may apply a name prefix. `metricsSnapshot()` returns only mirrored
+adapter instruments under canonical family names; application instruments stay
+in the configured registry and are not copied into that snapshot.
 
 ```js
 // src/routes/metrics/+server.js
 export async function GET({ platform }) {
-	return new Response(await platform.metricsSnapshot(), {
+	const body = await platform.metricsSnapshot();
+	if (body === null) return new Response('metrics not configured', { status: 503 });
+	return new Response(body, {
 		headers: { 'content-type': 'text/plain; version=0.0.4' }
 	});
 }
 ```
 
-Your own instruments go on the same registry and land in the same document,
-after the adapter's own families:
+With metrics configured, transport hooks record bounded-label completion counters
+and monotonic durations. Live-state gauges and cumulative counters project from
+the runtime state on the existing pressure sampler and during a snapshot. No
+extra timer is installed. Without a registry, the sampler's metrics export hook and transport metric
+hooks remain disabled.
 
-```js
-// src/ws-handler.js
-let orders;
-export function init({ platform }) {
-	orders = platform.metrics.counter('orders_placed_total', 'orders placed', ['tier']);
-}
-```
+Counters and immediately measurable gauges register at initialization; a throwing
+factory fails startup. Sampled gauges register when their first measurement arrives.
+Instrument emit failures are contained and reported once per instrument, while
+the adapter mirror retains the recorded value. A gauge's optional `remove()`
+method retracts unavailable samples. Registries without removal receive memory
+wall samples only when a permanent engine wall makes them continuously available;
+the adapter snapshot tracks wall availability independently. Gauge factories should
+leave samples absent until `set()` is called. A factory that publishes a default
+value without supporting removal cannot represent an unavailable measurement
+in its own serializer.
 
-**The adapter owns the registry, and that is deliberate.**
-svelte-adapter-uws takes one from a module you name in `websocket.metrics`.
-That cannot work here: measured on this repo's own fixture, a module imported
-by both a SvelteKit route and the WebSocket handler ends up as **two copies** in
-the built output, because SvelteKit's server bundle is already bundled before
-the adapter's own pass sees your handler. An app that imported its registry to
-serve `/metrics` would render one the adapter never wrote to - every adapter
-family stuck at zero, and nothing to indicate why. Reaching it through
-`platform`, which is the same object SSR already gets, is what makes there be
-exactly one.
+Signals with no measurement are absent. Pressure gauges appear after the first
+sampler tick; unavailable kernel readings and memory walls withdraw their earlier
+samples. `pressure_sample_timestamp_seconds` gives the sample's age.
+`metrics_snapshot_workers_expected` is 1 for this single-process adapter.
+`metrics_snapshot_workers_reporting` counts a complete report only when every
+required instrument is registered and each required gauge has a sample.
+`metrics_snapshot_degraded` distinguishes a failed collection from an incomplete
+report. Compare reporting with expected before treating absent series as zero.
 
-**Nothing is emitted from a hot path.** The runtime already counts refusals by
-reason, publishes, closed-socket aborts and the rest; the document is projected
-from those authoritative numbers when something scrapes. So metrics cost nothing
-until they are read, and there is no second tally that can disagree with the
-first. The pressure-derived gauges are as fresh as the last sampler tick, which
-`pressure_sample_timestamp_seconds` states outright - alert on its age rather
-than assuming the gauges beside it are current.
+Metric applicability follows the fixed runtime source inventory from
+`createMetricProfile`, exported with `METRIC_SOURCE_GROUPS` and
+`NATIVE_METRIC_PROFILE` from `svelte-adapter-bunserve/observability`. The adapter's
+inventory is part of its implementation, not an application option. A build
+without a WebSocket tier reports HTTP, process memory and framework assertions;
+a realtime build also reports upgrade, rate-limit, admission, pacing, WebSocket,
+subscription, publish, backpressure, direct-send drop, egress, pressure and OS
+pressure sources. Missing samples from supported sources still make the report
+incomplete. Sources without measurements, such as worker relay and state audit,
+are absent rather than represented by zero.
 
-`websocket.metrics` - the sibling's option naming your registry module - is
-**accepted so a carried config builds, and not loaded**. The build says so, and
-names `platform.metrics` as where to go instead. Honouring it would produce a
-server that looks instrumented and is not.
-
-The metric names are svelte-adapter-uws's, so dashboards move between the two
-adapters. Signals this adapter cannot measure are **absent** rather than zero: a
-zero published for something never measured reads as healthy and no alert ever
-fires. That applies over time as well as at boot - the pressure families appear
-at the sampler's first tick, roughly a second in, and the kernel readings
-disappear again if `/proc/pressure` stops answering rather than republishing the
-last figure as current. `metrics_snapshot_workers_expected`, `_reporting` and
-`metrics_snapshot_degraded` are always `1`, `1` and `0` here, because this
-adapter is single-process - they are carried so an alert written against the
-sibling still evaluates.
+In-flight upgrades are measured even without an admission ceiling. A server with
+no pacing controller has an empty queue, with zero depth and age. Drop counters
+cover direct socket sends; Bun does not expose per-recipient publish drops.
+Snapshots identify this with `# metric_sources` and
+`# ws_dropped_coverage direct-sends` comments. Preserve that coverage when comparing
+drop rates. See [transport availability](docs/transport-availability.md#metric-sources)
+for source and completeness rules.
 
 ### Options
 
@@ -454,8 +808,40 @@ adapter: bunserve({
 	readinessCheckPath: '/readyz',   // readiness probe; 503 once a drain begins. false disables it
 	staticDotfiles: false,           // see Static files
 	staticHeaders: undefined,        // extra response headers for static and prerendered files
+	staticCacheControl: undefined,   // path-specific cache policies
+	warmup: true,                    // warm '/' before readiness; false, or { paths: [...] }
 	websocket: undefined             // the realtime endpoint; see below
 })
+```
+
+**`warmup` renders your paths once before readiness reports ready.** A cold
+SvelteKit SSR render costs about twenty times a warm one - measured on Bun
+against this repository's fixture at 16.1-18.0 ms cold against a 0.75-0.92 ms
+settled mean, 17-24x across runs - and the whole penalty lands on whichever
+client arrives first after a deploy. The warmup runs in the `starting` window,
+after your `init` hook and before readiness turns green, so a load balancer
+cannot route anyone into the cold render. `true` (the default) warms `/`;
+`false` disables it; `{ paths: ['/', '/dashboard'] }` names the routes, which
+must be absolute pathnames.
+
+It is bounded in every direction, because it sits on the readiness-critical
+path: each render is aborted past a per-render budget, a never-ending body (an
+SSE route) is cancelled rather than buffered, and the whole pass is raced
+against a total budget so readiness commits even if a render ignores its abort.
+A warmup that fails or times out is logged and readiness proceeds - an instance
+that never reports ready is worse than one whose first render is cold.
+
+The render goes through the same engine entry a real request reaches, so your
+hooks run. `platform.isWarmupRequest(request)` tells them apart: the request is
+tagged by object identity, never a header, so a real client cannot forge one.
+Use it to skip what a real visit would incur - analytics, rate counting, an
+audit log entry.
+
+```js
+export async function handle({ event, resolve }) {
+	if (!event.platform.isWarmupRequest(event.request)) track(event);
+	return resolve(event);
+}
 ```
 
 `healthCheckPath` answers liveness and `readinessCheckPath` answers readiness -
@@ -466,10 +852,89 @@ instead. Neither may collide with `websocket.path` or `websocket.authPath`: the
 probe routes are matched first, so the endpoint behind the collision would never
 be reached, and that fails the build rather than going quiet.
 
+A request target that carries a `#` is refused with `400` on every path - the
+probes, the auth path, the WebSocket handshake, the built assets and your own
+routes - as svelte-adapter-uws refuses it: RFC 9112 does not allow a fragment
+in a request line, and Bun would read the rest as one, so `/healthz#frag` would
+be answered as the probe. A WebSocket handshake whose query carries one is
+counted as `upgrade_rejected_total{reason="malformed_handshake"}`. Routing
+uses the target after removing Bun's Host-derived URL prefix. Probes and
+built assets do not need a valid Host; SSR and authentication reject an
+invalid authority with `400` before calling application code. Configured
+proxy protocol and port headers must carry `http` or `https` and decimal
+digits respectively. A refused proxy header logs its setting once.
+svelte-adapter-uws also refuses a raw byte outside visible ASCII in the target.
+Bun answers a space or a byte below `0x20` there with its own `505` before the
+adapter runs, and a bare CR with nothing. It hands DEL on as `%7F`, and every
+byte from `0x80` up decoded as UTF-8 and escaped again, a byte that is not part
+of UTF-8 as `%EF%BF%BD`: here a raw UTF-8 `caf` + `é` is served as `/caf%C3%A9`
+would be. Browsers, and clients that build the target from a parsed URL, send
+neither.
+
+The paths the adapter answers ahead of your routes - the probes, the auth path
+while your handler mounts it, and the WebSocket path while an
+`upgradeAdmission` limit makes its GETs the adapter's - are matched exactly. A
+request SvelteKit would route onto one of them without spelling it, its data or
+route-resolution request (`/healthz/__data.json`, `/readyz/__route.js`) or an
+escape of its letters (`/%68ealthz`), is refused with `400` whatever its method,
+as svelte-adapter-uws refuses it, rather than handed to your router as that
+path. A page one trailing slash further on, `/healthz/`, stays yours, and so
+does its data, and a file of yours that sits at such a path is still served.
+Bun resolves dot segments and backslashes before the adapter sees the target,
+so a spelling through them is the path itself here, on every lane: a GET of
+`/x/../healthz` is answered by the probe and a POST of it reaches your routes
+as `/healthz`, a POST to `/x/../__ws/auth` reaches the auth endpoint, and a
+handshake on `/x/../ws` opens a socket. uws refuses each of them with `400`,
+the last only under a limit, where without one it hands the request to your
+routes.
+
 Files at or below 4 MiB are held in the in-memory static index; larger ones are
 streamed from disk through `Bun.file`, which uses the kernel's own send path.
 The threshold is fixed rather than an option, because the adapter this one
 mirrors declares none.
+
+Static negotiation reads `Accept-Encoding` weights and wildcard codings.
+For example, `br;q=0, gzip;q=0.8` selects an available gzip copy; equal accepted
+weights prefer Brotli. Identity is the fallback when neither available coding
+is accepted. Byte ranges address those selected bytes, including precompressed
+Brotli and gzip. A zero-length suffix (`bytes=-0`) is unsatisfiable and answers
+416. `If-Range` requires a strong validator; the weak file validators cause a
+full response when supplied in `If-Range`.
+
+Conditional requests follow the same policy as svelte-adapter-uws.
+`If-Match` accepts any validator issued for the asset's identity, Brotli or gzip
+representation, including its `W/` prefix; `If-None-Match` compares the selected
+representation weakly, so adding or removing `W/` preserves a match. Both accept
+a comma-separated list or a standalone `*`. A wildcard also applies to immutable assets without
+an ETag. `If-Match` takes precedence over `If-Unmodified-Since`, and
+`If-None-Match` over `If-Modified-Since`. Date conditions accept only the
+three HTTP-date forms, validate the calendar and weekday, and interpret RFC
+850 two-digit years with a rolling fifty-year boundary. `Last-Modified` is
+omitted for future or pre-1900 file timestamps; those files retain their ETags
+and ignore date conditions.
+A 304 carries the selected response headers except `Content-Type`, `Content-Encoding` and
+`Content-Disposition`, preserving configured cache and security metadata.
+
+`staticCacheControl` sets path-specific policies for static and prerendered files:
+
+```js
+adapter({
+	staticCacheControl: [
+		{ pattern: '/fonts/', cacheControl: 'public, max-age=31536000, immutable' },
+		{ pattern: '/images/logo.svg', cacheControl: 'public, max-age=86400' }
+	]
+});
+```
+
+Patterns are literal asset paths relative to the configured SvelteKit base. A
+trailing slash matches a directory tree; other patterns match one exact file.
+The longest matching pattern wins, regardless of rule order. SvelteKit
+`/_app/immutable/` files always retain their built-in immutable policy. Other
+files default to `no-cache`. Configured files keep their ETags and byte ranges,
+and their selected policy appears on both 200 and 304 responses. Use immutable
+caching only when content changes also change the filename. Invalid paths,
+duplicate patterns, empty policies and control characters fail at adapter
+creation.
 
 `staticHeaders` is an object of string header values applied to static and
 prerendered responses, merged once while the index is built rather than per
@@ -487,7 +952,7 @@ is replaced by yours.
 adapter: bunserve({
 	websocket: {
 		path: '/ws',                        // default
-		handler: 'src/ws-handler.js',       // default
+		handler: 'src/hooks.ws.js',       // discovered automatically
 		authPath: '/__ws/auth',             // the auth preflight POST; must differ from `path`
 		authPathRequireOrigin: true,        // CSRF guard on it; false accepts native clients
 		metrics: undefined,                 // accepted for config portability; NOT loaded - see Metrics
@@ -503,7 +968,7 @@ adapter: bunserve({
 		allowedOrigins: 'same-origin',      // 'any' | '*' | ['https://app.example']
 		allowNonAsciiTopics: false,
 		allowSystemTopicSubscribe: false,
-		allowUnauthenticatedSubscribe: false,
+		authorizeWireSubscribe: false,      // true, or 'strict'
 		upgradeRateLimit: 10,               // upgrades per client address per window; 0 disables
 		upgradeRateLimitWindow: 10,         // that window, in seconds
 		upgradeTimeout: 10,                 // seconds the `upgrade` hook may take; 0 waits forever
@@ -529,9 +994,8 @@ adapter: bunserve({
 		// Pressure-sampler thresholds; each signal accepts `false` to
 		// disable it. The sampler always runs - this only tunes it.
 		pressure: {
-			// OFF here, and the one default that deliberately differs from
-			// svelte-adapter-uws (which ships 0.85). See below.
-			memoryHeapUsedRatio: false,
+			// The family default: distance to the nearest memory wall. See below.
+			memoryHeapUsedRatio: 0.85,
 			publishRatePerSec: 10_000,
 			subscriberRatio: 50,
 			sampleIntervalMs: 1000,           // under 100 resets to 1000; capped at 2^31-1
@@ -546,74 +1010,46 @@ adapter: bunserve({
 })
 ```
 
-This adapter also enforces five per-connection bounds that are not options -
+This adapter also applies fixed per-connection limits and hook policies -
 the adapter it mirrors declares none of them, so they are fixed constants and a
 config carried between the two means the same thing in both. They are different
 jobs rather than different sizes of the same one:
 
-- `maxSubscriptionsPerConnection` bounds what can INSTALL. It counts installed
-  plus DISTINCT pending topics, because N concurrent subscribes to one topic can
-  only ever install one subscription - counting them N times would deny requests
-  that are not over any real limit.
-- `maxConcurrentSubscribeGates` bounds concurrent APP WORK in the SUBSCRIBE
-  gate: the `subscribe` / `subscribeBatch` hook, counted for as long as each
-  call is suspended. That is where an app does its database round-trip, and
-  distinct-topic counting cannot bound it - N concurrent gates for one topic
-  cost 1 against the cap above. Exceeding it denies the subscribe with
-  `RATE_LIMITED`. The same counter also bounds the `resume` hook on both lanes
-  that reach it, so lowering this number starts refusing gap-fills too: a
-  standalone `resume` frame over the bound is answered `RESUME_RATE_LIMITED`,
-  and a `subscribe` carrying `recover` is denied `RATE_LIMITED` as usual. It does NOT cover `platform.checkSubscribe`, which the app
-  calls from its own code: the adapter can bound the verbs it owns and answer a
-  refusal in a protocol it defines, and it can do neither for a server-side
-  call, the same reason the `message` hook is unbounded.
-- `maxConcurrentUnsubscribeHooks` and `maxQueuedUnsubscribeHooks` bound the
-  `unsubscribe` hook, and they are a SEPARATE pair rather than a share of the
-  gate number because the two lanes have different rights. A subscribe may be
-  refused - the client asked, and it is told no. An unsubscribe may only be
-  DEFERRED: the hook is where the app releases plugin state that outlives native
-  membership, and the family client sends `unsubscribe` with no `ref` and has no
-  branch for a refusal, so dropping one leaks that state silently. So releases
-  past the concurrency bound queue in FIFO order rather than being dropped, and
-  only a speculative release - for a topic this connection was never granted,
-  which costs an attacker nothing to invent - yields its place, and a release
-  refused there runs no hook at all. A connection that fills even the queue is
-  closed with 4429, and every release whose hook has not SUCCEEDED is named in
-  the set handed to the `close` hook, so the app performs that teardown by
-  another route.
-
-  **Teardown is at-least-once, so make it idempotent.** If a release's
-  `unsubscribe` hook does not resolve - because it is still queued when the
-  socket dies, or it threw, or it rejected against a backend that is down - the
-  topic is named to the `close` hook instead. (The one limit: a connection
-  records at most 2176 DISTINCT topics owed a teardown, which no amount of
-  ordinary concurrency reaches - getting there takes that many different topics
-  on one connection whose hook never resolved, and releasing the same topic
-  repeatedly does not grow it. Past that the release is not recorded, the
-  adapter says so once and every further drop is silent.) The
-  cost is that a hook which was mid-await when the connection died can finish
-  AND have its topic named there, so a teardown that is not idempotent (a bare
-  `roster.decr(topic)`) can run twice. The alternative is dropping the release
-  whenever the two race, which leaks silently; running it twice is the failure
-  an app can defend against. A speculative release carries no promise at all,
-  because recording those would let a client grow the record by naming topics it
-  never had.
+- `maxSubscriptionsPerConnection` bounds installed membership at 65,536 topics.
+  Held topics do not consume another slot, and the cap is rechecked after
+  authorization settles.
+- `maxPendingSubscribesPerConnection` bounds pending authorization at 4096
+  attempts, including repeated requests for the same topic. Single frames,
+  batch entries and server subscribes share this bound. Recovery keeps its
+  attempt counted until the subscription settles. Batch headroom follows valid
+  topic order, including topics that the grant gate denies. Excess entries
+  receive `FORBIDDEN` for permanent grant denials and `RATE_LIMITED` otherwise.
+- Standalone resume calls reach the application hook without a separate
+  concurrency ceiling. Server-side `checkSubscribe` does not install membership
+  or consume subscription attempts. A permanently ungranted wire topic receives
+  `FORBIDDEN` before pending-attempt pressure can return `RATE_LIMITED`.
+- Unsubscribe hooks start directly for client and server releases. Synchronous
+  throws and rejected promises are contained and reported. Released topics are
+  not retained as teardown debt for the close hook. Applications must handle
+  cleanup failures in their own hooks.
 - `maxControlEgressBytes` bounds the ACK CHANNEL, in bytes per 10 s. Exceeding
-  it closes the connection with `CONTROL_FLOOD` and code 4429. It covers every
+  it closes the connection with code 4429 and writes nothing before the close;
+  the server logs the connection's request id. It covers every
   frame the client's own input buys, which includes the `__replay:t`
   `truncated` marker: a resume or recover naming many topics can be answered
   with a marker per topic, so that lane amplifies the same way acks do. A
   marker the budget cannot afford therefore CUTS the connection rather than
   being dropped - a client that reconnects cold-resyncs, which is what the
-  marker says.
+  marker says. The `wire-id` announce that precedes a topic's first binary
+  frame is charged too; one the budget cannot afford cuts the connection the
+  same way.
 
 `upgradeRateLimit` meters upgrades PER CLIENT ADDRESS - ten per ten seconds by
 default, `0` to disable - on a sliding window, so a client cannot double its
 rate by placing requests either side of a boundary. It is checked before the
 Origin comparison and before your `upgrade` hook, because the Origin gate bounds
 no rate at all (a non-browser client sends whatever Origin it likes) and the
-hook is the expensive part. Over the limit is `429` with a `retry-after` naming
-the window.
+hook is the expensive part. Over the limit is `429` without `Retry-After`.
 
 Two things decide whether it means what it says:
 
@@ -701,17 +1137,18 @@ storm of connect-then-drop clients cannot hold the ceiling closed behind them.
 
 The block is spelled as `svelte-adapter-uws` spells it, with the same defaults
 and the same accepted values, so a config moved between the two adapters gates
-identically. One key is accepted without being honoured: uws serves a holding
-PAGE at a crossed ceiling unless `waitingRoom: false`, and this adapter has no
-holding page - it always answers `503`. A config that asks for one builds and
-runs, and says at build time that the page will not be served.
+identically. One key is accepted without being honoured: uws serves a
+self-polling holding PAGE at a crossed ceiling unless `waitingRoom: false`, and
+this adapter has no holding page. It answers a browser that navigates to the
+WebSocket path at capacity the way uws does with `waitingRoom: false`: `503`
+with a short static page that says the server is at capacity and offers a
+button to try again. A config that asks for the holding page builds and runs,
+and says at build time that the page will not be served.
 
-Two smaller differences in what a refusal looks like, both of them uws's to
-settle: uws omits `retry-after` on a cursor-lane refusal and on every refusal
-once the holding page is off, where this adapter always sends it; and uws
-reports refusals through its metrics registry rather than the log, so a runbook
-built on these lines has no counterpart there until `websocket.metrics` is
-supported here.
+Both adapters count refusals on `upgrade_rejected_total{reason}`, so an alert
+written against that counter works on either. The log line is this
+adapter's alone: uws records a shed upgrade on the counter only, so a runbook
+keyed on the line has nothing to match there.
 
 Every one of these is PER CONNECTION, which is the honest scope and not the same
 as per client. A peer that reconnects after being cut gets a fresh budget, so
@@ -792,110 +1229,107 @@ fallback. Set `ORIGIN=https://app.example` in production, or pass an explicit
 
 Client to server: `subscribe` (optionally carrying
 `recover: { offset, epoch? }` to gap-fill the missed tail before going live),
-`unsubscribe`, `subscribe-batch` (each accepts an optional `ref`),
+`subscribe-batch` (both accept an optional `ref`), `unsubscribe`,
 `hello` (`{"caps":[...]}` capability declaration; re-sends replace the set),
 `request-n` (flow-control window replenish; the carried `n` is advisory - the
 server sizes every window from its own posture),
 and `resume` (`{"sessionId","lastSeenSeqs",{"lastSeenEpochs"?}}`).
 
+**`epoch` is an opaque generation token, compared for equality only.** It rides
+the `subscribed` ack and comes back on `resume` as `lastSeenEpochs`. A different
+value than the one a client last saw means the server's seq space reset, and
+that is the only fact any client reads from it. Never interpret it: do not treat
+it as a timestamp, render it as a date, store it in a time-typed column, or
+order by it. The value is a random 32-bit draw, not a boot time - a boot
+timestamp would hand every unauthenticated client the exact millisecond the
+process started, which is free uptime and deploy-timing intelligence and a
+stable fingerprint for correlating instances behind a load balancer. It is drawn
+once per process, never persisted, and both adapters in the family draw from the
+same domain, so a client written against one reads the other unchanged.
+
 A `hello` whose caps include `lease` arms flow control on that connection,
 FIRST hello only: the server answers `{"type":"lease-ok"}` plus a
 `{"type":"lease","count","ttlMs"}` window grant, and re-grants on each
-`request-n`. Windows narrow as per-connection subscriber load rises and
-always floor, so an opted-in client keeps making forward progress; the
-server never gates its own sends on the window - pacing is the client's job,
-which is what makes a non-opting old client's behavior byte-identical to
-before.
+`request-n`. Windows narrow with the worker's own readings - above a
+`heap_used_ratio` of 0.7 they ramp down from the full 256 requests to half at
+the default 0.85 MEMORY threshold and to a twentieth near the wall, and past 25
+subscriptions per connection they shrink in proportion - and always floor, so
+an opted-in client keeps making forward progress. A worker between 0.7 and
+0.85 therefore grants smaller windows while `reason` still reads `NONE`:
+backpressure applied before the alarm, by design. The server never gates its
+own sends on the window - pacing is the client's job, which is what makes a
+non-opting old client's behavior byte-identical to before.
 
-A `subscribe-batch` and a `resume` each name at most **256 topics** - the
-batch's entries, and the UNION of the resume's `lastSeenSeqs` and
-`lastSeenEpochs` (a topic in both counts once, two disjoint maps of 256 do not
-pass). One number for both lanes, so a client needs one chunking rule rather
-than two. Over it, the frame is refused WHOLE and nothing is applied.
+`request-n` may include `queued`, the client's advisory backlog. The server
+divides it by the fixed queue ceiling of 256, clamps the ratio to 0 to 1, and
+folds it into the worker saturation peak used by `pressure.value`. Each
+sampler pass halves the retained worker peak, so an old backlog report
+fades. It never changes `reason` or decides a grant. A client that
+omits it behaves as before.
 
-Chunk by BYTES as well: the 8192-byte control-frame ceiling below bites first
-for realistic topic names - a resume naming UUID-shaped topics overflows it at
-roughly 150 - and answers `CONTROL_FRAME_TOO_LARGE` instead. The family clients
-chunk at 200 topics and 8000 bytes, which clears both.
+A `subscribe-batch` applies its first **256 entries** and answers additional
+string entries with `BATCH_OVERFLOW`. Per-topic authorization hooks run
+concurrently; recovery and subscription activation wait for every decision and
+then retain the original entry order.
 
-A `resume` also carries a `sessionId`: 1 to 128 characters of printable ASCII
-with no quote or backslash. It is handed to the app's `resume` hook, which
-queries a backend with it, so a `sessionId` that is a string but breaks those
-rules is refused rather than forwarded. Printable ASCII rather than merely "no
-control byte", because the looser rule still admits DEL, the C1 block, the bidi
-overrides and U+2028 / U+2029 - which `JSON.stringify` emits raw - and because
-over printable ASCII the 128 bound is characters and bytes alike. Server to
-client:
+Every control frame remains below 8192 bytes. A frame at or above that limit receives
+`CONTROL_FRAME_TOO_LARGE` before application work.
+
+A standalone `resume` carries a string `sessionId` and an object or array
+`lastSeenSeqs`, plus an optional object or array `lastSeenEpochs`. The hook
+receives these application-owned values unchanged. When server grants decide
+authorization, both maps first drop topics without confirmed grants. The hook
+owns validation of its session and history values.
+
+Server to client:
 
 | frame | when |
 |---|---|
 | `{"type":"welcome","sessionId":"..."}` | on open |
 | `{"type":"wire-id","topic":"t","id":N}` | the numeric topic id for `0x03` frames, announced on the same socket before the first binary frame for its topic |
-| `{"type":"resumed"}` | the `resume` frame's gap-fill RAN and flushed - or the app exports no `resume` hook, so there was nothing to serve; switch to live. Sent only then: every other outcome is an `error` carrying a `code`, so a client that does not receive this must not treat itself as caught up |
+| `{"type":"resumed"}` | the standalone resume hook has settled, including a contained failure, or no hook is installed. The acknowledgement does not certify replay completeness |
 | `{"topic":"__replay:t","event":"truncated","data":null}` | the gap-fill for `t` is INCOMPLETE - the buffered window overflowed its cap, or a frame was refused past the backpressure limit. Drop the stored per-topic offset and cold-resync; do not trust the partial flush. A socket that refuses this marker twice is closed instead of being acked, since there is no way left to tell it |
 | binary `[0x03][schemaVersion:u8][topicId:varint][seq:varint][codec payload]` | a codec frame, for connections that declared the codec's capability in `hello` |
-| `{"type":"subscribed","topic":"t","ref":N,"epoch":E}` | a subscription took |
+| `{"type":"subscribed","topic":"t","ref":N,"epoch":E}` | a subscription took. `epoch` is an OPAQUE per-process generation token, compared for equality only - see below |
 | `{"type":"subscribe-denied","topic":"t","ref":N,"reason":"..."}` | it did not |
-| `{"type":"unsubscribed","topic":"t","ref":N}` | released, whether or not it was held |
-| `{"type":"unsubscribe-denied","topic":"t","ref":N,"reason":"..."}` | the topic failed wire validation, so the adapter will not claim it was released |
 | `{"type":"error","code":"CONTROL_FRAME_TOO_LARGE","limit":L,"size":N}` | a control frame at or above 8192 BYTES |
-| `{"type":"error","code":"BATCH_TOO_LARGE","limit":L,"size":N}` | a `subscribe-batch` carrying more than 256 entries; NONE of them were applied |
-| `{"type":"error","code":"RESUME_TOO_LARGE","limit":L,"size":N}` | a `resume` naming more than 256 topics across either of its maps; NO gap-fill ran and no `resumed` follows |
-| `{"type":"error","code":"INVALID_SESSION_ID"}` | a `resume` whose `sessionId` was a string but empty, over 128 characters, or carried a byte outside printable ASCII (or a quote or backslash); the value is never echoed back. A frame whose `sessionId` is not a string at all is not recognised as a `resume` and reaches the app's `message` hook like any other unrecognised frame |
-| `{"type":"error","code":"RESUME_RATE_LIMITED"}` | this connection already has `maxConcurrentSubscribeGates` (64) hooks in flight, so the `resume` hook never ran and NO gap-fill happened. Transient: retry |
-| `{"type":"error","code":"RESUME_FAILED"}` | the app's `resume` hook threw or rejected, so how much of the window it covered is unknown. Retrying does not help; drop the stored per-topic offsets and cold-resync |
-| `{"type":"error","code":"CONTROL_FLOOD","limit":B}` | this connection's control-frame budget is spent; the socket is then closed **4429** |
+| `{"type":"subscribe-denied","topic":"t","ref":R,"reason":"BATCH_OVERFLOW"}` | a string entry after the first 256 in a `subscribe-batch`; the first 256 are processed |
 | `{"type":"reconnect","afterMs":N,"windowMs":W}` | shutdown advice, before the drain closes the socket; `afterMs` is omitted when the advice carries no delay |
-| `{topic, event, data, seq?, j?}` | the data envelopes. On the PUBLISH lanes `seq` is present unless the call said `{ seq: false }`; the single-target lanes (`send`, `sendTo`, and the JSON fallbacks of `sendWire`/`sendWireBatch`) never carry one and have no seq option, so an absent `seq` does not by itself mean a publisher opted out. `j` is the per-subscriber jitter in ms, present only when `publish` was given `jitterMs` |
+| `{topic, event, data, seq?, j?}` | the data envelopes. On the publish lanes `seq` is present unless the call said `{ seq: false }`. The directed `send` and JSON fallback of `sendWire` include one only when explicitly supplied; `sendTo` and `sendWireBatch` have no seq option. An absent `seq` therefore does not by itself mean a publisher opted out. `j` is the per-subscriber jitter in ms, present only when `publish` was given `jitterMs` |
+
+Unsubscribe frames with a string topic release membership and run the app's hook without
+sending an acknowledgement, including when they carry a `ref`. Clients must not
+wait for the former `unsubscribed` frame. Use an application message when a
+release needs an explicit confirmation.
 
 Acks are sent only when the client supplied a `ref`; a `ref` over 128 BYTES is
 treated as absent. DENIALS follow the same rule, which is the sharp edge of it:
-a subscribe sent without a `ref` that the gate refuses - or that the concurrent
-gate ceiling sheds - installs nothing and is answered with nothing, so a client
+a subscribe sent without a `ref` that authorization or the pending-attempt cap
+refuses installs nothing and is answered with nothing, so a client
 that omits `ref` must treat every subscribe as unconfirmed rather than assuming
-it took. On a subscribe carrying `recover` that also means the gap-fill it asked
-for silently did not happen. The standalone `resume` frame is the exception: it
-carries no `ref` at all, so its refusals are unconditional. Send a `ref`.
+it took.
 
-Every subscribe / unsubscribe reply names the topic it
-answers for - a denial a client cannot correlate is one it discards, which is
-why the frames that answer for no single topic (`BATCH_TOO_LARGE`,
-`RESUME_TOO_LARGE`, `INVALID_SESSION_ID`, `RESUME_RATE_LIMITED`,
-`RESUME_FAILED`, `CONTROL_FLOOD`) are `error` frames carrying a `code` rather
-than denials carrying a null topic.
+A subscribe carrying `recover` without a `ref` is refused before any gate or
+hook with `{"type":"error","code":"RECOVER_REQUIRES_REF","topic":"<t>"}`.
+The reply to a subscription names its topic; control-frame errors carry a
+`code` instead.
 
-A `resume` is refused whole rather than truncated to the limit, which matters
-more than it does for a batch: a partly-covered gap-fill would still end in
-`resumed`, and the client has no gap detection, so it would go live believing
-it had caught up on topics the server never read.
+Standalone `resume` installs no live membership. Its hook is awaited before
+`resumed` is sent, including when the hook throws or rejects. Replay handlers
+must report truncation or denial on the replay channel and check their send
+results. The acknowledgement alone is not evidence that every historical frame
+was delivered.
 
-The topics a `resume` names are held to the always-illegal bytes, to
-`__proto__`, and to the system-topic guard - but NOT to the wire subscribe
-lane's `allowNonAsciiTopics` rule. The wire is not the only way a connection
-acquires a topic: `platform.subscribe` is the documented server-side spelling
-and trusts non-ASCII names past that bound on purpose, so holding a resume to
-the stricter rule would drop a topic the app legitimately granted. That refusal
-would be SILENT - the topic simply vanishes from the map the hook gap-fills
-from, and `resumed` still says go live - which is the hole this machinery
-exists to prevent. Refusing must never be stricter than granting, the same
-reason the `unsubscribe` lane is permissive.
-
-`resumed` therefore means the hook ran to completion for the topics the frame
-was allowed to name. Every other outcome is an `error` carrying a `code` -
-`RESUME_TOO_LARGE`, `INVALID_SESSION_ID`, `RESUME_RATE_LIMITED`,
-`RESUME_FAILED` - because `resumed` is the only frame a resuming client keys on
-and it has no gap detection: an ack that follows no gap-fill tells the client it
-caught up on history nobody read. A client that pipelines many frames at
-reconnect WILL meet `RESUME_RATE_LIMITED`, so handle it rather than waiting for
-an ack that is not coming.
-
-Two limits on that guarantee, both deliberate. Topics the frame named but the
-lane refused (an always-illegal byte, `__proto__`, a system topic where
-`allowSystemTopicSubscribe` is off) are dropped from the map silently and are
-not reported per topic. And a hook that itself calls `platform.send` is
-responsible for its own send results: the adapter cannot see that a frame the
-hook pushed was refused past the backpressure limit, so a resume hook that
-ignores the tri-state can still lose frames under a full socket.
+**Stamp the replayed frames.** A hook returning "the highest seq you actually
+delivered" needs the client to have received those seqs, so pass each replayed
+frame its own authority: `platform.send(ws, topic, event, data, { seq })`, and
+`platform.sendWire(..., { seq })` for a codec frame. Both take the same explicit
+number-or-bigint the publish lanes take, and both stay side-effect-free - no
+counter advance, no max-seen record, no resume capture - because gap-fill
+replays history that is already accounted. `{ seq: true }` throws here: this
+lane has no counter to draw. Without a stamped seq the client has no value to
+resume from next time, and the returned watermark is only a server-side dedup
+floor.
 
 On the `subscribe` + `recover` lane the answer is the marker rather than an
 error, because that lane already has the replay channel open and answers per
@@ -1002,15 +1436,35 @@ The maps still overlap: a topic published both ways is in both, and the
 recency touch described above means "writes no seq into a map" is not the same
 as "does not touch it".
 
-An explicit `{ seq: <number> }` must be an INTEGER OF AT LEAST 1. There is no
-upper bound - the frame varint carries any magnitude exactly, so snowflake ids
-and log sequence numbers past 2^53 are fine - but each of the excluded cases
-makes the two wires disagree about one event: `0` is the binary frame's "no seq"
-sentinel, so a stamped 0 vanishes for binary subscribers while the envelope
-carries `"seq":0`; a negative seq parses back off the wire as a different number
-(`-1` arrives as `127`); and a fractional one is truncated on the frame while
-the JSON envelope prints it in full. The counter lane and every shipped
-authority are 1-based, so a 0-based external source must offset by 1.
+An explicit seq is written `{ seq: <number> }` or `{ seq: <bigint> }` - two
+spellings of one authority, validated identically, so a caller reading an offset
+out of a store that hands back `BigInt` does not convert at the call site. It
+must be a POSITIVE INTEGER INSIDE THE SAFE-INTEGER RANGE (at most
+`9007199254740991`).
+
+Each excluded case makes the two wires disagree about one event: `0` is the
+binary frame's "no seq" sentinel, so a stamped 0 vanishes for binary subscribers
+while the envelope carries `"seq":0`; a negative seq parses back off the wire as
+a different number (`-1` arrives as `127`); and a fractional one is truncated on
+the frame while the JSON envelope prints it in full. The counter lane and every
+shipped authority are 1-based, so a 0-based external source must offset by 1.
+
+The upper bound is the seq SPACE, not the varint. The varint carries any
+magnitude, but the space is IEEE-754 double everywhere else - the JSON envelope,
+the frame's slot, the client's watermark reader - and above 2^53 a double stops
+having a neighbour at distance one, so two ids you mean to be different land on
+one value. Watermarks advance on a strict greater-than, so the second frame
+never advances the client's and resume dedup goes ambiguous with nothing on the
+wire to notice by. Snowflake ids and large log offsets are therefore refused
+loudly: keep the wide id in the event data and give `seq` an authority inside
+the range, or offset it by a per-topic base. Do not truncate - that destroys the
+ordering `seq` exists for.
+
+Exact representability is not the test, though it looks like the natural one.
+`2 ** 60` is an exact double and still reaches a subscriber as
+`1152921504606847000`, because the envelope serializes through `String(double)`;
+and just above 2^53, where the gap is two, an exactness rule would accept your
+even ids and refuse your odd ones.
 
 One rule the integer check cannot enforce: a topic's explicit seqs must all
 come from ONE authority. The mark they advance is monotone - it only ever
@@ -1042,16 +1496,20 @@ a batch with no seq option, or with `{ seq: true }`, does. The call is
 refused even when the batch is empty, because the seq is a property of the
 call rather than of that tick's data.
 
-A call-level `{ excludeWs }` withholds every entry from that socket, on the
-stateful lane and on the stateless reroute alike. An entry that names its own
-overrides it for that entry - `null` included, which is how one entry opts a
-socket back in to a batch it is otherwise excluded from. One exclusion says the
-same thing about every entry, which is why it is honoured here where a
-call-level seq is refused.
+A call-level `{ excludeWs }` is the default exclusion for every entry, on the
+stateful lane and on the stateless reroute alike - the author of a tick's
+updates is one socket for the whole batch, which is what the exclusion is for.
+An entry carrying its own overrides it for that entry; a `null` entry exclusion
+is absent and inherits the call-level one. One exclusion says the same thing
+about every entry, which is why it is honoured here where a call-level seq is
+refused.
 
-An ENTRY seq is a number or it is absent: `null` defers to whatever the batch
-options ask for, which is what a per-row authority column reads as when the
-row has none, and anything else is refused naming the entry's position. The
+An ENTRY seq speaks the same table as the batch option, and every form but
+absent is an OVERRIDE for that entry: a number or bigint is its explicit
+authority, `true` draws the counter for it alone, `false` and `null` publish it
+seq-less (what a per-row authority column reads as when the row has none), and
+absent inherits whatever the batch asked for. Anything else is refused naming
+the entry's position. The
 batch-level option follows the same four spellings as every other publish
 lane, so a `{ seq: '742' }` there is refused before the first entry is
 stamped rather than drawing the counter for all of them.
@@ -1067,7 +1525,7 @@ The reported boundary is trusted only up to the highest seq this server has
 stamped for the topic. That bound exists because echoing the client's own
 offset straight back is the easiest hook to write and that value is client
 input: unbounded, it would let a client suppress precisely the frames the
-barrier is holding for it. (`test/fixture/src/ws-handler.js` echoes it on
+barrier is holding for it. (`test/fixture/src/hooks.ws.js` echoes it on
 purpose - it is a controlled test double, not a pattern to copy. Its
 `fixture-resume-script` lane is the opposite double, and needs both halves of the
 contract to be one: it DELIVERS every frame it publishes into the window at or
@@ -1086,38 +1544,276 @@ is passed to the app as data, because recognizing it costs 21-27 ns on every
 inbound frame against 4.1-4.8 ns for the prefix compare
 (`bench/control-frame-prefix.mjs`).
 
-`subscribe-batch` carries at most 256 entries. A batch over that is refused
-WHOLE, with one `BATCH_TOO_LARGE` frame and nothing applied, rather than being
-partly applied and answered per dropped entry: the reply must not scale with the
-inbound frame. An 8 KB frame holds four thousand two-byte entries, and at ~200
-bytes per answer a per-entry reply would turn one frame into 800 KB. Every
-client in the family chunks at 200 topics and 8000 bytes to stay under this, so
-none of them can reach the refusal.
+A `subscribe-batch` may carry `recover: { topic: { offset, epoch? } }`.
+Authorization settles before one resume hook receives all allowed cursors.
+Live frames published during recovery are buffered until each topic lands.
+History requests require a `ref`, including recover entries outside the topic list.
+
+`subscribe-batch` processes its first 256 entries. Each extra string entry is
+answered with `subscribe-denied` and reason `BATCH_OVERFLOW` when a ref is
+present. Replies use the same bounded control-egress path as other control
+frames.
 
 Within the limit the batch is answered PER ENTRY, which is an amplifier and
 deliberately so - the family client keys its denial store and its per-topic
 epochs off those frames and re-subscribes everything as a batch on reconnect, so
-collapsing them loses every denial and degrades resume. What that costs is
-bounded twice over, and `bench/control-egress.mjs` measures both: no batch frame
-can be answered with more than 256 frames (48 KB at the worst shape, 256
-one-character entries with a maximal ref; roughly 17 KB for a full batch of
-ordinary topic names that all install), and the ACK CHANNEL as a whole gets
-4 MB per 10 s per connection
-(`maxControlEgressBytes`) - 86 of those worst-shaped frames - after which the
-connection is closed with `CONTROL_FLOOD` and close code 4429. 4429 rather than
-1008 because the family clients treat 1008 as terminal and stop reconnecting for
-good, while 4429 is their throttle code.
+collapsing them loses every denial and degrades resume. The ACK CHANNEL as a
+whole gets **4 MiB per 10 seconds per connection** (`maxControlEgressBytes`),
+after which the connection closes with code 4429 and no preceding error frame.
+4429 is the family client's reconnectable throttle code; 1008 is terminal.
+Application data sent by `send` and `publish` is not charged to this budget.
+
+`bench/control-egress.mjs` measures the amplification against the built server.
+On Bun 1.3.14, 256 ordinary topics with a numeric ref cost roughly 17 KB of
+replies. A near-8-KiB frame containing 256 compact topic names plus empty
+overflow entries produced about 177 KB across 2,496 replies: **21.6x**, enough
+to spend 4 MiB in ten seconds from roughly **20 KB/s** of inbound traffic.
+That is a measured shape, not an upper bound: a 128-byte ref made the same
+size request produce about 490 KB (**60x**). Sustained numeric-ref overflow
+traffic closed at 4.00 MiB with code 4429. Batches without a ref produced no
+acknowledgements. These are payload byte counts; network framing is excluded.
 
 A control-shaped frame at or above 8192 BYTES is refused with
 `CONTROL_FRAME_TOO_LARGE`; an oversized frame that merely *begins* `{"type"` but
 carries a type the adapter does not consume is passed to the app hook untouched
 rather than swallowed.
 
-The WebSocket handler is bundled by Rollup from project source, with SvelteKit's
-`$lib` alias resolved. There is no esbuild fallback, so the handler must be
-plain JavaScript resolvable by that plugin set.
+The Vite plugin builds the handler alongside server routes, including TypeScript
+and SvelteKit virtual imports. Without it, the adapter bundles the handler with
+Rollup, resolves `$lib` and configured aliases, and compiles TypeScript with
+esbuild. This fallback does not share modules with SSR routes; the build warns
+that the Vite plugin is needed for shared state.
+
+## Client store API
+
+Import the bundled Svelte client from `svelte-adapter-bunserve/client`. Topic
+stores connect automatically and release their server subscription when their
+last local subscriber leaves. The client works with both adapters' wire protocol.
+
+```svelte
+<script>
+  import { on, status } from 'svelte-adapter-bunserve/client';
+  const messages = on('chat');
+</script>
+
+<p>{$status}</p>
+{#if $messages}
+  <p>{$messages.event}: {JSON.stringify($messages.data)}</p>
+{/if}
+```
+
+`on(topic)` starts at `null` and emits `{ topic, event, data }` envelopes.
+`on(topic, event)` filters that event and emits `{ data }`, also starting at
+`null`. Guard either store before reading its value. `on(topic).scan(initial,
+reducer)` accumulates events into application state. `onDerived(topicFn, store)`
+switches subscriptions when a source store changes.
+
+| Helper | Store value and behavior |
+| --- | --- |
+| `crud(topic, initial = [], options?)` | Array updated by `created`, `updated`, and `deleted` events; `key` defaults to `'id'`, `prepend` to `false` |
+| `lookup(topic, initial = [], options?)` | Object keyed by `options.key` (default `'id'`), updated by the same CRUD events |
+| `latest(topic, max = 50, initial = [])` | Last `max` event envelopes |
+| `count(topic, initial = 0)` | Counter updated by `set`, `increment`, and `decrement` events |
+| `once(topic, event?, options?)` | Promise for the first matching event, then unsubscribes; `options.timeout` is in milliseconds |
+
+`crud` and `lookup` accept an optional `maxAge` in milliseconds. Entries expire
+when they have received no create/update within that window. The sweep interval
+is half `maxAge`, with a one-second minimum; its timer stops when the last local
+subscriber leaves. Seed stores from your SvelteKit load data when the UI needs a
+current value before the first live event.
+
+### Connection options and state
+
+Call `connect(options)` before any auto-connecting helper when using custom
+options. It returns a singleton; later option changes do not replace an existing
+connection. After `connection.close()`, a later explicit `connect(options)` creates
+a replacement. Module topic and diagnostic stores, accumulated helpers, and
+managed ingress handles follow it; stores obtained from the old connection stay
+attached to that closed connection. Reading stores or constructing plugins after
+close stays inert until an explicit connect.
+
+With no explicit URL, browser connections use the current page's
+origin and `/ws`. Without a browser or explicit URL, SSR stays inert.
+
+```js
+import { connect, ready } from 'svelte-adapter-bunserve/client';
+
+const connection = connect({
+  path: '/ws',
+  auth: true,
+  reconnectInterval: 3000,
+  maxReconnectInterval: 300000,
+  maxReconnectAttempts: Infinity,
+  debug: false
+});
+await ready();
+const admitted = connection.send({ type: 'message', text: 'Hello' });
+```
+
+All options are optional. `auth` defaults to `false`; use `true` when your server
+exports `authenticate`, or a string for a custom auth path. `url` takes precedence
+over `path` and enables native clients without `window`, for example
+`connect({ url: 'wss://example.com/ws' })`. Reconnect defaults are 3000 ms base,
+300000 ms cap before jitter, and unlimited attempts. Delays grow by a factor of
+2.2 and apply proportional jitter of +/-25%. `debug` defaults to `false`.
+
+The `status` readable, also available as `connection.status`, has five values:
+
+- `connecting`: an initial connection or retry is being established.
+- `open`: the socket is connected.
+- `suspended`: the socket is open while the browser tab is in the background.
+- `disconnected`: the socket was lost or the connection is temporarily paused.
+- `failed`: permanent refusal, exhausted retries, or explicit `close()`.
+
+`ready()` resolves when the connection opens, resolves immediately during inert
+SSR, and rejects if the connection closes permanently before opening. Handle that
+rejection where refusal is possible. `failure` describes a disconnect using
+stable `kind`, `class`, `code`, and HTTP `status` fields. Its `diagnosticReason`
+and deprecated `reason` alias are diagnostic text, not localized UI messages.
+An intentional `close()` leaves `failure` at `null`. `denials` exposes the latest
+subscription denial; `overloads` exposes established-message shedding responses.
+
+The optional auth preflight runs before each connection attempt. It includes
+credentials and the adapter's `x-requested-with: XMLHttpRequest` CSRF marker.
+Explicit WebSocket URLs determine the corresponding HTTP auth endpoint. A 429
+is retried no sooner than `Retry-After`, while network errors and 5xx responses
+retry with backoff. Other 4xx refusals are terminal.
+
+### Sending and temporary offline simulation
+
+`connection.send(value)` returns `true` only when serialization completed and the
+same open socket accepted the local send call. It returns `false` while
+connecting, disconnected, paused, or closed, including when `toJSON()` closes or
+pauses the connection. This is local admission, not a server receipt.
+Serialization and transport exceptions propagate. JSON values become text frames;
+`ArrayBuffer` and `ArrayBufferView` values are sent as binary frames unchanged.
+
+Import `onReplay` from `svelte-adapter-bunserve/plugins/replay/client` and call
+`onReplay(topic, { since })` to request history from an SSR sequence and report truncation.
+An unanswered replay resumes after reconnection from its last delivered replay
+sequence. Presence, cursor and replay helpers keep a permanently closed client
+offline until an explicit `connect()`.
+
+`connection.sendSerialized(text)` sends a complete JSON message already encoded
+as text without parsing or serializing it again. It requires a primitive string,
+returns the same boolean local admission result as `send()`, never queues a
+message, and preserves transport exceptions.
+
+`connection.sendQueued(value)` sends immediately when connected or retains the
+serialized payload for FIFO delivery on reconnect. The queue holds at most 1000
+messages; overflow drops the oldest. Binary views remain binary when queued.
+
+```js
+connection.simulateOffline();
+connection.sendQueued({ type: 'message', text: 'Deliver after resume' });
+connection.resumeOnline();
+```
+
+`simulateOffline()` reports `disconnected` immediately, cancels the current socket
+or auth attempt, and suppresses reconnect timers and browser reconnect triggers.
+Subscriptions, listeners, recovery offsets, and queued messages survive. A
+cancelled scheduled or active retry refunds its reservation. `resumeOnline()`
+starts a fresh attempt with the configured URL and fresh auth, then restores
+subscriptions and queued sends. Both calls are idempotent and inert during SSR
+without a URL. Permanent close, refusal, and retry exhaustion cannot be resumed.
+Use `connection.close()` for permanent disconnection.
+
+Recovery keeps the requested offset until a matching topic/ref acknowledgement,
+even if newer live frames arrive first. Denial discards speculative progress.
+Replay truncation and relay gaps clear the offset while retaining its epoch;
+rehydration adopts the announced epoch. Standalone and inline truncation are
+reported once per outstanding replay request.
+
+The client also handles browser offline/online and visibility events, suspended
+devices, silent sockets, batched subscriptions, and recovery on reconnect.
+Advanced protocol consumers can use `onRequest`, `registerWireCodec`,
+`setTopicManaged`, and `bindIngress`; their typed contracts are in
+[`src/client.d.ts`](src/client.d.ts).
+Module-level `onRequest` handlers and unresolved `once` listeners follow an
+explicit `connect()` after `close()`.
+
+## HTTP requests
+
+The application's `request.signal` aborts when a client disconnects before the
+native request body's completion has been observed. After that, a disconnect
+does not abort the signal, so work already accepted by the application can
+finish. Bodyless requests remain sensitive to disconnect while the response is
+pending. Streaming responses remain registered until they finish or are
+cancelled, so graceful shutdown waits for them up to `SHUTDOWN_TIMEOUT`. When
+shutdown stops waiting, it aborts any application request signals still active
+with an `AbortError` whose message names the shutdown.
+A response that finishes releases its registration and cancels any unread
+request body.
+
+An encoded separator inside the admin prefix stays encoded when passed to
+`admin()`: `/__realtime/..%2Freflect` reaches that handler unchanged. Split
+the pathname on `/` before decoding each segment, so a decoded `..` cannot
+walk the application's routing.
+
+Request bodies read ahead into a 64 KiB queue, with at most one native chunk
+beyond that watermark, then honor consumer backpressure. Bun exposes body
+completion through its readable stream. For a larger unread body, the signal
+remains sensitive to disconnect until that completion has been observed. An
+application that cancels its body before completion keeps the same disconnect
+behavior. Native body errors abort the signal even while the queue is full.
+
+`bodyLimits` narrows the request body budget before application parsing:
+
+```js
+adapter({
+ bodyLimits: [
+  { path: '/app/avatar', bytes: 64 * 1024 },
+  { path: '/app/admin', prefix: true, methods: ['POST', 'PUT'], bytes: 16 * 1024 }
+ ]
+});
+```
+
+Paths are decoded absolute paths including SvelteKit's base and are matched before
+an application reroute. Queries and trailing slashes do not affect matching; a
+prefix ends at a segment boundary. Every matching rule narrows the process-wide
+`BODY_SIZE_LIMIT`; rules cannot raise it. `BODY_SIZE_LIMIT=0` disables that global
+ceiling while route rules still apply. A rule with `bytes: 0` accepts no body bytes.
+GET and HEAD bodies are not read, so rules cannot explicitly name those methods.
+
+Declared and chunked uploads use the same budget for SSR, authentication, and
+admin requests. Authentication also retains its 64 KiB ceiling. An oversized
+upload receives 413 even when a handler catches the body error or remains pending;
+an already-started streaming response is cut short instead. The application's
+request signal aborts on overflow. A response sent before upload completion closes
+its connection. Input pauses when the application queue reaches 64 KiB. As on the
+lead transport, a full-queue pause lasts at most ten seconds before one further
+native read checks queued input; finite route budgets continue to apply during
+these checks. Unread excess bytes are detected on those checks rather than eagerly
+buffering an entire configured budget. Consumer demand resumes input immediately.
+The Vite dev plugin applies these rules to its auth and admin endpoints; preview
+owns its transport. Verify SSR behavior against the generated Bun server.
+
+HEAD responses omit the body while retaining available GET metadata. Static
+responses keep their known byte length. SSR HEAD responses cancel the body
+without reading or compressing it, including a buffered GET fallback. They
+retain a declared `Content-Length`; when none was supplied, the adapter leaves
+it unset. SSR GET compression uses the same weighted `Accept-Encoding`
+negotiation as static responses. Every HEAD response gets the current server `Date`. Application-supplied
+Date values are removed from SSR, authentication and admin responses.
+
+Bun writes `Transfer-Encoding: chunked` on an unknown-length HEAD, although no
+body follows; svelte-adapter-uws omits both framing headers there. A declared
+HEAD length is preserved without reading the application body. A 304 without a
+declared representation length omits Content-Length.
+
+HTTP/1.1 pipelining follows the transport's response lifetime. On Bun 1.4.4,
+two synchronous `/healthz` requests in one TCP write receive two responses.
+A delayed SvelteKit response followed immediately by another request closes
+the connection without a response, as with svelte-adapter-uws. Use sequential
+keep-alive requests or separate connections for asynchronous handlers.
+`test/live/http-pipelining-check.mjs` pins both cases against the built server.
 
 ## Static files
+
+Static and prerendered `.css`, `.csv`, `.htm`/`.html`, `.ics`, `.js`/`.mjs`,
+`.md`, `.txt`, `.vtt` and `.yaml`/`.yml` files declare `charset=utf-8` in
+`Content-Type`. Their bytes are served unchanged; store these text assets as
+UTF-8. The declaration also appears on compressed responses; 304 responses omit Content-Type.
 
 A static path with a dot-prefixed segment (`/.env`, `/deep/.hidden`,
 anything under `/.git/`) is left out of the static index and answers `404`.
@@ -1126,10 +1822,23 @@ a stray `.env`, an `.htpasswd`, editor backups, an unpacked `.git` - and
 `adapter-node` refuses plain dotfiles too, so an app migrating from it keeps
 that posture. The exclusion is segment-wise and decided once while the index
 is built: there is no per-request check to bypass. An encoded request
-(`/%2Eenv`) reaches nothing either - the static lane looks the raw
-pathname up as a Map key and never decodes it, and the decoded spelling
-was never a key. A refused directory is not descended into, so an
-unpacked `.git` is never even read.
+(`/%2Eenv`) reaches nothing either - the static lane looks the pathname up
+as a Map key, decoded only to find a file by its own name, and `/.env` was
+never a key. A refused directory is not descended into, so an unpacked
+`.git` is never even read.
+
+A file whose name a browser percent-encodes - a space, or a letter outside
+ASCII such as `Übersicht.pdf` - is served for that encoded spelling, as under
+SvelteKit's Node adapter and svelte-adapter-uws: `/My%20Report.pdf`,
+`/%C3%9Cbersicht.pdf`, with the escapes in either letter case. It is decoded
+with `decodeURI`, so an escaped `/` and the other characters it leaves encoded
+(`#`, `?`, `&` among them) stay encoded: `/My%2FReport.pdf` does not reach into
+a directory `My/`, and a name carrying a `#` or `?` is not served for an
+escaped spelling. A name written decomposed, as some macOS tools write it, is
+found for the composed spelling a browser sends too. With `staticDotfiles` on,
+an escaped dotfile (`/%2Ehtpasswd`) is served like its plain spelling. A
+download's `Content-Disposition` carries its file name as UTF-8 bytes, as
+svelte-adapter-uws writes it.
 
 A top-level `.well-known/` keeps serving its ordinary files - RFC 8615
 discovery (`security.txt`, ACME HTTP-01 challenges) is documented served
@@ -1157,6 +1866,125 @@ sirv's dotfile filter off). So a dotfile you can fetch in dev is not
 evidence the built server will serve it. svelte-adapter-uws applies the
 same production rule and spells the option the same way.
 
+## Response bodies
+
+SSR responses accept strings, ArrayBuffers and exact typed-array/DataView
+ranges as body chunks. Direct responses collect a single ready chunk followed
+by EOF for compression; a second chunk or pending continuation streams
+uncompressed. Anonymous GET deduplication can collect several ready chunks
+within one shared check-phase turn, up to 512 KiB, and skips collection when
+the declared Content-Length exceeds that cap. Disconnects cancel the source
+and release its reader even when the source's cancel promise never settles.
+A fully read POST keeps its completed request signal intact.
+
+HEAD preserves a supplied Content-Length without pulling the body. Application
+Transfer-Encoding is removed from SSR and authentication responses so Bun
+chooses wire framing.
+
+## Extra server entries
+
+A Vite plugin can put code in front of the handler by writing a file into the
+SvelteKit server output whose name starts with `__` and ends in `.js`
+(svelte-realtime's generated registry is one). The adapter bundles each such
+file as its own entry and imports all of them at the top of the built
+`index.js`, in file-name order, before the handler loads, so the order is the
+same on every filesystem. They are static ES module imports: one whose top
+level awaits does not hold back the next, so an entry that needs another's
+finished work should import that entry itself. Each is imported by the file
+name Rollup wrote for it, which differs from the entry name when the name
+holds a character Rollup will not put in a file name.
+
+An entry's top level, up to its first `await`, runs before SvelteKit's server
+is initialized, so `$env/dynamic/*` is still empty there; read `process.env`,
+or read the dynamic env inside a function called later.
+
+## Plugins and testing helpers
+
+Every entry below includes TypeScript declarations and uses the
+`svelte-adapter-bunserve` package prefix.
+
+| Entry | Purpose |
+|---|---|
+| `./plugins/replay`, `./plugins/replay/client` | Retained topic history and replay-aware client stores |
+| `./plugins/presence`, `./plugins/presence/client` | Presence rosters and client updates |
+| `./plugins/channels`, `./plugins/channels/client` | Typed topic event channels |
+| `./plugins/cursor`, `./plugins/cursor/client` | Cursor state, codecs and rendering |
+| `./plugins/groups`, `./plugins/groups/client` | Group membership and client stores |
+| `./plugins/throttle`, `./plugins/ratelimit` | Message throttling and rate limits |
+| `./plugins/middleware`, `./plugins/queue` | Hook composition and bounded work queues |
+| `./plugins/lock`, `./plugins/session`, `./plugins/dedup` | Locks, sessions and duplicate suppression |
+| `./plugins/crdt`, `./plugins/crdt/client`, `./plugins/crdt/replica`, `./plugins/crdt/channel` | Shared CRDT documents, authority and channels |
+| `./plugins/smooth`, `./plugins/smooth/client`, `./plugins/smooth/random` | Authoritative motion, interpolation and seeded randomness |
+| `./plugins/webhooks` | Controlled outbound webhook delivery |
+| `./safe-url` | URL and IP policy checks, including resolved-address validation |
+| `./observability` | Telemetry declarations, diagnostic envelopes and trace-context helpers |
+| `./platform-contract` | Generated public Platform member inventory |
+| `./testing` | A native Bun test server and protocol helpers |
+| `./sim` | Seeded in-memory simulation, replay and golden comparisons |
+
+The CRDT authority's `applyUpdate()` returns `null` for updates and resync
+snapshots already held by the replica. These merges trigger neither fan-out nor
+persistence. Out-of-order inserts and deletes still count as durable changes:
+they are forwarded and stored while waiting for their missing predecessors.
+
+Use `createTestServer` from `svelte-adapter-bunserve/testing` in Bun tests. It
+starts on an available port and exposes `url`, `wsUrl`, `platform`, tracked
+connections and async `close()`. Always await `close()` during teardown. No
+native uWebSockets addon is required. Set `host: '127.0.0.1'` to bind a specific
+address and use it in the returned URLs; omission keeps the wildcard listener
+and `localhost` URLs. The optional `ws` peer supports Node-style client sockets
+in test code.
+
+Use `runSim`, `runSimMany` and `replaySim` from
+`svelte-adapter-bunserve/sim` for deterministic protocol scenarios without
+opening a network listener. Public simulator helpers and the production
+runtime's internal golden runner have separate entrypoints. `LEAK_LANE_THRESHOLDS`,
+`judgeLeakLane` and `judgeLeakLaneSelfCheck` expose the shared memory-growth,
+retention, connection and measurement-health checks for custom leak lanes.
+
+`npm test` includes public plugin and simulator tests. `npm run test:public-native`
+checks native server and wire contracts under Bun.
+
+## Platform member inventory
+
+`svelte-adapter-bunserve/platform-contract` exports the frozen
+`PLATFORM_MEMBERS` array and the TypeScript `PlatformMember` name union.
+They are generated from this adapter's complete public `Platform` declaration,
+including contextual `requestId`. Symbol-keyed internals and plugin-added
+members are outside the inventory.
+
+Wrappers read through the original object to retain live getters and invoke
+methods with their original receiver:
+
+```js
+import { PLATFORM_MEMBERS } from 'svelte-adapter-bunserve/platform-contract';
+
+export function forwardPlatform(source) {
+	const forwarded = {};
+	for (const name of PLATFORM_MEMBERS) {
+		if (!(name in source)) continue;
+		Object.defineProperty(forwarded, name, {
+			enumerable: true,
+			get() {
+				const value = source[name];
+				return typeof value === 'function' ? value.bind(source) : value;
+			}
+		});
+	}
+	return forwarded;
+}
+```
+
+The inventory describes declared members. It does not certify an arbitrary
+object or infer which adapter produced it. Preserve absent members: HTTP-only
+builds have a smaller surface, and per-request fields belong to a request or
+connection platform. Require only capabilities supplied by the adapter and
+context in use; plugin-added fields follow their plugin's contract.
+
+After changing `Platform`, run `node scripts/generate-platform-contract.js`.
+`npm run check:platform` rejects stale generated files, and the native suite
+compares the inventory with a production connection platform.
+
 ## Versions at boot
 
 A built server logs its resolved identity while it boots, before the line
@@ -1182,12 +2010,15 @@ Read by the built server at boot, not at build time. The `envPrefix` adapter
 option prefixes every name below, so `envPrefix: 'MY_'` makes the port
 `MY_PORT`; the server warns when it sees an unprefixed name it would otherwise
 have read, since that is a variable someone expected to take effect.
+`envPrefix` must be a string; another type throws `TypeError` when configuring
+the adapter. Proxy warnings name the settings with this prefix.
 
 | variable | default | what it does |
 |---|---|---|
 | `HOST` | `0.0.0.0` | listen address |
 | `PORT` | `3000` | listen port |
 | `ORIGIN` | unset | the public origin, e.g. `https://example.com`. Set it behind a proxy so redirects and the CSRF check use the address clients actually used |
+| `CANONICAL_HOST_ALIASES` | disabled | Comma-separated host authorities that redirect to `ORIGIN` with 308. Matching is case-insensitive and port-sensitive. Requires an absolute HTTP(S) origin with no path, credentials, query or fragment; the canonical authority cannot also be an alias |
 | `PROTOCOL_HEADER` | unset | header carrying the client's protocol, e.g. `x-forwarded-proto` |
 | `HOST_HEADER` | unset | header carrying the client's host, e.g. `x-forwarded-host` |
 | `PORT_HEADER` | unset | header carrying the client's port |
@@ -1196,7 +2027,7 @@ have read, since that is a variable someone expected to take effect.
 | `TRUSTED_PROXIES` | unset | comma-separated IPs and CIDR ranges, IPv4 and IPv6. When set, an address claim is honoured only from a peer in this set, and one from anywhere else is ignored in favour of the socket address, once with a warning. Unset trusts the header verbatim |
 | `BODY_SIZE_LIMIT` | `512K` | largest request body accepted, with `K`/`M`/`G` suffixes and an optional trailing `B`. `0` disables the cap; a negative or non-finite value such as `Infinity` is refused rather than read as "no limit" |
 | `IDLE_TIMEOUT` | `120` | seconds a connection may go idle before Bun closes it. See Timeouts |
-| `SHUTDOWN_TIMEOUT` | `30` | seconds to wait for in-flight work during a graceful shutdown before closing anyway |
+| `SHUTDOWN_TIMEOUT` | `30` | shared shutdown budget in seconds for the hook, in-flight drain and async cleanup listeners; `0` waits without a deadline. A second SIGTERM or SIGINT aborts active requests and exits with code 1, including while startup is pending. |
 | `SHUTDOWN_DELAY_MS` | `0` | milliseconds to keep serving after the signal arrives, so a load balancer notices the readiness 503 before connections are cut |
 | `SHUTDOWN_RECONNECT_WINDOW_MS` | `3000` | the window advertised in the `reconnect` frame sent to WebSocket clients before the drain closes them |
 | `SSL_CERT` | unset | path to a TLS certificate. TLS is enabled only when both this and `SSL_KEY` are set |
@@ -1205,6 +2036,14 @@ have read, since that is a variable someone expected to take effect.
 `PROTOCOL_HEADER`, `HOST_HEADER` and `PORT_HEADER` are trusted as given. Set
 them only behind a proxy that overwrites those headers on every request;
 otherwise a client can choose its own origin by sending them.
+
+For example, `ORIGIN=https://example.com CANONICAL_HOST_ALIASES=www.example.com,old.example.com`
+redirects listed aliases while preserving the path and query. Health/readiness
+probes and unlisted hosts keep their normal behavior. With configured host,
+port or protocol headers, Bun exposes the final repeated header line as the
+incoming authority. A comma inside a single configured value is rejected with
+400 rather than interpreted as a proxy chain. Set those headers only behind a
+proxy that replaces untrusted client values.
 
 `CLUSTER_WORKERS` is accepted and ignored, with a warning naming it. This
 adapter runs single-process on purpose: multi-node scale-out rides the
@@ -1239,10 +2078,13 @@ adapter options (Bun caps that one at 960).
 
 ## Development
 
-Requires [Bun](https://bun.com) installed. The supported floor is **Bun 1.3.14**
-(`engines.bun`), which is also the version the committed probe report was
-generated against. CI runs every gate on both Bun generations - 1.3.14 and 1.4.0 - because 1.4
-changed several behaviours this adapter reads: the API probe, the live and leak
+Requires [Bun](https://bun.com) installed. The supported floor is **Bun 1.4.4**
+(`engines.bun`). Earlier Bun 1.3.14 leaves an incomplete upload's TCP connection
+open after sending an early response with `Connection: close`; cancelling its
+native body does not close it either. Bun 1.4.4 closes it and passes the generated
+server's body-budget and incomplete-upload tests. Historical probe and benchmark
+reports retain the runtime versions on which they were measured.
+CI pins Bun 1.4.4 for the API probe, live and leak
 suites, the unit and sim lanes (one process per file, via
 `scripts/bun-test-lane.mjs`), both golden corpora and the determinism scan. The
 corpora are blessed under Node and must match fingerprint-for-fingerprint under
@@ -1309,15 +2151,25 @@ of the base before `grantSizeFor` stopped feeding it into the sizing math.
 
 The unit suite covers the pure decision modules (range parsing, content
 negotiation, path canonicalization, proxy trust, header validation) and runs
-under Node, not Bun. It also covers the WebSocket demux and the authorization
-gate, which reach the app through a specifier the build injects: a loader hook
-(`test/helpers/ws-handler-loader.mjs`) resolves that specifier to a stub, so
-`handler/ws.js` and `handler/platform.js` can be driven without a build. Put
-frame-shape and hook-contract assertions there - it is the fast lane:
+under Node, and again under Bun in CI (`bun scripts/bun-test-lane.mjs unit`).
+It also covers the WebSocket demux and the authorization gate, which reach the
+app through a specifier the build injects: under the `bunserve-test` condition
+the `#ws-handler` package import resolves that specifier to a stub
+(`test/helpers/ws-handler-stub.mjs`), so `handler/ws.js` and
+`handler/platform.js` can be driven without a build. Put frame-shape and
+hook-contract assertions there - it is the fast lane:
 
 ```sh
 npm test   # requires Node 22+ for the test-runner glob
 ```
+
+The unit and sim suites run in test mode on both runtimes (`NODE_ENV=test`:
+preloaded by `test/helpers/test-env.mjs` on Node, set by
+`scripts/bun-test-lane.mjs` on Bun), and so do the golden corpora under
+`npm run sim:golden` and in CI. In test mode a framework invariant violation
+throws rather than logging. A test that drives the runtime into one therefore
+fails, and a stand-in socket has to carry what a real upgrade hands `open` -
+`test/helpers/upgrade-data.mjs` builds that.
 
 `test/unit/io-budget.test.mjs` is the performance gate in that lane, and
 `test/unit/http-io-budget.test.mjs` is its HTTP twin: per-response operation
@@ -1338,7 +2190,10 @@ second header build once an entry has been served forty times, hides completely
 inside a short window and is exactly the shape a cache or pool regression
 takes. The decode budgets are the inverse, and the reason the repetition is not
 always of an identical request: what they require is that a SECOND sighting of
-a path, and two hundred distinct unencoded ones, add no decodes at all.
+a path, and two hundred distinct unencoded ones, add no decodes at all. The one
+exception is the lookup of an asset by its encoded name, which decodes once per
+request, as svelte-adapter-uws's does, and only after both cached lookups
+missed.
 
 Every budget that can be stated at scale is. The four exceptions are all one
 shape - a FIRST decode, measured once because a first sighting happens once:
@@ -1372,39 +2227,110 @@ npm run test:live   # builds test/fixture twice and runs the suites in test/live
 
 The leak lane asks a question none of the others can: does serving for a while
 make the process grow? It boots the built fixture, drives it at a fixed rate,
-and applies five independent gates - retained memory across the run, the
-footprint's trend, error rate, p95 latency creep, and connections still
-registered after every client has closed.
+and gates the way the svelte-adapter-uws lane gates, so a record from either
+runtime reads the same. The verdict rules are pure functions in
+`test/leak/rules.mjs`, unit-tested in milliseconds; the lane itself spends
+minutes, because a slope needs a window to be fitted over.
 
-Two of those deserve their reasoning stated, because the obvious version of
-each is wrong. Retention is measured after forcing the collector until it
-SETTLES: one forced collection is not settled, and comparing single readings
-made a healthy run's growth swing between +7.5% and +67.6%. It counts heap plus
-external, since a typed array lives outside the JS heap and most of what a
-server retains is buffers. The footprint is measured as a least-squares slope
-gated on an r-squared floor, so a runner whose memory merely wanders produces
-no fit and cannot fail the build - and its thresholds are set to catch runaway
-rather than to be precise, because RSS under Bun's allocator climbs toward a
-working-set plateau that looks exactly like a leak over a short window.
+Three gates are the family's, constant for constant. Resident-set growth is
+judged by the shared `detectGrowth` kernel: the least-squares slope over the
+window must exceed 256 KiB per sample, the total delta 16 MiB, and the fit's
+r-squared must reach 0.5 - a runner whose memory merely wanders produces no
+fit and cannot fail the build. Beside it an error-rate ceiling of 0.5% and a
+p95-creep ceiling of 50% over the warmed baseline, because a window that lost
+its requests has not shown the memory is flat, it has shown the server
+stopped answering.
 
-It ends with a self-check that arms a deliberate leak in the fixture and
-requires the verdict to fail. A gate never observed failing cannot be told
-apart from one that is unable to.
+The family also gates two signals RSS cannot give on this runtime.
+Retention is heap plus external, read after forcing the collector until two
+readings agree, at both ends of the run: what survives a settled collection
+is held on purpose by something, and a typed array lives outside the JS
+heap, so buffers - which are what a server retains - move `external` and
+barely touch `heapUsed`. One forced collection is not settled: comparing
+single readings made a healthy run's growth swing between +7.5% and +67.6%.
+It fails only past BOTH a 30% ratio and a 2 MiB floor, because a bounded
+structure filling once is not a leak, and on a single-digit-MiB baseline the
+ratio alone cannot tell the two apart. And the live WebSocket count after
+every client has closed, because a close path that fails to release leaves
+connections registered while the allocator quietly reuses their pages. An
+unreadable live count is a lane health failure, never a zero-connections pass.
 
-It has its own CI job and is not part of `npm run test:live`, because it spends
-minutes by design and a gate that slow in the dev loop is one people stop
-running.
+The `ws` scenario holds four sockets and cycles through 512 topic names at
+200 subscribe/publish/unsubscribe operations per second, matching the family
+workload. The subscribe acknowledgement and the fixture application's
+unsubscribe-hook confirmation must arrive for a unit to succeed. The sockets close before cooldown and the final live count.
+The separate `churn` scenario opens a connection, subscribes to one of 32
+topics and closes it per unit. Its rate comes from the fixture's upgrade
+limit: 80% of the configured allowance per second, floored to one, or 50/s
+when that limit is disabled. A denied subscription counts as a failed unit.
+
+The measurement has a shape, and each phase exists because its absence
+produces a confident wrong answer: a sixty-second warmup; a forced-collection
+baseline; a worked but UNSAMPLED resettle, since sampling straight after a
+collection measures the climb back to the working set (303 KB/s at
+r-squared 0.996 here - a textbook leak, drawn by the measurement); a settle
+loop that opens the window only once the reading has held inside a band for
+eight rounds in a row; then the window, sampled every two seconds. A run that
+never settled, could not read the probe, or lost its warmup is reported as
+the lane's problem (exit 2), not the server's (exit 1), and CI fails on both.
+
+It ends with a self-check that settles a clean server and then plants a real
+leak for the window, and requires the GROWTH gate itself to have caught it. A
+verdict failing on error rate or p95 does not count, and neither does the
+retention gate: a deliberately leaking server degrades in those ways too, and
+a self-check satisfied by any of them would certify a lane whose family gate
+had gone blind.
+
+It has its own CI job and is not part of `npm run test:live`, because it
+spends minutes by design and a gate that slow in the dev loop is one people
+stop running. The flags are the uws lane's, and a JSON record with every
+sample and settle reading is written per run:
 
 ```sh
-npm run test:leak                      # two scenarios plus the self-check
-LEAK_SCENARIO=ws npm run test:leak     # one scenario, for investigating a trend
-LEAK_DURATION_MS=240000 npm run test:leak   # a longer window settles a plateau question
-LEAK_RESETTLE_MS=0 npm run test:leak   # start sampling straight off the baseline collection
+npm run test:leak                              # four scenarios, 3-minute windows
+npm run test:leak -- --scenario ws             # one scenario, for investigating a trend
+npm run test:leak -- --minutes 8               # a longer window settles a plateau question
+npm run test:leak -- --out ./leak-records      # where the record goes (default: test/leak/records/)
 ```
 
-A window that cannot hold at least eight samples at the configured cadence is
-refused before the fixture is built, rather than run and then reported as
-having measured nothing.
+`--minutes` accepts finite numbers from 1 to 60 inclusive, including `1.5`
+and `1e1`. The default is 3. Each flag accepts `--name value` or `--name=value`;
+values may contain `=`, and the first occurrence of each flag wins. The first
+value must be present, nonempty and valid; errors fail before the fixture build.
+`--scenario` accepts `http`, `ws`, `churn`, `selfcheck` or `all`.
+
+The fixture's probe is `/__leak?op=mem|gc|retain|release`, armed by
+`LEAK_PROBE=1` on the server the lane spawns and answering 404 on every other
+server; `op=gc` forces a synchronous full collection, which is why it is not
+reachable in anything anyone deploys.
+
+WHAT A HEALTHY RUN MEASURES on Bun, so the headroom is legible and a future
+reader can tell drift from a threshold that was always loose. The rules are
+the family's; the readings are this runtime's, and JavaScriptCore's allocator
+is not V8's - per-runtime calibration is expected and stated rather than
+hidden. Use the default three-minute window for calibration; a one-minute
+window can fail the p95-creep gate before the workload settles. This machine:
+
+| Scenario (window)   | RSS slope / fit                          | Growth verdict          | Retained (heap+external)          | p95 warmed -> window | Settle rounds |
+|---------------------|------------------------------------------|-------------------------|-----------------------------------|----------------------|---------------|
+| http (3 min)        | flat, 104-109 MiB, r-squared 0.00        | delta-within-tolerance  | 8.5 -> 8.6 MiB (+0.7%)            | 4.9 -> 3.9 ms        | 19            |
+| ws (3 min)          | 202 -> 170 MiB (fell), r-squared 0.68    | delta-within-tolerance  | 5.2 -> 5.6 MiB (+8.3%)            | 8.4 -> 6.7 ms        | 18            |
+| churn (3 min)       | 110 -> 100 MiB (fell), r-squared 0.62    | delta-within-tolerance  | 4.8 -> 5.9 MiB (+23.6%, +1.1 MiB) | 20.1 -> 21.0 ms      | 10            |
+| churn (8 min)       | 108 -> 102 MiB (fell), r-squared 0.32    | delta-within-tolerance  | 4.8 -> 5.9 MiB (+24.3%, +1.1 MiB) | -                    | 9             |
+| selfcheck (3 min)   | 111 -> 683 MiB, r-squared 1.00           | growth-detected         | 9.4 -> 1134 MiB                   | 5.5 -> 3.9 ms        | 9             |
+
+Bun 1.3.14 on Windows, one run each; the record for every run is in its JSON
+file. The held-socket `ws` run completed 35,909 operations with no failures
+and ended with zero live connections. The connection-churn runs predate the
+separate held-socket scenario. Two things the table says that the thresholds alone would not.
+Connection churn retains the same 1.1 MiB whether it churns nine thousand connections or
+twenty-four thousand, which is a bounded structure reaching its bound rather
+than growth per connection - a per-connection leak would have tripled between
+the rows - and it is why the retention gate has a byte floor as well as a
+ratio. And the resident set under both healthy workloads FELL across the
+window while the settled heap held still: Bun's allocator hands pages back
+mid-run, which is one more reason the family gate needs a fit and not just a
+slope.
 
 The deterministic simulation drives the REAL handler dispatch - the same
 modules a built server runs - over an in-memory Bun.serve double, a virtual
@@ -1419,9 +2345,16 @@ svelte-adapter-uws's own committed corpus at the parity pin, checked locally
 with
 
 ```
-node scripts/sim-golden.js --corpus adapter-single \
+node -C bunserve-sim --import ./test/helpers/test-env.mjs scripts/sim-golden.js \
+  --corpus adapter-single \
   --against ../svelte-adapter-uws/test/dst-goldens/adapter-single.golden.json
 ```
+
+The `-C bunserve-sim` condition resolves the WebSocket handler to the
+simulator's stub, and the preload runs the corpus in test mode, as
+`npm run sim:golden` does. A framework invariant check that fires during a seed
+is recorded as a violation of that run whether or not a boundary contained its
+throw, so it moves the fingerprint and fails the verification.
 
 Identical golden traces are the positioning guard: the tier line stays a
 performance statement, never a capability statement. Nothing adapter-specific
@@ -1437,7 +2370,8 @@ than a loop. Select one with `--corpus <name>`; an unrecognised name is refused
 rather than defaulted.
 
 A change that deliberately moves a fingerprint is blessed with
-`node scripts/sim-golden.js --update`, and the corpus diff is the reviewable
+`node -C bunserve-sim --import ./test/helpers/test-env.mjs scripts/sim-golden.js --corpus <name> --update`,
+and the corpus diff is the reviewable
 record of what moved. The corpus records the commit it was blessed from,
 because a seed without one is half a bug report. Blessing while any TRACKED
 file differs from `HEAD` records that commit with a `-dirty` suffix, which is
