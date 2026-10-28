@@ -49,42 +49,32 @@ const PLATFORM_GAPS = {
 	diagnostic: 'request tracing',
 	trace: 'request tracing',
 	traceContext: 'request tracing',
-	authorizeWireSubscribe: 'wire-subscribe authorization',
-	grantPublish: 'client-publish grants',
-	publishGrant: 'client-publish grants',
-	revokePublish: 'client-publish grants',
 	request: 'RPC over the socket',
 	requestTopic: 'RPC over the socket',
 	batch: 'batched publish API',
-	publishBatched: 'batched publish API',
-	sendCoalesced: 'per-key send coalescing',
-	publishGame: 'game ingress lane',
 	hlc: 'hybrid logical clock (cluster ordering)',
-	topicEpoch: 'resume epoch introspection',
+
+
+
 	introspect: 'diagnostics'
 };
 
 /**
- * Members this adapter exposes that uws does not declare. Every one of these is
- * DRIFT against the lead, not a feature: an app written against them cannot
- * move back to uws, which is half of "drop-in replacement".
+ * Members this adapter exposes that the manifest's uws does not declare. Such a
+ * member is DRIFT against the lead, not a feature: an app written against it
+ * cannot move back to uws, which is half of "drop-in replacement". The one
+ * exception is an entry saying the manifest itself is behind uws, which the
+ * staleness check retires at the next re-pin.
  */
-const PLATFORM_EXTRAS = {
-	// Empty, and it stays empty. The three counters that lived here are read
-	// through the metrics registry now, which is where uws reports them: its
-	// platform carries `metrics` and `metricsSnapshot` and no counter getters.
-};
+const PLATFORM_EXTRAS = {};
 
 /**
  * Top-level adapter options uws declares and this adapter does not accept.
  *
- * Both entries arrived with the tracing surface and the static-cache header
- * work. Neither is implemented here, so both are acknowledged rather than
- * counted as parity.
  */
 const ADAPTER_OPTION_GAPS = {
-	staticCacheControl: 'static cache-control headers',
 	tracing: 'request tracing'
+
 };
 
 /** Top-level adapter options this adapter accepts that uws does not declare. */
@@ -98,12 +88,8 @@ const WS_OPTION_GAPS = {
 	// Accepted so a carried config builds, and not loaded - the feature is the
 	// operator-owned registry, which this adapter does not have. See
 	// INERT_WS_OPTION_KEYS.
-	metrics: 'operator-owned metrics registry',
-	adminPath: 'admin endpoint',
 	maxTopicSeqEntries: 'bounded topic-seq registry',
 	messageAdmission: 'inbound message admission',
-	adminAuthAcknowledged: 'admin endpoint',
-	authorizeWireSubscribe: 'wire-subscribe authorization',
 	consistencyAuditIntervalMs: 'background audits',
 	resourceGrowthAuditIntervalMs: 'background audits',
 	stateHashIntervalMs: 'background audits',
@@ -124,58 +110,22 @@ const WS_OPTION_GAPS = {
 	unsafeSameOriginWithoutHostPin: 'origin pinning escape hatch'
 };
 
-/**
- * Export subpaths uws declares and this adapter does not. A single-entry
- * adapter today: the browser client and the plugin families ship from uws's
- * own package, and the sim stays internal, reached by path from scripts/ and
- * test/ rather than exported.
- */
-const EXPORT_GAPS = {
-	'./client': 'browser client',
-	'./connection': 'connection introspection',
-	'./observability': 'request tracing',
-	'./plugins/channels': 'plugin: channels',
-	'./plugins/channels/client': 'plugin: channels',
-	'./plugins/crdt': 'plugin: crdt',
-	'./plugins/crdt/channel': 'plugin: crdt',
-	'./plugins/crdt/client': 'plugin: crdt',
-	'./plugins/crdt/replica': 'plugin: crdt',
-	'./plugins/cursor': 'plugin: cursor',
-	'./plugins/cursor/client': 'plugin: cursor',
-	'./plugins/dedup': 'plugin: dedup',
-	'./plugins/groups': 'plugin: groups',
-	'./plugins/groups/client': 'plugin: groups',
-	'./plugins/lock': 'plugin: lock',
-	'./plugins/middleware': 'plugin: middleware',
-	'./plugins/presence': 'plugin: presence',
-	'./plugins/presence/client': 'plugin: presence',
-	'./plugins/queue': 'plugin: queue',
-	'./plugins/ratelimit': 'plugin: ratelimit',
-	'./plugins/replay': 'plugin: replay',
-	'./plugins/replay/client': 'plugin: replay',
-	'./plugins/session': 'plugin: session',
-	'./plugins/smooth': 'plugin: smooth',
-	'./plugins/smooth/client': 'plugin: smooth',
-	'./plugins/smooth/random': 'plugin: smooth',
-	'./plugins/throttle': 'plugin: throttle',
-	'./plugins/webhooks': 'plugin: webhooks',
-	'./safe-url': 'safe-url helper',
-	'./sim': 'sim is internal here, reached by path, not exported',
-	'./testing': 'testing server double',
-	'./upgrade-response': 'upgrade-response helper',
-	'./vite': 'vite dev plugin'
-};
+/** Export subpaths declared by the lead but absent from this package. */
+const EXPORT_GAPS = {};
 
-/** Export subpaths this adapter declares that uws does not. */
+/**
+ * Export subpaths this adapter declares that uws does not. Drift, like the
+ * platform extras, with one exception: an entry saying the manifest itself is
+ * behind uws, which the staleness check retires at the next re-pin.
+ */
 const EXPORT_EXTRAS = {};
 
 /** `websocket.*` keys this adapter accepts that uws does not declare. */
 const WS_OPTION_EXTRAS = {
-	// The bounds that used to sit here are internal constants now, at the same
-	// values. This one is the last: uws decides the no-hook subscribe case
-	// through `authorizeWireSubscribe`, which this adapter does not have yet, so
-	// the key stays until that gap closes and takes the stand-in with it.
-	allowUnauthenticatedSubscribe: 'stand-in for the authorizeWireSubscribe gap'
+	// Empty, and it stays empty: a `websocket.*` key only this adapter accepts
+	// cannot travel back to the one it mirrors. Per-connection bounds uws does
+	// not declare are internal constants here, and the no-hook subscribe case
+	// is decided through `authorizeWireSubscribe`, which uws does declare.
 };
 
 /**
@@ -441,17 +391,9 @@ test('an accepted-but-inert key is recorded as a gap, and says so at build time'
 			`\`websocket.${key}\` is accepted, or it would not need to be listed as inert`
 		);
 	}
-	// The one that exists today, driven through the real validator: a valid value
-	// builds, the build says what the adapter does instead, and NOTHING IS KEPT.
-	// The third check is the one the other two cannot make - a stored value is a
-	// key that becomes honoured the moment some module reads it, with the warning
-	// still firing and both lists still calling it a gap.
 	const { options, warnings } = normalizeWsOptions({ metrics: './src/lib/metrics.js' });
-	assert.ok(
-		warnings.some((w) => w.includes('`websocket.metrics`') && w.includes('does not load it')),
-		'the build says the module is not loaded'
-	);
-	assert.equal(options.metrics, undefined, 'and keeps nothing for a later reader to honour');
+	assert.equal(options.metrics, './src/lib/metrics.js');
+	assert.equal(warnings.some(w => w.includes('does not load it')), false);
 });
 
 test('export subpaths match the uws contract, or the difference is recorded', () => {

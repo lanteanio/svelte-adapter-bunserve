@@ -14,6 +14,7 @@
 // consumer, and it distinguishes public API from whatever the implementation
 // happens to expose.
 
+import { declarationSignatures, interfaceMethodContracts, publicDeclarationSignatures } from './type-signatures.mjs';
 import { writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -748,6 +749,39 @@ function guardEnforcesCeiling(body, bodyRaw) {
 					'describe the old one. Fix the extractor against the new guard shape.'
 				);
 			}
+			// NOT ASSIGNING IS NOT THE SAME AS NOT MUTATING. `const n = ++ceiling;`
+			// and `const n = bump();` both raise a bound the recorded range then
+			// describes wrongly, and neither carries an `=` for the test above to
+			// see. A call is the wider hole of the two: whatever it closes over is
+			// reachable, so it can rewrite `value` or `ceiling` from another file.
+			//
+			// Scoped to the statements the ACCEPTED path actually runs - those
+			// before the floor comparison returns. The real guard formats its
+			// refusal with a call (`const shown = ... describeValue(value)`), and
+			// that sits after acceptance has already returned, where nothing it
+			// does can change a range that was decided upstream of it. Refusing
+			// there would fail the extractor on the guard as it is written, which
+			// is the one thing worse than reading it too loosely.
+			if (acceptAt === -1) {
+				// `Number.x(...)` is the one call shape read as pure, because it
+				// is the shape the guard's own comparisons are written in
+				// (`Number.isFinite`, `Number.isSafeInteger`) and a guard may
+				// reasonably hold one in a const. Nothing else: a bare or
+				// member call on anything else reaches whatever it closes over.
+				const probed = initializer.replace(/\bNumber\.\w+\s*\(/g, '(');
+				const impure = /\+\+|--|\bdelete\s|\bawait\s|\byield\b|\bnew\s|[\w$)\]]\s*\(/.exec(probed);
+				if (impure) {
+					throw new Error(
+						'assertProtectiveNumber declares a constant whose initializer can side-effect ' +
+						`before the floor comparison runs ("${impure[0].trim().replace('(', '(...)')}" in ` +
+						`"${bodyRaw.slice(i, Math.min(end, i + 60)).replace(/\s+/g, ' ').trim()}"). ` +
+						'A call reaches whatever it closes over and an increment rewrites a bound in ' +
+						'place, so either can change what the verified branches compare while the ' +
+						'recorded ranges go on describing the old rule. Fix the extractor against the ' +
+						'new guard shape rather than certifying a range it cannot verify.'
+					);
+				}
+			}
 			i = end + 1;
 		}
 	}
@@ -1024,8 +1058,19 @@ function main() {
 	// like one: UWS_REF=<sha>.
 	const ref = process.env.UWS_REF || pinnedRef() || 'HEAD';
 	const commit = execFileSync('git', ['rev-parse', ref], { cwd: uwsRoot, encoding: 'utf8' }).trim();
+	const manifestPath = join(HERE, 'uws-surface.json');
+	const previous = existsSync(manifestPath) ? JSON.parse(readFileSync(manifestPath, 'utf8')) : {};
+	const clientRef = commit;
+	const clientCommit = execFileSync('git', ['rev-parse', clientRef], { cwd: uwsRoot, encoding: 'utf8' }).trim();
 	const dts = showAtRef(uwsRoot, commit, 'src/index.d.ts');
 	const pkg = JSON.parse(showAtRef(uwsRoot, commit, 'package.json'));
+	const nativeRoot = join(uwsRoot, 'node_modules', 'uWebSockets.js');
+	const nativePackage = JSON.parse(readFileSync(join(nativeRoot, 'package.json'), 'utf8'));
+	const nativeDependency = pkg.dependencies?.['uWebSockets.js'] ?? pkg.optionalDependencies?.['uWebSockets.js'] ?? pkg.devDependencies?.['uWebSockets.js'];
+	if (!nativeDependency?.endsWith(`/v${nativePackage.version}.tar.gz`)) {
+		throw new Error('Install the pinned uWebSockets.js dependency before extracting its socket contract.');
+	}
+	const nativeTypes = readFileSync(join(nativeRoot, 'index.d.ts'), 'utf8');
 	const schema = showAtRef(uwsRoot, commit, 'protocol.schema.json');
 	const indexSource = showAtRef(uwsRoot, commit, 'src/index.js');
 	const guardsSource = showAtRef(uwsRoot, commit, 'src/config-guards.js');
@@ -1066,7 +1111,20 @@ function main() {
 		// entirely - inside the gate it builds, not while it reads the config. That
 		// split is why a looser rule for these went unnoticed here.
 		nestedProtectiveNumbers: { upgradeAdmission: admissionBoundRanges(admissionSource) },
-		exports: Object.keys(pkg.exports ?? {}).sort()
+		exports: Object.keys(pkg.exports ?? {}).sort(),
+		typeDeclarations: declarationSignatures(dts),
+		clientContract: {
+			commit: clientCommit,
+			declarations: publicDeclarationSignatures(showAtRef(uwsRoot, clientCommit, 'src/client.d.ts'))
+		},
+		typeReferences: {
+			TraceContext: declarationSignatures(showAtRef(uwsRoot, commit, 'src/observability.d.ts'), 1).TraceContext
+		},
+		webSocketContract: {
+			version: nativePackage.version,
+			sha256: createHash('sha256').update(nativeTypes.replace(/\r\n/g, '\n'), 'utf8').digest('hex'),
+			methods: interfaceMethodContracts(nativeTypes, 'WebSocket')
+		}
 	};
 
 	// Floors, not exact counts: this guards against a parser change silently

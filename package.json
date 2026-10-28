@@ -1,6 +1,7 @@
 {
 	"name": "svelte-adapter-bunserve",
 	"version": "0.0.3",
+	"types": "./src/index.d.ts",
 	"description": "SvelteKit adapter for Bun - Bun.serve HTTP with the svelte-adapter-uws realtime DX, no native addon",
 	"author": "Kevin Radziszewski",
 	"license": "MIT",
@@ -15,10 +16,155 @@
 	"type": "module",
 	"exports": {
 		".": {
+			"types": "./src/index.d.ts",
 			"default": "./src/index.js"
+		},
+		"./vite": {
+			"types": "./src/vite.d.ts",
+			"default": "./src/vite.js"
+		},
+		"./subscriptions": {
+			"types": "./src/subscriptions.d.ts",
+			"default": "./src/subscriptions.js"
+		},
+		"./upgrade-response": {
+			"types": "./src/upgrade-response.d.ts",
+			"default": "./src/upgrade-response.js"
+		},
+		"./connection": {
+			"types": "./src/connection.d.ts",
+			"default": "./src/connection.js"
+		},
+		"./platform-contract": {
+			"types": "./src/platform-contract.d.ts",
+			"default": "./src/platform-contract.js"
+		},
+		"./client": {
+			"types": "./src/client.d.ts",
+			"default": "./src/client.js"
+		},
+		"./testing": {
+			"types": "./src/testing.d.ts",
+			"default": "./src/testing.js"
+		},
+		"./sim": {
+			"types": "./src/sim.d.ts",
+			"default": "./src/public-sim.js"
+		},
+		"./safe-url": {
+			"types": "./src/safe-url.d.ts",
+			"default": "./src/safe-url.js"
+		},
+		"./observability": {
+			"types": "./src/observability.d.ts",
+			"default": "./src/observability.js"
+		},
+		"./plugins/replay": {
+			"types": "./src/plugins/replay/server.d.ts",
+			"default": "./src/plugins/replay/server.js"
+		},
+		"./plugins/replay/client": {
+			"types": "./src/plugins/replay/client.d.ts",
+			"default": "./src/plugins/replay/client.js"
+		},
+		"./plugins/presence": {
+			"types": "./src/plugins/presence/server.d.ts",
+			"default": "./src/plugins/presence/server.js"
+		},
+		"./plugins/presence/client": {
+			"types": "./src/plugins/presence/client.d.ts",
+			"default": "./src/plugins/presence/client.js"
+		},
+		"./plugins/channels": {
+			"types": "./src/plugins/channels/server.d.ts",
+			"default": "./src/plugins/channels/server.js"
+		},
+		"./plugins/channels/client": {
+			"types": "./src/plugins/channels/client.d.ts",
+			"default": "./src/plugins/channels/client.js"
+		},
+		"./plugins/throttle": {
+			"types": "./src/plugins/throttle/server.d.ts",
+			"default": "./src/plugins/throttle/server.js"
+		},
+		"./plugins/ratelimit": {
+			"types": "./src/plugins/ratelimit/server.d.ts",
+			"default": "./src/plugins/ratelimit/server.js"
+		},
+		"./plugins/cursor": {
+			"types": "./src/plugins/cursor/server.d.ts",
+			"default": "./src/plugins/cursor/server.js"
+		},
+		"./plugins/cursor/client": {
+			"types": "./src/plugins/cursor/client.d.ts",
+			"default": "./src/plugins/cursor/client.js"
+		},
+		"./plugins/middleware": {
+			"types": "./src/plugins/middleware/server.d.ts",
+			"default": "./src/plugins/middleware/server.js"
+		},
+		"./plugins/queue": {
+			"types": "./src/plugins/queue/server.d.ts",
+			"default": "./src/plugins/queue/server.js"
+		},
+		"./plugins/groups": {
+			"types": "./src/plugins/groups/server.d.ts",
+			"default": "./src/plugins/groups/server.js"
+		},
+		"./plugins/groups/client": {
+			"types": "./src/plugins/groups/client.d.ts",
+			"default": "./src/plugins/groups/client.js"
+		},
+		"./plugins/lock": {
+			"types": "./src/plugins/lock/server.d.ts",
+			"default": "./src/plugins/lock/server.js"
+		},
+		"./plugins/session": {
+			"types": "./src/plugins/session/server.d.ts",
+			"default": "./src/plugins/session/server.js"
+		},
+		"./plugins/dedup": {
+			"types": "./src/plugins/dedup/server.d.ts",
+			"default": "./src/plugins/dedup/server.js"
+		},
+		"./plugins/crdt": {
+			"types": "./src/plugins/crdt/server.d.ts",
+			"default": "./src/plugins/crdt/server.js"
+		},
+		"./plugins/crdt/client": {
+			"types": "./src/plugins/crdt/client.d.ts",
+			"default": "./src/plugins/crdt/client.js"
+		},
+		"./plugins/crdt/replica": {
+			"types": "./src/plugins/crdt/replica.d.ts",
+			"default": "./src/plugins/crdt/replica.js"
+		},
+		"./plugins/crdt/channel": {
+			"types": "./src/plugins/crdt/channel.d.ts",
+			"default": "./src/plugins/crdt/channel.js"
+		},
+		"./plugins/smooth": {
+			"types": "./src/plugins/smooth/server.d.ts",
+			"default": "./src/plugins/smooth/server.js"
+		},
+		"./plugins/smooth/client": {
+			"types": "./src/plugins/smooth/client.d.ts",
+			"default": "./src/plugins/smooth/client.js"
+		},
+		"./plugins/smooth/random": {
+			"types": "./src/plugins/smooth/random.d.ts",
+			"default": "./src/plugins/smooth/random.js"
+		},
+		"./plugins/webhooks": {
+			"types": "./src/plugins/webhooks/server.d.ts",
+			"default": "./src/plugins/webhooks/server.js"
 		}
 	},
 	"imports": {
+		"#metrics-registry": {
+			"bunserve-test": "./test/helpers/metrics-registry-stub.mjs",
+			"bunserve-sim": "./src/runtime/metrics-null.js"
+		},
 		"#ws-handler": {
 			"bunserve-test": "./test/helpers/ws-handler-stub.mjs",
 			"bunserve-sim": "./src/runtime/sim-hooks.js"
@@ -29,6 +175,8 @@
 	},
 	"files": [
 		"src",
+		"docs",
+		"examples/observability",
 		"protocol.schema.json",
 		"LICENSE",
 		"README.md",
@@ -36,26 +184,34 @@
 	],
 	"scripts": {
 		"probe": "bun probe/bun-api-facts.mjs",
-		"test": "node -C bunserve-test --test \"test/unit/*.test.mjs\" && node -C bunserve-sim --test \"test/sim/*.test.mjs\"",
+		"test": "node -C bunserve-test --import ./test/helpers/test-env.mjs --test \"test/unit/*.test.mjs\" && node -C bunserve-sim --import ./test/helpers/test-env.mjs --test \"test/sim/*.test.mjs\" && npm run test:client && npm run test:public",
 		"test:live": "bun test/live/run.mjs",
 		"test:leak": "bun test/leak/run.mjs",
 		"check:publish": "publint && attw --pack . --profile esm-only",
 		"check:determinism": "node scripts/check-determinism.js",
-		"sim:golden": "node -C bunserve-sim scripts/sim-golden.js --corpus adapter-single && node -C bunserve-sim scripts/sim-golden.js --corpus adapter-admission",
-		"probe:uws": "node probe/uws-surface.mjs"
+		"sim:golden": "node -C bunserve-sim --import ./test/helpers/test-env.mjs scripts/sim-golden.js --corpus adapter-single && node -C bunserve-sim --import ./test/helpers/test-env.mjs scripts/sim-golden.js --corpus adapter-admission",
+		"probe:uws": "node probe/uws-surface.mjs",
+		"test:client": "vitest run --config test/client/vitest.config.js",
+		"test:public": "vitest run --config test/public/vitest.config.js",
+		"test:public-native": "bun test ./test/public-native",
+		"check:platform": "node scripts/generate-platform-contract.js --check"
 	},
 	"dependencies": {
 		"@rollup/plugin-commonjs": "^28.0.0",
 		"@rollup/plugin-json": "^6.0.0",
 		"@rollup/plugin-node-resolve": "^16.0.0",
-		"rollup": "^4.0.0"
+		"rollup": "^4.0.0",
+		"esbuild": "^0.25.0 || ^0.26.0 || ^0.27.0 || ^0.28.0",
+		"yjs": "^13.6.31",
+		"parse5": "^8.0.0"
 	},
 	"peerDependencies": {
-		"@sveltejs/kit": "^2.0.0",
-		"svelte": "^4.0.0 || ^5.0.0"
+		"@sveltejs/kit": "^2.0.0 || ^3.0.0",
+		"svelte": "^4.0.0 || ^5.0.0",
+		"ws": "^8.0.0"
 	},
 	"engines": {
-		"bun": ">=1.3.14"
+		"bun": ">=1.4.4"
 	},
 	"keywords": [
 		"svelte",
@@ -68,6 +224,14 @@
 	],
 	"devDependencies": {
 		"@arethetypeswrong/cli": "^0.18.5",
-		"publint": "^0.3.22"
+		"publint": "^0.3.22",
+		"vitest": "^4.0.18",
+		"typescript": "^6.0.3",
+		"ws": "^8.19.0"
+	},
+	"peerDependenciesMeta": {
+		"ws": {
+			"optional": true
+		}
 	}
 }

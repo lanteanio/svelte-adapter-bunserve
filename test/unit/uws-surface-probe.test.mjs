@@ -212,6 +212,54 @@ test('only a const may be read past; anything that can rebind fails the walk', (
 		'an ordinary const declaration is still harmless');
 });
 
+test('a const initializer that mutates without assigning fails the walk too', () => {
+	// Not assigning is not the same as not mutating, and neither of these
+	// carries an `=` for the assignment test to catch. Both change what the
+	// verified branches compare, so the recorded range would certify a rule the
+	// guard does not enforce - accepting more than the manifest claims.
+	const index = "assertProtectiveNumber(websocket, 'w', 'websocket.w', { allowZero: false });";
+
+	// A call reaches whatever it closes over, so it can rewrite `value` or the
+	// caller's `ceiling` from another file entirely.
+	const called = PINNED_GUARD.replace(
+		'const floor = allowZero ? 0 : 1;',
+		'const floor = allowZero ? 0 : 1;\n\tconst x = raiseTheBound();'
+	);
+	assert.throws(() => protectiveNumberRanges(index, called), /can side-effect/,
+		'a call before the floor comparison');
+
+	// An increment rewrites the bound in place, with no call and no assignment.
+	const bumped = PINNED_GUARD.replace(
+		'const floor = allowZero ? 0 : 1;',
+		'const floor = allowZero ? 0 : 1;\n\tconst x = ++ceiling;'
+	);
+	assert.throws(() => protectiveNumberRanges(index, bumped), /can side-effect/,
+		'an increment before the floor comparison');
+
+	// AFTER acceptance has returned, a call changes nothing about a range that
+	// was already decided - and the real guard formats its refusal with one
+	// (`const shown = ... describeValue(value)`), so refusing there would fail
+	// the extractor on the guard as written. That is the case the rule has to
+	// keep letting through, and it is why the rule is scoped rather than blanket.
+	const formatted = PINNED_GUARD.replace(
+		"throw new Error('nope');",
+		"const shown = describeValue(value);\n\tthrow new Error(shown);"
+	);
+	assert.equal(protectiveNumberRanges(index, formatted).w.floor, 1,
+		'a formatter call behind the acceptance still reads');
+
+	// `Number.x(...)` is the one call shape read as pure before acceptance,
+	// because it is how the guard's own comparisons are written and a guard may
+	// hold one in a const. Pinned so narrowing or widening that carve-out is a
+	// deliberate act.
+	const builtin = PINNED_GUARD.replace(
+		'const floor = allowZero ? 0 : 1;',
+		'const floor = allowZero ? 0 : 1;\n\tconst safe = Number.isSafeInteger(value);'
+	);
+	assert.equal(protectiveNumberRanges(index, builtin).w.floor, 1,
+		'a Number builtin in a const still reads');
+});
+
 test('a ceiling branch behind the acceptance return enforces nothing', () => {
 	// The comparison exists, governs a throw, and never runs: every accepted
 	// value has already returned by the time control would reach it.
@@ -635,6 +683,7 @@ test('the manifest names an immutable commit, so regenerating cannot re-pin it',
 	const manifest = JSON.parse(readFileSync(new URL('../../probe/uws-surface.json', import.meta.url), 'utf8'));
 	assert.match(manifest.uwsCommit, /^[0-9a-f]{40}$/, 'the commit is a full sha');
 	assert.equal(manifest.uwsRef, manifest.uwsCommit, 'and the ref it was taken at is that same commit');
+	assert.equal(manifest.clientContract.commit, manifest.uwsCommit, 'the client contract follows the same immutable pin');
 	assert.equal(pinnedRef(), manifest.uwsCommit, 'which is what a regeneration reads by default');
 });
 

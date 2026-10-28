@@ -1,13 +1,16 @@
 {
-	"uwsVersion": "0.6.0-next.92",
-	"uwsRef": "1d93b7355a0ffdf882737b04db35526c2fdb4576",
-	"uwsCommit": "1d93b7355a0ffdf882737b04db35526c2fdb4576",
-	"protocolSchemaSha256": "0b82ec36a19ac524d1930b617a95c5220c77cfbe1f852284b545da1090c4d862",
+	"uwsVersion": "0.6.0-next.97",
+	"uwsRef": "f77ea3178d2b",
+	"uwsCommit": "f77ea3178d2bbccd3d2631d10a292aad8dc7fcd6",
+	"protocolSchemaSha256": "7ac229bdef8a0cf5fe9e70a882807d8a30b045b7befcd22481a685b79e55c497",
 	"platform": [
 		"adviseReconnect",
+		"assertions",
+		"authorizeDelivery",
 		"authorizeWireSubscribe",
 		"batch",
 		"bufferedAmount",
+		"bumpTopicEpoch",
 		"checkSubscribe",
 		"closedWsAborts",
 		"connections",
@@ -16,6 +19,7 @@
 		"grantPublish",
 		"hlc",
 		"introspect",
+		"isWarmupRequest",
 		"maxPayloadLength",
 		"metrics",
 		"metricsSnapshot",
@@ -51,6 +55,7 @@
 		"unsubscribe"
 	],
 	"adapterOptions": [
+		"bodyLimits",
 		"envPrefix",
 		"healthCheckPath",
 		"out",
@@ -60,6 +65,7 @@
 		"staticDotfiles",
 		"staticHeaders",
 		"tracing",
+		"warmup",
 		"websocket"
 	],
 	"webSocketOptions": [
@@ -230,6 +236,7 @@
 		"./client",
 		"./connection",
 		"./observability",
+		"./platform-contract",
 		"./plugins/channels",
 		"./plugins/channels/client",
 		"./plugins/crdt",
@@ -257,8 +264,261 @@
 		"./plugins/webhooks",
 		"./safe-url",
 		"./sim",
+		"./subscriptions",
 		"./testing",
 		"./upgrade-response",
 		"./vite"
-	]
+	],
+	"typeDeclarations": {
+		"StaticCacheControlRule": "export interface StaticCacheControlRule {\n    pattern: string;\n    cacheControl: string;\n}",
+		"BodyLimitRule": "export interface BodyLimitRule {\n    path: string;\n    prefix?: boolean;\n    methods?: string[];\n    bytes: number;\n}",
+		"DeliveryAuthorizationContext": "export interface DeliveryAuthorizationContext {\n    topic: string | null;\n    event: string | null;\n    data: unknown;\n    binary: boolean;\n    kind: 'message' | 'replay' | 'request';\n}",
+		"DeliveryAuthorizationOptions": "export interface DeliveryAuthorizationOptions {\n    maxPendingBytes?: number;\n    timeoutMs?: number;\n}",
+		"AdapterOptions": "export interface AdapterOptions {\n    out?: string;\n    precompress?: boolean;\n    envPrefix?: string;\n    healthCheckPath?: string | false;\n    readinessCheckPath?: string | false;\n    warmup?: boolean | {\n        paths: string[];\n    };\n    staticHeaders?: Record<string, string>;\n    staticCacheControl?: StaticCacheControlRule[];\n    staticDotfiles?: boolean;\n    bodyLimits?: BodyLimitRule[];\n    tracing?: string;\n    websocket?: boolean | WebSocketOptions;\n}",
+		"MessageAdmissionOptions": "export interface MessageAdmissionOptions {\n    perConnectionRate?: number;\n    globalRate?: number;\n    perConnectionBytesRate?: number;\n    globalBytesRate?: number;\n    rateWindowMs?: number;\n    perConnectionConcurrent?: number;\n    globalConcurrent?: number;\n    maxQueue?: number;\n}",
+		"EgressCeilings": "export interface EgressCeilings {\n    messages?: number;\n    bytes?: number;\n    deliveries?: number;\n}",
+		"EgressOptions": "export interface EgressOptions {\n    windowMs?: number;\n    maxKeys?: number;\n    evictionSample?: number;\n    topic?: EgressCeilings;\n    tenant?: EgressCeilings;\n}",
+		"MessageOverloadReason": "export type MessageOverloadReason = 'rate_limit' | 'concurrency_limit' | 'queue_full';",
+		"MessageOverloadedFrame": "export interface MessageOverloadedFrame {\n    type: 'message-overloaded';\n    reason: MessageOverloadReason;\n    scope: 'connection' | 'global';\n    retryAfterMs?: number;\n}",
+		"WebSocketOptions": "export interface WebSocketOptions {\n    handler?: string;\n    path?: string;\n    authPath?: string;\n    adminPath?: string | false;\n    adminAuthAcknowledged?: boolean;\n    maxPayloadLength?: number;\n    maxTopicSeqEntries?: number;\n    idleTimeout?: number;\n    maxBackpressure?: number;\n    closeOnBackpressureLimit?: boolean;\n    compression?: boolean | number;\n    sendPingsAutomatically?: boolean;\n    upgradeTimeout?: number;\n    allowedOrigins?: 'same-origin' | '*' | string[];\n    upgradeRateLimit?: number;\n    upgradeRateLimitWindow?: number;\n    authPathRateLimit?: number;\n    authPathRateLimitWindow?: number;\n    messageAdmission?: MessageAdmissionOptions;\n    egress?: EgressOptions;\n    upgradeAdmission?: {\n        maxConcurrent?: number;\n        maxConnections?: number;\n        perTickBudget?: number;\n        maxDeferred?: number;\n        cursorLane?: {\n            fraction?: number;\n        };\n        waitingRoom?: false | {\n            path?: string;\n            admitCheckPath?: string;\n            retryAfterSeconds?: number;\n            pollIntervalMs?: number;\n            appName?: string;\n            statusUrl?: string;\n            supportUrl?: string;\n            incidentId?: string;\n            renderer?: string;\n            template?: string;\n        };\n    };\n    protection?: 'normal' | 'elevated' | 'siege' | 'auto';\n    metrics?: string;\n    primaryInit?: string;\n    workers?: {\n        compute?: number;\n    };\n    stateHashIntervalMs?: number;\n    consistencyAuditIntervalMs?: number;\n    resourceGrowthAuditIntervalMs?: number;\n    pressure?: {\n        memoryHeapUsedRatio?: number | false;\n        publishRatePerSec?: number | false;\n        subscriberRatio?: number | false;\n        sampleIntervalMs?: number;\n        topicPublishRatePerSec?: number | false;\n        topicPublishBytesPerSec?: number | false;\n        psiCpuSome?: number | false;\n        psiMemoryFull?: number | false;\n        psiIoFull?: number | false;\n        cpuThrottledRatio?: number | false;\n    };\n    postureExport?: string | {\n        path: string;\n    } | false;\n    allowSystemTopicSubscribe?: boolean;\n    authorizeWireSubscribe?: boolean | 'strict';\n    allowNonAsciiTopics?: boolean;\n    authPathRequireOrigin?: boolean;\n    compressCredentialedResponses?: boolean;\n    unsafeSameOriginWithoutHostPin?: boolean;\n}",
+		"CookieSerializeOptions": "export interface CookieSerializeOptions {\n    path: string;\n    domain?: string;\n    expires?: Date;\n    maxAge?: number;\n    httpOnly?: boolean;\n    secure?: boolean;\n    partitioned?: boolean;\n    sameSite?: 'strict' | 'lax' | 'none' | boolean;\n    encode?: boolean;\n}",
+		"AuthenticateCookies": "export interface AuthenticateCookies {\n    get(name: string): string | undefined;\n    getAll(): Record<string, string>;\n    set(name: string, value: string, options: CookieSerializeOptions): void;\n    delete(name: string, options: CookieSerializeOptions): void;\n}",
+		"WaitingRoomContext": "export interface WaitingRoomContext {\n    queueDepth: number;\n    estimatedSeconds: number;\n    pollIntervalMs: number;\n    retryAfterSeconds: number;\n    admitCheckPath: string;\n    appName: string;\n    statusUrl: string;\n    supportUrl: string;\n    incidentId: string;\n}",
+		"WaitingRoomRequestContext": "export interface WaitingRoomRequestContext {\n    readonly method: string;\n    readonly url: string;\n    readonly headers: {\n        get(name: string): string | null;\n    };\n}",
+		"WaitingRoomRendererContext": "export interface WaitingRoomRendererContext extends WaitingRoomContext {\n    readonly request: WaitingRoomRequestContext;\n}",
+		"AccessibleWaitingDocument": "export interface AccessibleWaitingDocument {\n    body: string;\n    lang: string;\n    dir: 'ltr' | 'rtl' | 'auto';\n    headers?: Record<string, string>;\n}",
+		"WaitingRoomRendererResult": "export interface WaitingRoomRendererResult extends AccessibleWaitingDocument {\n}",
+		"WaitingRoomRenderer": "export type WaitingRoomRenderer = (context: WaitingRoomRendererContext) => AccessibleWaitingDocument;",
+		"MetricsRegistry": "export interface MetricsRegistry {\n    counter(name: string, help: string, labelNames?: string[]): {\n        inc(labels?: Record<string, string>, value?: number): void;\n    };\n    gauge(name: string, help: string): {\n        set(value: number): void;\n        remove?(): void;\n    };\n    histogram?(name: string, help: string, options?: {\n        labelNames?: string[];\n        buckets?: number[];\n    }): {\n        observe(labels?: Record<string, string>, value?: number): void;\n    };\n    serialize?(): string;\n}",
+		"UpgradeContext": "export interface UpgradeContext {\n    headers: Record<string, string>;\n    cookies: Record<string, string>;\n    url: string;\n    remoteAddress: string;\n    requestId: string;\n    traceContext: TraceContext | null;\n}",
+		"AuthenticateContext": "export interface AuthenticateContext {\n    request: Request;\n    headers: Record<string, string>;\n    cookies: AuthenticateCookies;\n    url: string;\n    remoteAddress: string;\n    getClientAddress: () => string;\n    platform: Platform;\n}",
+		"OpenContext": "export interface OpenContext {\n    platform: Platform;\n}",
+		"MessageContext": "export interface MessageContext {\n    data: ArrayBuffer;\n    isBinary: boolean;\n    msg?: any;\n    platform: Platform;\n}",
+		"CloseContext": "export interface CloseContext {\n    code: number;\n    message: ArrayBuffer;\n    platform: Platform;\n    subscriptions: Set<string>;\n    id?: string;\n    duration?: number;\n    messagesIn?: number;\n    messagesOut?: number;\n    bytesIn?: number;\n    bytesOut?: number;\n}",
+		"SubscribeContext": "export interface SubscribeContext {\n    platform: Platform;\n}",
+		"SubscribeDenialReason": "export type SubscribeDenialReason = 'UNAUTHENTICATED' | 'FORBIDDEN' | 'INVALID_TOPIC' | 'RATE_LIMITED';",
+		"GameFrame": "export interface GameFrame {\n    type: 'game';\n    event: string;\n    data?: unknown;\n    id?: number | string;\n}",
+		"GameDenialReason": "export type GameDenialReason = 'FORBIDDEN' | 'INVALID';",
+		"GameDeniedFrame": "export interface GameDeniedFrame {\n    type: 'game-denied';\n    reason: GameDenialReason;\n    id?: number | string;\n}",
+		"ResumeContext": "export interface ResumeContext {\n    sessionId: string;\n    lastSeenSeqs: Record<string, number>;\n    lastSeenEpochs?: Record<string, number>;\n    platform: Platform;\n}",
+		"Attribution": "export interface Attribution {\n    readonly tenantId?: string;\n    readonly principalId?: string;\n    readonly entitlement?: string;\n}",
+		"WebSocketHandler": "export interface WebSocketHandler<UserData = unknown> {\n    authenticate?: (ctx: AuthenticateContext) => Response | false | void | Promise<Response | false | void>;\n    init?: (ctx: {\n        platform: Platform;\n        workerData: any;\n    }) => void | Promise<void>;\n    shutdown?: (ctx: {\n        platform: Platform;\n        reason?: string | null;\n        signal?: AbortSignal | null;\n        deadline?: number | null;\n    }) => void | Promise<void>;\n    upgrade?: (ctx: UpgradeContext) => UserData | false | ReturnType<typeof upgradeResponse<UserData>> | Promise<UserData | false | ReturnType<typeof upgradeResponse<UserData>>>;\n    attribution?: (user: UserData) => Attribution | null | undefined;\n    egressTenantOf?: (topic: string) => string | null | undefined;\n    open?: (ws: WebSocket<UserData>, ctx: OpenContext) => void;\n    message?: (ws: WebSocket<UserData>, ctx: MessageContext) => void;\n    subscribe?: (ws: WebSocket<UserData>, topic: string, ctx: SubscribeContext) => boolean | void | SubscribeDenialReason | string | Promise<boolean | void | SubscribeDenialReason | string>;\n    subscribeBatch?: (ws: WebSocket<UserData>, topics: string[], ctx: SubscribeContext) => Record<string, boolean | SubscribeDenialReason | string> | void | Promise<Record<string, boolean | SubscribeDenialReason | string> | void>;\n    unsubscribe?: (ws: WebSocket<UserData>, topic: string, ctx: SubscribeContext) => void | Promise<void>;\n    drain?: (ws: WebSocket<UserData>, ctx: OpenContext) => void;\n    resume?: (ws: WebSocket<UserData>, ctx: ResumeContext) => void | Record<string, number> | number | Promise<void | Record<string, number> | number>;\n    close?: (ws: WebSocket<UserData>, ctx: CloseContext) => void;\n}",
+		"PressureSnapshot": "export interface PressureSnapshot {\n    readonly sampledAt: number | null;\n    readonly active: boolean;\n    readonly value: number;\n    readonly subscriberRatio: number;\n    readonly publishRate: number;\n    readonly memoryMB: number;\n    readonly reason: 'NONE' | 'PUBLISH_RATE' | 'SUBSCRIBERS' | 'MEMORY' | 'CPU_QUOTA' | 'PSI' | 'CAPACITY';\n    readonly psi: {\n        cpuSome10: number;\n        memoryFull10: number;\n        ioFull10: number;\n    } | null;\n    readonly cpuThrottle: {\n        throttledRatio: number;\n        nrThrottledDelta: number;\n    } | null;\n    readonly maxBufferedBytes: number;\n    readonly backpressuredConnections: number;\n    readonly droppedFrames: number;\n    readonly droppedBytes: number;\n    readonly egress: {\n        deliveries: number;\n        bytes: number;\n        refusedTopic: number;\n        refusedTenant: number;\n    };\n    readonly topPublishers: TopicPublishRate[];\n}",
+		"TopicPublishRate": "export interface TopicPublishRate {\n    topic: string;\n    messagesPerSec: number;\n    bytesPerSec: number;\n    deliveriesPerSec: number;\n}",
+		"RuntimeVersionInfo": "export interface RuntimeVersionInfo {\n    adapter: string | null;\n    protocolRevision: number | null;\n    realtime: string | null;\n    extensions: string | null;\n}",
+		"Platform": "export interface Platform {\n    readonly requestId: string;\n    readonly traceContext: TraceContext | null;\n    readonly trace: Readonly<{\n        readonly enabled: boolean;\n        current(): TraceContext | null;\n        extract(carrier: Headers | Record<string, unknown>): TraceContext | null;\n        inject<T extends Headers | Record<string, string>>(carrier: T, context?: TraceContext | null): T;\n        run<T>(name: string, options: TraceOperationOptions, fn: (span: TraceSpan | null) => T): T;\n        withContext<T>(context: TraceContext | null, fn: () => T): T;\n    }>;\n    publish(topic: string, event: string, data?: unknown, options?: {\n        relay?: boolean;\n        seq?: boolean | number | bigint | null;\n        compress?: boolean;\n        jitterMs?: number;\n    }): boolean;\n    publishWire(topic: string, event: string, data: unknown, wire: {\n        capability: string;\n        schemaVersion: number;\n        encode: (event: string, data: unknown, state?: unknown) => Uint8Array | null;\n        shared?: boolean;\n        state?: {\n            onAttach: (ws: WebSocket<any>) => unknown;\n            onDetach?: (ws: WebSocket<any>, state: unknown) => void;\n        };\n    }, options?: {\n        relay?: boolean;\n        seq?: boolean | number | bigint | null;\n        compress?: boolean;\n        excludeWs?: WebSocket<any>;\n    }): boolean;\n    sendWire(ws: WebSocket<any>, topic: string, event: string, data: unknown, wire: {\n        capability: string;\n        schemaVersion: number;\n        encode: (event: string, data: unknown, state?: unknown) => Uint8Array | null;\n        state?: {\n            onAttach: (ws: WebSocket<any>) => unknown;\n            onDetach?: (ws: WebSocket<any>, state: unknown) => void;\n        };\n    }, options?: {\n        compress?: boolean;\n        seq?: number | bigint | false | null;\n    }): number;\n    publishWireBatch(topic: string, event: string, entries: Array<{\n        data: unknown;\n        excludeWs?: WebSocket<any>;\n        seq?: boolean | number | bigint | null;\n    }>, wire: {\n        capability: string;\n        schemaVersion: number;\n        encode: (event: string, data: unknown, state?: unknown) => Uint8Array | null;\n        state?: {\n            onAttach: (ws: WebSocket<any>) => unknown;\n            onDetach?: (ws: WebSocket<any>, state: unknown) => void;\n        };\n    }, options?: {\n        seq?: boolean | null;\n        relay?: boolean;\n        compress?: boolean;\n        excludeWs?: WebSocket<any>;\n    }): boolean;\n    sendWireBatch(ws: WebSocket<any>, topic: string, event: string, entries: Array<{\n        data: unknown;\n    }>, wire: {\n        capability: string;\n        schemaVersion: number;\n        encode: (event: string, data: unknown, state?: unknown) => Uint8Array | null;\n        state?: {\n            onAttach: (ws: WebSocket<any>) => unknown;\n            onDetach?: (ws: WebSocket<any>, state: unknown) => void;\n        };\n    }, options?: {\n        compress?: boolean;\n    }): number;\n    registerWireCodec(wire: {\n        capability: string;\n        schemaVersion: number;\n        encode: (event: string, data: unknown, state?: unknown) => Uint8Array | null;\n        shared?: boolean;\n        state?: {\n            onAttach: (ws: WebSocket<any>) => unknown;\n            onDetach?: (ws: WebSocket<any>, state: unknown) => void;\n        };\n    }): void;\n    batch(messages: {\n        topic: string;\n        event: string;\n        data?: unknown;\n        options?: {\n            relay?: boolean;\n            seq?: boolean | number | bigint | null;\n            compress?: boolean;\n            jitterMs?: number;\n        };\n    }[]): boolean[];\n    publishBatched(messages: Array<{\n        topic: string;\n        event: string;\n        data?: unknown;\n        coalesceKey?: string;\n        options?: {\n            relay?: boolean;\n            seq?: boolean | number | bigint | null;\n        };\n    }>, options?: {\n        compress?: boolean;\n    }): void;\n    request<TReply = unknown>(ws: WebSocket<any>, event: string, data?: unknown, options?: {\n        timeoutMs?: number;\n    }): Promise<TReply>;\n    requestTopic<TReply = unknown>(topic: string, event: string, data?: unknown, options?: {\n        timeoutMs?: number;\n    }): Promise<Array<{\n        ok: true;\n        reply: TReply;\n    } | {\n        ok: false;\n        error: string;\n    }>>;\n    send(ws: WebSocket<any>, topic: string, event: string, data?: unknown, options?: {\n        compress?: boolean;\n        seq?: number | bigint | false | null;\n    }): number;\n    sendCoalesced(ws: WebSocket<any>, message: {\n        key: string;\n        topic: string;\n        event: string;\n        data?: unknown;\n    }): void;\n    sendTo(filter: (userData: any) => boolean, topic: string, event: string, data?: unknown, options?: {\n        compress?: boolean;\n    }): number;\n    adviseReconnect(options?: {\n        windowMs?: number;\n        afterMs?: number;\n        close?: boolean;\n        filter?: (userData: any) => boolean;\n        compress?: boolean;\n    }): number;\n    readonly connections: number;\n    readonly closedWsAborts: number;\n    readonly assertions: ReadonlyMap<string, number>;\n    introspect(): {\n        connections: number;\n        closedWsAborts: number;\n        protection: 'normal' | 'elevated' | 'siege';\n        maxPayloadLength: number;\n        versions: RuntimeVersionInfo;\n        pressure: {\n            sampledAt: number | null;\n            active: boolean;\n            reason: 'NONE' | 'PUBLISH_RATE' | 'SUBSCRIBERS' | 'MEMORY' | 'CPU_QUOTA' | 'PSI' | 'CAPACITY';\n            value: number;\n            subscriberRatio: number;\n            publishRate: number;\n            memoryMB: number;\n            maxBufferedBytes: number;\n            backpressuredConnections: number;\n            droppedFrames: number;\n            droppedBytes: number;\n            egress: {\n                deliveries: number;\n                bytes: number;\n                refusedTopic: number;\n                refusedTenant: number;\n            };\n        };\n        assertions: Record<string, number>;\n        diagnostics: {\n            retained: number;\n            recent: Array<{\n                diagnosticId: string;\n                kind: 'state-divergence';\n                observedAt: number;\n                complete: boolean;\n                affectedStreamCount: number;\n                evidenceTruncated: boolean;\n            }>;\n        };\n    };\n    diagnostic(diagnosticId: string): {\n        diagnosticId: string;\n        kind: 'state-divergence';\n        epoch: number;\n        observedAt: number;\n        complete: boolean;\n        evidenceTruncated: boolean;\n        explainedBySequenceSummary: boolean;\n        expectedWorkers: number;\n        reportingWorkers: number;\n        workers: Array<{\n            threadId: number;\n            role: 'majority' | 'minority';\n            totalStreams: number;\n            sampledStreams: number;\n            truncated: boolean;\n        }>;\n        affectedStreams: Array<{\n            streamId: string;\n            classification: 'tail-sequence-gap' | 'stream-presence-mismatch';\n            gapLowerBound: number | null;\n            workers: Array<{\n                threadId: number;\n                role: 'majority' | 'minority';\n                sequence: number | null;\n            }>;\n        }>;\n    } | null;\n    subscribers(topic: string): number;\n    isWarmupRequest(request: Request): boolean;\n    forEachSubscriber(topic: string, fn: (ws: WebSocket<unknown>, userData: any) => void): void;\n    readonly maxPayloadLength: number;\n    bufferedAmount(ws: WebSocket<unknown>): number;\n    subscribe(ws: WebSocket<unknown>, topic: string): Promise<string | null>;\n    checkSubscribe(ws: WebSocket<unknown>, topic: string, options?: {\n        requireGrant?: boolean;\n    }): Promise<string | null>;\n    authorizeWireSubscribe(): 'legacy' | 'strict';\n    authorizeWireSubscribe(mode: 'legacy' | 'strict'): 'legacy' | 'strict';\n    authorizeDelivery(authorize: (ws: WebSocket<unknown>, delivery: DeliveryAuthorizationContext) => boolean | PromiseLike<boolean>, options?: DeliveryAuthorizationOptions): void;\n    unsubscribe(ws: WebSocket<unknown>, topic: string): boolean;\n    grantPublish(ws: WebSocket<unknown>, topic: string): boolean;\n    revokePublish(ws: WebSocket<unknown>): boolean;\n    publishGrant(ws: WebSocket<unknown>): string | null;\n    publishGame(senderWs: WebSocket<unknown> | null, topic: string, event: string, data?: unknown, id?: number | string): {\n        seq: number | null;\n        delivered: number;\n    };\n    readonly pressure: PressureSnapshot;\n    readonly protection: 'normal' | 'elevated' | 'siege';\n    readonly metrics: MetricsRegistry | null;\n    metricsSnapshot(options?: {\n        timeoutMs?: number;\n    }): Promise<string | null>;\n    onPressure(cb: (snapshot: PressureSnapshot) => void): () => void;\n    onPublishRate(cb: (events: TopicPublishRate[]) => void): () => void;\n    topic(topic: string): TopicHelper;\n    topicEpoch(topic: string): number;\n    bumpTopicEpoch(topic: string): number;\n    now(): number;\n    monotonic(): number;\n    hlc(): {\n        wall: number;\n        logical: number;\n        nodeId: string;\n    };\n    random: {\n        float(): number;\n        u32(): number;\n        uuid(): string;\n        bytes(n: number): Uint8Array;\n    };\n}",
+		"TopicHelper": "export interface TopicHelper {\n    publish(event: string, data?: unknown, options?: {\n        relay?: boolean;\n        seq?: boolean | number | bigint | null;\n        compress?: boolean;\n        jitterMs?: number;\n    }): void;\n    created(data?: unknown, options?: {\n        relay?: boolean;\n        seq?: boolean | number | bigint | null;\n        compress?: boolean;\n        jitterMs?: number;\n    }): void;\n    updated(data?: unknown, options?: {\n        relay?: boolean;\n        seq?: boolean | number | bigint | null;\n        compress?: boolean;\n        jitterMs?: number;\n    }): void;\n    deleted(data?: unknown, options?: {\n        relay?: boolean;\n        seq?: boolean | number | bigint | null;\n        compress?: boolean;\n        jitterMs?: number;\n    }): void;\n    set(value: number, options?: {\n        relay?: boolean;\n        seq?: boolean | number | bigint | null;\n        compress?: boolean;\n        jitterMs?: number;\n    }): void;\n    increment(amount?: number, options?: {\n        relay?: boolean;\n        seq?: boolean | number | bigint | null;\n        compress?: boolean;\n        jitterMs?: number;\n    }): void;\n    decrement(amount?: number, options?: {\n        relay?: boolean;\n        seq?: boolean | number | bigint | null;\n        compress?: boolean;\n        jitterMs?: number;\n    }): void;\n}"
+	},
+	"clientContract": {
+		"commit": "f77ea3178d2bbccd3d2631d10a292aad8dc7fcd6",
+		"declarations": [
+			"export interface ConnectOptions {\n    url?: string;\n    path?: string;\n    reconnectInterval?: number;\n    maxReconnectInterval?: number;\n    maxReconnectAttempts?: number;\n    debug?: boolean;\n    auth?: boolean | string;\n}",
+			"export interface WSEvent<T = unknown> {\n    topic: string;\n    event: string;\n    data: T;\n    seq?: number;\n    t?: number;\n    j?: number;\n}",
+			"export interface TopicStore<T> extends Readable<T | null> {\n    scan<A>(initial: A, reducer: (acc: A, value: T) => A): Readable<A>;\n}",
+			"export function on<T = unknown>(topic: string): TopicStore<WSEvent<T>>;",
+			"export function on<T = unknown>(topic: string, event: string): TopicStore<{\n    data: T;\n}>;",
+			"export const status: Readable<'connecting' | 'open' | 'suspended' | 'disconnected' | 'failed'>;",
+			"export type SubscribeDenialReason = 'UNAUTHENTICATED' | 'FORBIDDEN' | 'INVALID_TOPIC' | 'RATE_LIMITED';",
+			"export const denials: Readable<{\n    topic: string;\n    reason: SubscribeDenialReason | string;\n    ref: number | string;\n} | null>;",
+			"export type MessageOverloadReason = 'rate_limit' | 'concurrency_limit' | 'queue_full';",
+			"export interface MessageOverload {\n    reason: MessageOverloadReason | string;\n    scope: 'connection' | 'global';\n    retryAfterMs?: number;\n}",
+			"export const overloads: Readable<MessageOverload | null>;",
+			"export type FailureClass = 'TERMINAL' | 'EXHAUSTED' | 'THROTTLE' | 'RETRY' | 'AUTH' | 'DRAIN';",
+			"export type Failure = ({\n    kind: 'ws-close';\n    class: 'TERMINAL' | 'EXHAUSTED' | 'THROTTLE' | 'RETRY' | 'DRAIN';\n    code: number;\n} & FailureDiagnosticText) | ({\n    kind: 'auth-preflight';\n    class: 'AUTH' | 'THROTTLE';\n    status: number;\n} & FailureDiagnosticText);",
+			"export const failure: Readable<Failure | null>;",
+			"export function onRequest(handler: (event: string, data: unknown) => unknown | Promise<unknown>): () => void;",
+			"export function crud<T extends Record<string, any>>(topic: string, initial?: T[], options?: {\n    key?: keyof T & string;\n    prepend?: boolean;\n    maxAge?: number;\n}): Readable<T[]>;",
+			"export function lookup<T extends Record<string, any>>(topic: string, initial?: T[], options?: {\n    key?: keyof T & string;\n    maxAge?: number;\n}): Readable<Record<string, T>>;",
+			"export function latest<T = unknown>(topic: string, max?: number, initial?: WSEvent<T>[]): Readable<WSEvent<T>[]>;",
+			"export function count(topic: string, initial?: number): Readable<number>;",
+			"export function once<T = unknown>(topic: string, options?: {\n    timeout?: number;\n}): Promise<WSEvent<T>>;",
+			"export function once<T = unknown>(topic: string, event: string, options?: {\n    timeout?: number;\n}): Promise<{\n    data: T;\n}>;",
+			"export function onDerived<T = unknown>(topicFn: (value: T) => string, store: import('svelte/store').Readable<T>): import('svelte/store').Readable<WSEvent | null>;",
+			"export function ready(): Promise<void>;",
+			"export interface WSConnection {\n    events: Readable<WSEvent | null>;\n    status: Readable<'connecting' | 'open' | 'suspended' | 'disconnected' | 'failed'>;\n    denials: Readable<{\n        topic: string;\n        reason: SubscribeDenialReason | string;\n        ref: number | string;\n    } | null>;\n    overloads: Readable<MessageOverload | null>;\n    failure: Readable<Failure | null>;\n    onRequest: (handler: (event: string, data: unknown) => unknown | Promise<unknown>) => () => void;\n    on<T = unknown>(topic: string): TopicStore<WSEvent<T>>;\n    subscribe(topic: string): void;\n    unsubscribe(topic: string): void;\n    send(data: unknown): boolean;\n    sendSerialized(text: string): boolean;\n    sendQueued(data: unknown): void;\n    readonly bufferedAmount: number;\n    simulateOffline(): void;\n    resumeOnline(): void;\n    close(): void;\n}",
+			"export function connect(options?: ConnectOptions): WSConnection;",
+			"export interface IngressBinding {\n    send(schemaVersion: number, payload: Uint8Array): boolean;\n    live(): boolean;\n    reannounce(): void;\n    dispose(): void;\n}",
+			"export function bindIngress(kind: string, target: unknown): IngressBinding;",
+			"export function registerWireCodec(prefix: string, codec: {\n    capability: string;\n    capabilities?: string[];\n    sink?: boolean;\n    state?: {\n        onAttach?: () => unknown;\n        onDetach?: (state: unknown) => void;\n    };\n    decode: (payload: Uint8Array, state?: unknown, schemaVersion?: number, seq?: number, topic?: string) => {\n        event: string;\n        data: unknown;\n    } | null | void;\n}): void;",
+			"export function setTopicManaged(topic: string): void;",
+			"export function classifyCloseCode(code: number | undefined): 'TERMINAL' | 'THROTTLE' | 'RETRY';",
+			"export function nextReconnectDelay(base: number, maxDelay: number, attempt: number, randFactor?: number): number;"
+		]
+	},
+	"typeReferences": {
+		"TraceContext": "export interface TraceContext {\n    readonly traceparent: string;\n    readonly tracestate?: string;\n}"
+	},
+	"webSocketContract": {
+		"version": "20.69.0",
+		"sha256": "bcc3ff1a2384e7427e47c9ec2a1bb8f552eb3fe0a974f37a413c3392a45685c1",
+		"methods": {
+			"send": {
+				"parameters": [
+					{
+						"optional": false,
+						"rest": false
+					},
+					{
+						"optional": true,
+						"rest": false
+					},
+					{
+						"optional": true,
+						"rest": false
+					}
+				],
+				"returns": "number"
+			},
+			"getBufferedAmount": {
+				"parameters": [],
+				"returns": "number"
+			},
+			"end": {
+				"parameters": [
+					{
+						"optional": true,
+						"rest": false
+					},
+					{
+						"optional": true,
+						"rest": false
+					}
+				],
+				"returns": "void"
+			},
+			"close": {
+				"parameters": [],
+				"returns": "void"
+			},
+			"ping": {
+				"parameters": [
+					{
+						"optional": true,
+						"rest": false
+					}
+				],
+				"returns": "number"
+			},
+			"subscribe": {
+				"parameters": [
+					{
+						"optional": false,
+						"rest": false
+					}
+				],
+				"returns": "boolean"
+			},
+			"unsubscribe": {
+				"parameters": [
+					{
+						"optional": false,
+						"rest": false
+					}
+				],
+				"returns": "boolean"
+			},
+			"isSubscribed": {
+				"parameters": [
+					{
+						"optional": false,
+						"rest": false
+					}
+				],
+				"returns": "boolean"
+			},
+			"getTopics": {
+				"parameters": [],
+				"returns": "string[]"
+			},
+			"publish": {
+				"parameters": [
+					{
+						"optional": false,
+						"rest": false
+					},
+					{
+						"optional": false,
+						"rest": false
+					},
+					{
+						"optional": true,
+						"rest": false
+					},
+					{
+						"optional": true,
+						"rest": false
+					}
+				],
+				"returns": "boolean"
+			},
+			"cork": {
+				"parameters": [
+					{
+						"optional": false,
+						"rest": false
+					}
+				],
+				"returns": "WebSocket<UserData>"
+			},
+			"getRemoteAddress": {
+				"parameters": [],
+				"returns": "ArrayBuffer"
+			},
+			"getRemoteAddressAsText": {
+				"parameters": [],
+				"returns": "ArrayBuffer"
+			},
+			"getRemotePort": {
+				"parameters": [],
+				"returns": "number"
+			},
+			"getUserData": {
+				"parameters": [],
+				"returns": "UserData"
+			},
+			"sendFirstFragment": {
+				"parameters": [
+					{
+						"optional": false,
+						"rest": false
+					},
+					{
+						"optional": true,
+						"rest": false
+					},
+					{
+						"optional": true,
+						"rest": false
+					}
+				],
+				"returns": "number"
+			},
+			"sendFragment": {
+				"parameters": [
+					{
+						"optional": false,
+						"rest": false
+					},
+					{
+						"optional": true,
+						"rest": false
+					}
+				],
+				"returns": "number"
+			},
+			"sendLastFragment": {
+				"parameters": [
+					{
+						"optional": false,
+						"rest": false
+					},
+					{
+						"optional": true,
+						"rest": false
+					}
+				],
+				"returns": "number"
+			}
+		}
+	}
 }
