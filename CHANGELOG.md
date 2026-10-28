@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added the typed bundled client with bounded connection attempts, offline admission, replay recovery and stores that follow explicit connection replacements.
+
 - Added structured operational events, bounded diagnostic formatting and a versioned legacy-prefix table.
 
 - Added binary value, stream, bit and key-dictionary primitives for the bundled client and plugins.

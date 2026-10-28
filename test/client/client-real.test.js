@@ -1,0 +1,4133 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { installFakeRuntimeClock, releaseRuntimeClock } from '../public/_helpers.js';
+import { parseDiagnostic } from '../../src/runtime/diagnostic.js';
+
+// - Mock WebSocket -----------------------------------------------------------
+
+class MockWebSocket {
+	static CONNECTING = 0;
+	static OPEN = 1;
+	static CLOSING = 2;
+	static CLOSED = 3;
+
+	constructor(url) {
+		this.url = url;
+		this.readyState = MockWebSocket.CONNECTING;
+		this._sent = [];
+
+		MockWebSocket._last = this;
+
+		// Auto-open after microtask, unless a case holds the handshake open.
+		queueMicrotask(() => {
+			if (this.readyState === MockWebSocket.CONNECTING && !MockWebSocket._holdHandshake) {
+				this.readyState = MockWebSocket.OPEN;
+				this.onopen?.();
+			}
+		});
+	}
+
+	send(data) { this._sent.push(data); }
+
+	close(code = 1000, reason = '') {
+		this.readyState = MockWebSocket.CLOSED;
+		this.onclose?.({ code, reason });
+	}
+
+	_receive(data) {
+		this.onmessage?.({ data: JSON.stringify(data) });
+	}
+}
+
+// - Setup globals before import ---------------------------------------------
+
+globalThis.WebSocket = /** @type {any} */ (MockWebSocket);
+globalThis.window = /** @type {any} */ ({
+	location: { protocol: 'http:', host: 'localhost:5173' }
+});
+
+// Import the real module - vitest.config.js aliases 'svelte/store'
+let clientModule = await import('../../src/client.js');
+
+// - Helpers ------------------------------------------------------------------
+
+/** Wait for all pending microtasks (WebSocket auto-open) */
+function flush() {
+	return new Promise((r) => setTimeout(r, 0));
+}
+
+/** Get a fresh store value synchronously */
+function get(store) {
+	let value;
+	const unsub = store.subscribe((v) => { value = v; });
+	unsub();
+	return value;
+}
+
+// - Tests --------------------------------------------------------------------
+
+describe('client.js (real module)', () => {
+	beforeEach(async () => {
+		// Each case starts a fresh module lifetime; close is a permanent barrier.
+		try {
+			const conn = clientModule.connect();
+			conn.close();
+		} catch { /* no existing connection */ }
+		vi.resetModules();
+		clientModule = await import('../../src/client.js');
+		MockWebSocket._last = null;
+	});
+
+	describe('singleton behavior', () => {
+		it('connect() returns the same instance on repeated calls', async () => {
+			const a = clientModule.connect();
+			const b = clientModule.connect();
+			expect(a).toBe(b);
+			a.close();
+		});
+
+		it('on() auto-connects (implicit singleton)', async () => {
+			const store = clientModule.on('test-topic');
+			await flush();
+			// WebSocket was created
+			expect(MockWebSocket._last).not.toBeNull();
+			expect(MockWebSocket._last.url).toBe('ws://localhost:5173/ws');
+
+			// Clean up
+			clientModule.connect().close();
+		});
+
+		it('status auto-connects on first subscribe', async () => {
+			const values = [];
+			const unsub = clientModule.status.subscribe((v) => values.push(v));
+			await flush();
+			// Should have gone through connecting -> open (or at least connecting)
+			expect(values.length).toBeGreaterThanOrEqual(1);
+			unsub();
+			clientModule.connect().close();
+		});
+
+		it('warns when connect(options) is called after implicit auto-connect', async () => {
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+			// Trigger implicit auto-connect via on()
+			clientModule.on('some-topic');
+			await flush();
+
+			// Now call connect() with options - should warn
+			clientModule.connect({ path: '/custom-ws' });
+			expect(warnSpy).toHaveBeenCalledWith(
+				expect.stringContaining('options are ignored')
+			);
+
+			warnSpy.mockRestore();
+			clientModule.connect().close();
+		});
+
+		it('does not warn when connect() is called without options after auto-connect', async () => {
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+			clientModule.on('x');
+			await flush();
+			clientModule.connect(); // no options
+			expect(warnSpy).not.toHaveBeenCalled();
+
+			warnSpy.mockRestore();
+			clientModule.connect().close();
+		});
+
+		it('does not warn when connect(options) is the first call', async () => {
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+			clientModule.connect({ path: '/ws', debug: false });
+			await flush();
+			expect(warnSpy).not.toHaveBeenCalled();
+
+			warnSpy.mockRestore();
+			clientModule.connect().close();
+		});
+	});
+
+	describe('on() and message dispatch', () => {
+		it('on(topic) returns a store that starts as null', async () => {
+			const store = clientModule.on('notifications');
+			expect(get(store)).toBeNull();
+			clientModule.connect().close();
+		});
+
+		it('on(topic) receives messages for that topic', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = clientModule.on('todos');
+			const events = [];
+			const unsub = store.subscribe((v) => { if (v) events.push(v); });
+			await flush();
+
+			ws._receive({ topic: 'todos', event: 'created', data: { id: 1 } });
+			expect(events).toHaveLength(1);
+			expect(events[0]).toEqual({ topic: 'todos', event: 'created', data: { id: 1 } });
+
+			unsub();
+			conn.close();
+		});
+
+		it('forwards the de-herd window `j` (and seq) on the dispatched envelope', async () => {
+			// Regression: the de-herd consumer reads `envelope.j`; if dispatchEvent
+			// drops it, client-side jitter never fires. Round-trips through the real
+			// JSON serialize -> onmessage -> dispatchEvent path.
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+			const store = clientModule.on('herd');
+			const events = [];
+			const unsub = store.subscribe((v) => { if (v) events.push(v); });
+			await flush();
+
+			ws._receive({ topic: 'herd', event: 'reroute', data: { id: 1 }, seq: 4, j: 5000 });
+			expect(events[0]).toMatchObject({ topic: 'herd', event: 'reroute', data: { id: 1 }, seq: 4, j: 5000 });
+
+			// A frame without a window carries no spurious `j`.
+			ws._receive({ topic: 'herd', event: 'reroute', data: { id: 2 } });
+			expect(events[1].j).toBeUndefined();
+
+			unsub();
+			conn.close();
+		});
+
+		it('on(topic, event) filters by event name', async () => {
+			const store = clientModule.on('todos', 'created');
+			let value = null;
+			const unsub = store.subscribe((v) => { value = v; });
+			await flush();
+
+			const ws = MockWebSocket._last;
+			// Send a 'deleted' event - should not update the filtered store
+			ws._receive({ topic: 'todos', event: 'deleted', data: { id: 1 } });
+			expect(value).toBeNull();
+
+			// Send a 'created' event - should update
+			ws._receive({ topic: 'todos', event: 'created', data: { id: 2 } });
+			expect(value).toEqual({ data: { id: 2 } });
+			unsub();
+			clientModule.connect().close();
+		});
+
+		it('ignores messages for unsubscribed topics', async () => {
+			const store = clientModule.on('todos');
+			await flush();
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: 'other', event: 'created', data: {} });
+			expect(get(store)).toBeNull();
+			clientModule.connect().close();
+		});
+	});
+
+	describe('visibility reconnect after terminal close', () => {
+		it('does not reconnect when the server has permanently rejected the client', async () => {
+			// document must exist for the visibility handler to be registered
+			const origDoc = globalThis.document;
+			let visibilityHandler;
+			globalThis.document = {
+				hidden: false,
+				addEventListener(evt, fn) { if (evt === 'visibilitychange') visibilityHandler = fn; },
+				removeEventListener() {}
+			};
+
+			const conn = clientModule.connect();
+			await flush();
+			const ws1 = MockWebSocket._last;
+			const wsCount = () => MockWebSocket._last;
+
+			// Simulate terminal close from server
+			ws1.readyState = MockWebSocket.CLOSED;
+			ws1.onclose?.({ code: 1008 });
+
+			// Simulate tab resume
+			globalThis.document.hidden = false;
+			visibilityHandler?.();
+			await flush();
+
+			// A new WebSocket should NOT have been created
+			expect(MockWebSocket._last).toBe(ws1);
+
+			globalThis.document = origDoc;
+			conn.close();
+		});
+	});
+
+	describe('visibility reconnect on tab resume', () => {
+		it('reconnects immediately when tab resumes after hidden disconnect', async () => {
+			const origDoc = globalThis.document;
+			let visibilityHandler;
+			globalThis.document = {
+				hidden: false,
+				addEventListener(evt, fn) { if (evt === 'visibilitychange') visibilityHandler = fn; },
+				removeEventListener() {}
+			};
+
+			const conn = clientModule.connect();
+			await flush();
+			const ws1 = MockWebSocket._last;
+
+			// Simulate network drop while tab is hidden
+			globalThis.document.hidden = true;
+			visibilityHandler?.();
+
+			ws1.readyState = MockWebSocket.CLOSED;
+			ws1.onclose?.({ code: 1006 });
+
+			// Resume tab - should reconnect immediately
+			globalThis.document.hidden = false;
+			visibilityHandler?.();
+			await flush();
+
+			expect(MockWebSocket._last).not.toBe(ws1);
+			expect(MockWebSocket._last.url).toBe('ws://localhost:5173/ws');
+
+			globalThis.document = origDoc;
+			conn.close();
+		});
+
+		it('clears pending reconnect timer on tab resume', async () => {
+			vi.useFakeTimers();
+			const origDoc = globalThis.document;
+			let visibilityHandler;
+			globalThis.document = {
+				hidden: false,
+				addEventListener(evt, fn) { if (evt === 'visibilitychange') visibilityHandler = fn; },
+				removeEventListener() {}
+			};
+
+			const conn = clientModule.connect();
+			await vi.advanceTimersByTimeAsync(0);
+			const ws1 = MockWebSocket._last;
+
+			// Drop connection (starts backoff timer)
+			ws1.readyState = MockWebSocket.CLOSED;
+			ws1.onclose?.({ code: 1006 });
+
+			// Tab resumes - should reconnect immediately, not wait for backoff
+			globalThis.document.hidden = false;
+			visibilityHandler?.();
+			await vi.advanceTimersByTimeAsync(0);
+
+			expect(MockWebSocket._last).not.toBe(ws1);
+
+			globalThis.document = origDoc;
+			vi.useRealTimers();
+			conn.close();
+		});
+	});
+
+	describe('once()', () => {
+		it('resolves with the first matching event', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const p = clientModule.once('once-topic');
+			ws._receive({ topic: 'once-topic', event: 'hello', data: 42 });
+
+			const result = await p;
+			expect(result.data).toBe(42);
+
+			conn.close();
+		});
+
+		it('resolves with filtered event when event name is provided', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const p = clientModule.once('once-filtered', 'created');
+			ws._receive({ topic: 'once-filtered', event: 'deleted', data: 'no' });
+			ws._receive({ topic: 'once-filtered', event: 'created', data: 'yes' });
+
+			const result = await p;
+			expect(result.data).toBe('yes');
+
+			conn.close();
+		});
+
+		it('rejects on timeout', async () => {
+			vi.useFakeTimers();
+			const conn = clientModule.connect();
+			await vi.advanceTimersByTimeAsync(0);
+
+			const p = clientModule.once('once-timeout', { timeout: 1000 });
+			vi.advanceTimersByTime(1001);
+
+			await expect(p).rejects.toThrow('timed out');
+
+			vi.useRealTimers();
+			conn.close();
+		});
+
+		it('timeout with event name includes event in error', async () => {
+			vi.useFakeTimers();
+			const conn = clientModule.connect();
+			await vi.advanceTimersByTimeAsync(0);
+
+			const p = clientModule.once('once-evt-timeout', 'specific', { timeout: 500 });
+			vi.advanceTimersByTime(501);
+
+			await expect(p).rejects.toThrow("'specific'");
+
+			vi.useRealTimers();
+			conn.close();
+		});
+	});
+
+	describe('onDerived()', () => {
+		it('subscribes to a topic derived from a source store', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			// Create a minimal writable store to use as source
+			let sourceValue = 'room-1';
+			const subscribers = new Set();
+			const sourceStore = {
+				subscribe(fn) {
+					subscribers.add(fn);
+					fn(sourceValue);
+					return () => subscribers.delete(fn);
+				}
+			};
+
+			const derived = clientModule.onDerived((id) => `room:${id}`, sourceStore);
+			const values = [];
+			const unsub = derived.subscribe((v) => { if (v) values.push(v); });
+			await flush();
+
+			ws._receive({ topic: 'room:room-1', event: 'msg', data: 'hello' });
+			expect(values).toHaveLength(1);
+			expect(values[0].topic).toBe('room:room-1');
+
+			unsub();
+			conn.close();
+		});
+
+		it('returns null when source value is null', async () => {
+			const conn = clientModule.connect();
+			await flush();
+
+			const sourceStore = {
+				subscribe(fn) {
+					fn(null);
+					return () => {};
+				}
+			};
+
+			const derived = clientModule.onDerived((id) => `room:${id}`, sourceStore);
+			let value = 'not-null';
+			const unsub = derived.subscribe((v) => { value = v; });
+
+			expect(value).toBeNull();
+
+			unsub();
+			conn.close();
+		});
+	});
+
+	describe('maxReconnectAttempts exhaustion', () => {
+		it('stops reconnecting after maxReconnectAttempts consecutive failures', async () => {
+			vi.useFakeTimers();
+
+			// Make subsequent connections fail by throwing in the constructor
+			let connectCount = 0;
+			const OrigWS = globalThis.WebSocket;
+			globalThis.WebSocket = class extends MockWebSocket {
+				constructor(url) {
+					super(url);
+					connectCount++;
+					if (connectCount > 1) {
+						// Simulate connection failure
+						this.readyState = MockWebSocket.CLOSED;
+						queueMicrotask(() => {
+							this.onclose?.({ code: 1006 });
+						});
+					}
+				}
+			};
+			globalThis.WebSocket.CONNECTING = 0;
+			globalThis.WebSocket.OPEN = 1;
+			globalThis.WebSocket.CLOSING = 2;
+			globalThis.WebSocket.CLOSED = 3;
+
+			const conn = clientModule.connect({ maxReconnectAttempts: 2 });
+			await vi.advanceTimersByTimeAsync(0);
+
+			// Initial connection succeeds (connectCount=1)
+			const ws1 = MockWebSocket._last;
+			ws1.readyState = MockWebSocket.CLOSED;
+			ws1.onclose?.({ code: 1006 });
+
+			// Reconnect attempt 1 fails (connectCount=2)
+			await vi.advanceTimersByTimeAsync(5000);
+
+			// Reconnect attempt 2 fails (connectCount=3)
+			await vi.advanceTimersByTimeAsync(10000);
+
+			const lastWs = MockWebSocket._last;
+			// No more reconnects after exhaustion
+			await vi.advanceTimersByTimeAsync(60000);
+			expect(MockWebSocket._last).toBe(lastWs);
+			expect(connectCount).toBe(3);
+
+			globalThis.WebSocket = OrigWS;
+			vi.useRealTimers();
+			conn.close();
+		});
+	});
+
+	describe('throttle close code', () => {
+		it('jumps ahead in backoff on rate-limit close code (4429)', async () => {
+			vi.useFakeTimers();
+			const conn = clientModule.connect();
+			await vi.advanceTimersByTimeAsync(0);
+			const ws1 = MockWebSocket._last;
+
+			ws1.readyState = MockWebSocket.CLOSED;
+			ws1.onclose?.({ code: 4429 });
+
+			// Should still reconnect (not terminal), but with higher backoff.
+			// Throttle bumps the backoff index to 5; with the 2.2^n curve and a 3 second
+			// base that lands at ~155 seconds plus jitter (worst case ~194s),
+			// so a 250 second advance is enough to guarantee the timer fires.
+			await vi.advanceTimersByTimeAsync(250000);
+			expect(MockWebSocket._last).not.toBe(ws1);
+
+			vi.useRealTimers();
+			conn.close();
+		});
+	});
+
+	describe('debug mode', () => {
+		it('logs all WebSocket lifecycle events when debug is true', async () => {
+			const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const conn = clientModule.connect({ debug: true });
+			await flush();
+
+			const ws = MockWebSocket._last;
+
+			// Subscribe to a topic so resubscription is tested on reconnect
+			const store = clientModule.on('debug-topic');
+			const unsub = store.subscribe(() => {});
+			await flush();
+
+			// Send + sendQueued while connected
+			conn.send({ type: 'ping' });
+			conn.sendQueued({ type: 'queued-while-open' });
+
+			// Queue a message while disconnected
+			ws.readyState = MockWebSocket.CLOSED;
+			ws.onclose?.({ code: 1006 });
+			conn.sendQueued({ type: 'queued-while-closed' });
+
+			// Reconnect -> should log resubscribe-batch and flush
+			await new Promise((r) => setTimeout(r, 50));
+			await flush();
+
+			const allLogs = logSpy.mock.calls.map(c => String(c[0]));
+			expect(allLogs.some(m => m.includes('[ws] connected'))).toBe(true);
+			expect(allLogs.some(m => m.includes('[ws] subscribe'))).toBe(true);
+			expect(allLogs.some(m => m.includes('[ws] send'))).toBe(true);
+			expect(allLogs.some(m => m.includes('[ws] disconnected'))).toBe(true);
+			expect(allLogs.some(m => m.includes('[ws] queued'))).toBe(true);
+
+			unsub();
+			logSpy.mockRestore();
+			warnSpy.mockRestore();
+			conn.close();
+		});
+
+		it('logs terminal close with debug', async () => {
+			const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const conn = clientModule.connect({ debug: true });
+			await flush();
+
+			const ws = MockWebSocket._last;
+			ws.readyState = MockWebSocket.CLOSED;
+			ws.onclose?.({ code: 1008 });
+
+			const warns = warnSpy.mock.calls.map(c => String(c[0]));
+			expect(warns.some(m => m.includes('permanently closed'))).toBe(true);
+
+			logSpy.mockRestore();
+			warnSpy.mockRestore();
+			conn.close();
+		});
+	});
+
+	describe('inbound text cap measures bytes, not UTF-16 code units', () => {
+		// PROTOCOL.md 1.3 documents the client cap as 1 MiB "in either
+		// encoding". A JS string's length is UTF-16 code units, which
+		// understates UTF-8 by up to 3x on non-ASCII text, so a code-unit cap
+		// admitted ~3 MB CJK payloads straight into JSON.parse - the blocking
+		// the guard exists to prevent, defeated exactly where it is worst.
+		// Expected sizes here are computed with TextEncoder, an encoder
+		// independent of the client's counting loop, so the two cannot agree
+		// by construction.
+		const CAP = 1048576;
+
+		function envelope(topic, filler) {
+			return `{"topic":"${topic}","event":"blob","data":"${filler}"}`;
+		}
+
+		async function deliver(topic, raw) {
+			const store = clientModule.on(topic);
+			const seen = [];
+			const unsub = store.subscribe((v) => { if (v !== null && v !== undefined) seen.push(v); });
+			await flush();
+			MockWebSocket._last.onmessage({ data: raw });
+			unsub();
+			clientModule.connect().close();
+			return seen;
+		}
+
+		it('drops a payload over the cap in bytes even when under it in code units', async () => {
+			// CJK: 3 UTF-8 bytes per code unit. Sized to sit just over the cap
+			// in bytes while far under it in units - the exact input the old
+			// code-unit check admitted.
+			const raw = envelope('cap-cjk-over', '一'.repeat(349600));
+			expect(raw.length).toBeLessThan(CAP);
+			expect(new TextEncoder().encode(raw).byteLength).toBeGreaterThan(CAP);
+			expect(await deliver('cap-cjk-over', raw)).toEqual([]);
+		});
+
+		it('accepts a payload in the measuring band whose bytes fit the cap', async () => {
+			// In the band (units * 3 > cap) so the exact count runs, yet the
+			// real byte size fits: mostly ASCII with enough two-byte characters
+			// to force the measurement. Rejecting on units * 3 alone would drop
+			// it; only a correct byte count accepts it.
+			const filler = 'a'.repeat(500000) + 'ä'.repeat(20000);
+			const raw = envelope('cap-band-ok', filler);
+			expect(raw.length * 3).toBeGreaterThan(CAP);
+			expect(new TextEncoder().encode(raw).byteLength).toBeLessThanOrEqual(CAP);
+			const seen = await deliver('cap-band-ok', raw);
+			expect(seen.length).toBeGreaterThan(0);
+		});
+
+		it('rejects a pair-heavy payload only when its real four-byte count crosses the cap', async () => {
+			// Emoji are one surrogate pair: two units, FOUR encoded bytes. Sized
+			// so only the correct per-pair arithmetic rejects: the real count
+			// sits just over the cap, while a loop that missed the pair rule in
+			// the other direction is caught by the accept test below.
+			const pairs = 262200; // 4 bytes each: 1048800 > CAP
+			const raw = envelope('cap-emoji', '\u{1f600}'.repeat(pairs));
+			expect(raw.length).toBeLessThan(CAP);
+			expect(new TextEncoder().encode(raw).byteLength).toBeGreaterThan(CAP);
+			expect(await deliver('cap-emoji', raw)).toEqual([]);
+		});
+
+		it('accepts a pair-heavy payload a six-byte-per-pair overcount would drop', async () => {
+			// The other half of the pair rule: 240,000 pairs are 480,000 units
+			// and ~960,050 real bytes - inside the cap. A loop that counted a
+			// surrogate pair as two three-byte units (six bytes) would measure
+			// ~1.44 MB and wrongly drop a legal payload; only the four-byte
+			// arithmetic accepts it. Together with the reject test above, both
+			// directions of the pair rule are pinned.
+			const pairs = 240000;
+			const raw = envelope('cap-emoji-ok', '\u{1f600}'.repeat(pairs));
+			expect(raw.length * 3).toBeGreaterThan(CAP);
+			expect(new TextEncoder().encode(raw).byteLength).toBeLessThanOrEqual(CAP);
+			const seen = await deliver('cap-emoji-ok', raw);
+			expect(seen.length).toBeGreaterThan(0);
+		});
+
+		it('accepts a payload of exactly the cap in bytes', async () => {
+			// The cap is "larger than 1 MiB" drops, so exactly 1 MiB passes -
+			// the same boundary the binary branch applies to byteLength. ASCII
+			// sized so the whole frame lands on the cap to the byte, inside the
+			// measuring band (units * 3 over the cap).
+			const overhead = envelope('cap-exact', '').length;
+			const raw = envelope('cap-exact', 'a'.repeat(CAP - overhead));
+			expect(new TextEncoder().encode(raw).byteLength).toBe(CAP);
+			const seen = await deliver('cap-exact', raw);
+			expect(seen.length).toBeGreaterThan(0);
+		});
+
+		it('still drops an over-cap ASCII payload exactly as before', async () => {
+			const raw = envelope('cap-ascii-over', 'x'.repeat(CAP + 100));
+			expect(await deliver('cap-ascii-over', raw)).toEqual([]);
+		});
+	});
+
+	describe('oversized message rejection', () => {
+		it('drops messages larger than 1MB', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = clientModule.on('big-topic');
+			const events = [];
+			const unsub = store.subscribe((v) => { if (v) events.push(v); });
+			await flush();
+
+			// Simulate a >1MB message
+			const bigData = 'x'.repeat(1048577);
+			ws.onmessage?.({ data: bigData });
+
+			expect(events).toHaveLength(0);
+
+			unsub();
+			conn.close();
+		});
+	});
+
+	describe('visibility cleanup on close()', () => {
+		it('removes visibilitychange listener on close()', async () => {
+			const origDoc = globalThis.document;
+			let removed = false;
+			globalThis.document = {
+				hidden: false,
+				addEventListener() {},
+				removeEventListener(evt) { if (evt === 'visibilitychange') removed = true; }
+			};
+
+			const conn = clientModule.connect();
+			await flush();
+			conn.close();
+			expect(removed).toBe(true);
+
+			globalThis.document = origDoc;
+		});
+	});
+
+	describe('sendQueued overflow', () => {
+		it('drops oldest message when queue is full', async () => {
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			// Close connection so messages go to queue
+			ws.readyState = MockWebSocket.CLOSED;
+			ws.onclose?.({ code: 1006 });
+
+			// Fill queue to MAX_QUEUE_SIZE (1000)
+			for (let i = 0; i < 1001; i++) {
+				conn.sendQueued({ i });
+			}
+
+			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('queue full'));
+			warnSpy.mockRestore();
+			conn.close();
+		});
+	});
+
+	describe('zombie connection detection', () => {
+		it('force-closes a silent connection after SERVER_TIMEOUT_MS', async () => {
+			vi.useFakeTimers();
+			const conn = clientModule.connect();
+			await vi.advanceTimersByTimeAsync(0);
+			const ws = MockWebSocket._last;
+
+			// Advance past SERVER_TIMEOUT_MS (150s) + one 30s interval
+			vi.advanceTimersByTime(180000);
+
+			// The zombie detection should have called ws.close()
+			expect(ws.readyState).toBe(MockWebSocket.CLOSED);
+
+			vi.useRealTimers();
+			conn.close();
+		});
+	});
+
+	describe('ready()', () => {
+		it('resolves when connection is open', async () => {
+			const p = clientModule.ready();
+			await flush();
+			await p; // should not hang
+			clientModule.connect().close();
+		});
+
+		it('rejects when close() is called before connection opens', async () => {
+			// Open, then immediately close before any resolve
+			const conn = clientModule.connect();
+			const p = clientModule.ready();
+			conn.close();
+			await expect(p).rejects.toThrow('permanently closed');
+		});
+
+		it('rejects when the server sends a terminal close code', async () => {
+			const p = clientModule.ready();
+			// Do not flush - WS is still CONNECTING. Simulate terminal reject
+			// before the connection opens so the promise cannot resolve first.
+			const ws = MockWebSocket._last;
+			ws.readyState = MockWebSocket.CLOSED;
+			ws.onclose?.({ code: 1008 });
+			await expect(p).rejects.toThrow('permanently closed');
+		});
+	});
+
+	describe('ready() SSR', () => {
+		it('resolves immediately in SSR when no url is set', async () => {
+			clientModule.connect();
+			await flush();
+
+			const savedWindow = globalThis.window;
+			delete globalThis.window;
+			try {
+				const p = clientModule.ready();
+				await p;
+			} finally {
+				globalThis.window = savedWindow;
+			}
+			clientModule.connect().close();
+		});
+
+		it('waits for connection in native app (no window, but url is set)', async () => {
+			const savedWindow = globalThis.window;
+			delete globalThis.window;
+			try {
+				clientModule.connect({ url: 'ws://backend.example.com/ws' });
+				const p = clientModule.ready();
+				// Should NOT resolve immediately - it should wait for the WS to open
+				let resolved = false;
+				p.then(() => { resolved = true; });
+				// Give microtasks a chance
+				await new Promise((r) => setTimeout(r, 0));
+				// The mock auto-opens after a microtask, so it should resolve
+				expect(resolved).toBe(true);
+			} finally {
+				globalThis.window = savedWindow;
+			}
+			clientModule.connect().close();
+		});
+	});
+
+	describe('crud()', () => {
+		it('accumulates created/updated/deleted events', async () => {
+			const store = clientModule.crud('items', [{ id: 1, name: 'a' }]);
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await flush();
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: 'items', event: 'created', data: { id: 2, name: 'b' } });
+			expect(value).toEqual([{ id: 1, name: 'a' }, { id: 2, name: 'b' }]);
+
+			ws._receive({ topic: 'items', event: 'updated', data: { id: 1, name: 'A' } });
+			expect(value).toEqual([{ id: 1, name: 'A' }, { id: 2, name: 'b' }]);
+
+			ws._receive({ topic: 'items', event: 'deleted', data: { id: 2 } });
+			expect(value).toEqual([{ id: 1, name: 'A' }]);
+
+			unsub();
+			clientModule.connect().close();
+		});
+
+		it('prepend option adds to the beginning', async () => {
+			const store = clientModule.crud('items', [], { prepend: true });
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await flush();
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: 'items', event: 'created', data: { id: 1 } });
+			ws._receive({ topic: 'items', event: 'created', data: { id: 2 } });
+			expect(value).toEqual([{ id: 2 }, { id: 1 }]);
+
+			unsub();
+			clientModule.connect().close();
+		});
+
+		it('ignores events with null data and does not throw', async () => {
+			const store = clientModule.crud('items', [{ id: 1, name: 'a' }]);
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await flush();
+
+			const ws = MockWebSocket._last;
+			expect(() => {
+				ws._receive({ topic: 'items', event: 'created', data: null });
+				ws._receive({ topic: 'items', event: 'updated', data: null });
+				ws._receive({ topic: 'items', event: 'deleted', data: null });
+			}).not.toThrow();
+			expect(value).toEqual([{ id: 1, name: 'a' }]);
+
+			unsub();
+			clientModule.connect().close();
+		});
+	});
+
+	describe('count()', () => {
+		it('handles set/increment/decrement', async () => {
+			const store = clientModule.count('online', 10);
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await flush();
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: 'online', event: 'increment', data: 5 });
+			expect(value).toBe(15);
+
+			ws._receive({ topic: 'online', event: 'decrement', data: 3 });
+			expect(value).toBe(12);
+
+			ws._receive({ topic: 'online', event: 'set', data: 42 });
+			expect(value).toBe(42);
+
+			unsub();
+			clientModule.connect().close();
+		});
+	});
+
+	describe('latest()', () => {
+		it('keeps only last N events', async () => {
+			const store = clientModule.latest('chat', 2);
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await flush();
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: 'chat', event: 'msg', data: 'a' });
+			ws._receive({ topic: 'chat', event: 'msg', data: 'b' });
+			ws._receive({ topic: 'chat', event: 'msg', data: 'c' });
+
+			expect(value).toHaveLength(2);
+			expect(value[0].data).toBe('b');
+			expect(value[1].data).toBe('c');
+
+			unsub();
+			clientModule.connect().close();
+		});
+	});
+
+	describe('lookup()', () => {
+		it('maintains a keyed record', async () => {
+			const store = clientModule.lookup('users', [{ id: 'a', name: 'Alice' }]);
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await flush();
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: 'users', event: 'created', data: { id: 'b', name: 'Bob' } });
+			expect(value).toEqual({ a: { id: 'a', name: 'Alice' }, b: { id: 'b', name: 'Bob' } });
+
+			ws._receive({ topic: 'users', event: 'deleted', data: { id: 'a' } });
+			expect(value).toEqual({ b: { id: 'b', name: 'Bob' } });
+
+			unsub();
+			clientModule.connect().close();
+		});
+
+		it('ignores events with null data and does not throw', async () => {
+			const store = clientModule.lookup('users', [{ id: 'a', name: 'Alice' }]);
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await flush();
+
+			const ws = MockWebSocket._last;
+			expect(() => {
+				ws._receive({ topic: 'users', event: 'created', data: null });
+				ws._receive({ topic: 'users', event: 'updated', data: null });
+				ws._receive({ topic: 'users', event: 'deleted', data: null });
+				ws._receive({ topic: 'users', event: 'custom', data: null });
+			}).not.toThrow();
+			expect(value).toEqual({ a: { id: 'a', name: 'Alice' } });
+
+			unsub();
+			clientModule.connect().close();
+		});
+	});
+
+	describe('connect().send / sendQueued', () => {
+		it('send() transmits when connected', async () => {
+			const conn = clientModule.connect();
+			await flush();
+
+			const ws = MockWebSocket._last;
+			conn.send({ type: 'ping' });
+			// First messages are subscribe messages, then our send
+			const sent = ws._sent.map((s) => JSON.parse(s));
+			expect(sent.some((m) => m.type === 'ping')).toBe(true);
+			conn.close();
+		});
+
+		it('sendQueued() queues when disconnected, flushes on reconnect', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws1 = MockWebSocket._last;
+
+			// Close the connection (simulates network drop)
+			ws1.readyState = MockWebSocket.CLOSED;
+			ws1.onclose?.();
+
+			// Queue a message while disconnected
+			conn.sendQueued({ type: 'important' });
+
+			conn.close();
+		});
+	});
+
+	describe('close()', () => {
+		it('resets singleton so next connect() creates a new connection', async () => {
+			const a = clientModule.connect();
+			await flush();
+			a.close();
+
+			const b = clientModule.connect();
+			expect(b).not.toBe(a);
+			b.close();
+		});
+	});
+
+	describe('url option', () => {
+		it('connects to the given URL instead of deriving from window.location', async () => {
+			const conn = clientModule.connect({ url: 'wss://remote.example.com/ws' });
+			await flush();
+
+			const ws = MockWebSocket._last;
+			expect(ws.url).toBe('wss://remote.example.com/ws');
+
+			conn.close();
+		});
+
+		it('url takes precedence over path', async () => {
+			const conn = clientModule.connect({ url: 'wss://remote.example.com/custom', path: '/ignored' });
+			await flush();
+
+			const ws = MockWebSocket._last;
+			expect(ws.url).toBe('wss://remote.example.com/custom');
+
+			conn.close();
+		});
+
+		it('on() works after connect({ url }) for cross-origin usage', async () => {
+			clientModule.connect({ url: 'wss://remote.example.com/ws' });
+			await flush();
+
+			const ws = MockWebSocket._last;
+			const store = clientModule.on('chat');
+			const events = [];
+			const unsub = store.subscribe((v) => { if (v) events.push(v); });
+			await flush();
+
+			ws._receive({ topic: 'chat', event: 'msg', data: 'hello' });
+			expect(events).toHaveLength(1);
+			expect(events[0]).toEqual({ topic: 'chat', event: 'msg', data: 'hello' });
+
+			unsub();
+			clientModule.connect().close();
+		});
+
+		it('reconnects to the same url after a disconnect', async () => {
+			vi.useFakeTimers();
+
+			const conn = clientModule.connect({ url: 'wss://remote.example.com/ws' });
+			await vi.advanceTimersByTimeAsync(0);
+
+			const ws1 = MockWebSocket._last;
+			expect(ws1.url).toBe('wss://remote.example.com/ws');
+
+			// Simulate network drop (non-terminal code so it reconnects)
+			ws1.readyState = MockWebSocket.CLOSED;
+			ws1.onclose?.({ code: 1006 });
+
+			// Wait for reconnect (backoff timer + microtask for WS open)
+			await vi.advanceTimersByTimeAsync(4000);
+
+			const ws2 = MockWebSocket._last;
+			expect(ws2).not.toBe(ws1);
+			expect(ws2.url).toBe('wss://remote.example.com/ws');
+
+			vi.useRealTimers();
+			conn.close();
+		});
+	});
+
+	describe('lookup() with maxAge', () => {
+		afterEach(() => {
+			vi.useRealTimers();
+		});
+
+		it('expires entries after maxAge', async () => {
+			vi.useFakeTimers();
+			const store = clientModule.lookup('sensors', [], { key: 'id', maxAge: 2000 });
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			// Let MockWebSocket auto-open (microtask) and flush pending timers
+			await vi.advanceTimersByTimeAsync(0);
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: 'sensors', event: 'created', data: { id: 'a', temp: 20 } });
+			expect(value).toEqual({ a: { id: 'a', temp: 20 } });
+
+			// Advance past maxAge + one full sweep cycle
+			// Sweep fires at 1000ms intervals (maxAge/2). Entry created at T=0.
+			// At T=3000 sweep: cutoff = 3000-2000 = 1000 > 0, so entry expires.
+			vi.advanceTimersByTime(3100);
+			expect(value).toEqual({});
+
+			unsub();
+			vi.useRealTimers();
+			clientModule.connect().close();
+		});
+
+		it('refreshes timestamp on update, only expires stale entries', async () => {
+			vi.useFakeTimers();
+			const store = clientModule.lookup('sensors', [], { key: 'id', maxAge: 2000 });
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await vi.advanceTimersByTimeAsync(0);
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: 'sensors', event: 'created', data: { id: 'a', temp: 20 } });
+			ws._receive({ topic: 'sensors', event: 'created', data: { id: 'b', temp: 30 } });
+
+			// Advance 1500ms then refresh 'a' (its timestamp becomes T+1500)
+			vi.advanceTimersByTime(1500);
+			ws._receive({ topic: 'sensors', event: 'updated', data: { id: 'a', temp: 22 } });
+
+			// Advance to T=3100: sweep at T=3000, cutoff=1000.
+			// 'b' created at T=0 < 1000: expired. 'a' refreshed at T=1500 >= 1000: survives.
+			vi.advanceTimersByTime(1600);
+			expect(value).toEqual({ a: { id: 'a', temp: 22 } });
+
+			unsub();
+			vi.useRealTimers();
+			clientModule.connect().close();
+		});
+
+		it('does not expire when maxAge is not set', async () => {
+			vi.useFakeTimers();
+			const store = clientModule.lookup('users', [{ id: 'a', name: 'Alice' }]);
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await vi.advanceTimersByTimeAsync(0);
+
+			vi.advanceTimersByTime(100000);
+			expect(value).toEqual({ a: { id: 'a', name: 'Alice' } });
+
+			unsub();
+			vi.useRealTimers();
+			clientModule.connect().close();
+		});
+
+		it('cleans up sweep timer on last unsubscribe', async () => {
+			vi.useFakeTimers();
+			const store = clientModule.lookup('sensors', [], { key: 'id', maxAge: 2000 });
+			const unsub = store.subscribe(() => {});
+			await vi.advanceTimersByTimeAsync(0);
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: 'sensors', event: 'created', data: { id: 'a', temp: 20 } });
+
+			unsub();
+			// Should not throw after cleanup
+			vi.advanceTimersByTime(5000);
+
+			vi.useRealTimers();
+			clientModule.connect().close();
+		});
+
+		it('ignores events with null data and does not throw', async () => {
+			vi.useFakeTimers();
+			const store = clientModule.lookup('sensors', [], { key: 'id', maxAge: 5000 });
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await vi.advanceTimersByTimeAsync(0);
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: 'sensors', event: 'created', data: { id: 'a', temp: 20 } });
+			// Unknown event with null data - should not throw
+			expect(() => {
+				ws._receive({ topic: 'sensors', event: 'custom', data: null });
+			}).not.toThrow();
+			// Map should be unchanged
+			expect(value).toEqual({ a: { id: 'a', temp: 20 } });
+
+			unsub();
+			vi.useRealTimers();
+			clientModule.connect().close();
+		});
+
+		it('initializes timestamps for non-empty initial data', async () => {
+			vi.useFakeTimers();
+			const store = clientModule.lookup('seeded-sensors',
+				[{ id: 'x', temp: 99 }],
+				{ key: 'id', maxAge: 2000 });
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await vi.advanceTimersByTimeAsync(0);
+
+			expect(value).toEqual({ x: { id: 'x', temp: 99 } });
+
+			vi.advanceTimersByTime(3100);
+			expect(value).toEqual({});
+
+			unsub();
+			vi.useRealTimers();
+			clientModule.connect().close();
+		});
+
+		it('stop() resets to initial map on full unsubscribe', async () => {
+			vi.useFakeTimers();
+			const store = clientModule.lookup('stop-sensors',
+				[{ id: 'a', temp: 10 }],
+				{ key: 'id', maxAge: 60000 });
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await vi.advanceTimersByTimeAsync(0);
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: 'stop-sensors', event: 'created', data: { id: 'b', temp: 20 } });
+			expect(Object.keys(value)).toHaveLength(2);
+
+			unsub();
+
+			let value2;
+			const unsub2 = store.subscribe((v) => { value2 = v; });
+			expect(value2).toEqual({ a: { id: 'a', temp: 10 } });
+
+			unsub2();
+			vi.useRealTimers();
+			clientModule.connect().close();
+		});
+
+		it('explicit delete removes entry immediately regardless of maxAge', async () => {
+			vi.useFakeTimers();
+			const store = clientModule.lookup('sensors', [], { key: 'id', maxAge: 60000 });
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await vi.advanceTimersByTimeAsync(0);
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: 'sensors', event: 'created', data: { id: 'a', temp: 20 } });
+			ws._receive({ topic: 'sensors', event: 'deleted', data: { id: 'a' } });
+			expect(value).toEqual({});
+
+			unsub();
+			vi.useRealTimers();
+			clientModule.connect().close();
+		});
+	});
+
+	describe('crud() with maxAge', () => {
+		afterEach(() => {
+			vi.useRealTimers();
+		});
+
+		it('expires entries after maxAge', async () => {
+			vi.useFakeTimers();
+			const store = clientModule.crud('items', [], { key: 'id', maxAge: 2000 });
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await vi.advanceTimersByTimeAsync(0);
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: 'items', event: 'created', data: { id: 1, text: 'a' } });
+			expect(value).toEqual([{ id: 1, text: 'a' }]);
+
+			vi.advanceTimersByTime(3100);
+			expect(value).toEqual([]);
+
+			unsub();
+			vi.useRealTimers();
+			clientModule.connect().close();
+		});
+
+		it('refreshes timestamp on update', async () => {
+			vi.useFakeTimers();
+			const store = clientModule.crud('items', [], { key: 'id', maxAge: 2000 });
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await vi.advanceTimersByTimeAsync(0);
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: 'items', event: 'created', data: { id: 1, text: 'a' } });
+			ws._receive({ topic: 'items', event: 'created', data: { id: 2, text: 'b' } });
+
+			vi.advanceTimersByTime(1500);
+			ws._receive({ topic: 'items', event: 'updated', data: { id: 1, text: 'A' } });
+
+			vi.advanceTimersByTime(1600);
+			expect(value).toEqual([{ id: 1, text: 'A' }]);
+
+			unsub();
+			vi.useRealTimers();
+			clientModule.connect().close();
+		});
+
+		it('ignores events with null data and does not throw', async () => {
+			vi.useFakeTimers();
+			const store = clientModule.crud('items', [], { key: 'id', maxAge: 5000 });
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await vi.advanceTimersByTimeAsync(0);
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: 'items', event: 'created', data: { id: 1, text: 'a' } });
+			// Unknown event with null data - should not throw
+			expect(() => {
+				ws._receive({ topic: 'items', event: 'custom', data: null });
+			}).not.toThrow();
+			// List should be unchanged
+			expect(value).toEqual([{ id: 1, text: 'a' }]);
+
+			unsub();
+			vi.useRealTimers();
+			clientModule.connect().close();
+		});
+
+		it('prepend still works with maxAge', async () => {
+			vi.useFakeTimers();
+			const store = clientModule.crud('items', [], { key: 'id', maxAge: 5000, prepend: true });
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await vi.advanceTimersByTimeAsync(0);
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: 'items', event: 'created', data: { id: 1 } });
+			ws._receive({ topic: 'items', event: 'created', data: { id: 2 } });
+			expect(value).toEqual([{ id: 2 }, { id: 1 }]);
+
+			unsub();
+			vi.useRealTimers();
+			clientModule.connect().close();
+		});
+
+		it('initializes timestamps for non-empty initial data', async () => {
+			vi.useFakeTimers();
+			const store = clientModule.crud('seeded-items',
+				[{ id: 1, text: 'seed' }],
+				{ key: 'id', maxAge: 2000 });
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await vi.advanceTimersByTimeAsync(0);
+
+			expect(value).toEqual([{ id: 1, text: 'seed' }]);
+
+			// Advance past maxAge + sweep interval
+			vi.advanceTimersByTime(3100);
+			expect(value).toEqual([]);
+
+			unsub();
+			vi.useRealTimers();
+			clientModule.connect().close();
+		});
+
+		it('handles deleted event in maxAge mode', async () => {
+			vi.useFakeTimers();
+			const store = clientModule.crud('del-items', [], { key: 'id', maxAge: 60000 });
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await vi.advanceTimersByTimeAsync(0);
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: 'del-items', event: 'created', data: { id: 1 } });
+			ws._receive({ topic: 'del-items', event: 'deleted', data: { id: 1 } });
+			expect(value).toEqual([]);
+
+			unsub();
+			vi.useRealTimers();
+			clientModule.connect().close();
+		});
+
+		it('stop() resets list to initial on full unsubscribe', async () => {
+			vi.useFakeTimers();
+			const store = clientModule.crud('stop-items',
+				[{ id: 1, text: 'init' }],
+				{ key: 'id', maxAge: 60000 });
+			let value;
+			const unsub = store.subscribe((v) => { value = v; });
+			await vi.advanceTimersByTimeAsync(0);
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: 'stop-items', event: 'created', data: { id: 2, text: 'new' } });
+			expect(value).toHaveLength(2);
+
+			unsub();
+
+			// Resubscribe - should start with initial data, not accumulated
+			let value2;
+			const unsub2 = store.subscribe((v) => { value2 = v; });
+			expect(value2).toEqual([{ id: 1, text: 'init' }]);
+
+			unsub2();
+			vi.useRealTimers();
+			clientModule.connect().close();
+		});
+	});
+
+	describe('onReplay plugin', () => {
+		/** @type {any} */
+		let onReplayFn;
+
+		beforeEach(async () => {
+			const mod = await import('../../src/plugins/replay/client.js');
+			onReplayFn = mod.onReplay;
+		});
+
+		it('delivers missed messages then switches to live mode', async () => {
+			const store = onReplayFn('chat', { since: 2 });
+			/** @type {any[]} */
+			const events = [];
+			const unsub = store.subscribe((v) => { if (v) events.push(v); });
+			await flush();
+
+			const ws = MockWebSocket._last;
+
+			// Replay request should have been sent after ready()
+			const replayMsg = ws._sent.map((s) => JSON.parse(s)).find((m) => m.type === 'replay');
+			expect(replayMsg).toEqual(expect.objectContaining({ type: 'replay', topic: 'chat', since: 2 }));
+
+			// Server sends one missed message then the end marker
+			ws._receive({ topic: '__replay:chat', event: 'msg', data: { seq: 3, event: 'created', data: { id: 3 } } });
+			ws._receive({ topic: '__replay:chat', event: 'end', data: null });
+
+			expect(events).toHaveLength(1);
+			expect(events[0]).toEqual({ topic: 'chat', event: 'created', data: { id: 3 } });
+
+			// After replay ends, live messages flow through
+			ws._receive({ topic: 'chat', event: 'created', data: { id: 4 } });
+			expect(events).toHaveLength(2);
+			expect(events[1]).toEqual({ topic: 'chat', event: 'created', data: { id: 4 } });
+
+			unsub();
+			clientModule.connect().close();
+		});
+
+		it('drops live messages during the replay window', async () => {
+			const store = onReplayFn('chat', { since: 0 });
+			/** @type {any[]} */
+			const events = [];
+			const unsub = store.subscribe((v) => { if (v) events.push(v); });
+			await flush();
+
+			const ws = MockWebSocket._last;
+
+			// Live message arrives before end marker - should be dropped
+			ws._receive({ topic: 'chat', event: 'created', data: { id: 99 } });
+			expect(events).toHaveLength(0);
+
+			// Replay message + end marker
+			ws._receive({ topic: '__replay:chat', event: 'msg', data: { seq: 1, event: 'created', data: { id: 1 } } });
+			ws._receive({ topic: '__replay:chat', event: 'end', data: null });
+
+			expect(events).toHaveLength(1);
+			expect(events[0].data).toEqual({ id: 1 });
+
+			unsub();
+			clientModule.connect().close();
+		});
+
+		it('emits a truncated event when the server signals buffer overflow', async () => {
+			const store = onReplayFn('chat', { since: 1 });
+			/** @type {any[]} */
+			const events = [];
+			const unsub = store.subscribe((v) => { if (v) events.push(v); });
+			await flush();
+
+			const ws = MockWebSocket._last;
+
+			// Server replays what it has, then signals truncation
+			ws._receive({ topic: '__replay:chat', event: 'msg', data: { seq: 5, event: 'created', data: { id: 5 } } });
+			ws._receive({ topic: '__replay:chat', event: 'end', data: { truncated: true } });
+
+			expect(events).toHaveLength(2);
+			expect(events[0]).toEqual({ topic: 'chat', event: 'created', data: { id: 5 } });
+			expect(events[1]).toEqual({ topic: 'chat', event: 'truncated', data: null });
+
+			unsub();
+			clientModule.connect().close();
+		});
+
+		it('emits no truncated event when replay is gap-free', async () => {
+			const store = onReplayFn('chat', { since: 0 });
+			/** @type {any[]} */
+			const events = [];
+			const unsub = store.subscribe((v) => { if (v) events.push(v); });
+			await flush();
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: '__replay:chat', event: 'end', data: null });
+
+			const truncatedEvents = events.filter((e) => e.event === 'truncated');
+			expect(truncatedEvents).toHaveLength(0);
+
+			unsub();
+			clientModule.connect().close();
+		});
+
+		it('resets output to null on unsubscribe so reuse starts clean', async () => {
+			const store = onReplayFn('chat', { since: 0 });
+			/** @type {any[]} */
+			const events = [];
+			const unsub1 = store.subscribe((v) => { if (v) events.push(v); });
+			await flush();
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: '__replay:chat', event: 'msg', data: { seq: 1, event: 'created', data: { id: 1 } } });
+			ws._receive({ topic: '__replay:chat', event: 'end', data: null });
+			expect(events).toHaveLength(1);
+
+			unsub1();
+
+			// Resubscribe - should start null, not emit the previous event immediately
+			const seen = [];
+			const unsub2 = store.subscribe((v) => seen.push(v));
+			expect(seen).toEqual([null]);
+
+			unsub2();
+			clientModule.connect().close();
+		});
+
+		it('does not send a replay request after the store is torn down', async () => {
+			const store = onReplayFn('chat', { since: 0 });
+			// Subscribe then immediately unsubscribe before the socket opens
+			const unsub = store.subscribe(() => {});
+			unsub();
+
+			// Let the socket open and any microtasks flush
+			await flush();
+
+			const ws = MockWebSocket._last;
+			const replayMsgs = ws._sent.map((s) => JSON.parse(s)).filter((m) => m.type === 'replay');
+			expect(replayMsgs).toHaveLength(0);
+
+			clientModule.connect().close();
+		});
+	});
+
+	describe('store reuse after full unsubscribe', () => {
+		it('delivers messages after resubscribing to the same on() wrapper', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = clientModule.on('reuse-topic');
+
+			// First subscription cycle
+			const events1 = [];
+			const unsub1 = store.subscribe((v) => { if (v) events1.push(v); });
+			await flush();
+			ws._receive({ topic: 'reuse-topic', event: 'ping', data: 1 });
+			expect(events1).toHaveLength(1);
+
+			// Full unsubscribe (triggers release + topicStores.delete)
+			unsub1();
+
+			// Second subscription cycle on the SAME wrapper object
+			const events2 = [];
+			const unsub2 = store.subscribe((v) => { if (v) events2.push(v); });
+			await flush();
+			ws._receive({ topic: 'reuse-topic', event: 'ping', data: 2 });
+			expect(events2).toHaveLength(1);
+			expect(events2[0].data).toBe(2);
+
+			unsub2();
+			conn.close();
+		});
+
+		it('delivers messages after resubscribing to the same on(topic, event) wrapper', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = clientModule.on('reuse-topic2', 'created');
+
+			const events1 = [];
+			const unsub1 = store.subscribe((v) => { if (v) events1.push(v); });
+			await flush();
+			ws._receive({ topic: 'reuse-topic2', event: 'created', data: { id: 1 } });
+			expect(events1).toHaveLength(1);
+
+			unsub1();
+
+			const events2 = [];
+			const unsub2 = store.subscribe((v) => { if (v) events2.push(v); });
+			await flush();
+			ws._receive({ topic: 'reuse-topic2', event: 'created', data: { id: 2 } });
+			expect(events2).toHaveLength(1);
+			expect(events2[0].data).toEqual({ id: 2 });
+
+			unsub2();
+			conn.close();
+		});
+
+		it('crud() with maxAge delivers messages after the store restarts', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = clientModule.crud('reuse-items', [], { maxAge: 60000 });
+
+			let value1 = [];
+			const unsub1 = store.subscribe((v) => { value1 = v; });
+			await flush();
+			ws._receive({ topic: 'reuse-items', event: 'created', data: { id: 1 } });
+			expect(value1).toHaveLength(1);
+
+			unsub1(); // triggers stop() -> sourceUnsub() -> release() -> topicStores.delete()
+
+			let value2 = [];
+			const unsub2 = store.subscribe((v) => { value2 = v; });
+			await flush();
+			ws._receive({ topic: 'reuse-items', event: 'created', data: { id: 2 } });
+			expect(value2).toContainEqual({ id: 2 });
+
+			unsub2();
+			conn.close();
+		});
+	});
+
+	describe('ref-counted subscriptions (real module)', () => {
+		it('sends subscribe on first on() and unsubscribe when all unsub', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._sent.length = 0; // clear initial messages
+
+			const store1 = clientModule.on('shared-topic');
+			const unsub1 = store1.subscribe(() => {});
+			await flush();
+
+			// Should have sent subscribe
+			const sub1 = ws._sent.find((s) => {
+				const m = JSON.parse(s);
+				return m.type === 'subscribe' && m.topic === 'shared-topic';
+			});
+			expect(sub1).toBeDefined();
+			ws._sent.length = 0;
+
+			// Second subscriber - no new WS message
+			const store2 = clientModule.on('shared-topic');
+			const unsub2 = store2.subscribe(() => {});
+			await flush();
+			const sub2 = ws._sent.find((s) => {
+				const m = JSON.parse(s);
+				return m.type === 'subscribe' && m.topic === 'shared-topic';
+			});
+			expect(sub2).toBeUndefined();
+
+			// Unsubscribe first - still subscribed at WS level
+			unsub1();
+			await flush();
+			expect(ws._sent.find((s) => {
+				const m = JSON.parse(s);
+				return m.type === 'unsubscribe' && m.topic === 'shared-topic';
+			})).toBeUndefined();
+
+			// Unsubscribe second - now unsubscribe at WS level
+			unsub2();
+			await flush();
+			const unsub_msg = ws._sent.find((s) => {
+				const m = JSON.parse(s);
+				return m.type === 'unsubscribe' && m.topic === 'shared-topic';
+			});
+			expect(unsub_msg).toBeDefined();
+
+			conn.close();
+		});
+
+		it('skips wire subscribe and unsubscribe for __-prefixed topics', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._sent.length = 0;
+
+			const store = clientModule.on('__presence:room');
+			const unsub = store.subscribe(() => {});
+			await flush();
+
+			const sentSubscribes = ws._sent.filter((s) => {
+				try {
+					const m = JSON.parse(s);
+					return (m.type === 'subscribe' || m.type === 'subscribe-batch') &&
+						(m.topic === '__presence:room' || (Array.isArray(m.topics) && m.topics.includes('__presence:room')));
+				} catch { return false; }
+			});
+			expect(sentSubscribes).toEqual([]);
+
+			ws._receive({ topic: '__presence:room', event: 'state', data: { '1': { id: '1' } } });
+			let received = null;
+			const unsubObserve = store.subscribe((v) => { received = v; });
+			expect(received).toEqual({ topic: '__presence:room', event: 'state', data: { '1': { id: '1' } } });
+			unsubObserve();
+
+			unsub();
+			await flush();
+
+			const sentUnsubs = ws._sent.filter((s) => {
+				try {
+					const m = JSON.parse(s);
+					return m.type === 'unsubscribe' && m.topic === '__presence:room';
+				} catch { return false; }
+			});
+			expect(sentUnsubs).toEqual([]);
+
+			conn.close();
+		});
+
+		it('excludes __-prefixed topics from reconnect resubscribe-batch', async () => {
+			const conn = clientModule.connect({ reconnectInterval: 5, maxReconnectInterval: 5 });
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const userStore = clientModule.on('user-topic');
+			const sysStore = clientModule.on('__realtime');
+			const unsubUser = userStore.subscribe(() => {});
+			const unsubSys = sysStore.subscribe(() => {});
+			await flush();
+
+			ws.readyState = MockWebSocket.CLOSED;
+			ws.onclose?.({ code: 1006 });
+
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			const newWs = MockWebSocket._last;
+			expect(newWs).not.toBe(ws);
+			await flush();
+
+			const subscribeFrames = newWs._sent
+				.map((s) => { try { return JSON.parse(s); } catch { return null; } })
+				.filter((m) => m && (m.type === 'subscribe' || m.type === 'subscribe-batch'));
+
+			const sawUser = subscribeFrames.some((m) =>
+				m.topic === 'user-topic' || (Array.isArray(m.topics) && m.topics.includes('user-topic'))
+			);
+			const sawSys = subscribeFrames.some((m) =>
+				m.topic === '__realtime' || (Array.isArray(m.topics) && m.topics.includes('__realtime'))
+			);
+			expect(sawUser).toBe(true);
+			expect(sawSys).toBe(false);
+
+			unsubUser();
+			unsubSys();
+			conn.close();
+		});
+
+		it('excludes server-managed topics from the wire subscribe and the reconnect resubscribe-batch', async () => {
+			const conn = clientModule.connect({ reconnectInterval: 5, maxReconnectInterval: 5 });
+			await flush();
+			const ws = MockWebSocket._last;
+
+			// A framework marks the topic server-managed (it subscribed the socket
+			// itself), then attaches the client-side store.
+			clientModule.setTopicManaged('managed:room-1');
+			const managedStore = clientModule.on('managed:room-1');
+			const unsubManaged = managedStore.subscribe(() => {});
+			await flush();
+
+			const initialSubs = ws._sent
+				.map((s) => { try { return JSON.parse(s); } catch { return null; } })
+				.filter((m) => m && (m.type === 'subscribe' || m.type === 'subscribe-batch'));
+			const sawInitial = initialSubs.some((m) =>
+				m.topic === 'managed:room-1' || (Array.isArray(m.topics) && m.topics.includes('managed:room-1'))
+			);
+			expect(sawInitial).toBe(false);
+
+			// Reconnect: the managed topic must not ride the resubscribe-batch (the
+			// server re-subscribes it via the framework's RPC resume).
+			ws.readyState = MockWebSocket.CLOSED;
+			ws.onclose?.({ code: 1006 });
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			const newWs = MockWebSocket._last;
+			expect(newWs).not.toBe(ws);
+			await flush();
+
+			const reSubs = newWs._sent
+				.map((s) => { try { return JSON.parse(s); } catch { return null; } })
+				.filter((m) => m && (m.type === 'subscribe' || m.type === 'subscribe-batch'));
+			const sawReconnect = reSubs.some((m) =>
+				m.topic === 'managed:room-1' || (Array.isArray(m.topics) && m.topics.includes('managed:room-1'))
+			);
+			expect(sawReconnect).toBe(false);
+
+			unsubManaged();
+			conn.close();
+		});
+
+		it('sends the wire unsubscribe frame for a server-managed topic on last ref release', async () => {
+			// The subscribe frame is skipped for managed topics (the server subscribed
+			// the socket itself), but the RELEASE is not symmetric: the client is the
+			// only party that knows the last local consumer left, so the last release
+			// MUST emit the unsubscribe frame. Without it the server keeps delivering to
+			// a topic nothing consumes and never fires the app's unsubscribe hook.
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			clientModule.setTopicManaged('managed:leave-1');
+			const s1 = clientModule.on('managed:leave-1');
+			const s2 = clientModule.on('managed:leave-1');
+			const u1 = s1.subscribe(() => {});
+			const u2 = s2.subscribe(() => {});
+			await flush();
+
+			// Managed: no client subscribe frame ever rode the wire.
+			const sawSub = ws._sent
+				.map((s) => { try { return JSON.parse(s); } catch { return null; } })
+				.some((m) => m && (m.type === 'subscribe' || m.type === 'subscribe-batch') &&
+					(m.topic === 'managed:leave-1' || (Array.isArray(m.topics) && m.topics.includes('managed:leave-1'))));
+			expect(sawSub).toBe(false);
+			ws._sent.length = 0;
+
+			// Dropping one of two refs releases nothing at the wire level.
+			u1();
+			await flush();
+			const sawEarly = ws._sent
+				.map((s) => { try { return JSON.parse(s); } catch { return null; } })
+				.some((m) => m && m.type === 'unsubscribe' && m.topic === 'managed:leave-1');
+			expect(sawEarly).toBe(false);
+
+			// Dropping the LAST ref emits the unsubscribe frame.
+			u2();
+			await flush();
+			const frame = ws._sent
+				.map((s) => { try { return JSON.parse(s); } catch { return null; } })
+				.find((m) => m && m.type === 'unsubscribe' && m.topic === 'managed:leave-1');
+			expect(frame).toEqual({ type: 'unsubscribe', topic: 'managed:leave-1' });
+
+			conn.close();
+		});
+
+		it('clears the managed mark with the last ref, so a later plain on() subscribes itself', async () => {
+			// No inverse of setTopicManaged is needed: releasing the last ref is
+			// what clears it. A store attached afterwards without the mark is an
+			// ordinary client subscription and must put its own frame on the wire.
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			clientModule.setTopicManaged('managed:again-1');
+			const managed = clientModule.on('managed:again-1').subscribe(() => {});
+			await flush();
+			managed();
+			await flush();
+			ws._sent.length = 0;
+
+			const plain = clientModule.on('managed:again-1').subscribe(() => {});
+			await flush();
+			const subscribed = ws._sent
+				.map((s) => { try { return JSON.parse(s); } catch { return null; } })
+				.some((m) => m && (m.type === 'subscribe' || m.type === 'subscribe-batch') &&
+					(m.topic === 'managed:again-1' || (Array.isArray(m.topics) && m.topics.includes('managed:again-1'))));
+			expect(subscribed, 'the later plain store sent its own subscribe').toBe(true);
+
+			plain();
+			conn.close();
+		});
+
+		it('the public force-unsubscribe emits the wire frame for a managed topic too', async () => {
+			// force-unsubscribe (ignores the ref count) routes through the same release
+			// path as ref release, so a managed topic still emits the frame.
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			clientModule.setTopicManaged('managed:force-1');
+			const store = clientModule.on('managed:force-1');
+			const u = store.subscribe(() => {});
+			await flush();
+
+			// Confirm the topic really is on the managed path (no subscribe frame).
+			const sawSub = ws._sent
+				.map((s) => { try { return JSON.parse(s); } catch { return null; } })
+				.some((m) => m && (m.type === 'subscribe' || m.type === 'subscribe-batch') &&
+					(m.topic === 'managed:force-1' || (Array.isArray(m.topics) && m.topics.includes('managed:force-1'))));
+			expect(sawSub).toBe(false);
+			ws._sent.length = 0;
+
+			conn.unsubscribe('managed:force-1');
+			await flush();
+			const frame = ws._sent
+				.map((s) => { try { return JSON.parse(s); } catch { return null; } })
+				.find((m) => m && m.type === 'unsubscribe' && m.topic === 'managed:force-1');
+			expect(frame).toEqual({ type: 'unsubscribe', topic: 'managed:force-1' });
+
+			u();
+			conn.close();
+		});
+
+	describe('presence client plugin', () => {
+		/** @type {any} */
+		let presenceFn;
+
+		beforeEach(async () => {
+			const mod = await import('../../src/plugins/presence/client.js');
+			presenceFn = mod.presence;
+		});
+
+		it('refreshes entry when updated event arrives', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = presenceFn('presence-updated-topic');
+			/** @type {any[]} */
+			let current = [];
+			const unsub = store.subscribe((v) => { current = v; });
+
+			// Initial state snapshot
+			ws._receive({ topic: '__presence:presence-updated-topic', event: 'state',
+				data: { '1': { id: '1', name: 'Alice' } } });
+			expect(current).toEqual([{ id: '1', name: 'Alice' }]);
+
+			// Server broadcasts updated data for the same key (a 'join' in the diff overwrites)
+			ws._receive({ topic: '__presence:presence-updated-topic', event: 'diff',
+				data: { joins: { '1': { id: '1', name: 'Alice Renamed' } }, leaves: {} } });
+			expect(current).toEqual([{ id: '1', name: 'Alice Renamed' }]);
+
+			unsub();
+			conn.close();
+		});
+
+		it('evicts store from cache after all subscribers unsubscribe', async () => {
+			const conn = clientModule.connect();
+			await flush();
+
+			const store1 = presenceFn('presence-evict-topic');
+			const unsub = store1.subscribe(() => {});
+			unsub();
+
+			// After all subscribers are gone, the next call must return a fresh instance
+			const store2 = presenceFn('presence-evict-topic');
+			expect(store2).not.toBe(store1);
+
+			conn.close();
+		});
+
+		it('heartbeat as {userKey: data} map refreshes existing AND re-adds aged-out entries', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = presenceFn('presence-hb-map-topic');
+			/** @type {any[]} */
+			let current = [];
+			const unsub = store.subscribe((v) => { current = v; });
+
+			// Seed via initial state.
+			ws._receive({ topic: '__presence:presence-hb-map-topic', event: 'state',
+				data: { '1': { id: '1', name: 'Alice' } } });
+			expect(current).toEqual([{ id: '1', name: 'Alice' }]);
+
+			// Heartbeat with new shape: {userKey: data} map carrying a key
+			// not currently in the map. Pre-fix, this would be a no-op (array
+			// branch could only refresh existing); now it re-adds the missing
+			// entry from the heartbeat's data alone.
+			ws._receive({ topic: '__presence:presence-hb-map-topic', event: 'heartbeat',
+				data: { '1': { id: '1', name: 'Alice' }, '2': { id: '2', name: 'Bob' } } });
+			expect(current).toEqual([{ id: '1', name: 'Alice' }, { id: '2', name: 'Bob' }]);
+
+			unsub();
+			conn.close();
+		});
+
+		it('heartbeat as [keys] array (legacy server) is accepted but cannot re-add missing entries', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = presenceFn('presence-hb-array-topic');
+			/** @type {any[]} */
+			let current = [];
+			const unsub = store.subscribe((v) => { current = v; });
+
+			ws._receive({ topic: '__presence:presence-hb-array-topic', event: 'state',
+				data: { '1': { id: '1', name: 'Alice' } } });
+			expect(current).toEqual([{ id: '1', name: 'Alice' }]);
+
+			// Legacy keys-only shape. The client accepts it without throwing,
+			// but cannot re-add the missing key '2' from this shape (no data
+			// to draw from). Existing entry '1' stays.
+			ws._receive({ topic: '__presence:presence-hb-array-topic', event: 'heartbeat',
+				data: ['1', '2'] });
+			expect(current).toEqual([{ id: '1', name: 'Alice' }]);
+
+			unsub();
+			conn.close();
+		});
+
+		it('sends {type:"presence-snapshot", topic} on status=open (initial connect)', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = presenceFn('presence-snap-topic');
+			const unsub = store.subscribe(() => {});
+
+			// The store's startListening subscribes to `status`; status's
+			// initial value is the current connection state. After `await
+			// flush()` the connection is open, so the subscription callback
+			// fires synchronously with 'open' and the presence-snapshot
+			// frame is sent.
+			await flush();
+			const snapshots = ws._sent
+				.map((s) => JSON.parse(s))
+				.filter((m) => m.type === 'presence-snapshot');
+			expect(snapshots).toEqual([
+				{ type: 'presence-snapshot', topic: 'presence-snap-topic' }
+			]);
+
+			unsub();
+			conn.close();
+		});
+	});
+
+	describe('groups client plugin', () => {
+		/** @type {typeof import('../../src/plugins/groups/client.js').group} */
+		let groupFn;
+
+		beforeEach(async () => {
+			const mod = await import('../../src/plugins/groups/client.js');
+			groupFn = mod.group;
+		});
+
+		it('two instances of the same group share the same store object', async () => {
+			const conn = clientModule.connect();
+			await flush();
+
+			const a = groupFn('shared-lobby');
+			const b = groupFn('shared-lobby');
+			expect(a).toBe(b);
+
+			conn.close();
+		});
+
+		it('second instance sees members snapshot delivered to the first', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			// First subscriber - server sends initial members snapshot
+			const storeA = groupFn('snapshot-lobby');
+			let listA = [];
+			const unsubA = storeA.members.subscribe((v) => { listA = v; });
+
+			ws._receive({ topic: '__group:snapshot-lobby', event: 'members',
+				data: [{ role: 'member' }, { role: 'admin' }] });
+			expect(listA).toHaveLength(2);
+
+			// Second component subscribes after the snapshot was already delivered
+			const storeB = groupFn('snapshot-lobby');
+			let listB = [];
+			const unsubB = storeB.members.subscribe((v) => { listB = v; });
+
+			// Both see the same snapshot immediately - no server round-trip needed
+			expect(listB).toHaveLength(2);
+
+			unsubA();
+			unsubB();
+			conn.close();
+		});
+
+		it('evicts store from cache after all subscribers unsubscribe', async () => {
+			const conn = clientModule.connect();
+			await flush();
+
+			const store1 = groupFn('evict-lobby');
+			const unsub = store1.members.subscribe(() => {});
+			unsub();
+
+			const store2 = groupFn('evict-lobby');
+			expect(store2).not.toBe(store1);
+
+			conn.close();
+		});
+
+		it('handles join events by adding to members list', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = groupFn('join-lobby');
+			let members = [];
+			const unsub = store.members.subscribe((v) => { members = v; });
+
+			ws._receive({ topic: '__group:join-lobby', event: 'members', data: [] });
+			ws._receive({ topic: '__group:join-lobby', event: 'join', data: { role: 'member' } });
+			expect(members).toEqual([{ role: 'member' }]);
+
+			ws._receive({ topic: '__group:join-lobby', event: 'join', data: { role: 'admin' } });
+			expect(members).toHaveLength(2);
+
+			unsub();
+			conn.close();
+		});
+
+		it('handles leave events by removing from members list', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = groupFn('leave-lobby');
+			let members = [];
+			const unsub = store.members.subscribe((v) => { members = v; });
+
+			ws._receive({ topic: '__group:leave-lobby', event: 'members',
+				data: [{ role: 'member' }, { role: 'admin' }] });
+			expect(members).toHaveLength(2);
+
+			ws._receive({ topic: '__group:leave-lobby', event: 'leave', data: { role: 'member' } });
+			expect(members).toEqual([{ role: 'admin' }]);
+
+			unsub();
+			conn.close();
+		});
+
+		it('handles close events by clearing members', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = groupFn('close-lobby');
+			let members = [];
+			const unsub = store.members.subscribe((v) => { members = v; });
+
+			ws._receive({ topic: '__group:close-lobby', event: 'members',
+				data: [{ role: 'member' }] });
+			expect(members).toHaveLength(1);
+
+			ws._receive({ topic: '__group:close-lobby', event: 'close', data: null });
+			expect(members).toEqual([]);
+
+			unsub();
+			conn.close();
+		});
+
+		it('forwards user messages to the messages store', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = groupFn('msg-lobby');
+			const messages = [];
+			const unsub = store.subscribe((v) => { if (v) messages.push(v); });
+
+			ws._receive({ topic: '__group:msg-lobby', event: 'chat', data: { text: 'hello' } });
+			expect(messages).toHaveLength(1);
+			expect(messages[0].event).toBe('chat');
+
+			unsub();
+			conn.close();
+		});
+
+		it('stopListening clears stores on full unsubscribe', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = groupFn('lifecycle-lobby');
+			let members = [];
+			const unsub = store.members.subscribe((v) => { members = v; });
+
+			ws._receive({ topic: '__group:lifecycle-lobby', event: 'members',
+				data: [{ role: 'member' }] });
+			expect(members).toHaveLength(1);
+
+			unsub();
+
+			// Resubscribe - should start clean
+			let members2 = [];
+			const unsub2 = store.members.subscribe((v) => { members2 = v; });
+			expect(members2).toEqual([]);
+
+			unsub2();
+			conn.close();
+		});
+	});
+	});
+
+	describe('construct-without-subscribe cleanup', () => {
+		it('on(topic) store created but never subscribed is cleaned up after microtask', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			// Create a store but never subscribe to it
+			clientModule.on('cleanup-topic');
+
+			// A message arrives while the dangling store exists
+			ws._receive({ topic: 'cleanup-topic', event: 'ping', data: 'stale' });
+
+			// Let microtask cleanup run
+			await flush();
+
+			// Subscribe to a fresh store - must NOT see the pre-cleanup message
+			const events = [];
+			const store2 = clientModule.on('cleanup-topic');
+			const unsub = store2.subscribe((v) => { if (v) events.push(v); });
+			expect(events).toHaveLength(0);
+
+			// New messages still flow through normally
+			await flush();
+			ws._receive({ topic: 'cleanup-topic', event: 'ping', data: 'live' });
+			expect(events).toHaveLength(1);
+			expect(events[0].data).toBe('live');
+
+			unsub();
+			conn.close();
+		});
+
+		it('on(topic, event) store created but never subscribed is cleaned up after microtask', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			clientModule.on('cleanup-topic2', 'created');
+
+			ws._receive({ topic: 'cleanup-topic2', event: 'created', data: { id: 0 } });
+
+			await flush();
+
+			const events = [];
+			const store2 = clientModule.on('cleanup-topic2', 'created');
+			const unsub = store2.subscribe((v) => { if (v) events.push(v); });
+			expect(events).toHaveLength(0);
+
+			await flush();
+			ws._receive({ topic: 'cleanup-topic2', event: 'created', data: { id: 1 } });
+			expect(events).toHaveLength(1);
+			expect(events[0]).toEqual({ data: { id: 1 } });
+
+			unsub();
+			conn.close();
+		});
+
+		it('on(topic) store that IS subscribed before microtask is not cleaned up', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = clientModule.on('keepalive-topic');
+
+			// Subscribe synchronously - before the cleanup microtask fires
+			const events = [];
+			const unsub = store.subscribe((v) => { if (v) events.push(v); });
+
+			await flush();
+			ws._receive({ topic: 'keepalive-topic', event: 'update', data: 42 });
+			expect(events).toHaveLength(1);
+			expect(events[0].data).toBe(42);
+
+			unsub();
+			conn.close();
+		});
+
+		it('second on(topic) call reuses existing entry, cleanup does not evict it if subscribed', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			// First call: creates the entry, never subscribes
+			clientModule.on('shared-cleanup-topic');
+
+			// Second call: reuses the entry, subscribes immediately
+			const store2 = clientModule.on('shared-cleanup-topic');
+			const events = [];
+			const unsub = store2.subscribe((v) => { if (v) events.push(v); });
+
+			// Microtask fires; first wrapper's subs=0 but topicRefCounts shows an active sub
+			await flush();
+			ws._receive({ topic: 'shared-cleanup-topic', event: 'msg', data: 'hello' });
+			expect(events).toHaveLength(1);
+
+			unsub();
+			conn.close();
+		});
+	});
+
+	describe('cursor client plugin', () => {
+		/** @type {typeof import('../../src/plugins/cursor/client.js').cursor} */
+		let cursorFn;
+
+		beforeEach(async () => {
+			const mod = await import('../../src/plugins/cursor/client.js');
+			cursorFn = mod.cursor;
+		});
+
+		it('two calls with the same topic return the same store instance', async () => {
+			const conn = clientModule.connect();
+			await flush();
+
+			const a = cursorFn('cursor-shared');
+			const b = cursorFn('cursor-shared');
+			expect(a).toBe(b);
+
+			conn.close();
+		});
+
+		it('two calls with the same topic and maxAge return the same store instance', async () => {
+			const conn = clientModule.connect();
+			await flush();
+
+			const a = cursorFn('cursor-age', { maxAge: 5000 });
+			const b = cursorFn('cursor-age', { maxAge: 5000 });
+			expect(a).toBe(b);
+
+			conn.close();
+		});
+
+		it('different maxAge values produce different instances', async () => {
+			const conn = clientModule.connect();
+			await flush();
+
+			const a = cursorFn('cursor-diff', { maxAge: 5000 });
+			const b = cursorFn('cursor-diff', { maxAge: 10000 });
+			expect(a).not.toBe(b);
+
+			conn.close();
+		});
+
+		it('evicts cache entry after all subscribers unsubscribe', async () => {
+			const conn = clientModule.connect();
+			await flush();
+
+			const store1 = cursorFn('cursor-evict');
+			const unsub = store1.subscribe(() => {});
+			unsub();
+
+			const store2 = cursorFn('cursor-evict');
+			expect(store2).not.toBe(store1);
+
+			conn.close();
+		});
+
+		it('shared store receives cursor updates for all subscribers', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const storeA = cursorFn('cursor-live');
+			const storeB = cursorFn('cursor-live');
+			expect(storeA).toBe(storeB);
+
+			/** @type {Map<string, any>[]} */
+			const snapsA = [];
+			/** @type {Map<string, any>[]} */
+			const snapsB = [];
+			const unsubA = storeA.subscribe((m) => snapsA.push(m));
+			const unsubB = storeB.subscribe((m) => snapsB.push(m));
+			await flush();
+
+			// New wire shape: catalog/join carries user, update carries position only.
+			ws._receive({ topic: '__cursor:cursor-live', event: 'join',
+				data: { key: 'u1', user: { name: 'Alice' } } });
+			ws._receive({ topic: '__cursor:cursor-live', event: 'update',
+				data: { key: 'u1', data: { x: 10, y: 20 } } });
+
+			// Both subscribers should see the merged entry.
+			const lastA = snapsA[snapsA.length - 1];
+			const lastB = snapsB[snapsB.length - 1];
+			expect(lastA.get('u1')).toEqual({ user: { name: 'Alice' }, data: { x: 10, y: 20 } });
+			expect(lastB.get('u1')).toEqual({ user: { name: 'Alice' }, data: { x: 10, y: 20 } });
+
+			unsubA();
+			unsubB();
+			conn.close();
+		});
+
+		it('positions without a known user are withheld until catalog/join arrives', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = cursorFn('cursor-late-user');
+			const snapshots = [];
+			const unsub = store.subscribe((m) => snapshots.push(m));
+			await flush();
+
+			// Position arrives first - should not appear in output yet.
+			ws._receive({ topic: '__cursor:cursor-late-user', event: 'update',
+				data: { key: 'u1', data: { x: 1, y: 2 } } });
+			expect(snapshots[snapshots.length - 1].has('u1')).toBe(false);
+
+			// Join arrives - now the entry materializes.
+			ws._receive({ topic: '__cursor:cursor-late-user', event: 'join',
+				data: { key: 'u1', user: { name: 'Late' } } });
+			expect(snapshots[snapshots.length - 1].get('u1')).toEqual({
+				user: { name: 'Late' },
+				data: { x: 1, y: 2 }
+			});
+
+			unsub();
+			conn.close();
+		});
+
+		it('handles remove events', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = cursorFn('cursor-remove');
+			const snapshots = [];
+			const unsub = store.subscribe((m) => snapshots.push(m));
+			await flush();
+
+			ws._receive({ topic: '__cursor:cursor-remove', event: 'join',
+				data: { key: 'u1', user: {} } });
+			ws._receive({ topic: '__cursor:cursor-remove', event: 'update',
+				data: { key: 'u1', data: { x: 1, y: 2 } } });
+			expect(snapshots[snapshots.length - 1].has('u1')).toBe(true);
+
+			ws._receive({ topic: '__cursor:cursor-remove', event: 'remove',
+				data: { key: 'u1' } });
+			expect(snapshots[snapshots.length - 1].has('u1')).toBe(false);
+
+			unsub();
+			conn.close();
+		});
+
+		it('handles catalog + bulk snapshot pair from the server', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = cursorFn('cursor-bulk');
+			const snapshots = [];
+			const unsub = store.subscribe((m) => snapshots.push(m));
+			await flush();
+
+			ws._receive({ topic: '__cursor:cursor-bulk', event: 'catalog',
+				data: [
+					{ key: 'a', user: { name: 'A' } },
+					{ key: 'b', user: { name: 'B' } }
+				] });
+			ws._receive({ topic: '__cursor:cursor-bulk', event: 'bulk',
+				data: [
+					{ key: 'a', data: { x: 1, y: 1 } },
+					{ key: 'b', data: { x: 2, y: 2 } }
+				] });
+
+			const last = snapshots[snapshots.length - 1];
+			expect(last.size).toBe(2);
+			expect(last.get('a')).toEqual({ user: { name: 'A' }, data: { x: 1, y: 1 } });
+			expect(last.get('b')).toEqual({ user: { name: 'B' }, data: { x: 2, y: 2 } });
+
+			unsub();
+			conn.close();
+		});
+
+		it('catalog replaces the user map (drops users no longer in roster)', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = cursorFn('cursor-catalog-reset');
+			const snapshots = [];
+			const unsub = store.subscribe((m) => snapshots.push(m));
+			await flush();
+
+			ws._receive({ topic: '__cursor:cursor-catalog-reset', event: 'join',
+				data: { key: 'a', user: { name: 'A' } } });
+			ws._receive({ topic: '__cursor:cursor-catalog-reset', event: 'update',
+				data: { key: 'a', data: { x: 1 } } });
+			expect(snapshots[snapshots.length - 1].has('a')).toBe(true);
+
+			// New catalog without 'a' should hide 'a' from output (its user is gone).
+			ws._receive({ topic: '__cursor:cursor-catalog-reset', event: 'catalog',
+				data: [{ key: 'b', user: { name: 'B' } }] });
+			expect(snapshots[snapshots.length - 1].has('a')).toBe(false);
+
+			unsub();
+			conn.close();
+		});
+
+		it('handles bulk (batched) position events', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = cursorFn('cursor-batch');
+			const snapshots = [];
+			const unsub = store.subscribe((m) => snapshots.push(m));
+			await flush();
+
+			ws._receive({ topic: '__cursor:cursor-batch', event: 'join',
+				data: { key: 'a', user: { name: 'A' } } });
+			ws._receive({ topic: '__cursor:cursor-batch', event: 'join',
+				data: { key: 'b', user: { name: 'B' } } });
+			ws._receive({ topic: '__cursor:cursor-batch', event: 'bulk',
+				data: [
+					{ key: 'a', data: { x: 10, y: 10 } },
+					{ key: 'b', data: { x: 20, y: 20 } }
+				] });
+
+			const last = snapshots[snapshots.length - 1];
+			expect(last.size).toBe(2);
+			expect(last.get('a').data).toEqual({ x: 10, y: 10 });
+			expect(last.get('b').data).toEqual({ x: 20, y: 20 });
+
+			unsub();
+			conn.close();
+		});
+
+		it('sends cursor-snapshot request on reconnect', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = cursorFn('cursor-snap-req');
+			const unsub = store.subscribe(() => {});
+			await flush();
+
+			const snapshotMsgs = ws._sent
+				.map((s) => JSON.parse(s))
+				.filter((m) => m.type === 'cursor-snapshot' && m.topic === 'cursor-snap-req');
+			expect(snapshotMsgs.length).toBeGreaterThanOrEqual(1);
+
+			unsub();
+			conn.close();
+		});
+
+		it('maxAge sweeps stale cursor entries', async () => {
+			vi.useFakeTimers();
+			// The cursor store stamps and sweeps entry timestamps through the
+			// shared decode helpers, which default to the injectable runtime
+			// clock; bind it to the faked Date.now() so advancing time ages the
+			// entries past maxAge.
+			installFakeRuntimeClock();
+			const conn = clientModule.connect();
+			await vi.advanceTimersByTimeAsync(0);
+			const ws = MockWebSocket._last;
+
+			const store = cursorFn('cursor-maxage', { maxAge: 2000 });
+			const snapshots = [];
+			const unsub = store.subscribe((m) => snapshots.push(m));
+			await vi.advanceTimersByTimeAsync(0);
+
+			ws._receive({ topic: '__cursor:cursor-maxage', event: 'join',
+				data: { key: 'stale', user: {} } });
+			ws._receive({ topic: '__cursor:cursor-maxage', event: 'update',
+				data: { key: 'stale', data: { x: 0, y: 0 } } });
+			expect(snapshots[snapshots.length - 1].has('stale')).toBe(true);
+
+			vi.advanceTimersByTime(3000);
+			expect(snapshots[snapshots.length - 1].has('stale')).toBe(false);
+
+			unsub();
+			releaseRuntimeClock();
+			vi.useRealTimers();
+			conn.close();
+		});
+
+		it('cleans up sweep timer on unsubscribe', async () => {
+			vi.useFakeTimers();
+			const conn = clientModule.connect();
+			await vi.advanceTimersByTimeAsync(0);
+
+			const store = cursorFn('cursor-cleanup');
+			const unsub = store.subscribe(() => {});
+			await vi.advanceTimersByTimeAsync(0);
+
+			unsub();
+			// Should not throw after cleanup
+			vi.advanceTimersByTime(5000);
+
+			vi.useRealTimers();
+			conn.close();
+		});
+
+		describe('move() helper', () => {
+			/** @type {typeof import('../../src/plugins/cursor/client.js').move} */
+			let moveFn;
+			/** @type {Array<{ cb: () => void }>} */
+			let rafQueue;
+			let prevRaf;
+
+			beforeEach(async () => {
+				const mod = await import('../../src/plugins/cursor/client.js');
+				moveFn = mod.move;
+				rafQueue = [];
+				// Replace requestAnimationFrame with a manual flush queue so
+				// the test can drive the rAF coalescing deterministically.
+				prevRaf = globalThis.requestAnimationFrame;
+				globalThis.requestAnimationFrame = (cb) => {
+					rafQueue.push({ cb });
+					return rafQueue.length;
+				};
+			});
+
+			afterEach(() => {
+				globalThis.requestAnimationFrame = prevRaf;
+			});
+
+			function flushRaf() {
+				const q = rafQueue;
+				rafQueue = [];
+				for (const { cb } of q) cb();
+			}
+
+			function cursorSends(ws) {
+				return ws._sent
+					.map((s) => JSON.parse(s))
+					.filter((m) => m.type === 'cursor');
+			}
+
+			it('coalesces high-rate calls into one send per frame', async () => {
+				const conn = clientModule.connect();
+				await flush();
+				const ws = MockWebSocket._last;
+
+				moveFn('canvas', { x: 1, y: 1 });
+				moveFn('canvas', { x: 2, y: 2 });
+				moveFn('canvas', { x: 3, y: 3 });
+
+				// Before the frame flushes, nothing has been sent.
+				expect(cursorSends(ws)).toHaveLength(0);
+
+				flushRaf();
+
+				// One send carrying the latest position only.
+				const sent = cursorSends(ws);
+				expect(sent).toHaveLength(1);
+				expect(sent[0]).toEqual({ type: 'cursor', topic: 'canvas', data: { x: 3, y: 3 } });
+
+				conn.close();
+			});
+
+			it('sends one message per topic on flush (no cross-topic clobber)', async () => {
+				const conn = clientModule.connect();
+				await flush();
+				const ws = MockWebSocket._last;
+
+				moveFn('canvas-a', { x: 10 });
+				moveFn('canvas-b', { x: 20 });
+				moveFn('canvas-a', { x: 11 });
+
+				flushRaf();
+
+				const sent = cursorSends(ws).sort((a, b) => a.topic.localeCompare(b.topic));
+				expect(sent).toHaveLength(2);
+				expect(sent[0]).toEqual({ type: 'cursor', topic: 'canvas-a', data: { x: 11 } });
+				expect(sent[1]).toEqual({ type: 'cursor', topic: 'canvas-b', data: { x: 20 } });
+
+				conn.close();
+			});
+
+			it('next-frame call schedules another rAF tick', async () => {
+				const conn = clientModule.connect();
+				await flush();
+				const ws = MockWebSocket._last;
+
+				moveFn('canvas', { x: 1 });
+				flushRaf();
+				expect(cursorSends(ws)).toHaveLength(1);
+
+				moveFn('canvas', { x: 2 });
+				// Without a flush, nothing new yet.
+				expect(cursorSends(ws)).toHaveLength(1);
+
+				flushRaf();
+				const sent = cursorSends(ws);
+				expect(sent).toHaveLength(2);
+				expect(sent[1].data).toEqual({ x: 2 });
+
+				conn.close();
+			});
+		});
+	});
+
+	describe('presence client - join/leave/heartbeat events', () => {
+		/** @type {any} */
+		let presenceFn;
+
+		beforeEach(async () => {
+			const mod = await import('../../src/plugins/presence/client.js');
+			presenceFn = mod.presence;
+		});
+
+		it('handles join events', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = presenceFn('p-join');
+			let current = [];
+			const unsub = store.subscribe((v) => { current = v; });
+
+			ws._receive({ topic: '__presence:p-join', event: 'state', data: {} });
+			ws._receive({ topic: '__presence:p-join', event: 'diff',
+				data: { joins: { '1': { name: 'Alice' } }, leaves: {} } });
+			expect(current).toEqual([{ name: 'Alice' }]);
+
+			unsub();
+			conn.close();
+		});
+
+		it('ignores join for already-present key', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = presenceFn('p-join-dup');
+			let current = [];
+			const unsub = store.subscribe((v) => { current = v; });
+
+			ws._receive({ topic: '__presence:p-join-dup', event: 'state',
+				data: { '1': { name: 'Alice' } } });
+			ws._receive({ topic: '__presence:p-join-dup', event: 'diff',
+				data: { joins: { '1': { name: 'Alice' } }, leaves: {} } });
+			expect(current).toHaveLength(1);
+
+			unsub();
+			conn.close();
+		});
+
+		it('handles leave events', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+
+			const store = presenceFn('p-leave');
+			let current = [];
+			const unsub = store.subscribe((v) => { current = v; });
+
+			ws._receive({ topic: '__presence:p-leave', event: 'state',
+				data: { '1': { name: 'Alice' }, '2': { name: 'Bob' } } });
+			expect(current).toHaveLength(2);
+
+			ws._receive({ topic: '__presence:p-leave', event: 'diff',
+				data: { joins: {}, leaves: { '1': { name: 'Alice' } } } });
+			expect(current).toEqual([{ name: 'Bob' }]);
+
+			unsub();
+			conn.close();
+		});
+
+		it('handles heartbeat events by refreshing timestamps', async () => {
+			vi.useFakeTimers();
+			const conn = clientModule.connect();
+			await vi.advanceTimersByTimeAsync(0);
+			const ws = MockWebSocket._last;
+
+			const store = presenceFn('p-heartbeat', { maxAge: 5000 });
+			let current = [];
+			const unsub = store.subscribe((v) => { current = v; });
+
+			ws._receive({ topic: '__presence:p-heartbeat', event: 'state',
+				data: { '1': { name: 'Alice' } } });
+			expect(current).toHaveLength(1);
+
+			// Advance near maxAge, then send heartbeat to refresh
+			vi.advanceTimersByTime(4000);
+			ws._receive({ topic: '__presence:p-heartbeat', event: 'heartbeat', data: ['1'] });
+
+			// Advance past original maxAge but within heartbeat refresh
+			vi.advanceTimersByTime(2000);
+			expect(current).toHaveLength(1);
+
+			unsub();
+			vi.useRealTimers();
+			conn.close();
+		});
+	});
+
+	describe('presence client - maxAge sweep', () => {
+		/** @type {any} */
+		let presenceFn;
+
+		beforeEach(async () => {
+			const mod = await import('../../src/plugins/presence/client.js');
+			presenceFn = mod.presence;
+		});
+
+		it('sweeps stale entries after maxAge', async () => {
+			vi.useFakeTimers();
+			const conn = clientModule.connect();
+			await vi.advanceTimersByTimeAsync(0);
+			const ws = MockWebSocket._last;
+
+			const store = presenceFn('presence-sweep', { maxAge: 2000 });
+			let current = [];
+			const unsub = store.subscribe((v) => { current = v; });
+
+			ws._receive({ topic: '__presence:presence-sweep', event: 'state',
+				data: { '1': { id: '1', name: 'Alice' } } });
+			expect(current).toHaveLength(1);
+
+			vi.advanceTimersByTime(3000);
+			expect(current).toHaveLength(0);
+
+			unsub();
+			vi.useRealTimers();
+			conn.close();
+		});
+
+		it('cleans up sweep timer on unsubscribe', async () => {
+			vi.useFakeTimers();
+			const conn = clientModule.connect();
+			await vi.advanceTimersByTimeAsync(0);
+
+			const store = presenceFn('presence-sweep-cleanup', { maxAge: 2000 });
+			const unsub = store.subscribe(() => {});
+			await vi.advanceTimersByTimeAsync(0);
+
+			unsub();
+			vi.advanceTimersByTime(5000);
+
+			vi.useRealTimers();
+			conn.close();
+		});
+	});
+
+	describe('replay client - scan()', () => {
+		/** @type {any} */
+		let onReplayFn;
+
+		beforeEach(async () => {
+			const mod = await import('../../src/plugins/replay/client.js');
+			onReplayFn = mod.onReplay;
+		});
+
+		it('throws on invalid options.since', async () => {
+			expect(() => onReplayFn('topic', {})).toThrow('options.since must be a number');
+			expect(() => onReplayFn('topic')).toThrow('options.since must be a number');
+		});
+
+		it('scan() accumulates events through a reducer', async () => {
+			const store = onReplayFn('scan-test', { since: 0 });
+			const accumulated = store.scan([], (acc, event) => [...acc, event.data]);
+			let value = [];
+			const unsub = accumulated.subscribe((v) => { value = v; });
+			await flush();
+
+			const ws = MockWebSocket._last;
+			ws._receive({ topic: '__replay:scan-test', event: 'end', data: null });
+			ws._receive({ topic: 'scan-test', event: 'created', data: { id: 1 } });
+			ws._receive({ topic: 'scan-test', event: 'created', data: { id: 2 } });
+
+			expect(value).toEqual([{ id: 1 }, { id: 2 }]);
+
+			unsub();
+			clientModule.connect().close();
+		});
+
+		it('scan() cleans up source subscription on last unsubscribe', async () => {
+			const store = onReplayFn('scan-cleanup', { since: 0 });
+			const accumulated = store.scan(0, (acc) => acc + 1);
+			const unsub1 = accumulated.subscribe(() => {});
+			await flush();
+
+			// Unsubscribe - should clean up without errors
+			unsub1();
+
+			// Second subscriber re-activates cleanly
+			let value = 0;
+			const unsub2 = accumulated.subscribe((v) => { value = v; });
+			expect(value).toBe(0);
+
+			unsub2();
+			clientModule.connect().close();
+		});
+	});
+
+	describe('session resume (real module)', () => {
+		/** @type {Map<string, string>} */
+		let storage;
+
+		beforeEach(() => {
+			storage = new Map();
+			globalThis.sessionStorage = /** @type {any} */ ({
+				getItem: (k) => storage.get(k) ?? null,
+				setItem: (k, v) => storage.set(k, String(v)),
+				removeItem: (k) => storage.delete(k),
+				clear: () => storage.clear()
+			});
+		});
+
+		afterEach(() => {
+			delete (/** @type {any} */ (globalThis)).sessionStorage;
+		});
+
+		it('stores sessionId from welcome envelope', async () => {
+			clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._receive({ type: 'welcome', sessionId: 'abc-123' });
+			expect(storage.get('svelte-adapter-uws.session./ws')).toBe('abc-123');
+			clientModule.connect().close();
+		});
+
+		it('tracks highest seq per topic and recovers it on the resubscribe', async () => {
+			vi.useFakeTimers();
+			const sa = clientModule.on('a').subscribe(() => {});
+			const sb = clientModule.on('b').subscribe(() => {});
+			await vi.advanceTimersByTimeAsync(0);
+			const ws = MockWebSocket._last;
+			ws._receive({ type: 'welcome', sessionId: 's1' });
+			ws._receive({ topic: 'a', event: 'x', data: 1, seq: 5 });
+			ws._receive({ topic: 'a', event: 'x', data: 2, seq: 7 });
+			ws._receive({ topic: 'a', event: 'x', data: 3, seq: 6 }); // out-of-order, ignored
+			ws._receive({ topic: 'b', event: 'y', data: 9, seq: 2 });
+
+			ws.close();
+			await vi.advanceTimersByTimeAsync(10000);
+			const ws2 = MockWebSocket._last;
+			const batch = ws2._sent.map(s => JSON.parse(s)).find(m => m.type === 'subscribe-batch');
+			expect(batch).toBeTruthy();
+			// The highest observed seq per topic rides the resubscribe as recovery
+			// (merged in, not a separate resume frame).
+			expect(batch.recover).toEqual({ a: { offset: 7 }, b: { offset: 2 } });
+
+			sa(); sb();
+			clientModule.connect().close();
+			vi.useRealTimers();
+		});
+
+		it('attaches recover to the resubscribe on reconnect (no separate resume frame)', async () => {
+			vi.useFakeTimers();
+			const store = clientModule.on('topic-x');
+			const unsub = store.subscribe(() => {});
+			await vi.advanceTimersByTimeAsync(0);
+			const ws = MockWebSocket._last;
+			ws._receive({ type: 'welcome', sessionId: 's2' });
+			ws._receive({ topic: 'topic-x', event: 'created', data: {}, seq: 4 });
+
+			ws.close();
+			await vi.advanceTimersByTimeAsync(10000);
+			const ws2 = MockWebSocket._last;
+			const sent = ws2._sent.map(s => JSON.parse(s));
+			// The recovery is merged into the resubscribe; no standalone resume frame.
+			expect(sent.find(m => m.type === 'resume')).toBeUndefined();
+			const batch = sent.find(m => m.type === 'subscribe-batch');
+			expect(batch).toBeTruthy();
+			expect(batch.topics).toContain('topic-x');
+			expect(batch.recover).toEqual({ 'topic-x': { offset: 4 } });
+
+			unsub();
+			clientModule.connect().close();
+			vi.useRealTimers();
+		});
+
+		it('resubscribes without recover when no seqs have been observed', async () => {
+			vi.useFakeTimers();
+			const unsub = clientModule.on('topic-y').subscribe(() => {});
+			await vi.advanceTimersByTimeAsync(0);
+			const ws = MockWebSocket._last;
+			ws._receive({ type: 'welcome', sessionId: 's3' });
+			// No seq observed for topic-y.
+
+			ws.close();
+			await vi.advanceTimersByTimeAsync(10000);
+			const ws2 = MockWebSocket._last;
+			const sent = ws2._sent.map(s => JSON.parse(s));
+			expect(sent.find(m => m.type === 'resume')).toBeUndefined();
+			const batch = sent.find(m => m.type === 'subscribe-batch');
+			expect(batch).toBeTruthy();
+			expect(batch.topics).toContain('topic-y');
+			// No tracked seq -> a plain resubscribe, no recover field.
+			expect(batch.recover).toBeUndefined();
+
+			unsub();
+			clientModule.connect().close();
+			vi.useRealTimers();
+		});
+
+		it('does not dispatch welcome or resumed envelopes as data events', async () => {
+			const store = clientModule.on('topic-y');
+			const events = [];
+			const unsub = store.subscribe((v) => { if (v) events.push(v); });
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._receive({ type: 'welcome', sessionId: 's4' });
+			ws._receive({ type: 'resumed' });
+			ws._receive({ topic: 'topic-y', event: 'msg', data: 'hi' });
+
+			expect(events).toHaveLength(1);
+			expect(events[0].data).toBe('hi');
+
+			unsub();
+			clientModule.connect().close();
+		});
+
+		it('survives missing sessionStorage (private mode)', async () => {
+			delete (/** @type {any} */ (globalThis)).sessionStorage;
+
+			clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+			expect(() => ws._receive({ type: 'welcome', sessionId: 'lost' })).not.toThrow();
+			expect(() => ws._receive({ topic: 't', event: 'e', data: 1, seq: 1 })).not.toThrow();
+
+			clientModule.connect().close();
+		});
+	});
+
+	describe('subscribe ack protocol (real module)', () => {
+		it('attaches a numeric ref to the microtask-batched subscribe-batch frame', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._sent.length = 0;
+
+			// Two subscribes in the same microtask coalesce into one
+			// subscribe-batch frame. Single-topic case stays as plain
+			// subscribe (covered separately above).
+			const a = clientModule.on('topic-a');
+			const unsubA = a.subscribe(() => {});
+			const b = clientModule.on('topic-b');
+			const unsubB = b.subscribe(() => {});
+			await flush();
+
+			const batches = ws._sent.map(s => JSON.parse(s)).filter(m => m.type === 'subscribe-batch');
+			expect(batches.length).toBe(1);
+			expect(typeof batches[0].ref).toBe('number');
+			expect(batches[0].topics).toEqual(['topic-a', 'topic-b']);
+			// No straggler single-topic subscribe frames in this microtask.
+			const singles = ws._sent.map(s => JSON.parse(s)).filter(m => m.type === 'subscribe');
+			expect(singles.length).toBe(0);
+
+			unsubA();
+			unsubB();
+			conn.close();
+		});
+
+		it('attaches a ref to subscribe-batch on reconnect', async () => {
+			vi.useFakeTimers();
+			const store = clientModule.on('topic-x');
+			const unsub = store.subscribe(() => {});
+			await vi.advanceTimersByTimeAsync(0);
+			const ws = MockWebSocket._last;
+			ws.close();
+			await vi.advanceTimersByTimeAsync(10000);
+			const ws2 = MockWebSocket._last;
+			const batch = ws2._sent.map(s => JSON.parse(s)).find(m => m.type === 'subscribe-batch');
+			expect(batch).toBeTruthy();
+			expect(typeof batch.ref).toBe('number');
+
+			unsub();
+			clientModule.connect().close();
+			vi.useRealTimers();
+		});
+
+		it('emits subscribe-denied frames into the denials store', async () => {
+			const conn = clientModule.connect();
+			const seen = [];
+			const unsub = conn.denials.subscribe((d) => { if (d) seen.push(d); });
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._receive({ type: 'subscribe-denied', topic: 'admin', ref: 7, reason: 'FORBIDDEN' });
+			ws._receive({ type: 'subscribe-denied', topic: 'private', ref: 8, reason: 'UNAUTHENTICATED' });
+
+			expect(seen).toHaveLength(2);
+			expect(seen[0]).toEqual({ topic: 'admin', reason: 'FORBIDDEN', ref: 7 });
+			expect(seen[1]).toEqual({ topic: 'private', reason: 'UNAUTHENTICATED', ref: 8 });
+
+			unsub();
+			conn.close();
+		});
+
+		// RATE_LIMITED means a per-connection server bound was momentarily
+		// full, and it clears on its own as the server's in-flight work
+		// settles. Warning and moving on left the application believing it
+		// was subscribed to a topic the server never enrolled, with nothing
+		// correcting it until the next reconnect.
+		it('re-sends a topic the server refused RATE_LIMITED', async () => {
+			vi.useFakeTimers();
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const conn = clientModule.connect();
+			const store = clientModule.on('capped');
+			const unsub = store.subscribe(() => {});
+			await vi.advanceTimersByTimeAsync(0);
+			const ws = MockWebSocket._last;
+			ws._sent.length = 0;
+
+			ws._receive({ type: 'subscribe-denied', topic: 'capped', ref: 3, reason: 'RATE_LIMITED' });
+			// Not immediate: the retry is deliberately delayed and jittered, so
+			// every connection refused by one full server does not refill it in
+			// the same instant.
+			expect(ws._sent).toHaveLength(0);
+
+			await vi.advanceTimersByTimeAsync(600);
+			const retried = ws._sent
+				.map((s) => JSON.parse(s))
+				.filter((m) => m.type === 'subscribe-batch' || m.type === 'subscribe');
+			expect(retried).toHaveLength(1);
+			expect(retried[0].topics ?? [retried[0].topic]).toContain('capped');
+
+			unsub();
+			warnSpy.mockRestore();
+			conn.close();
+			vi.useRealTimers();
+		});
+
+		// The reason is not exclusively the transient in-flight bound: the
+		// landed-subscription cap answers RATE_LIMITED too, and an application
+		// hook may return it as its own throttle. Retrying forever would turn
+		// either into a hot loop that re-runs the hook every round.
+		it('backs off and gives up rather than retrying RATE_LIMITED forever', async () => {
+			vi.useFakeTimers();
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const conn = clientModule.connect();
+			const store = clientModule.on('always-capped');
+			const unsub = store.subscribe(() => {});
+			await vi.advanceTimersByTimeAsync(0);
+			const ws = MockWebSocket._last;
+
+			let rounds = 0;
+			for (let i = 0; i < 12; i++) {
+				ws._sent.length = 0;
+				ws._receive({ type: 'subscribe-denied', topic: 'always-capped', ref: 100 + i, reason: 'RATE_LIMITED' });
+				// Generous enough to cover the whole backoff ladder including jitter.
+				await vi.advanceTimersByTimeAsync(120_000);
+				const retried = ws._sent
+					.map((s) => JSON.parse(s))
+					.filter((m) => m.type === 'subscribe-batch' || m.type === 'subscribe');
+				if (retried.length === 0) break;
+				rounds++;
+			}
+
+			expect(rounds).toBeGreaterThan(0);
+			expect(rounds).toBeLessThanOrEqual(6);
+
+			unsub();
+			warnSpy.mockRestore();
+			conn.close();
+			vi.useRealTimers();
+		});
+
+		// A topic refused during a reconnect resubscribe was asking for its
+		// missed tail too, and the truncated frame served no replay for it.
+		// Re-asking without the offset would restore the subscription and
+		// silently drop the gap.
+		it('carries recovery offsets on a retry after a reconnect resubscribe', async () => {
+			vi.useFakeTimers();
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const conn = clientModule.connect();
+			const store = clientModule.on('recovered');
+			const unsub = store.subscribe(() => {});
+			await vi.advanceTimersByTimeAsync(0);
+			const ws1 = MockWebSocket._last;
+			// Land the subscription and take a seq, so the client tracks an offset.
+			ws1._receive({ type: 'subscribed', topic: 'recovered', ref: 1, epoch: 4 });
+			ws1._receive({ topic: 'recovered', event: 'msg', data: 'one', seq: 11 });
+
+			// Reconnect: the resubscribe carries recover, and the server refuses it.
+			ws1.readyState = MockWebSocket.CLOSED;
+			ws1.onclose?.({ code: 1006 });
+			await vi.advanceTimersByTimeAsync(5000);
+			const ws2 = MockWebSocket._last;
+			expect(ws2).not.toBe(ws1);
+			ws2._sent.length = 0;
+			ws2._receive({ type: 'subscribe-denied', topic: 'recovered', ref: 2, reason: 'RATE_LIMITED' });
+			await vi.advanceTimersByTimeAsync(600);
+
+			const retry = ws2._sent
+				.map((s) => JSON.parse(s))
+				.find((m) => m.type === 'subscribe-batch' && m.topics?.includes('recovered'));
+			expect(retry).toBeTruthy();
+			expect(retry.recover?.recovered).toMatchObject({ offset: 11, epoch: 4 });
+
+			unsub();
+			warnSpy.mockRestore();
+			conn.close();
+			vi.useRealTimers();
+		});
+
+		// The server pushes a `gap` marker when it proved it lost relayed
+		// frames for a topic - and by then the delivered sequences have
+		// already stepped past the hole, so the tracked offset points AFTER
+		// frames this client never held. Presenting it on a reconnect would
+		// gap-fill from past the hole and the desync would survive every
+		// reconnect; the marker must clear it. The sibling case above pins
+		// the offset being CARRIED, so together they hold both directions.
+		it('drops the recovery offset after a gap marker, so a reconnect does not resume past the hole', async () => {
+			vi.useFakeTimers();
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const conn = clientModule.connect();
+			const store = clientModule.on('holed');
+			const unsub = store.subscribe(() => {});
+			await vi.advanceTimersByTimeAsync(0);
+			const ws1 = MockWebSocket._last;
+			// Land the subscription and take a seq past the (unseen) hole.
+			ws1._receive({ type: 'subscribed', topic: 'holed', ref: 1, epoch: 4 });
+			ws1._receive({ topic: 'holed', event: 'msg', data: 'late', seq: 11 });
+
+			ws1._receive({ topic: '__replay:holed', event: 'gap', data: { lost: 1 } });
+
+			ws1.readyState = MockWebSocket.CLOSED;
+			ws1.onclose?.({ code: 1006 });
+			await vi.advanceTimersByTimeAsync(5000);
+			const ws2 = MockWebSocket._last;
+			expect(ws2).not.toBe(ws1);
+
+			const resub = ws2._sent
+				.map((s) => JSON.parse(s))
+				.find((m) => (m.type === 'subscribe-batch' && m.topics?.includes('holed')) || (m.type === 'subscribe' && m.topic === 'holed'));
+			expect(resub, 'the subscription itself survives the reconnect').toBeTruthy();
+			expect(resub.recover?.holed, 'the poisoned offset must not be presented').toBeUndefined();
+
+			unsub();
+			warnSpy.mockRestore();
+			conn.close();
+			vi.useRealTimers();
+		});
+
+		// A WebTransport stream server truncates a gap-fill held up by a message
+		// too large to send by holding the topic back and writing the standalone
+		// truncated event just before the ack (PROTOCOL.md 15.1). Fed the
+		// vector's own written frames, this client has to stop presenting the
+		// offset from before the hole, and keep the epoch the ack reports.
+		// A case with one recovering subscribe, a standalone truncated event and no
+		// reset; `withRehydrate` picks the one whose ack reports a new epoch.
+		const truncationVector = (withRehydrate = false, inline = false) => {
+			const vector = JSON.parse(readFileSync(new URL('../../test-vectors/webtransport-stream.json', import.meta.url), 'utf8'));
+			const vectorCase = vector.recoveryTruncation.find((c) => {
+				const requests = c.transcript.filter((e) => e.client);
+				return requests.length === 1 && requests[0].client.type === 'subscribe' && requests[0].recovers.length === 1 &&
+					c.written.some((m) => inline ? m.frame?.event === 'end' && m.frame.data?.truncated : m.frame?.event === 'truncated') && !c.thenResets &&
+					c.written.some((m) => m.frame?.event === 'rehydrate') === withRehydrate;
+			});
+			const request = vectorCase.transcript.find((e) => e.client).client;
+			const topic = request.topic;
+			const frames = vectorCase.written.map((m) => m.frame);
+			const ackAt = frames.findIndex((f) => f.type === 'subscribed' && f.topic === topic);
+			return { request, topic, frames, ackAt };
+		};
+		const resubscribeOf = (ws, topic) => ws._sent
+			.map((s) => JSON.parse(s))
+			.find((m) => (m.type === 'subscribe-batch' && m.topics?.includes(topic)) || (m.type === 'subscribe' && m.topic === topic));
+		const recoverOf = (frame, topic) => (frame.type === 'subscribe' ? frame.recover : frame.recover?.[topic]);
+
+		// Take an offset and epoch for the topic, reconnect, answer the recovering
+		// resubscribe with the first `count` written frames (less the truncated
+		// event when `withoutEvent` is set), reconnect again, and return what the
+		// client then asks to recover.
+		async function recoverAfterTruncation(count, { withoutEvent = false, withRehydrate = false, inline = false } = {}) {
+			const { request, topic, frames } = truncationVector(withRehydrate, inline);
+			vi.useFakeTimers();
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const conn = clientModule.connect();
+			const unsub = clientModule.on(topic).subscribe(() => {});
+			const markers = [];
+			const unsubMarker = clientModule.on('__replay:' + topic).subscribe((e) => { if (e) markers.push(e.event); });
+			try {
+				await vi.advanceTimersByTimeAsync(0);
+				const ws1 = MockWebSocket._last;
+				ws1._receive({ type: 'subscribed', topic, ref: 1, epoch: request.recover.epoch });
+				ws1._receive({ topic, event: 'put', data: { n: 1 }, seq: request.recover.offset });
+				ws1.readyState = MockWebSocket.CLOSED;
+				ws1.onclose?.({ code: 1006 });
+				await vi.advanceTimersByTimeAsync(5000);
+				const ws2 = MockWebSocket._last;
+				expect(ws2).not.toBe(ws1);
+				const recovering = resubscribeOf(ws2, topic);
+				// The client asks for the same recover entry as the vector's request.
+				expect(recoverOf(recovering, topic)).toEqual(request.recover);
+				for (const frame of frames.slice(0, count)) {
+					if (withoutEvent && (frame.event === 'truncated' || (frame.event === 'end' && frame.data?.truncated))) continue;
+					ws2._receive(frame.type === 'subscribed' ? { ...frame, ref: recovering.ref } : frame);
+				}
+				ws2.readyState = MockWebSocket.CLOSED;
+				ws2.onclose?.({ code: 1006 });
+				await vi.advanceTimersByTimeAsync(5000);
+				const ws3 = MockWebSocket._last;
+				expect(ws3).not.toBe(ws2);
+				const next = resubscribeOf(ws3, topic);
+				expect(next, 'the subscription itself survives').toBeTruthy();
+				return { recover: recoverOf(next, topic), markers };
+			} finally {
+				unsubMarker();
+				unsub();
+				warnSpy.mockRestore();
+				conn.close();
+				vi.useRealTimers();
+			}
+		}
+
+		it('stops presenting the offset from before a truncated recovery', async () => {
+			const { ackAt } = truncationVector();
+			// Through the ack, before any live frame could seed a new offset.
+			const { recover, markers } = await recoverAfterTruncation(ackAt + 1);
+			expect(markers, 'the truncated event reaches the application').toContain('truncated');
+			expect(recover, 'no offset from before the hole may be presented').toBeUndefined();
+			// The same frames without the event leave that offset in place, so it
+			// is the event that drops it.
+			const { request, frames } = truncationVector();
+			const before = frames.slice(0, ackAt).filter((f) => f.topic === request.topic && typeof f.seq === 'number');
+			const control = await recoverAfterTruncation(ackAt + 1, { withoutEvent: true });
+			expect(control.recover).toEqual({ offset: before.at(-1).seq, epoch: frames[ackAt].epoch });
+		});
+
+		it('drops the offset on a protocol vector inline truncation before its recovery ack', async () => {
+			const { request, frames } = truncationVector(false, true);
+			const endAt = frames.findIndex(frame => frame.event === 'end' && frame.data?.truncated);
+			expect(endAt).toBeGreaterThanOrEqual(0);
+			const result = await recoverAfterTruncation(endAt + 1, { inline: true });
+			expect(result.markers, 'the inline terminal event reaches application listeners').toContain('end');
+			expect(result.recover).toBeUndefined();
+			const control = await recoverAfterTruncation(endAt + 1, { inline: true, withoutEvent: true });
+			expect(control.recover).toEqual(request.recover);
+		});
+
+		it('resumes after a truncated recovery from the frames past the ack, under the epoch the ack reports', async () => {
+			const { request, topic, frames, ackAt } = truncationVector(true);
+			const live = frames.slice(ackAt + 1).filter((f) => f.topic === topic && typeof f.seq === 'number');
+			expect(live.length).toBeGreaterThan(0);
+			// Rehydrate and the ack report the replacement generation. Later
+			// truncation must retain it when the following live frame seeds an offset.
+			expect(frames[ackAt].epoch).not.toBe(request.recover.epoch);
+			const { recover } = await recoverAfterTruncation(frames.length, { withRehydrate: true });
+			expect(recover).toEqual({ offset: live.at(-1).seq, epoch: frames[ackAt].epoch });
+		});
+
+		it('advertises relay.resync:1, which is what opts it into gap markers', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+			const hello = ws._sent.map((s) => JSON.parse(s)).find((m) => m.type === 'hello');
+			expect(hello, 'the client negotiates capabilities on connect').toBeTruthy();
+			expect(hello.caps, 'without this token the server never sends a gap marker').toContain('relay.resync:1');
+			conn.close();
+		});
+
+		it('does not re-send a topic refused for any other reason', async () => {
+			vi.useFakeTimers();
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const conn = clientModule.connect();
+			const store = clientModule.on('private');
+			const unsub = store.subscribe(() => {});
+			await vi.advanceTimersByTimeAsync(0);
+			const ws = MockWebSocket._last;
+			ws._sent.length = 0;
+
+			ws._receive({ type: 'subscribe-denied', topic: 'private', ref: 4, reason: 'FORBIDDEN' });
+			await vi.advanceTimersByTimeAsync(600);
+
+			expect(ws._sent).toHaveLength(0);
+
+			unsub();
+			warnSpy.mockRestore();
+			conn.close();
+			vi.useRealTimers();
+		});
+
+		it('drops a pending retry for a topic the application released', async () => {
+			vi.useFakeTimers();
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const conn = clientModule.connect();
+			const store = clientModule.on('transient');
+			const unsub = store.subscribe(() => {});
+			await vi.advanceTimersByTimeAsync(0);
+			const ws = MockWebSocket._last;
+			ws._sent.length = 0;
+
+			ws._receive({ type: 'subscribe-denied', topic: 'transient', ref: 5, reason: 'RATE_LIMITED' });
+			// The application stops wanting the topic while the retry is armed:
+			// the retry must not resurrect a released subscription.
+			unsub();
+			conn.unsubscribe('transient');
+			ws._sent.length = 0;
+			await vi.advanceTimersByTimeAsync(600);
+
+			const resurrect = ws._sent
+				.map((s) => JSON.parse(s))
+				.filter((m) => (m.type === 'subscribe-batch' && m.topics?.includes('transient')) ||
+					(m.type === 'subscribe' && m.topic === 'transient'));
+			expect(resurrect).toHaveLength(0);
+
+			warnSpy.mockRestore();
+			conn.close();
+			vi.useRealTimers();
+		});
+
+		it('routes hostile denial values through structured ASCII-safe diagnostics', async () => {
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const topic = 'admin' + String.fromCodePoint(0x0007, 0x0085, 0x202e, 0x05d0);
+			const reason = 'denied' + String.fromCodePoint(0x2068, 0x05d1);
+			const conn = clientModule.connect();
+			await flush();
+			MockWebSocket._last._receive({ type: 'subscribe-denied', topic, ref: 17, reason });
+
+			expect(warnSpy).toHaveBeenCalledTimes(1);
+			const line = warnSpy.mock.calls[0][0];
+			expect(line).toContain('event=client.subscription.denied severity=warn');
+			expect(/[\u0000-\u001f\u007f-\uffff]/u.test(line)).toBe(false);
+			const parsed = parseDiagnostic(line);
+			expect(parsed?.format).toBe('canonical');
+			expect(parsed?.record.attributes).toMatchObject({ topic, reason, ref: 17 });
+
+			warnSpy.mockRestore();
+			conn.close();
+		});
+
+		it('does not dispatch subscribed/denied as data events', async () => {
+			const store = clientModule.on('chat');
+			const events = [];
+			const unsub = store.subscribe((v) => { if (v) events.push(v); });
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._receive({ type: 'subscribed', topic: 'chat', ref: 1 });
+			ws._receive({ type: 'subscribe-denied', topic: 'chat', ref: 2, reason: 'FORBIDDEN' });
+			ws._receive({ topic: 'chat', event: 'msg', data: 'live' });
+
+			expect(events).toHaveLength(1);
+			expect(events[0].data).toBe('live');
+
+			unsub();
+			clientModule.connect().close();
+		});
+
+		it('exports a top-level denials store', async () => {
+			const seen = [];
+			const unsub = clientModule.denials.subscribe((d) => { if (d) seen.push(d); });
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._receive({ type: 'subscribe-denied', topic: 'x', ref: 1, reason: 'FORBIDDEN' });
+
+			expect(seen).toHaveLength(1);
+			expect(seen[0].topic).toBe('x');
+
+			unsub();
+			clientModule.connect().close();
+		});
+	});
+
+	describe('initial-mount subscribe-batch coalescing (real module)', () => {
+		it('coalesces multiple same-microtask subscribes into one subscribe-batch frame', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._sent.length = 0;
+
+			const a = clientModule.on('feed-a').subscribe(() => {});
+			const b = clientModule.on('feed-b').subscribe(() => {});
+			const c = clientModule.on('feed-c').subscribe(() => {});
+			await flush();
+
+			const sent = ws._sent.map(s => JSON.parse(s));
+			const batches = sent.filter(m => m.type === 'subscribe-batch');
+			const singles = sent.filter(m => m.type === 'subscribe');
+			expect(batches).toHaveLength(1);
+			expect(batches[0].topics).toEqual(['feed-a', 'feed-b', 'feed-c']);
+			expect(singles).toHaveLength(0);
+
+			a();
+			b();
+			c();
+			conn.close();
+		});
+
+		it('keeps single-topic subscribe as a plain subscribe frame', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._sent.length = 0;
+
+			const unsub = clientModule.on('only-topic').subscribe(() => {});
+			await flush();
+
+			const sent = ws._sent.map(s => JSON.parse(s));
+			const subs = sent.filter(m => m.type === 'subscribe');
+			const batches = sent.filter(m => m.type === 'subscribe-batch');
+			expect(subs).toHaveLength(1);
+			expect(subs[0].topic).toBe('only-topic');
+			expect(batches).toHaveLength(0);
+
+			unsub();
+			conn.close();
+		});
+
+		it('emits a fresh batch per microtask when subscribes are spread across awaits', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._sent.length = 0;
+
+			const a = clientModule.on('a').subscribe(() => {});
+			const b = clientModule.on('b').subscribe(() => {});
+			await flush();
+			const c = clientModule.on('c').subscribe(() => {});
+			await flush();
+
+			const sent = ws._sent.map(s => JSON.parse(s));
+			const batches = sent.filter(m => m.type === 'subscribe-batch');
+			const singles = sent.filter(m => m.type === 'subscribe');
+			// First microtask coalesced 2 -> one subscribe-batch.
+			expect(batches).toHaveLength(1);
+			expect(batches[0].topics).toEqual(['a', 'b']);
+			// Second microtask had only one topic -> plain subscribe.
+			expect(singles).toHaveLength(1);
+			expect(singles[0].topic).toBe('c');
+
+			a(); b(); c();
+			conn.close();
+		});
+
+		it('sends nothing while disconnected; reconnect path picks up the topics', async () => {
+			vi.useFakeTimers();
+			const conn = clientModule.connect();
+			await vi.advanceTimersByTimeAsync(0);
+			const ws1 = MockWebSocket._last;
+
+			ws1.close(1006);
+			await vi.advanceTimersByTimeAsync(0);
+
+			// Subscribe while the socket is closed; the queued frame
+			// should NOT go out, and the topic must land in subscribedTopics
+			// so the reconnect path resubscribes it.
+			const unsub = clientModule.on('queued-topic').subscribe(() => {});
+			await vi.advanceTimersByTimeAsync(0);
+
+			// No new ws yet; nothing to assert against.
+			await vi.advanceTimersByTimeAsync(10000);
+			const ws2 = MockWebSocket._last;
+			expect(ws2).not.toBe(ws1);
+
+			const sent = ws2._sent.map(s => JSON.parse(s));
+			const batches = sent.filter(m => m.type === 'subscribe-batch');
+			expect(batches.length).toBeGreaterThan(0);
+			// Reconnect path resubscribes via subscribe-batch.
+			const allTopics = batches.flatMap(b => b.topics);
+			expect(allTopics).toContain('queued-topic');
+
+			unsub();
+			conn.close();
+			vi.useRealTimers();
+		});
+
+		it('does not double-emit when subscribe is called inside a topic-store handler', async () => {
+			// A consumer that subscribes inside an event-handler runs in a
+			// separate microtask from the original subscribe; both paths
+			// should produce correct (possibly distinct) frames without
+			// duplicates.
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._sent.length = 0;
+
+			const a = clientModule.on('first').subscribe(() => {
+				clientModule.on('second').subscribe(() => {});
+			});
+			await flush();
+			await flush();
+
+			const sent = ws._sent.map(s => JSON.parse(s));
+			const subs = sent.filter(m => m.type === 'subscribe');
+			const batches = sent.filter(m => m.type === 'subscribe-batch');
+			const allSubscribed = [
+				...subs.map(s => s.topic),
+				...batches.flatMap(b => b.topics)
+			];
+			// 'first' and 'second' each appear exactly once across all frames.
+			expect(allSubscribed.filter(t => t === 'first')).toHaveLength(1);
+			expect(allSubscribed.filter(t => t === 'second')).toHaveLength(1);
+
+			a();
+			conn.close();
+		});
+	});
+
+	describe('onRequest push-with-reply (real module)', () => {
+		it('replies with the handler return value', async () => {
+			const conn = clientModule.connect();
+			conn.onRequest((event, data) => ({ event, data, ok: true }));
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._receive({ type: 'request', ref: 1, event: 'ping', data: { n: 7 } });
+
+			await flush();
+			const reply = ws._sent.map(s => JSON.parse(s)).find(m => m.type === 'reply');
+			expect(reply).toEqual({ type: 'reply', ref: 1, data: { event: 'ping', data: { n: 7 }, ok: true } });
+
+			conn.close();
+		});
+
+		it('awaits async handler before replying', async () => {
+			const conn = clientModule.connect();
+			conn.onRequest(async (event) => {
+				await new Promise(r => setTimeout(r, 20));
+				return { event, async: true };
+			});
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._receive({ type: 'request', ref: 5, event: 'slow', data: null });
+
+			// Reply has not been sent yet
+			await flush();
+			expect(ws._sent.map(s => JSON.parse(s)).find(m => m.type === 'reply')).toBeUndefined();
+
+			await new Promise(r => setTimeout(r, 50));
+			const reply = ws._sent.map(s => JSON.parse(s)).find(m => m.type === 'reply');
+			expect(reply).toEqual({ type: 'reply', ref: 5, data: { event: 'slow', async: true } });
+
+			conn.close();
+		});
+
+		it('sends an error reply when the handler throws', async () => {
+			const conn = clientModule.connect();
+			conn.onRequest(() => { throw new Error('handler exploded'); });
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._receive({ type: 'request', ref: 9, event: 'risky', data: null });
+
+			await flush();
+			const reply = ws._sent.map(s => JSON.parse(s)).find(m => m.type === 'reply');
+			expect(reply).toEqual({ type: 'reply', ref: 9, error: 'handler exploded' });
+
+			conn.close();
+		});
+
+		it('sends an error reply when an async handler rejects', async () => {
+			const conn = clientModule.connect();
+			conn.onRequest(async () => { throw new Error('async fail'); });
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._receive({ type: 'request', ref: 11, event: 'risky', data: null });
+
+			await new Promise(r => setTimeout(r, 20));
+			const reply = ws._sent.map(s => JSON.parse(s)).find(m => m.type === 'reply');
+			expect(reply).toEqual({ type: 'reply', ref: 11, error: 'async fail' });
+
+			conn.close();
+		});
+
+		it('drops request frames silently when no handler is installed', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._sent.length = 0;
+			ws._receive({ type: 'request', ref: 1, event: 'whatever', data: null });
+
+			await flush();
+			const reply = ws._sent.map(s => JSON.parse(s)).find(m => m.type === 'reply');
+			expect(reply).toBeUndefined();
+
+			conn.close();
+		});
+
+		it('replaces the handler on a second onRequest call', async () => {
+			const conn = clientModule.connect();
+			conn.onRequest(() => 'first');
+			conn.onRequest(() => 'second');
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._receive({ type: 'request', ref: 1, event: 'x', data: null });
+
+			await flush();
+			const reply = ws._sent.map(s => JSON.parse(s)).find(m => m.type === 'reply');
+			expect(reply.data).toBe('second');
+
+			conn.close();
+		});
+
+		it('unsubscribe clears only the matching handler', async () => {
+			const conn = clientModule.connect();
+			const fn1 = () => 'one';
+			const fn2 = () => 'two';
+			const unsub1 = conn.onRequest(fn1);
+			conn.onRequest(fn2);
+			// fn1 is no longer active; unsub1 should be a no-op
+			unsub1();
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._receive({ type: 'request', ref: 1, event: 'x', data: null });
+
+			await flush();
+			const reply = ws._sent.map(s => JSON.parse(s)).find(m => m.type === 'reply');
+			expect(reply.data).toBe('two');
+
+			conn.close();
+		});
+
+		it('does not dispatch request frames as data events', async () => {
+			const store = clientModule.on('chat');
+			const events = [];
+			const unsub = store.subscribe((v) => { if (v) events.push(v); });
+			const conn = clientModule.connect();
+			conn.onRequest(() => null);
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._receive({ type: 'request', ref: 1, event: 'ping', data: null });
+			ws._receive({ topic: 'chat', event: 'msg', data: 'live' });
+
+			expect(events).toHaveLength(1);
+			expect(events[0].data).toBe('live');
+
+			unsub();
+			conn.close();
+		});
+
+		it('exports a top-level onRequest', async () => {
+			const unsub = clientModule.onRequest(() => 'top-level');
+			await flush();
+			const ws = MockWebSocket._last;
+			ws._receive({ type: 'request', ref: 1, event: 'x', data: null });
+
+			await flush();
+			const reply = ws._sent.map(s => JSON.parse(s)).find(m => m.type === 'reply');
+			expect(reply.data).toBe('top-level');
+
+			unsub();
+			clientModule.connect().close();
+		});
+	});
+
+	describe('connection state machine (real module)', () => {
+		afterEach(() => {
+			// Guard against tests that left fake timers active so the next
+			// test does not hang waiting on setTimeout that never fires.
+			vi.useRealTimers();
+		});
+
+		it('transitions through connecting -> open on a successful connect', async () => {
+			const states = [];
+			const unsub = clientModule.status.subscribe((v) => states.push(v));
+			await flush();
+
+			expect(states).toContain('connecting');
+			expect(states).toContain('open');
+			expect(states.indexOf('connecting')).toBeLessThan(states.indexOf('open'));
+
+			unsub();
+			clientModule.connect().close();
+		});
+
+		it('transitions to disconnected on a retryable close, then to connecting on retry', async () => {
+			vi.useFakeTimers();
+			const conn = clientModule.connect();
+			await vi.advanceTimersByTimeAsync(0);
+			const states = [];
+			const unsub = conn.status.subscribe((v) => states.push(v));
+
+			const ws = MockWebSocket._last;
+			ws.close(1006); // abnormal close, retryable
+			expect(states[states.length - 1]).toBe('disconnected');
+
+			await vi.advanceTimersByTimeAsync(10000);
+			expect(states).toContain('connecting');
+			expect(states.lastIndexOf('connecting')).toBeGreaterThan(states.lastIndexOf('disconnected'));
+
+			unsub();
+			conn.close();
+			vi.useRealTimers();
+		});
+
+		it('transitions to failed on a terminal close', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const states = [];
+			const unsub = conn.status.subscribe((v) => states.push(v));
+
+			const ws = MockWebSocket._last;
+			ws.close(4401); // unauthorized, terminal
+			expect(states[states.length - 1]).toBe('failed');
+
+			unsub();
+			conn.close();
+		});
+
+		it('transitions to failed when no retries are allowed', async () => {
+			const conn = clientModule.connect({ maxReconnectAttempts: 0 });
+			await flush();
+			const states = [];
+			const unsub = conn.status.subscribe((v) => states.push(v));
+
+			const ws = MockWebSocket._last;
+			ws.close(1006); // retryable, but maxReconnectAttempts is 0
+			expect(states[states.length - 1]).toBe('failed');
+
+			unsub();
+			conn.close();
+		});
+
+		it('transitions to failed on intentional close()', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const states = [];
+			const unsub = conn.status.subscribe((v) => states.push(v));
+
+			conn.close();
+			expect(states[states.length - 1]).toBe('failed');
+
+			unsub();
+		});
+
+		it('downgrades open to suspended when the tab is hidden, restores on visible', async () => {
+			const origDoc = globalThis.document;
+			let hidden = false;
+			let listener = null;
+			globalThis.document = /** @type {any} */ ({
+				get hidden() { return hidden; },
+				addEventListener(evt, fn) { if (evt === 'visibilitychange') listener = fn; },
+				removeEventListener() { listener = null; }
+			});
+
+			const conn = clientModule.connect();
+			await flush();
+			const states = [];
+			const unsub = conn.status.subscribe((v) => states.push(v));
+
+			expect(states[states.length - 1]).toBe('open');
+
+			hidden = true;
+			listener?.();
+			expect(states[states.length - 1]).toBe('suspended');
+
+			hidden = false;
+			listener?.();
+			expect(states[states.length - 1]).toBe('open');
+
+			unsub();
+			conn.close();
+			globalThis.document = origDoc;
+		});
+
+		it('opens directly into suspended when the tab is already hidden', async () => {
+			const origDoc = globalThis.document;
+			globalThis.document = /** @type {any} */ ({
+				hidden: true,
+				addEventListener() {},
+				removeEventListener() {}
+			});
+
+			const conn = clientModule.connect();
+			await flush();
+			const states = [];
+			const unsub = conn.status.subscribe((v) => states.push(v));
+
+			expect(states[states.length - 1]).toBe('suspended');
+
+			unsub();
+			conn.close();
+			globalThis.document = origDoc;
+		});
+
+		it('ready() resolves on suspended as well as open', async () => {
+			const origDoc = globalThis.document;
+			globalThis.document = /** @type {any} */ ({
+				hidden: true,
+				addEventListener() {},
+				removeEventListener() {}
+			});
+
+			const promise = clientModule.ready();
+			await flush();
+			await expect(promise).resolves.toBeUndefined();
+
+			clientModule.connect().close();
+			globalThis.document = origDoc;
+		});
+	});
+
+	describe('failure store (real module)', () => {
+		afterEach(async () => {
+			MockWebSocket._last = null;
+			vi.useRealTimers();
+		});
+
+		it('starts at null and stays null while connected', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			let last = 'unset';
+			const unsub = conn.failure.subscribe((v) => { last = v; });
+			expect(last).toBe(null);
+
+			unsub();
+			conn.close();
+		});
+
+		it('sets diagnosticReason and the exact deprecated alias for auth preflight failures', async () => {
+			const originalFetch = globalThis.fetch;
+			globalThis.fetch = vi.fn(async () => ({ ok: false, status: 401, statusText: 'Unauthorized' }));
+			try {
+				const conn = clientModule.connect({ auth: true });
+				const seen = [];
+				const unsub = conn.failure.subscribe((v) => seen.push(v));
+				await flush();
+				const last = seen[seen.length - 1];
+				expect(last).toEqual({
+					kind: 'auth-preflight', class: 'AUTH', status: 401,
+					diagnosticReason: 'Unauthorized', reason: 'Unauthorized'
+				});
+				unsub();
+				conn.close();
+			} finally {
+				globalThis.fetch = originalFetch;
+			}
+		});
+
+		it('treats a rate-limited preflight as throttling, retried no sooner than Retry-After', async () => {
+			// Clients behind one address share the per-IP preflight budget, so a
+			// 429 is not a verdict on this user; closing for good on it would lock
+			// every one of them out until a reload.
+			const originalFetch = globalThis.fetch;
+			globalThis.fetch = vi.fn(async () => ({
+				ok: false, status: 429, statusText: 'Too Many Requests',
+				headers: { get: (name) => (name.toLowerCase() === 'retry-after' ? '2' : null) }
+			}));
+			vi.useFakeTimers();
+			try {
+				const conn = clientModule.connect({ auth: true, reconnectInterval: 10, maxReconnectInterval: 20 });
+				const seen = [];
+				const unsubFailure = conn.failure.subscribe((v) => seen.push(v));
+				let closedForGood = false;
+				const unsubPerma = conn._permaClosed.subscribe((v) => { closedForGood = v; });
+				await vi.advanceTimersByTimeAsync(0);
+				expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+				expect(seen[seen.length - 1]).toEqual({
+					kind: 'auth-preflight', class: 'THROTTLE', status: 429,
+					diagnosticReason: 'Too Many Requests', reason: 'Too Many Requests'
+				});
+				expect(closedForGood).toBe(false);
+
+				await vi.advanceTimersByTimeAsync(1900);
+				expect(globalThis.fetch, 'not before the server asked').toHaveBeenCalledTimes(1);
+				await vi.advanceTimersByTimeAsync(300);
+				expect(globalThis.fetch, 'retried after Retry-After').toHaveBeenCalledTimes(2);
+				unsubFailure();
+				unsubPerma();
+				conn.close();
+			} finally {
+				vi.useRealTimers();
+				globalThis.fetch = originalFetch;
+			}
+		});
+
+		it('abandons a handshake the network never answers and tries again', async () => {
+			// No open, no error, no close ever arrives for this socket; without a
+			// bound the client would sit in 'connecting' for good.
+			vi.useFakeTimers();
+			MockWebSocket._holdHandshake = true;
+			try {
+				const conn = clientModule.connect({ reconnectInterval: 10, maxReconnectInterval: 20 });
+				await vi.advanceTimersByTimeAsync(0);
+				const stuck = MockWebSocket._last;
+				expect(stuck.readyState).toBe(MockWebSocket.CONNECTING);
+
+				await vi.advanceTimersByTimeAsync(14_900);
+				expect(stuck.readyState, 'still waiting inside the bound').toBe(MockWebSocket.CONNECTING);
+				expect(MockWebSocket._last).toBe(stuck);
+
+				MockWebSocket._holdHandshake = false;
+				await vi.advanceTimersByTimeAsync(300);
+				expect(stuck.readyState, 'the stuck attempt was abandoned').toBe(MockWebSocket.CLOSED);
+				expect(MockWebSocket._last, 'a fresh attempt was made').not.toBe(stuck);
+				expect(MockWebSocket._last.readyState).toBe(MockWebSocket.OPEN);
+				conn.close();
+			} finally {
+				MockWebSocket._holdHandshake = false;
+				vi.useRealTimers();
+			}
+		});
+
+		it('abandons an auth preflight that never answers and retries it', async () => {
+			const originalFetch = globalThis.fetch;
+			globalThis.fetch = vi.fn((_url, init) => new Promise((_resolve, reject) => {
+				init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+			}));
+			vi.useFakeTimers();
+			try {
+				const conn = clientModule.connect({ auth: true, reconnectInterval: 10, maxReconnectInterval: 20 });
+				const seen = [];
+				const unsub = conn.failure.subscribe((v) => seen.push(v));
+				await vi.advanceTimersByTimeAsync(0);
+				expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+				await vi.advanceTimersByTimeAsync(15_100);
+				expect(seen[seen.length - 1]).toMatchObject({ kind: 'auth-preflight', class: 'AUTH', status: 0 });
+				await vi.advanceTimersByTimeAsync(100);
+				expect(globalThis.fetch, 'the preflight is retried').toHaveBeenCalledTimes(2);
+				unsub();
+				conn.close();
+			} finally {
+				vi.useRealTimers();
+				globalThis.fetch = originalFetch;
+			}
+		});
+
+		it.each([
+			{
+				name: 'server failure',
+				fetchResult: () => Promise.resolve({ ok: false, status: 503, statusText: 'Service Unavailable' }),
+				status: 503,
+				diagnosticReason: 'Service Unavailable'
+			},
+			{
+				name: 'network failure',
+				fetchResult: () => Promise.reject(new Error('offline')),
+				status: 0,
+				diagnosticReason: 'network error'
+			}
+		])('sets diagnosticReason and its exact alias for transient auth $name', async ({ fetchResult, status, diagnosticReason }) => {
+			const originalFetch = globalThis.fetch;
+			globalThis.fetch = vi.fn(fetchResult);
+			try {
+				const conn = clientModule.connect({ auth: true });
+				const seen = [];
+				const unsub = conn.failure.subscribe((v) => seen.push(v));
+				await flush();
+				const last = seen[seen.length - 1];
+				expect(last).toEqual({
+					kind: 'auth-preflight', class: 'AUTH', status,
+					diagnosticReason, reason: diagnosticReason
+				});
+				expect(last.reason).toBe(last.diagnosticReason);
+				unsub();
+				conn.close();
+			} finally {
+				globalThis.fetch = originalFetch;
+			}
+		});
+
+		it('sets class=TERMINAL on a 4401 close, includes the code and reason', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const seen = [];
+			const unsub = conn.failure.subscribe((v) => seen.push(v));
+
+			const ws = MockWebSocket._last;
+			ws.close(4401, 'session expired');
+
+			const last = seen[seen.length - 1];
+			expect(last).toMatchObject({
+				kind: 'ws-close',
+				class: 'TERMINAL',
+				code: 4401,
+				diagnosticReason: 'session expired',
+				reason: 'session expired'
+			});
+			expect(last.reason).toBe(last.diagnosticReason);
+
+			unsub();
+			conn.close();
+		});
+
+		it('sets class=THROTTLE on a 4429 close', async () => {
+			vi.useFakeTimers();
+			const conn = clientModule.connect();
+			await vi.advanceTimersByTimeAsync(0);
+			const seen = [];
+			const unsub = conn.failure.subscribe((v) => seen.push(v));
+
+			const ws = MockWebSocket._last;
+			ws.close(4429, 'rate limited');
+
+			const last = seen[seen.length - 1];
+			expect(last).toMatchObject({
+				kind: 'ws-close',
+				class: 'THROTTLE',
+				code: 4429,
+				diagnosticReason: 'rate limited',
+				reason: 'rate limited'
+			});
+
+			unsub();
+			conn.close();
+			vi.useRealTimers();
+		});
+
+		it('sets class=RETRY on a 1006 abnormal close', async () => {
+			vi.useFakeTimers();
+			const conn = clientModule.connect();
+			await vi.advanceTimersByTimeAsync(0);
+			const seen = [];
+			const unsub = conn.failure.subscribe((v) => seen.push(v));
+
+			const ws = MockWebSocket._last;
+			ws.close(1006, 'network blip');
+
+			const last = seen[seen.length - 1];
+			expect(last).toEqual({
+				kind: 'ws-close',
+				class: 'RETRY',
+				code: 1006,
+				diagnosticReason: 'network blip',
+				reason: 'network blip'
+			});
+			expect(last.reason).toBe(last.diagnosticReason);
+
+			unsub();
+			conn.close();
+			vi.useRealTimers();
+		});
+
+		it('sets class=EXHAUSTED when max retries hit', async () => {
+			const conn = clientModule.connect({ maxReconnectAttempts: 0 });
+			await flush();
+			const seen = [];
+			const unsub = conn.failure.subscribe((v) => seen.push(v));
+
+			const ws = MockWebSocket._last;
+			ws.close(1006, 'transient blip');
+
+			// With maxReconnectAttempts: 0, scheduleReconnect bails to
+			// EXHAUSTED. The RETRY value lands first then is replaced
+			// by EXHAUSTED on the same tick.
+			const last = seen[seen.length - 1];
+			expect(last).toEqual({
+				kind: 'ws-close',
+				class: 'EXHAUSTED',
+				code: 1006,
+				diagnosticReason: 'transient blip',
+				reason: 'transient blip'
+			});
+			expect(last.reason).toBe(last.diagnosticReason);
+
+			unsub();
+			conn.close();
+		});
+
+		it('clears to null on the next successful open', async () => {
+			vi.useFakeTimers();
+			const conn = clientModule.connect();
+			await vi.advanceTimersByTimeAsync(0);
+			const seen = [];
+			const unsub = conn.failure.subscribe((v) => seen.push(v));
+
+			const ws = MockWebSocket._last;
+			ws.close(1006);
+			expect(seen[seen.length - 1]).toMatchObject({ class: 'RETRY' });
+
+			// Advance past the reconnect backoff so a new MockWebSocket is
+			// constructed; its onopen fires synchronously and clears the
+			// failure store.
+			await vi.advanceTimersByTimeAsync(10000);
+			expect(seen[seen.length - 1]).toBe(null);
+
+			unsub();
+			conn.close();
+			vi.useRealTimers();
+		});
+
+		it('does NOT set on intentional close() and clears any prior value', async () => {
+			vi.useFakeTimers();
+			const conn = clientModule.connect();
+			await vi.advanceTimersByTimeAsync(0);
+			const seen = [];
+			const unsub = conn.failure.subscribe((v) => seen.push(v));
+
+			// Trigger a RETRY first to load the store with a non-null value.
+			const ws = MockWebSocket._last;
+			ws.close(1006);
+			expect(seen[seen.length - 1]).toMatchObject({ class: 'RETRY' });
+
+			// Now intentionally close. failure should clear; status='failed'
+			// alone is the deliberately-ended signal.
+			conn.close();
+			expect(seen[seen.length - 1]).toBe(null);
+
+			unsub();
+			vi.useRealTimers();
+		});
+
+		it('exposes failure as a top-level export mirroring the connection one', async () => {
+			const conn = clientModule.connect();
+			await flush();
+			const moduleSeen = [];
+			const connSeen = [];
+			const u1 = clientModule.failure.subscribe((v) => moduleSeen.push(v));
+			const u2 = conn.failure.subscribe((v) => connSeen.push(v));
+
+			const ws = MockWebSocket._last;
+			ws.close(4403);
+
+			expect(moduleSeen[moduleSeen.length - 1]).toMatchObject({ class: 'TERMINAL', code: 4403 });
+			expect(connSeen[connSeen.length - 1]).toMatchObject({ class: 'TERMINAL', code: 4403 });
+
+			u1();
+			u2();
+			conn.close();
+		});
+	});
+});
