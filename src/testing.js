@@ -1,4 +1,8 @@
 import { assert, fatal, readAssertionCounts } from './runtime/utils/assertions.js';
+import { responseConnectionHeaders, responseContentLength, isResponseHopHeader, responseHeaderBytes } from './runtime/utils/response-headers.js';
+import { createDeliveryAuthorization, DEFAULT_DELIVERY_PENDING_BYTES } from './runtime/utils/delivery-authorization.js';
+import { activeTraceContext, trace } from './runtime/tracing.js';
+import { createUnaccountedSubscriptionRegistry, addLogicalSubscription, removeLogicalSubscription, accountClosedLogicalSubscriptions } from './runtime/utils/ws-symbols.js';
 import { completeSerializedEnvelope, envelopeData } from './runtime/utils/epoch.js';
 import { copyUpgradeUserData } from './runtime/utils/upgrade-user-data.js';
 import { isSet, isUint8Array, isNativeError } from 'node:util/types';
@@ -11,7 +15,7 @@ import { collapseByCoalesceKey, drainCoalesced } from './runtime/utils/testing-b
 import { createSeqBound } from './runtime/utils/seq-bound.js';
 import { createByteBudget, controlFrameBytes, MAX_CONTROL_EGRESS_BYTES, CONTROL_EGRESS_WINDOW_MS, CONTROL_FLOOD_CLOSE_CODE } from './runtime/utils/byte-budget.js';
 import { mergeSamples } from './runtime/utils/metrics-merge.js';
-import { buildBinaryFrame, allocWireId, wireIdAnnounce, createCapCounts, createLeaseState, leaseGrantFrame, leaseReportedSaturation, controlFrameTooLargeFrame, DEFAULT_GRANT } from './runtime/wire.js';
+import { buildBinaryFrame, allocWireId, retireWireId, wireIdAnnounce, createCapCounts, createLeaseState, leaseGrantFrame, leaseReportedSaturation, controlFrameTooLargeFrame, DEFAULT_GRANT } from './runtime/wire.js';
 import { createSharedWireIdTable } from './runtime/handler/shared-wire-id.js';
 import { FORBIDDEN_METHODS, send405, endText, endBodyless, sendHandshakeRefusal, assertResponseStatus } from './runtime/handler/testing-http-helpers.js';
 import { webSocketHandshakeRefusal, isWebSocketUpgradeAttempt, readUwsHandshake } from './runtime/utils/testing-ws-handshake.js';
@@ -131,6 +135,11 @@ function envelopeBody(topic, event, data) {
 /** Default shutdown budget in seconds, the same value the server entry defaults to. */
 const DEFAULT_SHUTDOWN_TIMEOUT_S = 30;
 
+// Outbound text lanes through the delivery boundary (see gateSendT).
+const OUTBOUND_APPLICATION = 0;
+const OUTBOUND_CONTROL = 1;
+const OUTBOUND_REPLACEABLE = 2;
+
 /**
  * The shutdown budget `close()` gives the app's `shutdown` hook, in ms.
  *
@@ -179,6 +188,14 @@ function whenAbortedT(signal) {
  * @returns {Promise<import('./testing.js').TestServer>}
  */
 export async function createTestServer(options = {}) {
+	// A connection whose delivery policy held frames resumes its coalesced keys
+	// once they have all reached the transport, as in production. The bound and
+	// overflow rule are production's defaults (maxBackpressure 1 MiB, no close).
+	const deliveryAuthorization = createDeliveryAuthorization({
+		maxPendingBytes: DEFAULT_DELIVERY_PENDING_BYTES,
+		closeOnOverflow: false,
+		onIdle: (ws) => flushCoalescedForT(ws)
+	});
 	const divergenceDiagnosticsT = createDivergenceDiagnosticStore();
 	// A permissive test double for a restrictive production deployment creates a
 	// false-green authorization test. Apply the same value guard as the adapter
@@ -716,24 +733,31 @@ export async function createTestServer(options = {}) {
 		const pending = userData[WS_COALESCED];
 		if (!pending || pending.size === 0) return;
 		let callerError = null;
-		const yielded = drainCoalesced(pending, (msg, key) => {
-			let payload;
-			let failure;
-			try {
-				const body = JSON.stringify(msg.data ?? null);
-				if (typeof body === 'string') payload = msg.prefix + body + '}';
-			}
-			catch (err) { failure = err; }
-			// A serializer may have queued a newer value for this key.
-			if (pending.get(key) !== msg) return 1;
-			if (payload === undefined) {
-				const err = isNativeError(failure) ? failure : new TypeError('sendCoalesced data has no JSON form');
-				if (msg === callerEntry) callerError = err;
-				else reportCoalescedFailureT(userData, msg, key, err);
-				return 1;
-			}
-			return sendOutboundT(ws, payload);
-		});
+		let yielded;
+		// One scope for every value this flush sends, as production.
+		const fanout = deliveryAuthorization.begin();
+		try {
+			yielded = drainCoalesced(pending, (msg, key) => {
+				let payload;
+				let failure;
+				try {
+					const body = JSON.stringify(msg.data ?? null);
+					if (typeof body === 'string') payload = msg.prefix + body + '}';
+				}
+				catch (err) { failure = err; }
+				// A serializer may have queued a newer value for this key.
+				if (pending.get(key) !== msg) return 1;
+				if (payload === undefined) {
+					const err = isNativeError(failure) ? failure : new TypeError('sendCoalesced data has no JSON form');
+					if (msg === callerEntry) callerError = err;
+					else reportCoalescedFailureT(userData, msg, key, err);
+					return 1;
+				}
+				return sendOutboundT(ws, payload, true, OUTBOUND_REPLACEABLE);
+			});
+		} finally {
+			deliveryAuthorization.finish(fanout);
+		}
 		if (yielded && !coalescedContinuationsT.has(pending)) {
 			coalescedContinuationsT.add(pending);
 			setTimer(() => {
@@ -762,23 +786,32 @@ export async function createTestServer(options = {}) {
 	 * @param {string} payload
 	 * @param {boolean} [countStats] - false for topic broadcasts
 	 */
-	function sendOutboundT(ws, payload, countStats = true) {
+	function sendOutboundT(ws, payload, countStats = true, kind = OUTBOUND_APPLICATION, cache = null) {
 		if (chaos.shouldDropOutbound()) return 0;
 		const delay = chaos.getDelayMs();
 		if (delay > 0) {
 			setTimer(() => {
 				let result;
-				try { result = ws.send(payload, false, false); }
+				try { result = gateSendT(ws, payload, kind, cache); }
 				catch { closedWsAbortsT++; return; }
 				if (countStats && result !== 2) bumpOutT(ws, payload);
 			}, delay);
 			return 1;
 		}
 		let result;
-		try { result = ws.send(payload, false, false); }
+		try { result = gateSendT(ws, payload, kind, cache); }
 		catch { closedWsAbortsT++; return 2; }
 		if (countStats && result !== 2) bumpOutT(ws, payload);
 		return result;
+	}
+
+	// The delivery boundary's three text lanes: an application frame the
+	// policy checks, a control frame it only orders, and a latest-value frame
+	// it refuses while it holds earlier frames.
+	function gateSendT(ws, payload, kind, cache) {
+		if (kind === OUTBOUND_CONTROL) return deliveryAuthorization.control(ws, payload);
+		if (kind === OUTBOUND_REPLACEABLE) return deliveryAuthorization.sendReplaceable(ws, payload);
+		return deliveryAuthorization.send(ws, payload, false, false, null, cache);
 	}
 
 	/**
@@ -803,7 +836,7 @@ export async function createTestServer(options = {}) {
 	function sendControlT(ws, payload) {
 		let ud;
 		try { ud = ws.getUserData(); }
-		catch { return sendOutboundT(ws, payload); }
+		catch { return sendOutboundT(ws, payload, true, OUTBOUND_CONTROL); }
 		let budget = ud[WS_CONTROL_BUDGET];
 		if (budget === null) return 2;
 		if (budget === undefined) {
@@ -816,7 +849,7 @@ export async function createTestServer(options = {}) {
 			catch { closedWsAbortsT++; }
 			return 2;
 		}
-		return sendOutboundT(ws, payload);
+		return sendOutboundT(ws, payload, true, OUTBOUND_CONTROL);
 	}
 
 	/**
@@ -825,21 +858,22 @@ export async function createTestServer(options = {}) {
 	 * @param {import('./index.js').WebSocket<any>} ws
 	 * @param {Uint8Array} frame
 	 * @param {boolean} [countStats] - false for topic broadcasts
+	 * @param {string | null} [topic] - the frame's application topic
 	 */
-	function sendOutboundBinaryT(ws, frame, countStats = true) {
+	function sendOutboundBinaryT(ws, frame, countStats = true, topic = null) {
 		if (chaos.shouldDropOutbound()) return 0;
 		const delay = chaos.getDelayMs();
 		if (delay > 0) {
 			setTimer(() => {
 				let result;
-				try { result = ws.send(frame, true, false); }
+				try { result = deliveryAuthorization.send(ws, frame, true, false, topic); }
 				catch { closedWsAbortsT++; return; }
 				if (countStats && result !== 2) bumpOutT(ws, frame);
 			}, delay);
 			return 1;
 		}
 		let result;
-		try { result = ws.send(frame, true, false); }
+		try { result = deliveryAuthorization.send(ws, frame, true, false, topic); }
 		catch { closedWsAbortsT++; return 2; }
 		if (countStats && result !== 2) bumpOutT(ws, frame);
 		return result;
@@ -847,8 +881,8 @@ export async function createTestServer(options = {}) {
 
 	// Topic fan-out is excluded from per-connection close counters, as in
 	// production. Keep the typed send paths and their fault-injection behavior.
-	function sendWireFanoutT(ws, value, binary = false) {
-		return binary ? sendOutboundBinaryT(ws, value, false) : sendOutboundT(ws, value, false);
+	function sendWireFanoutT(ws, value, binary = false, topic = null, cache = null) {
+		return binary ? sendOutboundBinaryT(ws, value, false, topic) : sendOutboundT(ws, value, false, OUTBOUND_APPLICATION, cache);
 	}
 
 	// Binary wire (0x03) capability accounting + topic-id assignment, mirroring
@@ -883,7 +917,10 @@ export async function createTestServer(options = {}) {
 			// budget like every other one - and a connection the budget cut is a
 			// dropped announce too (sendControlT answers 2 for both).
 			const result = sendControlT(ws, wireIdAnnounce(topic, id));
-			if (result === 2) return -1;
+			if (result === 2) {
+				retireWireId(ud, WS_TOPIC_IDS, topic);
+				return -1;
+			}
 		}
 		return id;
 	}
@@ -1073,15 +1110,21 @@ export async function createTestServer(options = {}) {
 	function flushResumeTopicT(handle, topic, coveredSeq) {
 		const entry = handle.entries.find((e) => e.topic === topic);
 		if (entry === undefined) return;
-		if (entry.buffer.overflow) {
-			// Overflow: signal truncation FIRST so the resync marker is not lost
-			// behind the partial flush (mirror of handler/resume-buffer.js).
-			sendOutboundT(handle.ws, '{"topic":' + JSON.stringify('__replay:' + topic) + ',"event":"truncated","data":null}');
-		}
-		const floor = typeof coveredSeq === 'number' ? coveredSeq : entry.before;
-		for (const f of entry.buffer.frames) {
-			if (f.seq !== null && f.seq !== undefined && f.seq <= floor) continue;
-			sendOutboundT(handle.ws, f.env);
+		// One scope for the whole flush, as production.
+		const fanout = deliveryAuthorization.begin();
+		try {
+			if (entry.buffer.overflow) {
+				// Overflow: signal truncation FIRST so the resync marker is not lost
+				// behind the partial flush (mirror of handler/resume-buffer.js).
+				sendOutboundT(handle.ws, '{"topic":' + JSON.stringify('__replay:' + topic) + ',"event":"truncated","data":null}', true, OUTBOUND_CONTROL);
+			}
+			const floor = typeof coveredSeq === 'number' ? coveredSeq : entry.before;
+			for (const f of entry.buffer.frames) {
+				if (f.seq !== null && f.seq !== undefined && f.seq <= floor) continue;
+				sendOutboundT(handle.ws, f.env);
+			}
+		} finally {
+			deliveryAuthorization.finish(fanout);
 		}
 		unregisterResumeT(entry);
 		// Drop the entry from the handle too, so a repeat flush for this topic is a
@@ -1109,6 +1152,9 @@ export async function createTestServer(options = {}) {
 	}
 
 	const platform = {
+		authorizeDelivery(callback, options) { deliveryAuthorization.configure(callback, options); },
+		get traceContext() { return activeTraceContext(); },
+		trace,
 		// The observer lane's deny-unwind (authorizeDerivedSubscribe) runs the
 		// app's unsubscribe hook through this slot - the shared primitive has no
 		// reference to this server's hook container. Per-platform rather than
@@ -1123,7 +1169,7 @@ export async function createTestServer(options = {}) {
 		// WS_COHORT_JOIN.
 		[WS_RELEASE_MEMBERSHIP](ws, ud, topic) {
 			try { ws.unsubscribe(topic); } catch { return null; }
-			return ud[WS_SUBSCRIPTIONS].delete(topic);
+			return removeLogicalSubscription(ud[WS_SUBSCRIPTIONS], topic);
 		},
 		[WS_COHORT_JOIN](ws, ud, topic) {
 			if (sharedTopicsT.has(topic)) joinCohortT(ws, ud, topic, sharedTopicsT.get(topic));
@@ -1132,46 +1178,59 @@ export async function createTestServer(options = {}) {
 			if (sharedTopicsT.has(topic)) leaveCohortT(ws, ud, topic);
 		},
 		publish(topic, event, data, options) {
-			// The seq VALUE first, so a refusal does not depend on whether a
-			// budget happens to be armed - as production. An app validating
-			// against this harness must meet the same TypeError it will meet
-			// under `npm start`, not a `false` that reads as a quiet shed.
-			assertStampableSeq(options != null ? options.seq : undefined);
-			// Egress admission before the stamp, exactly as production: a
-			// refused publish consumes no sequence and reaches no transport.
-			const recipients = app.numSubscribers(topic);
-			let egressTenant = null;
-			if (egressAccountT.enabled) {
-				egressTenant = egressTenantForT(topic);
-				// An event whose batch already decided for the whole call
-				// charges but does not re-decide; see production's publish().
-				if (!admittedByBatch(options) &&
-					!egressAccountT.admit(topic, egressTenant, 1, recipients)) return false;
+			if (deliveryAuthorization.deciding) {
+				const captured = options == null ? options : { seq: options.seq, relay: options.relay, compress: options.compress, jitterMs: options.jitterMs };
+				assertStampableSeq(captured?.seq);
+				if (admittedByBatch(options)) markAdmitted(captured);
+				deliveryAuthorization.deferOperation(() => platform.publish(topic, event, data, captured));
+				return app.numSubscribers(topic) > 0;
 			}
-			const body = envelopeBody(topic, event, data);
-			const seq = stampSeq(options, topicSeqs, topic, seqBoundT);
-			const msg = completeSerializedEnvelope(body, seq);
-			chargeEgressT(topic, egressTenant, 1, recipients, chargeableBytes(msg, recipients));
-			// Relay the already-built envelope to other workers (sim), mirroring
-			// handler.js's `relayed = parentPort && options.relay !== false` gate.
-			if (onPublishT && !(options && options.relay === false)) {
-				onPublishT({ kind: 'publish', topic, envelope: msg, seq, compress: !!(options && options.compress) });
+			const operation = deliveryAuthorization.begin();
+			try {
+				// The seq VALUE first, so a refusal does not depend on whether a
+				// budget happens to be armed - as production. An app validating
+				// against this harness must meet the same TypeError it will meet
+				// under `npm start`, not a `false` that reads as a quiet shed.
+				assertStampableSeq(options != null ? options.seq : undefined);
+				// Egress admission before the stamp, exactly as production: a
+				// refused publish consumes no sequence and reaches no transport.
+				const recipients = app.numSubscribers(topic);
+				let egressTenant = null;
+				if (egressAccountT.enabled) {
+					egressTenant = egressTenantForT(topic);
+					// An event whose batch already decided for the whole call
+					// charges but does not re-decide; see production's publish().
+					if (!admittedByBatch(options) &&
+						!egressAccountT.admit(topic, egressTenant, 1, recipients)) return false;
+				}
+				const body = envelopeBody(topic, event, data);
+				const seq = stampSeq(options, topicSeqs, topic, seqBoundT);
+				const msg = completeSerializedEnvelope(body, seq);
+				chargeEgressT(topic, egressTenant, 1, recipients, chargeableBytes(msg, recipients));
+				// Relay the already-built envelope to other workers (sim), mirroring
+				// handler.js's `relayed = parentPort && options.relay !== false` gate.
+				if (onPublishT && !(options && options.relay === false)) {
+					onPublishT({ kind: 'publish', topic, envelope: msg, seq, compress: !!(options && options.compress) });
+				}
+				if (resumeBuffersT.size > 0) captureResumeFrameT(topic, seq, msg);
+				// Fast path: hand fan-out to uWS's C++ TopicTree. Chaos cannot
+				// intercept C++ dispatch, so when a scenario is active we
+				// degrade to a JS-side fanout that consults the chaos state
+				// per recipient.
+				if (chaos.scenario === null) {
+					return deliveryAuthorization.publish(app, wsConnections, topic, msg, false, false);
+				}
+				let delivered = false;
+				for (const ws of wsConnections) {
+					if (!ws.isSubscribed(topic)) continue;
+					sendOutboundT(ws, msg, false);
+					delivered = true;
+				}
+				return delivered;
+
+			} finally {
+				deliveryAuthorization.finish(operation);
 			}
-			if (resumeBuffersT.size > 0) captureResumeFrameT(topic, seq, msg);
-			// Fast path: hand fan-out to the native topic tree. Chaos cannot
-			// intercept C++ dispatch, so when a scenario is active we
-			// degrade to a JS-side fanout that consults the chaos state
-			// per recipient.
-			if (chaos.scenario === null) {
-				return app.publish(topic, msg, false, false);
-			}
-			let delivered = false;
-			for (const ws of wsConnections) {
-				if (!ws.isSubscribed(topic)) continue;
-				sendOutboundT(ws, msg, false);
-				delivered = true;
-			}
-			return delivered;
 		},
 		send(ws, topic, event, data, options) {
 			// `compress` is accepted for Platform-shape parity and is a no-op
@@ -1183,136 +1242,65 @@ export async function createTestServer(options = {}) {
 			return sendOutboundT(ws, payload);
 		},
 		publishWire(topic, event, data, wire, options, relayToken, relaySeq) {
-			// Relay re-encode (mirrors handler.js publishWire): a relayed wire publish
-			// re-encodes binary against THIS server's local connections, stamping the
-			// carried origin seq verbatim (no re-stamp) and never re-relaying (the
-			// token suppresses the onPublishT relay below on its own). An ARGUMENT
-			// compared by identity, as production: a marker read off the options
-			// object would be answered by anything that answers every key.
-			const isRelay = relayToken === RELAY_RECEIVE_T;
-			// Egress admission, origin-side only (a relayed frame was charged on
-			// the worker that published it), before the stamp - as production.
-			let recipients = 0;
-			let egressTenant = null;
-			if (!isRelay) {
-				recipients = app.numSubscribers(topic);
-				const excludeOpt = (options && options.excludeWs) || null;
-				if (excludeOpt !== null && excludedRecipient(excludeOpt, topic)) recipients--;
-				if (egressAccountT.enabled) {
-					egressTenant = egressTenantForT(topic);
-					// An entry whose batch already decided for the whole call
-					// charges but does not re-decide; see production.
-					if (!admittedByBatch(options) &&
-						!egressAccountT.admit(topic, egressTenant, 1, recipients)) return false;
-				}
+			if (deliveryAuthorization.deciding) {
+				const captured = options == null ? options : { seq: options.seq, relay: options.relay, compress: options.compress, jitterMs: options.jitterMs, excludeWs: options.excludeWs };
+				if (relayToken !== RELAY_RECEIVE_T) assertStampableSeq(captured?.seq);
+				if (admittedByBatch(options)) markAdmitted(captured);
+				deliveryAuthorization.deferOperation(() => platform.publishWire(topic, event, data, wire, captured, relayToken, relaySeq));
+				return app.numSubscribers(topic) > 0;
 			}
-			const seq = isRelay
-				? (typeof relaySeq === 'number' ? relaySeq : null)
-				: stampSeq(options, topicSeqs, topic, seqBoundT);
-			const env = envelope(topic, event, data, seq);
-			// The relay carries the JSON envelope plus, for a registered codec, its
-			// capability + raw payload so the receiving server re-encodes binary
-			// locally (codec-aware relay, mirroring handler.js). An unregistered codec
-			// carries envelope-only. The relay fires once per publish regardless of
-			// sender exclusion: the excluded socket only exists on this instance.
-			const relayCap = (onPublishT && byCapabilityT.has(wire.capability)) ? wire.capability : undefined;
-			if (onPublishT && !isRelay && !(options && options.relay === false)) {
-				onPublishT({
-					kind: 'publish', topic, envelope: env, seq, compress: false,
-					capability: relayCap,
-					event: relayCap !== undefined ? event : undefined,
-					data: relayCap !== undefined ? data : undefined
-				});
-			}
-			if (resumeBuffersT.size > 0) captureResumeFrameT(topic, seq, env);
-			// Sender exclusion, mirroring handler.js: the single C++ app.publish
-			// fan-out cannot skip a socket, so an excluding publish always takes
-			// the per-subscriber walk.
-			const excludeWs = (options && options.excludeWs) || null;
-			// JSON fast path: no capable client.
-			if (excludeWs === null && !capCountsT.has(wire.capability)) {
-				if (!isRelay) chargeEgressT(topic, egressTenant, 1, recipients, chargeableBytes(env, recipients));
-				if (chaos.scenario === null) return app.publish(topic, env, false, false);
-				let delivered = false;
-				for (const ws of wsConnections) {
-					if (!ws.isSubscribed(topic)) continue;
-					sendWireFanoutT(ws, env);
-					delivered = true;
-				}
-				return delivered;
-			}
-			const seqOnWire = seq == null ? 0 : seq;
-			// Stateful codec: per-connection encode (null-state connections share
-			// one encode-once frame, memoized by topic-id). Mirrors handler.js.
-			if (wire.state) {
-				// A stateful codec's frames are recipient-specific, so the JSON
-				// envelope is the charged per-recipient size - as production.
-				if (!isRelay) chargeEgressT(topic, egressTenant, 1, recipients, chargeableBytes(env, recipients));
-				let sharedPayload;
-				let sharedEncoded = false;
-				/** @type {Map<number, Uint8Array>} */
-				const sharedFrameById = new Map();
-				let delivered = false;
-				for (const ws of wsConnections) {
-					if (ws === excludeWs) continue;
-					let ud;
-					try { ud = ws.getUserData(); } catch { continue; }
-					const subs = ud[WS_SUBSCRIPTIONS];
-					if (!subs || !subs.has(topic)) continue;
-					const caps = ud[WS_CAPS];
-					if (!caps || !caps.has(wire.capability)) { sendWireFanoutT(ws, env); delivered = true; continue; }
-					const state = ensureWireStateT(ws, ud, wire);
-					if (state == null) {
-						// A poisoned capability is served exactly like a caps-less
-						// connection: the shared JSON envelope, never binary.
-						if (wireStatePoisonedT(ud, wire.capability)) { sendWireFanoutT(ws, env); delivered = true; continue; }
-						if (!sharedEncoded) { sharedPayload = wire.encode(event, data, null); sharedEncoded = true; }
-						if (sharedPayload == null) { sendWireFanoutT(ws, env); delivered = true; continue; }
-						if (!isUint8Array(sharedPayload)) throw new TypeError('wire.encode must return Uint8Array or null');
-						const id = ensureWireIdT(ws, ud, topic);
-						if (id === -1) {
-							// Dropped wire-id announce: JSON for this frame + poison.
-							poisonWireStateT(ws, ud, wire.capability);
-							sendWireFanoutT(ws, env);
-							delivered = true;
-							continue;
-						}
-						let frame = sharedFrameById.get(id);
-						if (!frame) { frame = buildBinaryFrame(wire.schemaVersion, id, seqOnWire, sharedPayload); sharedFrameById.set(id, frame); }
-						// A dropped shared frame needs no poisoning: the payload
-						// carries no per-connection state.
-						sendWireFanoutT(ws, frame, true);
-					} else {
-						const payload = wire.encode(event, data, state);
-						if (payload == null) { sendWireFanoutT(ws, env); delivered = true; continue; }
-						if (!isUint8Array(payload)) throw new TypeError('wire.encode must return Uint8Array or null');
-						const sv = typeof state.schemaVersion === 'number' ? state.schemaVersion : wire.schemaVersion;
-						const id = ensureWireIdT(ws, ud, topic);
-						if (id === -1) {
-							// Dropped wire-id announce: JSON for this frame + poison.
-							poisonWireStateT(ws, ud, wire.capability);
-							sendWireFanoutT(ws, env);
-							delivered = true;
-							continue;
-						}
-						const result = sendWireFanoutT(ws, buildBinaryFrame(sv, id, seqOnWire, payload), true);
-						// 2 = dropped past maxBackpressure (0 = enqueued or a chaos
-						// drop, NOT a drop here). The encode above already mutated
-						// this connection's dictionary for the dropped frame, so
-						// degrade the capability to JSON until reconnect.
-						if (result === 2) poisonWireStateT(ws, ud, wire.capability);
+			const operation = deliveryAuthorization.begin();
+			try {
+				// Relay re-encode (mirrors handler.js publishWire): a relayed wire publish
+				// re-encodes binary against THIS server's local connections, stamping the
+				// carried origin seq verbatim (no re-stamp) and never re-relaying (the
+				// token suppresses the onPublishT relay below on its own). An ARGUMENT
+				// compared by identity, as production: a marker read off the options
+				// object would be answered by anything that answers every key.
+				const isRelay = relayToken === RELAY_RECEIVE_T;
+				// Egress admission, origin-side only (a relayed frame was charged on
+				// the worker that published it), before the stamp - as production.
+				let recipients = 0;
+				let egressTenant = null;
+				if (!isRelay) {
+					recipients = app.numSubscribers(topic);
+					const excludeOpt = (options && options.excludeWs) || null;
+					if (excludeOpt !== null && excludedRecipient(excludeOpt, topic)) recipients--;
+					if (egressAccountT.enabled) {
+						egressTenant = egressTenantForT(topic);
+						// An entry whose batch already decided for the whole call
+						// charges but does not re-decide; see production.
+						if (!admittedByBatch(options) &&
+							!egressAccountT.admit(topic, egressTenant, 1, recipients)) return false;
 					}
-					delivered = true;
 				}
-				return delivered;
-			}
-			// Stateless codec: encode once, send many.
-			const payload = encodeStatelessWirePayload(wire, event, data);
-			if (payload == null) {
-				// Declined frame: every recipient gets the JSON envelope.
-				if (!isRelay) chargeEgressT(topic, egressTenant, 1, recipients, chargeableBytes(env, recipients));
-				if (excludeWs === null) {
-					if (chaos.scenario === null) return app.publish(topic, env, false, false);
+				const seq = isRelay
+					? (typeof relaySeq === 'number' ? relaySeq : null)
+					: stampSeq(options, topicSeqs, topic, seqBoundT);
+				const env = envelope(topic, event, data, seq);
+				// The relay carries the JSON envelope plus, for a registered codec, its
+				// capability + raw payload so the receiving server re-encodes binary
+				// locally (codec-aware relay, mirroring handler.js). An unregistered codec
+				// carries envelope-only. The relay fires once per publish regardless of
+				// sender exclusion: the excluded socket only exists on this instance.
+				const relayCap = (onPublishT && byCapabilityT.has(wire.capability)) ? wire.capability : undefined;
+				if (onPublishT && !isRelay && !(options && options.relay === false)) {
+					onPublishT({
+						kind: 'publish', topic, envelope: env, seq, compress: false,
+						capability: relayCap,
+						event: relayCap !== undefined ? event : undefined,
+						data: relayCap !== undefined ? data : undefined
+					});
+				}
+				if (resumeBuffersT.size > 0) captureResumeFrameT(topic, seq, env);
+				// Sender exclusion, mirroring handler.js: the single C++ app.publish
+				// fan-out cannot skip a socket, so an excluding publish always takes
+				// the per-subscriber walk.
+				const excludeWs = (options && options.excludeWs) || null;
+				// JSON fast path: no capable client.
+				if (excludeWs === null && !capCountsT.has(wire.capability)) {
+					if (!isRelay) chargeEgressT(topic, egressTenant, 1, recipients, chargeableBytes(env, recipients));
+					if (chaos.scenario === null) return deliveryAuthorization.publish(app, wsConnections, topic, env, false, false);
 					let delivered = false;
 					for (const ws of wsConnections) {
 						if (!ws.isSubscribed(topic)) continue;
@@ -1320,68 +1308,160 @@ export async function createTestServer(options = {}) {
 						delivered = true;
 					}
 					return delivered;
+
 				}
-				// Declined frame with sender exclusion: per-subscriber JSON walk,
-				// skipping the excluded socket. Mirrors handler.js.
-				return deliverStatelessWireFanout(wire, payload, {
-					topic, envelope: env, seq: seqOnWire, excludeWs, connections: wsConnections,
-					ensureId: ensureWireIdT, isPoisoned: wireStatePoisonedT,
-					poison: poisonWireStateT, send: sendWireFanoutT
-				});
-			}
-			// Shared binary fan-out (mirror of handler.js): the first shared publish
-			// migrates current subscribers into cohorts, then the publish is two native
-			// app.publish calls - the 0x03 frame to `topic\0bin`, the envelope to
-			// `topic\0json`. excludeWs falls through to the per-subscriber walk below.
-			if (wire.shared && excludeWs === null) {
-				if (!sharedTopicsT.has(topic)) {
+				const seqOnWire = seq == null ? 0 : seq;
+				// Stateful codec: per-connection encode (null-state connections share
+				// one encode-once frame, memoized by topic-id). Mirrors handler.js.
+				if (wire.state) {
+					// A stateful codec's frames are recipient-specific, so the JSON
+					// envelope is the charged per-recipient size - as production.
+					if (!isRelay) chargeEgressT(topic, egressTenant, 1, recipients, chargeableBytes(env, recipients));
+					let sharedPayload;
+					let sharedEncoded = false;
+					/** @type {Map<number, Uint8Array>} */
+					const sharedFrameById = new Map();
+					const envCache = deliveryAuthorization.cache();
+					let delivered = false;
 					for (const ws of wsConnections) {
+						if (ws === excludeWs) continue;
 						let ud;
 						try { ud = ws.getUserData(); } catch { continue; }
 						const subs = ud[WS_SUBSCRIPTIONS];
 						if (!subs || !subs.has(topic)) continue;
-						joinCohortT(ws, ud, topic, wire.capability);
+						const caps = ud[WS_CAPS];
+						if (!caps || !caps.has(wire.capability)) { sendWireFanoutT(ws, env, false, topic, envCache); delivered = true; continue; }
+						const state = ensureWireStateT(ws, ud, wire);
+						if (state == null) {
+							// A poisoned capability is served exactly like a caps-less
+							// connection: the shared JSON envelope, never binary.
+							if (wireStatePoisonedT(ud, wire.capability)) { sendWireFanoutT(ws, env, false, topic, envCache); delivered = true; continue; }
+							if (!sharedEncoded) { sharedPayload = wire.encode(event, data, null); sharedEncoded = true; }
+							if (sharedPayload == null) { sendWireFanoutT(ws, env, false, topic, envCache); delivered = true; continue; }
+							if (!isUint8Array(sharedPayload)) throw new TypeError('wire.encode must return Uint8Array or null');
+							const id = ensureWireIdT(ws, ud, topic);
+							if (id === -1) {
+								// Dropped wire-id announce: JSON for this frame + poison.
+								poisonWireStateT(ws, ud, wire.capability);
+								sendWireFanoutT(ws, env, false, topic, envCache);
+								delivered = true;
+								continue;
+							}
+							let frame = sharedFrameById.get(id);
+							if (!frame) { frame = buildBinaryFrame(wire.schemaVersion, id, seqOnWire, sharedPayload); sharedFrameById.set(id, frame); }
+							// A dropped shared frame needs no poisoning: the payload
+							// carries no per-connection state.
+							sendWireFanoutT(ws, frame, true, topic);
+						} else {
+							const payload = wire.encode(event, data, state);
+							if (payload == null) { sendWireFanoutT(ws, env, false, topic, envCache); delivered = true; continue; }
+							if (!isUint8Array(payload)) throw new TypeError('wire.encode must return Uint8Array or null');
+							const sv = typeof state.schemaVersion === 'number' ? state.schemaVersion : wire.schemaVersion;
+							const id = ensureWireIdT(ws, ud, topic);
+							if (id === -1) {
+								// Dropped wire-id announce: JSON for this frame + poison.
+								poisonWireStateT(ws, ud, wire.capability);
+								sendWireFanoutT(ws, env, false, topic, envCache);
+								delivered = true;
+								continue;
+							}
+							const result = sendWireFanoutT(ws, buildBinaryFrame(sv, id, seqOnWire, payload), true, topic);
+							// 2 = dropped past maxBackpressure (0 = enqueued or a chaos
+							// drop, NOT a drop here). The encode above already mutated
+							// this connection's dictionary for the dropped frame, so
+							// degrade the capability to JSON until reconnect.
+							if (result === 2) poisonWireStateT(ws, ud, wire.capability);
+						}
+						delivered = true;
 					}
-					sharedTopicsT.set(topic, wire.capability);
+
+					return delivered;
 				}
-				const { bin, json } = cohortTopicsT(topic);
-				// Cohort split charge, as production: the binary cohort pays its
-				// 0x03 frame, the JSON cohort its envelope.
+				// Stateless codec: encode once, send many.
+				const payload = encodeStatelessWirePayload(wire, event, data);
+				if (payload == null) {
+					// Declined frame: every recipient gets the JSON envelope.
+					if (!isRelay) chargeEgressT(topic, egressTenant, 1, recipients, chargeableBytes(env, recipients));
+					if (excludeWs === null) {
+						if (chaos.scenario === null) return deliveryAuthorization.publish(app, wsConnections, topic, env, false, false);
+						let delivered = false;
+						for (const ws of wsConnections) {
+							if (!ws.isSubscribed(topic)) continue;
+							sendWireFanoutT(ws, env);
+							delivered = true;
+						}
+						return delivered;
+
+					}
+					// Declined frame with sender exclusion: per-subscriber JSON walk,
+					// skipping the excluded socket. Mirrors handler.js.
+					return deliverStatelessWireFanout(wire, payload, {
+						topic, envelope: env, seq: seqOnWire, excludeWs, connections: wsConnections,
+						ensureId: ensureWireIdT, isPoisoned: wireStatePoisonedT,
+						poison: poisonWireStateT, send: sendWireFanoutT, cache: deliveryAuthorization.cache()
+					});
+
+				}
+				// Shared binary fan-out (mirror of handler.js): the first shared publish
+				// migrates current subscribers into cohorts, then the publish is two native
+				// app.publish calls - the 0x03 frame to `topic\0bin`, the envelope to
+				// `topic\0json`. excludeWs falls through to the per-subscriber walk below.
+				if (wire.shared && excludeWs === null) {
+					if (!sharedTopicsT.has(topic)) {
+						for (const ws of wsConnections) {
+							let ud;
+							try { ud = ws.getUserData(); } catch { continue; }
+							const subs = ud[WS_SUBSCRIPTIONS];
+							if (!subs || !subs.has(topic)) continue;
+							joinCohortT(ws, ud, topic, wire.capability);
+						}
+						sharedTopicsT.set(topic, wire.capability);
+					}
+					const { bin, json } = cohortTopicsT(topic);
+					// Cohort split charge, as production: the binary cohort pays its
+					// 0x03 frame, the JSON cohort its envelope.
+					if (!isRelay) {
+						chargeEgressT(topic, egressTenant, 1, recipients,
+							binaryFrameChargeBytes(payload.length, seqOnWire) * app.numSubscribers(bin) +
+							chargeableBytes(env, app.numSubscribers(json)));
+					}
+					const id = sharedWireIds.get(topic);
+					const frame = id !== undefined ? buildBinaryFrame(wire.schemaVersion, id, seqOnWire, payload) : null;
+					// One scope for both cohorts, as production.
+					if (chaos.scenario === null) {
+						if (frame) deliveryAuthorization.publish(app, wsConnections, bin, frame, true, false, topic);
+						deliveryAuthorization.publish(app, wsConnections, json, env, false, false);
+					} else {
+						// Chaos cannot intercept the app's C++-style fan-out, so degrade to a
+						// per-recipient walk through the chaos chokepoint, like every other path.
+						const cohortCache = deliveryAuthorization.cache();
+						for (const ws of wsConnections) {
+							if (frame && ws.isSubscribed(bin)) sendWireFanoutT(ws, frame, true, topic);
+							else if (ws.isSubscribed(json)) sendWireFanoutT(ws, env, false, topic, cohortCache);
+						}
+					}
+
+					return true;
+				}
+				// Walk-path charge, as production: with a capable connection the
+				// lane's encoded form is the binary frame and every recipient is
+				// charged at it; otherwise the walk exists only for the exclusion
+				// and every recipient gets the envelope.
 				if (!isRelay) {
-					chargeEgressT(topic, egressTenant, 1, recipients,
-						binaryFrameChargeBytes(payload.length, seqOnWire) * app.numSubscribers(bin) +
-						chargeableBytes(env, app.numSubscribers(json)));
+					const wireBytes = capCountsT.has(wire.capability)
+						? binaryFrameChargeBytes(payload.length, seqOnWire) * recipients
+						: chargeableBytes(env, recipients);
+					chargeEgressT(topic, egressTenant, 1, recipients, wireBytes);
 				}
-				const id = sharedWireIds.get(topic);
-				const frame = id !== undefined ? buildBinaryFrame(wire.schemaVersion, id, seqOnWire, payload) : null;
-				if (chaos.scenario === null) {
-					if (frame) app.publish(bin, frame, true, false);
-					app.publish(json, env, false, false);
-				} else {
-					// Chaos cannot intercept the app's C++-style fan-out, so degrade to a
-					// per-recipient walk through the chaos chokepoint, like every other path.
-					for (const ws of wsConnections) {
-						if (frame && ws.isSubscribed(bin)) sendWireFanoutT(ws, frame, true);
-						else if (ws.isSubscribed(json)) sendWireFanoutT(ws, env);
-					}
-				}
-				return true;
+				return deliverStatelessWireFanout(wire, payload, {
+					topic, envelope: env, seq: seqOnWire, excludeWs, connections: wsConnections,
+					ensureId: ensureWireIdT, isPoisoned: wireStatePoisonedT,
+					poison: poisonWireStateT, send: sendWireFanoutT, cache: deliveryAuthorization.cache()
+				});
+
+			} finally {
+				deliveryAuthorization.finish(operation);
 			}
-			// Walk-path charge, as production: with a capable connection the
-			// lane's encoded form is the binary frame and every recipient is
-			// charged at it; otherwise the walk exists only for the exclusion
-			// and every recipient gets the envelope.
-			if (!isRelay) {
-				const wireBytes = capCountsT.has(wire.capability)
-					? binaryFrameChargeBytes(payload.length, seqOnWire) * recipients
-					: chargeableBytes(env, recipients);
-				chargeEgressT(topic, egressTenant, 1, recipients, wireBytes);
-			}
-			return deliverStatelessWireFanout(wire, payload, {
-				topic, envelope: env, seq: seqOnWire, excludeWs, connections: wsConnections,
-				ensureId: ensureWireIdT, isPoisoned: wireStatePoisonedT,
-				poison: poisonWireStateT, send: sendWireFanoutT
-			});
 		},
 		publishWireBatch(topic, event, entries, wire, options) {
 			// A permissive test double for a restrictive production rule creates a
@@ -1402,32 +1482,133 @@ export async function createTestServer(options = {}) {
 			// envelopes for everyone else, per-entry sender exclusion, per-entry
 			// seq/relay, poison-on-drop. A stateless codec routes per entry.
 			if (!Array.isArray(entries) || entries.length === 0) return false;
-			// Same one-read rule as production (see platform.js publishWireBatch):
-			// a payload's toJSON runs during envelope building, so anything read
-			// out of the caller's entries afterwards could differ from what the
-			// earlier reads saw. A harness that re-read them would disagree with
-			// production about which bytes a subscriber gets.
-			const count = entries.length;
-			if (!wire || !wire.state) {
-				const statelessDatas = new Array(count);
-				const statelessExcludes = new Array(count);
-				// Per-entry seqs validated before the first publish fans out,
-				// as production does: whole batch or nothing.
-				let statelessSeqs = null;
-				let statelessSawExplicit = false;
+			if (deliveryAuthorization.deciding) {
+				const capturedEntries = entries.map((entry, i) => {
+					const data = entry.data;
+					const excludeWs = entry.excludeWs;
+					const seq = resolveEntrySeq(entry.seq, i);
+					if (typeof seq === 'number') assertBatchEntrySequenceAuthority(opts);
+					else if (seq === true) assertClusterSequenceAuthorityValues(true, opts?.relay);
+					return { data, excludeWs, seq };
+				});
+				deliveryAuthorization.deferOperation(() => platform.publishWireBatch(topic, event, capturedEntries, wire, opts));
+				return app.numSubscribers(topic) > 0;
+			}
+			const operation = deliveryAuthorization.begin();
+			try {
+				// Same one-read rule as production (see platform.js publishWireBatch):
+				// a payload's toJSON runs during envelope building, so anything read
+				// out of the caller's entries afterwards could differ from what the
+				// earlier reads saw. A harness that re-read them would disagree with
+				// production about which bytes a subscriber gets.
+				const count = entries.length;
+				if (!wire || !wire.state) {
+					const statelessDatas = new Array(count);
+					const statelessExcludes = new Array(count);
+					// Per-entry seqs validated before the first publish fans out,
+					// as production does: whole batch or nothing.
+					let statelessSeqs = null;
+					let statelessSawExplicit = false;
+					for (let i = 0; i < count; i++) {
+						const entry = entries[i];
+						statelessDatas[i] = entry.data;
+						statelessExcludes[i] = entry.excludeWs;
+						// One table for the entry lane on every surface
+						// (resolveEntrySeq): explicit number/bigint, counter true,
+						// no-seq false/null, inherit undefined, refuse the rest.
+						const resolved = resolveEntrySeq(entry.seq, i);
+						if (resolved !== undefined) {
+							if (typeof resolved === 'number') {
+								if (!statelessSawExplicit) {
+									assertBatchEntrySequenceAuthority(opts);
+									statelessSawExplicit = true;
+								}
+							} else if (resolved === true) {
+								// An entry drawing the per-worker counter takes the cluster's
+								// counter refusal up front, whole-batch-or-nothing - the same
+								// rule the shared options' counter form takes at the call gate.
+								assertClusterSequenceAuthorityValues(true, opts != null ? opts.relay : undefined);
+							}
+							if (statelessSeqs === null) statelessSeqs = new Array(count);
+							statelessSeqs[i] = resolved;
+						}
+					}
+					// One admission for the whole batch, mirroring production:
+					// delegating per entry would let each entry admit on its own
+					// and deliver a prefix of the batch under a ceiling. Each
+					// delegated entry still charges itself.
+					let statelessOpts = opts;
+					if (egressAccountT.enabled) {
+						const batchRecipients = app.numSubscribers(topic);
+						// Per resolved entry, as production: an entry overriding the
+						// call-level exclusion to a socket without the topic delivers
+						// the full recipient count, and a one-shot discount would
+						// under-estimate - the direction that admits past the ceiling.
+						let deliveries = count * batchRecipients;
+						if (batchRecipients > 0) {
+							const shared = opts != null && opts.excludeWs !== undefined && opts.excludeWs !== null
+								? opts.excludeWs : null;
+							const sharedHolds = shared !== null && excludedRecipient(shared, topic);
+							for (let i = 0; i < count; i++) {
+								const own = statelessExcludes[i];
+								if (own != null) { if (excludedRecipient(own, topic)) deliveries--; }
+								else if (sharedHolds) deliveries--;
+							}
+						}
+						if (!egressAccountT.admit(topic, egressTenantForT(topic), count, deliveries)) return false;
+						statelessOpts = markAdmitted({ ...(opts || {}) });
+					}
+					let ok = false;
+					for (let i = 0; i < count; i++) {
+						const entrySeq = statelessSeqs === null ? undefined : statelessSeqs[i];
+						let per = statelessOpts;
+						// An entry's own exclusion overrides the call-level one the
+						// delegated options already carry; null is absent, as production.
+						if (statelessExcludes[i] != null || entrySeq !== undefined) {
+							per = { ...(statelessOpts || {}) };
+							if (statelessExcludes[i] != null) per.excludeWs = statelessExcludes[i];
+							if (entrySeq !== undefined) per.seq = entrySeq;
+						}
+						ok = platform.publishWire(topic, event, statelessDatas[i], wire, per) || ok;
+					}
+					return ok;
+
+				}
+				const envs = new Array(count);
+				const seqs = new Array(count);
+				// Snapshot pass, as production has it: envelope building runs the
+				// payload's toJSON, so the reads for entries 1..N-1 must happen
+				// before the first one is built or entry 0's application code can
+				// replace a later payload or exclusion.
+				const datas = new Array(count);
+				let excludes = null;
+				let anyExclude = false;
+				// Per-entry explicit seqs, validated in the snapshot pass before
+				// anything is stamped or serialised - as production has it.
+				let entrySeqs = null;
+				let sawExplicitEntrySeq = false;
+				// The call-level exclusion defaults every entry; an entry's own
+				// overrides it - as production's stateful lane decides it.
+				const sharedExclude = opts != null && opts.excludeWs !== undefined && opts.excludeWs !== null ? opts.excludeWs : null;
 				for (let i = 0; i < count; i++) {
 					const entry = entries[i];
-					statelessDatas[i] = entry.data;
-					statelessExcludes[i] = entry.excludeWs;
+					datas[i] = entry.data;
+					const exclude = entry.excludeWs !== undefined && entry.excludeWs !== null
+						? entry.excludeWs : sharedExclude;
+					if (exclude !== undefined && exclude !== null) {
+						if (excludes === null) excludes = new Array(count);
+						excludes[i] = exclude;
+						anyExclude = true;
+					}
 					// One table for the entry lane on every surface
 					// (resolveEntrySeq): explicit number/bigint, counter true,
 					// no-seq false/null, inherit undefined, refuse the rest.
 					const resolved = resolveEntrySeq(entry.seq, i);
 					if (resolved !== undefined) {
 						if (typeof resolved === 'number') {
-							if (!statelessSawExplicit) {
+							if (!sawExplicitEntrySeq) {
 								assertBatchEntrySequenceAuthority(opts);
-								statelessSawExplicit = true;
+								sawExplicitEntrySeq = true;
 							}
 						} else if (resolved === true) {
 							// An entry drawing the per-worker counter takes the cluster's
@@ -1435,195 +1616,123 @@ export async function createTestServer(options = {}) {
 							// rule the shared options' counter form takes at the call gate.
 							assertClusterSequenceAuthorityValues(true, opts != null ? opts.relay : undefined);
 						}
-						if (statelessSeqs === null) statelessSeqs = new Array(count);
-						statelessSeqs[i] = resolved;
+						if (entrySeqs === null) entrySeqs = new Array(count);
+						entrySeqs[i] = resolved;
 					}
 				}
-				// One admission for the whole batch, mirroring production:
-				// delegating per entry would let each entry admit on its own
-				// and deliver a prefix of the batch under a ceiling. Each
-				// delegated entry still charges itself.
-				let statelessOpts = opts;
+				// Egress admission for the whole batch before the stamping loop, as
+				// production: deliveries deduct each entry whose excluded socket
+				// holds the topic, and one refusal refuses the batch with nothing
+				// stamped or delivered.
+				const recipients = app.numSubscribers(topic);
+				/** @type {number[] | null} */
+				let exDeduct = null;
+				let deliveries = recipients * count;
+				if (anyExclude) {
+					exDeduct = new Array(count).fill(0);
+					for (let i = 0; i < count; i++) {
+						if (excludes !== null && excludes[i] !== undefined && excludedRecipient(excludes[i], topic)) {
+							exDeduct[i] = 1;
+							deliveries--;
+						}
+					}
+				}
+				let egressTenant = null;
 				if (egressAccountT.enabled) {
-					const batchRecipients = app.numSubscribers(topic);
-					// Per resolved entry, as production: an entry overriding the
-					// call-level exclusion to a socket without the topic delivers
-					// the full recipient count, and a one-shot discount would
-					// under-estimate - the direction that admits past the ceiling.
-					let deliveries = count * batchRecipients;
-					if (batchRecipients > 0) {
-						const shared = opts != null && opts.excludeWs !== undefined && opts.excludeWs !== null
-							? opts.excludeWs : null;
-						const sharedHolds = shared !== null && excludedRecipient(shared, topic);
-						for (let i = 0; i < count; i++) {
-							const own = statelessExcludes[i];
-							if (own != null) { if (excludedRecipient(own, topic)) deliveries--; }
-							else if (sharedHolds) deliveries--;
-						}
-					}
-					if (!egressAccountT.admit(topic, egressTenantForT(topic), count, deliveries)) return false;
-					statelessOpts = markAdmitted({ ...(opts || {}) });
+					egressTenant = egressTenantForT(topic);
+					if (!egressAccountT.admit(topic, egressTenant, count, deliveries)) return false;
 				}
-				let ok = false;
+				let batchWireBytes = 0;
+				const hasEntrySeqs = entrySeqs !== null;
 				for (let i = 0; i < count; i++) {
-					const entrySeq = statelessSeqs === null ? undefined : statelessSeqs[i];
-					let per = statelessOpts;
-					// An entry's own exclusion overrides the call-level one the
-					// delegated options already carry; null is absent, as production.
-					if (statelessExcludes[i] != null || entrySeq !== undefined) {
-						per = { ...(statelessOpts || {}) };
-						if (statelessExcludes[i] != null) per.excludeWs = statelessExcludes[i];
-						if (entrySeq !== undefined) per.seq = entrySeq;
-					}
-					ok = platform.publishWire(topic, event, statelessDatas[i], wire, per) || ok;
-				}
-				return ok;
-			}
-			const envs = new Array(count);
-			const seqs = new Array(count);
-			// Snapshot pass, as production has it: envelope building runs the
-			// payload's toJSON, so the reads for entries 1..N-1 must happen
-			// before the first one is built or entry 0's application code can
-			// replace a later payload or exclusion.
-			const datas = new Array(count);
-			let excludes = null;
-			let anyExclude = false;
-			// Per-entry explicit seqs, validated in the snapshot pass before
-			// anything is stamped or serialised - as production has it.
-			let entrySeqs = null;
-			let sawExplicitEntrySeq = false;
-			// The call-level exclusion defaults every entry; an entry's own
-			// overrides it - as production's stateful lane decides it.
-			const sharedExclude = opts != null && opts.excludeWs !== undefined && opts.excludeWs !== null ? opts.excludeWs : null;
-			for (let i = 0; i < count; i++) {
-				const entry = entries[i];
-				datas[i] = entry.data;
-				const exclude = entry.excludeWs !== undefined && entry.excludeWs !== null
-					? entry.excludeWs : sharedExclude;
-				if (exclude !== undefined && exclude !== null) {
-					if (excludes === null) excludes = new Array(count);
-					excludes[i] = exclude;
-					anyExclude = true;
-				}
-				// One table for the entry lane on every surface
-				// (resolveEntrySeq): explicit number/bigint, counter true,
-				// no-seq false/null, inherit undefined, refuse the rest.
-				const resolved = resolveEntrySeq(entry.seq, i);
-				if (resolved !== undefined) {
-					if (typeof resolved === 'number') {
-						if (!sawExplicitEntrySeq) {
-							assertBatchEntrySequenceAuthority(opts);
-							sawExplicitEntrySeq = true;
-						}
-					} else if (resolved === true) {
-						// An entry drawing the per-worker counter takes the cluster's
-						// counter refusal up front, whole-batch-or-nothing - the same
-						// rule the shared options' counter form takes at the call gate.
-						assertClusterSequenceAuthorityValues(true, opts != null ? opts.relay : undefined);
-					}
-					if (entrySeqs === null) entrySeqs = new Array(count);
-					entrySeqs[i] = resolved;
-				}
-			}
-			// Egress admission for the whole batch before the stamping loop, as
-			// production: deliveries deduct each entry whose excluded socket
-			// holds the topic, and one refusal refuses the batch with nothing
-			// stamped or delivered.
-			const recipients = app.numSubscribers(topic);
-			/** @type {number[] | null} */
-			let exDeduct = null;
-			let deliveries = recipients * count;
-			if (anyExclude) {
-				exDeduct = new Array(count).fill(0);
-				for (let i = 0; i < count; i++) {
-					if (excludes !== null && excludes[i] !== undefined && excludedRecipient(excludes[i], topic)) {
-						exDeduct[i] = 1;
-						deliveries--;
+					const data = datas[i];
+					// A resolved entry seq overrides the shared options: an explicit
+					// value is stamped verbatim without advancing the counter, true
+					// draws this entry its own counter value, false leaves it
+					// seq-less - exactly as through publishWire and as production.
+					const resolvedEntry = hasEntrySeqs ? entrySeqs[i] : undefined;
+					const seq = resolvedEntry === undefined
+						? stampSeq(opts, topicSeqs, topic)
+						: resolvedEntry === false
+							? null
+							: resolvedEntry === true
+					? stampSeq({ seq: true }, topicSeqs, topic)
+					: resolvedEntry;
+					seqs[i] = seq == null ? 0 : seq;
+					envs[i] = envelope(topic, event, data, seq);
+					batchWireBytes += chargeableBytes(envs[i], recipients - (exDeduct === null ? 0 : exDeduct[i]));
+					if (onPublishT && !(opts && opts.relay === false)) {
+						onPublishT({ kind: 'publish', topic, envelope: envs[i], seq, compress: false });
 					}
 				}
-			}
-			let egressTenant = null;
-			if (egressAccountT.enabled) {
-				egressTenant = egressTenantForT(topic);
-				if (!egressAccountT.admit(topic, egressTenant, count, deliveries)) return false;
-			}
-			let batchWireBytes = 0;
-			const hasEntrySeqs = entrySeqs !== null;
-			for (let i = 0; i < count; i++) {
-				const data = datas[i];
-				// A resolved entry seq overrides the shared options: an explicit
-				// value is stamped verbatim without advancing the counter, true
-				// draws this entry its own counter value, false leaves it
-				// seq-less - exactly as through publishWire and as production.
-				const resolvedEntry = hasEntrySeqs ? entrySeqs[i] : undefined;
-				const seq = resolvedEntry === undefined
-					? stampSeq(opts, topicSeqs, topic)
-					: resolvedEntry === false
-						? null
-						: resolvedEntry === true
-							? stampSeq({ seq: true }, topicSeqs, topic)
-							: resolvedEntry;
-				seqs[i] = seq == null ? 0 : seq;
-				envs[i] = envelope(topic, event, data, seq);
-				batchWireBytes += chargeableBytes(envs[i], recipients - (exDeduct === null ? 0 : exDeduct[i]));
-				if (onPublishT && !(opts && opts.relay === false)) {
-					onPublishT({ kind: 'publish', topic, envelope: envs[i], seq, compress: false });
+				// One charge for the whole admitted batch: N logical publishes under
+				// one decision, envelope-priced (the stateful batch frame is
+				// recipient-specific) - as production.
+				chargeEgressT(topic, egressTenant, count, deliveries, batchWireBytes);
+				if (resumeBuffersT.size > 0) {
+					for (let i = 0; i < count; i++) captureResumeFrameT(topic, seqs[i] === 0 ? null : seqs[i], envs[i]);
 				}
-			}
-			// One charge for the whole admitted batch: N logical publishes under
-			// one decision, envelope-priced (the stateful batch frame is
-			// recipient-specific) - as production.
-			chargeEgressT(topic, egressTenant, count, deliveries, batchWireBytes);
-			if (resumeBuffersT.size > 0) {
-				for (let i = 0; i < count; i++) captureResumeFrameT(topic, seqs[i] === 0 ? null : seqs[i], envs[i]);
-			}
-			const sendJsonT = (ws, list) => { for (let i = 0; i < list.length; i++) sendWireFanoutT(ws, list[i]); };
-			if (!anyExclude && !capCountsT.has(wire.capability)) {
-				if (chaos.scenario === null) {
-					for (let i = 0; i < count; i++) app.publish(topic, envs[i], false, false);
-					return true;
+				// One parse cache per entry, so each envelope is parsed once per call.
+				const jsonCachesT = deliveryAuthorization.armed ? envs.map(() => deliveryAuthorization.cache()) : null;
+				const sendJsonT = (ws, list, caches = jsonCachesT) => {
+					for (let i = 0; i < list.length; i++) sendWireFanoutT(ws, list[i], false, topic, caches === null ? null : caches[i]);
+				};
+				if (!anyExclude && !capCountsT.has(wire.capability)) {
+					if (chaos.scenario === null) {
+						for (let i = 0; i < count; i++) deliveryAuthorization.publish(app, wsConnections, topic, envs[i], false, false);
+
+						return true;
+					}
+					let delivered = false;
+					for (const ws of wsConnections) {
+						if (!ws.isSubscribed(topic)) continue;
+						sendJsonT(ws, envs);
+						delivered = true;
+					}
+
+					return delivered;
 				}
 				let delivered = false;
 				for (const ws of wsConnections) {
-					if (!ws.isSubscribed(topic)) continue;
-					sendJsonT(ws, envs);
+					let ud;
+					try { ud = ws.getUserData(); } catch { continue; }
+					const subs = ud[WS_SUBSCRIPTIONS];
+					if (!subs || !subs.has(topic)) continue;
+					let dataList = datas;
+					let envList = envs;
+					let seqList = seqs;
+					let cacheList = jsonCachesT;
+					if (anyExclude) {
+						dataList = [];
+						envList = [];
+						seqList = [];
+						if (jsonCachesT !== null) cacheList = [];
+						for (let i = 0; i < count; i++) {
+							if (excludes[i] === ws) continue;
+							dataList.push(datas[i]);
+							envList.push(envs[i]);
+							seqList.push(seqs[i]);
+							if (cacheList !== null) cacheList.push(jsonCachesT[i]);
+						}
+						if (envList.length === 0) continue;
+					}
+					const caps = ud[WS_CAPS];
+					if (!caps || !caps.has(wire.capability)) { sendJsonT(ws, envList, cacheList); delivered = true; continue; }
+					const state = ensureWireStateT(ws, ud, wire);
+					if (state == null) { sendJsonT(ws, envList, cacheList); delivered = true; continue; }
+					deliverStatefulWireBatch({
+						wire, event, datas: dataList, envelopes: envList, seqs: seqList,
+						state, ws, ud, topic, ensureId: ensureWireIdT,
+						poison: poisonWireStateT, send: sendWireFanoutT, caches: cacheList
+					});
 					delivered = true;
 				}
+
 				return delivered;
+
+			} finally {
+				deliveryAuthorization.finish(operation);
 			}
-			let delivered = false;
-			for (const ws of wsConnections) {
-				let ud;
-				try { ud = ws.getUserData(); } catch { continue; }
-				const subs = ud[WS_SUBSCRIPTIONS];
-				if (!subs || !subs.has(topic)) continue;
-				let dataList = datas;
-				let envList = envs;
-				let seqList = seqs;
-				if (anyExclude) {
-					dataList = [];
-					envList = [];
-					seqList = [];
-					for (let i = 0; i < count; i++) {
-						if (excludes[i] === ws) continue;
-						dataList.push(datas[i]);
-						envList.push(envs[i]);
-						seqList.push(seqs[i]);
-					}
-					if (envList.length === 0) continue;
-				}
-				const caps = ud[WS_CAPS];
-				if (!caps || !caps.has(wire.capability)) { sendJsonT(ws, envList); delivered = true; continue; }
-				const state = ensureWireStateT(ws, ud, wire);
-				if (state == null) { sendJsonT(ws, envList); delivered = true; continue; }
-				deliverStatefulWireBatch({
-					wire, event, datas: dataList, envelopes: envList, seqs: seqList,
-					state, ws, ud, topic, ensureId: ensureWireIdT,
-					poison: poisonWireStateT, send: sendWireFanoutT
-				});
-				delivered = true;
-			}
-			return delivered;
 		},
 		registerWireCodec(wire) {
 			if (wire && typeof wire.capability === 'string') byCapabilityT.set(wire.capability, wire);
@@ -1643,40 +1752,51 @@ export async function createTestServer(options = {}) {
 			// The explicit gap-fill seq, riding the binary seq slot and the
 			// JSON fallback identically - mirrors production sendWire.
 			const seq = resolveSendSeq(options != null ? options.seq : undefined);
-			let ud;
-			try { ud = ws.getUserData(); } catch { closedWsAbortsT++; return 2; }
-			const caps = ud[WS_CAPS];
-			let payload = null;
-			let schemaVersion = wire.schemaVersion;
-			// A poisoned capability is served exactly like a caps-less
-			// connection: the JSON envelope, never binary. Mirrors handler.js.
-			if (caps && caps.has(wire.capability) && !wireStatePoisonedT(ud, wire.capability)) {
-				if (wire.state) {
-					const state = ensureWireStateT(ws, ud, wire);
-					payload = wire.encode(event, data, state);
-					if (state != null && typeof state.schemaVersion === 'number') schemaVersion = state.schemaVersion;
-				} else {
-					payload = wire.encode(event, data);
+			if (deliveryAuthorization.deciding) {
+				const captured = { seq: seq === null ? false : seq, compress: options?.compress };
+				deliveryAuthorization.deferOperation(() => platform.sendWire(ws, topic, event, data, wire, captured));
+				return 0;
+			}
+			const operation = deliveryAuthorization.begin();
+			try {
+				let ud;
+				try { ud = ws.getUserData(); } catch { closedWsAbortsT++; return 2; }
+				const caps = ud[WS_CAPS];
+				let payload = null;
+				let schemaVersion = wire.schemaVersion;
+				// A poisoned capability is served exactly like a caps-less
+				// connection: the JSON envelope, never binary. Mirrors handler.js.
+				if (caps && caps.has(wire.capability) && !wireStatePoisonedT(ud, wire.capability)) {
+					if (wire.state) {
+						const state = ensureWireStateT(ws, ud, wire);
+						payload = wire.encode(event, data, state);
+						if (state != null && typeof state.schemaVersion === 'number') schemaVersion = state.schemaVersion;
+					} else {
+						payload = wire.encode(event, data);
+					}
 				}
+				if (payload == null) {
+					return sendOutboundT(ws, envelope(topic, event, data, seq === null ? undefined : seq));
+				}
+				if (!isUint8Array(payload)) throw new TypeError('wire.encode must return Uint8Array or null');
+				const id = ensureWireIdT(ws, ud, topic);
+				if (id === -1) {
+					// Dropped wire-id announce: JSON for this frame + poison.
+					poisonWireStateT(ws, ud, wire.capability);
+					return sendOutboundT(ws, envelope(topic, event, data, seq === null ? undefined : seq));
+				}
+				const frame = buildBinaryFrame(schemaVersion, id, seq === null ? 0 : seq, payload);
+				const result = sendOutboundBinaryT(ws, frame, true, topic);
+				// 2 = dropped past maxBackpressure. A stateful encode already mutated
+				// this connection's dictionary for the dropped frame - degrade the
+				// capability to JSON until reconnect. Stateless payloads carry no
+				// per-connection state, so no poisoning.
+				if (result === 2 && wire.state) poisonWireStateT(ws, ud, wire.capability);
+				return result;
+
+			} finally {
+				deliveryAuthorization.finish(operation);
 			}
-			if (payload == null) {
-				return sendOutboundT(ws, envelope(topic, event, data, seq === null ? undefined : seq));
-			}
-			if (!isUint8Array(payload)) throw new TypeError('wire.encode must return Uint8Array or null');
-			const id = ensureWireIdT(ws, ud, topic);
-			if (id === -1) {
-				// Dropped wire-id announce: JSON for this frame + poison.
-				poisonWireStateT(ws, ud, wire.capability);
-				return sendOutboundT(ws, envelope(topic, event, data, seq === null ? undefined : seq));
-			}
-			const frame = buildBinaryFrame(schemaVersion, id, seq === null ? 0 : seq, payload);
-			const result = sendOutboundBinaryT(ws, frame);
-			// 2 = dropped past maxBackpressure. A stateful encode already mutated
-			// this connection's dictionary for the dropped frame - degrade the
-			// capability to JSON until reconnect. Stateless payloads carry no
-			// per-connection state, so no poisoning.
-			if (result === 2 && wire.state) poisonWireStateT(ws, ud, wire.capability);
-			return result;
 		},
 		sendWireBatch(ws, topic, event, entries, wire, options) {
 			// Mirror of handler/platform.js sendWireBatch: one binary frame for a
@@ -1684,57 +1804,68 @@ export async function createTestServer(options = {}) {
 			// envelopes otherwise, poison-on-drop.
 			void options;
 			if (!Array.isArray(entries) || entries.length === 0) return 1;
-			let ud;
-			try { ud = ws.getUserData(); } catch { closedWsAbortsT++; return 2; }
-			const caps = ud[WS_CAPS];
-			// Mirroring production: `source` is the pinned payload array once one
-			// exists and null while it does not, so a JSON-only send reads the
-			// caller's entry as it reaches it and allocates nothing. Pinning
-			// protects what has already been BUILT, and a JSON-only send to one
-			// socket builds nothing a later entry's toJSON could rewrite.
-			const count = entries.length;
-			const sendJsonFromT = (i, source, prior = 1) => {
-				let result = prior;
-				for (; i < count; i++) {
-					result = sendOutboundT(ws, envelope(topic, event, source === null ? entries[i].data : source[i]));
+			if (deliveryAuthorization.deciding) {
+				const captured = entries.map((entry) => ({ data: entry.data }));
+				deliveryAuthorization.deferOperation(() => platform.sendWireBatch(ws, topic, event, captured, wire, options));
+				return 0;
+			}
+			// One scope for every frame this call sends, as production.
+			const fanout = deliveryAuthorization.begin();
+			try {
+				let ud;
+				try { ud = ws.getUserData(); } catch { closedWsAbortsT++; return 2; }
+				const caps = ud[WS_CAPS];
+				// Mirroring production: `source` is the pinned payload array once one
+				// exists and null while it does not, so a JSON-only send reads the
+				// caller's entry as it reaches it and allocates nothing. Pinning
+				// protects what has already been BUILT, and a JSON-only send to one
+				// socket builds nothing a later entry's toJSON could rewrite.
+				const count = entries.length;
+				const sendJsonFromT = (i, source, prior = 1) => {
+					let result = prior;
+					for (; i < count; i++) {
+						result = sendOutboundT(ws, envelope(topic, event, source === null ? entries[i].data : source[i]));
+					}
+					return result;
+				};
+				if (!caps || !caps.has(wire.capability) || wireStatePoisonedT(ud, wire.capability) || !wire.state) {
+					return sendJsonFromT(0, null);
 				}
-				return result;
-			};
-			if (!caps || !caps.has(wire.capability) || wireStatePoisonedT(ud, wire.capability) || !wire.state) {
-				return sendJsonFromT(0, null);
-			}
-			const state = ensureWireStateT(ws, ud, wire);
-			if (state == null) return sendJsonFromT(0, null);
-			// From here the payloads are pinned: the batch encode is application
-			// code handed the whole array, and a decline falls back to per-entry
-			// encodes that must see what the batch attempt saw. Handed to the codec
-			// directly rather than copied into a second array.
-			const datas = new Array(count);
-			for (let i = 0; i < count; i++) datas[i] = entries[i].data;
-			const schemaVersion = typeof state.schemaVersion === 'number' ? state.schemaVersion : wire.schemaVersion;
-			const payload = wire.encode(event + '-batch', { updates: datas }, state);
-			if (payload == null) {
-				let result = 1;
-				for (let i = 0; i < count; i++) {
-					const p = wire.encode(event, datas[i], state);
-					if (p == null) { result = sendOutboundT(ws, envelope(topic, event, datas[i])); continue; }
-					if (!isUint8Array(p)) throw new TypeError('sendWireBatch: wire.encode must return Uint8Array or null');
-					const id = ensureWireIdT(ws, ud, topic);
-					if (id === -1) { poisonWireStateT(ws, ud, wire.capability); return sendJsonFromT(i, datas); }
-					result = sendOutboundBinaryT(ws, buildBinaryFrame(schemaVersion, id, 0, p));
-					if (result === 2) { poisonWireStateT(ws, ud, wire.capability); return sendJsonFromT(i + 1, datas, 2); }
+				const state = ensureWireStateT(ws, ud, wire);
+				if (state == null) return sendJsonFromT(0, null);
+				// From here the payloads are pinned: the batch encode is application
+				// code handed the whole array, and a decline falls back to per-entry
+				// encodes that must see what the batch attempt saw. Handed to the codec
+				// directly rather than copied into a second array.
+				const datas = new Array(count);
+				for (let i = 0; i < count; i++) datas[i] = entries[i].data;
+				const schemaVersion = typeof state.schemaVersion === 'number' ? state.schemaVersion : wire.schemaVersion;
+				const payload = wire.encode(event + '-batch', { updates: datas }, state);
+				if (payload == null) {
+					let result = 1;
+					for (let i = 0; i < count; i++) {
+						const p = wire.encode(event, datas[i], state);
+						if (p == null) { result = sendOutboundT(ws, envelope(topic, event, datas[i])); continue; }
+						if (!isUint8Array(p)) throw new TypeError('sendWireBatch: wire.encode must return Uint8Array or null');
+						const id = ensureWireIdT(ws, ud, topic);
+						if (id === -1) { poisonWireStateT(ws, ud, wire.capability); return sendJsonFromT(i, datas); }
+						result = sendOutboundBinaryT(ws, buildBinaryFrame(schemaVersion, id, 0, p), true, topic);
+						if (result === 2) { poisonWireStateT(ws, ud, wire.capability); return sendJsonFromT(i + 1, datas, 2); }
+					}
+					return result;
 				}
+				if (!isUint8Array(payload)) throw new TypeError('sendWireBatch: wire.encode must return Uint8Array or null');
+				const id = ensureWireIdT(ws, ud, topic);
+				if (id === -1) {
+					poisonWireStateT(ws, ud, wire.capability);
+					return sendJsonFromT(0, datas);
+				}
+				const result = sendOutboundBinaryT(ws, buildBinaryFrame(schemaVersion, id, 0, payload), true, topic);
+				if (result === 2) poisonWireStateT(ws, ud, wire.capability);
 				return result;
+			} finally {
+				deliveryAuthorization.finish(fanout);
 			}
-			if (!isUint8Array(payload)) throw new TypeError('sendWireBatch: wire.encode must return Uint8Array or null');
-			const id = ensureWireIdT(ws, ud, topic);
-			if (id === -1) {
-				poisonWireStateT(ws, ud, wire.capability);
-				return sendJsonFromT(0, datas);
-			}
-			const result = sendOutboundBinaryT(ws, buildBinaryFrame(schemaVersion, id, 0, payload));
-			if (result === 2) poisonWireStateT(ws, ud, wire.capability);
-			return result;
 		},
 		sendCoalesced(ws, { key, topic, event, data }) {
 			// Production's primitive on native backpressure: one pending value
@@ -1788,9 +1919,15 @@ export async function createTestServer(options = {}) {
 				if (!egressAccountT.admit(topic, egressTenant, 1, targets.length)) return 0;
 			}
 			let count = 0;
-			for (const ws of targets) {
-				sendOutboundT(ws, msg);
-				count++;
+			const msgCache = deliveryAuthorization.cache();
+			const fanout = deliveryAuthorization.begin();
+			try {
+				for (const ws of targets) {
+					sendOutboundT(ws, msg, true, OUTBOUND_APPLICATION, msgCache);
+					count++;
+				}
+			} finally {
+				deliveryAuthorization.finish(fanout);
 			}
 			chargeEgressT(topic, egressTenant, 1, count, chargeableBytes(msg, count));
 			return count;
@@ -1821,8 +1958,8 @@ export async function createTestServer(options = {}) {
 			}
 			let count = 0;
 			for (const ws of targets) {
-				sendOutboundT(ws, frame);
-				if (doClose && typeof ws.end === 'function') { try { ws.end(1001, 'Server draining'); } catch { closedWsAbortsT++; } }
+				sendOutboundT(ws, frame, true, OUTBOUND_CONTROL);
+				if (doClose && typeof ws.end === 'function') { try { deliveryAuthorization.end(ws, 1001, 'Server draining'); } catch { closedWsAbortsT++; } }
 				count++;
 			}
 			// Operator-lane egress: no topic, no tenant, outside every ceiling.
@@ -1887,7 +2024,7 @@ export async function createTestServer(options = {}) {
 		// aware branches it uses in production.
 		get maxPayloadLength() { return maxPayloadLength; },
 		bufferedAmount(ws) {
-			try { return ws.getBufferedAmount(); } catch { return 0; }
+			try { return ws.getBufferedAmount() + deliveryAuthorization.pendingBytes(ws); } catch { return 0; }
 		},
 		async subscribe(ws, topic) {
 			// Same contract as production platform.subscribe: runs the
@@ -1948,7 +2085,7 @@ export async function createTestServer(options = {}) {
 			if (!settlePendingSubscribe(ud, topic, token, true)) return 'FORBIDDEN';
 			try { ws.subscribe(topic); }
 			catch { closedWsAbortsT++; return null; }
-			subs.add(topic);
+			addLogicalSubscription(subs, topic);
 			if (sharedTopicsT.has(topic)) joinCohortT(ws, ws.getUserData(), topic, sharedTopicsT.get(topic));
 			return null;
 		},
@@ -2030,7 +2167,7 @@ export async function createTestServer(options = {}) {
 			if (!(subs instanceof Set) || !subs.has(topic)) return cancelledInFlight;
 			try { ws.unsubscribe(topic); }
 			catch { closedWsAbortsT++; return false; }
-			subs.delete(topic);
+			removeLogicalSubscription(subs, topic);
 			if (sharedTopicsT.has(topic)) leaveCohortT(ws, ws.getUserData(), topic);
 			runUnsubscribeHook(handler.unsubscribe, ws, topic, { platform: ud[WS_PLATFORM] });
 			return true;
@@ -2060,6 +2197,10 @@ export async function createTestServer(options = {}) {
 			return ud[WS_PUBLISH_GRANT] ?? null;
 		},
 		publishGame(senderWs, topic, event, data, id) {
+			if (deliveryAuthorization.deciding) {
+				deliveryAuthorization.deferOperation(() => platform.publishGame(senderWs, topic, event, data, id));
+				return { seq: null, delivered: 0 };
+			}
 			// Stamp the per-room seq (the session-home sequencer) and fan the
 			// game envelope out to the topic's local subscribers EXCLUDING the
 			// sender (echo suppression), echoing the sender's client id. Routes
@@ -2095,41 +2236,58 @@ export async function createTestServer(options = {}) {
 			/** @type {Map<number, Uint8Array> | null} */
 			let sharedFrameById = null;
 			let delivered = 0;
-			for (const ws of wsConnections) {
-				if (ws === senderWs) continue;
-				let ud;
-				try { ud = ws.getUserData(); } catch { continue; }
-				const subs = ud[WS_SUBSCRIPTIONS];
-				if (!subs || !subs.has(topic)) continue;
-				const caps = wantBinary ? ud[WS_CAPS] : null;
-				if (caps && caps.has(GAME_FANOUT_CAP) && !wireStatePoisonedT(ud, GAME_FANOUT_CAP)) {
-					if (!sharedEncoded) {
-						sharedPayload = encodeGameFanoutPayload(event, data, id);
-						sharedEncoded = true;
-						sharedFrameById = new Map();
-					}
-					const wid = ensureWireIdT(ws, ud, topic);
-					if (wid === -1) {
-						poisonWireStateT(ws, ud, GAME_FANOUT_CAP);
-						sendOutboundT(ws, env);
+			const envCache = deliveryAuthorization.cache();
+			const fanout = deliveryAuthorization.begin();
+			try {
+				for (const ws of wsConnections) {
+					if (ws === senderWs) continue;
+					let ud;
+					try { ud = ws.getUserData(); } catch { continue; }
+					const subs = ud[WS_SUBSCRIPTIONS];
+					if (!subs || !subs.has(topic)) continue;
+					const caps = wantBinary ? ud[WS_CAPS] : null;
+					if (caps && caps.has(GAME_FANOUT_CAP) && !wireStatePoisonedT(ud, GAME_FANOUT_CAP)) {
+						if (!sharedEncoded) {
+							sharedPayload = encodeGameFanoutPayload(event, data, id);
+							sharedEncoded = true;
+							sharedFrameById = new Map();
+						}
+						const wid = ensureWireIdT(ws, ud, topic);
+						if (wid === -1) {
+							poisonWireStateT(ws, ud, GAME_FANOUT_CAP);
+							sendOutboundT(ws, env, true, OUTBOUND_APPLICATION, envCache);
+							delivered++;
+							continue;
+						}
+						let frame = sharedFrameById.get(wid);
+						if (!frame) {
+							frame = buildBinaryFrame(GAME_FANOUT_SCHEMA_VERSION, wid, seqOnWire, /** @type {Uint8Array} */ (sharedPayload));
+							sharedFrameById.set(wid, frame);
+						}
+						sendOutboundBinaryT(ws, frame, true, topic);
 						delivered++;
 						continue;
 					}
-					let frame = sharedFrameById.get(wid);
-					if (!frame) {
-						frame = buildBinaryFrame(GAME_FANOUT_SCHEMA_VERSION, wid, seqOnWire, /** @type {Uint8Array} */ (sharedPayload));
-						sharedFrameById.set(wid, frame);
-					}
-					sendOutboundBinaryT(ws, frame);
+					sendOutboundT(ws, env);
 					delivered++;
-					continue;
 				}
-				sendOutboundT(ws, env);
-				delivered++;
+			} finally {
+				deliveryAuthorization.finish(fanout);
 			}
 			return { seq, delivered };
 		},
 		batch(messages) {
+			if (deliveryAuthorization.deciding) {
+
+				const captured = messages.map((message) => {
+					const given = message.options;
+					const snapshot = given == null ? given : { seq: given.seq, relay: given.relay, compress: given.compress, jitterMs: given.jitterMs };
+					assertStampableSeq(snapshot?.seq);
+					return { topic: message.topic, event: message.event, data: message.data, options: snapshot };
+				});
+				deliveryAuthorization.deferOperation(() => platform.batch(captured));
+				return captured.map((message) => app.numSubscribers(message.topic) > 0);
+			}
 			// Whole-batch-or-nothing, as production: every message's seq value is
 			// vetted before the first publish, or a bad value on message k throws
 			// with 0..k-1 already delivered. An app certifying against this
@@ -2138,134 +2296,159 @@ export async function createTestServer(options = {}) {
 				const o = messages[i].options;
 				assertStampableSeq(o == null ? undefined : o.seq);
 			}
-			return messages.map(({ topic, event, data, options }) => platform.publish(topic, event, data, options));
+			const fanout = deliveryAuthorization.begin();
+			try {
+				return messages.map(({ topic, event, data, options }) => platform.publish(topic, event, data, options));
+			} finally {
+				deliveryAuthorization.finish(fanout);
+			}
 		},
 		publishBatched(messages, options) {
-			void options; // Platform-shape parity; the test server configures no compressor.
-			if (!Array.isArray(messages) || messages.length === 0) return;
-			messages = collapseByCoalesceKey(messages);
-			if (messages.length === 0) return;
-			// Before the stamping loop below moves any topic counter - a refused
-			// batch that already consumed a sequence number leaves the counter
-			// skipping a value no client ever saw.
-			for (let i = 0; i < messages.length; i++) {
-				const o = messages[i].options;
-				assertStampableSeq(o == null ? undefined : o.seq);
+			if (deliveryAuthorization.deciding) {
+				if (!Array.isArray(messages) || messages.length === 0) return;
+				messages = collapseByCoalesceKey(messages);
+				const captured = messages.map((message) => {
+					const given = message.options;
+					const snapshot = given == null ? given : { seq: given.seq, relay: given.relay, compress: given.compress, jitterMs: given.jitterMs };
+					assertStampableSeq(snapshot?.seq);
+					return { topic: message.topic, event: message.event, data: message.data, options: snapshot };
+				});
+				deliveryAuthorization.deferOperation(() => platform.publishBatched(captured, options));
+				return ;
 			}
-			const firstTopic = messages[0].topic;
-			let allSameTopic = true;
-			for (let i = 1; i < messages.length; i++) {
-				if (messages[i].topic !== firstTopic) { allSameTopic = false; break; }
-			}
-			let allSeeAll = true;
-			let everyoneCapable = true;
-			let batchTopics = null;
-			if (!allSameTopic) {
-				batchTopics = new Set();
-				for (let i = 0; i < messages.length; i++) batchTopics.add(messages[i].topic);
-			}
-			for (const ws of wsConnections) {
-				const ud = ws.getUserData();
-				const subs = ud[WS_SUBSCRIPTIONS];
-				if (!subs || subs.size === 0) continue;
-				let touchesAny = false;
-				if (allSameTopic) {
-					touchesAny = subs.has(firstTopic);
-				} else {
-					let touchesAll = true;
-					for (const t of batchTopics) {
-						if (subs.has(t)) touchesAny = true;
-						else touchesAll = false;
-					}
-					if (touchesAny && !touchesAll) { allSeeAll = false; break; }
+			const operation = deliveryAuthorization.begin();
+			try {
+				void options; // Platform-shape parity; the test server configures no compressor.
+				if (!Array.isArray(messages) || messages.length === 0) return;
+				messages = collapseByCoalesceKey(messages);
+				if (messages.length === 0) return;
+				// Before the stamping loop below moves any topic counter - a refused
+				// batch that already consumed a sequence number leaves the counter
+				// skipping a value no client ever saw.
+				for (let i = 0; i < messages.length; i++) {
+					const o = messages[i].options;
+					assertStampableSeq(o == null ? undefined : o.seq);
 				}
-				if (!touchesAny) continue;
-				const caps = ud[WS_CAPS];
-				if (!caps || !caps.has('batch')) { everyoneCapable = false; break; }
-			}
-			if ((!allSameTopic && !allSeeAll) || !everyoneCapable) {
-				// Slow-path fallback: per-event publish(), but the batch is
-				// atomic here too - admitting per event would deliver a prefix
-				// and refuse the tail. Each event still charges itself.
-				if (egressAccountT.enabled && !admitBatchEgressT(messages, null)) return;
+				const firstTopic = messages[0].topic;
+				let allSameTopic = true;
+				for (let i = 1; i < messages.length; i++) {
+					if (messages[i].topic !== firstTopic) { allSameTopic = false; break; }
+				}
+				let allSeeAll = true;
+				let everyoneCapable = true;
+				let batchTopics = null;
+				if (!allSameTopic) {
+					batchTopics = new Set();
+					for (let i = 0; i < messages.length; i++) batchTopics.add(messages[i].topic);
+				}
+				for (const ws of wsConnections) {
+					const ud = ws.getUserData();
+					const subs = ud[WS_SUBSCRIPTIONS];
+					if (!subs || subs.size === 0) continue;
+					let touchesAny = false;
+					if (allSameTopic) {
+						touchesAny = subs.has(firstTopic);
+					} else {
+						let touchesAll = true;
+						for (const t of batchTopics) {
+							if (subs.has(t)) touchesAny = true;
+							else touchesAll = false;
+						}
+						if (touchesAny && !touchesAll) { allSeeAll = false; break; }
+					}
+					if (!touchesAny) continue;
+					const caps = ud[WS_CAPS];
+					if (!caps || !caps.has('batch')) { everyoneCapable = false; break; }
+				}
+				if ((!allSameTopic && !allSeeAll) || !everyoneCapable) {
+					// Slow-path fallback: per-event publish(), but the batch is
+					// atomic here too - admitting per event would deliver a prefix
+					// and refuse the tail. Each event still charges itself.
+					if (egressAccountT.enabled && !admitBatchEgressT(messages, null)) return;
+					for (let i = 0; i < messages.length; i++) {
+						const m = messages[i];
+						const per = egressAccountT.enabled
+							? markAdmitted({ ...(m.options || {}) })
+							: m.options;
+						platform.publish(m.topic, m.event, m.data, per);
+					}
+
+					return;
+				}
+				// Egress admission for the whole fast-path batch before anything is
+				// stamped, as production: in all-see-all the dispatch topic's
+				// native count is the recipient set for every batch topic.
+				const recipients = app.numSubscribers(messages[0].topic);
+				const gateArmed = egressAccountT.enabled;
+				let egressTenant = null;
+				if (gateArmed) {
+					if (allSameTopic) {
+						egressTenant = egressTenantForT(firstTopic);
+						if (!egressAccountT.admit(firstTopic, egressTenant, messages.length, messages.length * recipients)) return;
+					} else if (!admitBatchEgressT(messages, recipients)) return;
+				}
+				const events = new Array(messages.length);
 				for (let i = 0; i < messages.length; i++) {
 					const m = messages[i];
-					const per = egressAccountT.enabled
-						? markAdmitted({ ...(m.options || {}) })
-						: m.options;
-					platform.publish(m.topic, m.event, m.data, per);
+					const topic = m.topic;
+					events[i] = { topic, env: envelopeBody(topic, m.event, m.data) };
 				}
-				return;
-			}
-			// Egress admission for the whole fast-path batch before anything is
-			// stamped, as production: in all-see-all the dispatch topic's
-			// native count is the recipient set for every batch topic.
-			const recipients = app.numSubscribers(messages[0].topic);
-			const gateArmed = egressAccountT.enabled;
-			let egressTenant = null;
-			if (gateArmed) {
-				if (allSameTopic) {
-					egressTenant = egressTenantForT(firstTopic);
-					if (!egressAccountT.admit(firstTopic, egressTenant, messages.length, messages.length * recipients)) return;
-				} else if (!admitBatchEgressT(messages, recipients)) return;
-			}
-			const events = new Array(messages.length);
-			for (let i = 0; i < messages.length; i++) {
-				const m = messages[i];
-				const topic = m.topic;
-				events[i] = { topic, env: envelopeBody(topic, m.event, m.data) };
-			}
-			for (let i = 0; i < events.length; i++) {
-				const entry = events[i];
-				const seq = stampSeq(messages[i].options, topicSeqs, entry.topic);
-				const env = completeSerializedEnvelope(entry.env, seq);
-				entry.env = env;
-				// One charge per logical publish, envelope-priced with the batch
-				// wrapper uncharged - as production.
-				chargeEgressT(entry.topic,
-					gateArmed ? (allSameTopic ? egressTenant : egressTenantForT(entry.topic)) : null,
-					1, recipients, chargeableBytes(env, recipients));
-				// A caps-less resuming connection receives these as per-event JSON.
-				if (resumeBuffersT.size > 0) captureResumeFrameT(entry.topic, seq, env);
-			}
-			// Fast-path batch relay (sim): forward the stamped events as one IPC frame,
-			// mirroring handler.js's `publish-batched`. Per-message `relay: false` is
-			// excluded from the relayed list (a frame from an external pub/sub source
-			// already fans out to every process) while local fan-out keeps every event.
-			// The slow-path fallback above relays per event through platform.publish.
-			if (onPublishT) {
-				const relayed = [];
 				for (let i = 0; i < events.length; i++) {
-					const o = messages[i].options;
-					if (!o || o.relay !== false) relayed.push({ topic: events[i].topic, env: events[i].env });
+					const entry = events[i];
+					const seq = stampSeq(messages[i].options, topicSeqs, entry.topic);
+					const env = completeSerializedEnvelope(entry.env, seq);
+					entry.env = env;
+					// One charge per logical publish, envelope-priced with the batch
+					// wrapper uncharged - as production.
+					chargeEgressT(entry.topic,
+						gateArmed ? (allSameTopic ? egressTenant : egressTenantForT(entry.topic)) : null,
+						1, recipients, chargeableBytes(env, recipients));
+					// A caps-less resuming connection receives these as per-event JSON.
+					if (resumeBuffersT.size > 0) captureResumeFrameT(entry.topic, seq, env);
 				}
-				if (relayed.length > 0) onPublishT({ kind: 'publishBatched', events: relayed, compress: false });
-			}
-			const slice = new Array(events.length);
-			for (let i = 0; i < events.length; i++) slice[i] = events[i].env;
-			const sharedBatchEnv = wrapBatchEnvelope(slice);
-			// Chaos check: when active, sendOutboundT consults drop /
-			// delay state per recipient, so we cannot use the C++
-			// fanout shortcut. Walk subs in JS and route through the
-			// chaos chokepoint.
-			if (chaos.scenario !== null) {
-				for (const ws of wsConnections) {
-					const subs = ws.getUserData()[WS_SUBSCRIPTIONS];
-					if (!subs || subs.size === 0) continue;
-					let receives = false;
-					if (allSameTopic) {
-						receives = subs.has(firstTopic);
-					} else {
-						for (const t of batchTopics) {
-							if (subs.has(t)) { receives = true; break; }
-						}
+				// Fast-path batch relay (sim): forward the stamped events as one IPC frame,
+				// mirroring handler.js's `publish-batched`. Per-message `relay: false` is
+				// excluded from the relayed list (a frame from an external pub/sub source
+				// already fans out to every process) while local fan-out keeps every event.
+				// The slow-path fallback above relays per event through platform.publish.
+				if (onPublishT) {
+					const relayed = [];
+					for (let i = 0; i < events.length; i++) {
+						const o = messages[i].options;
+						if (!o || o.relay !== false) relayed.push({ topic: events[i].topic, env: events[i].env });
 					}
-					if (receives) sendOutboundT(ws, sharedBatchEnv, false);
+					if (relayed.length > 0) onPublishT({ kind: 'publishBatched', events: relayed, compress: false });
 				}
-				return;
+				const slice = new Array(events.length);
+				for (let i = 0; i < events.length; i++) slice[i] = events[i].env;
+				const sharedBatchEnv = wrapBatchEnvelope(slice);
+				// Chaos check: when active, sendOutboundT consults drop /
+				// delay state per recipient, so we cannot use the C++
+				// fanout shortcut. Walk subs in JS and route through the
+				// chaos chokepoint.
+				if (chaos.scenario !== null) {
+					for (const ws of wsConnections) {
+						const subs = ws.getUserData()[WS_SUBSCRIPTIONS];
+						if (!subs || subs.size === 0) continue;
+						let receives = false;
+						if (allSameTopic) {
+							receives = subs.has(firstTopic);
+						} else {
+							for (const t of batchTopics) {
+								if (subs.has(t)) { receives = true; break; }
+							}
+						}
+						if (receives) sendOutboundT(ws, sharedBatchEnv, false);
+					}
+
+					return;
+				}
+				const fanoutTopic = allSameTopic ? firstTopic : messages[0].topic;
+				deliveryAuthorization.publish(app, wsConnections, fanoutTopic, sharedBatchEnv, false, false);
+
+			} finally {
+				deliveryAuthorization.finish(operation);
 			}
-			const fanoutTopic = allSameTopic ? firstTopic : messages[0].topic;
-			app.publish(fanoutTopic, sharedBatchEnv, false, false);
 		},
 		request(ws, event, data, options) {
 			let userData;
@@ -2294,7 +2477,7 @@ export async function createTestServer(options = {}) {
 				const timer = setTimer(() => {
 					if (pending.delete(ref)) reject(new Error(adapterErrorMessage(ADAPTER_ERROR_IDS.REQUEST_TIMEOUT)));
 				}, timeoutMs);
-				const entry = { resolve, reject, timer, sent: false };
+				const entry = { resolve, reject, timer, status: 2, held: false };
 				pending.set(ref, entry);
 				const payload = JSON.stringify({ type: 'request', ref, event, data: data ?? null });
 				// Direct ws.send so we can distinguish "closed WS"
@@ -2304,8 +2487,9 @@ export async function createTestServer(options = {}) {
 				// sendOutboundT exists for chaos-injection; the request
 				// flow takes the bare path and re-uses bumpOutT. The
 				// outcome is recorded so the close sweep can say which
-				// side of transmission the close landed on.
-				try { entry.sent = ws.send(payload, false, false) !== 2; }
+				// side of transmission the close landed on; a frame the
+				// delivery policy still holds (`held`) has not reached it.
+				try { entry.status = deliveryAuthorization.send(ws, payload, false, false, null, null, entry); }
 				catch {
 					closedWsAbortsT++;
 					clearTimer(timer);
@@ -2316,7 +2500,7 @@ export async function createTestServer(options = {}) {
 					)));
 					return;
 				}
-				if (entry.sent) bumpOutT(ws, payload);
+				if (entry.status !== 2) bumpOutT(ws, payload);
 			});
 		},
 		// Broadcast-request to every local subscriber of `topic`; partial success
@@ -2331,11 +2515,17 @@ export async function createTestServer(options = {}) {
 				const subs = ud[WS_SUBSCRIPTIONS];
 				if (subs && subs.has(topic)) targets.push(ws);
 			}
-			return Promise.all(targets.map((ws) =>
-				platform.request(ws, event, data, { timeoutMs })
-					.then((reply) => ({ ok: true, reply }))
-					.catch((err) => ({ ok: false, error: (err && err.message) ? err.message : String(err) }))
-			));
+			let requests;
+			const fanout = deliveryAuthorization.begin();
+			try {
+				requests = targets.map((ws) =>
+					platform.request(ws, event, data, { timeoutMs })
+						.then((reply) => ({ ok: true, reply }))
+						.catch((err) => ({ ok: false, error: (err && err.message) ? err.message : String(err) })));
+			} finally {
+				deliveryAuthorization.finish(fanout);
+			}
+			return Promise.all(requests);
 		},
 		topic(name) {
 			if (!_topicHelperCache) _topicHelperCache = createTopicHelperCache(platform.publish);
@@ -2499,7 +2689,7 @@ export async function createTestServer(options = {}) {
 				// the underlying socket and the client sees 1006 instead.
 				const targets = Array.from(wsConnections);
 				for (const ws of targets) {
-					try { ws.end(code, reason); } catch {}
+					try { deliveryAuthorization.end(ws, code, reason); } catch {}
 				}
 				return;
 			}
@@ -2524,66 +2714,72 @@ export async function createTestServer(options = {}) {
 		 */
 		__relayReceive(frame) {
 			if (!frame) return;
-			if (frame.kind === 'publishBatched') {
-				const events = frame.events;
-				if (!Array.isArray(events) || events.length === 0) return;
-				if (typeof events[0].topic !== 'string' || typeof events[0].env !== 'string') return;
-				const firstTopic = events[0].topic;
-				let allSameTopic = true;
-				for (let i = 1; i < events.length; i++) {
-					if (events[i].topic !== firstTopic) { allSameTopic = false; break; }
-				}
-				let allSeeAll = true;
-				let everyoneCapable = true;
-				let batchTopics = null;
-				if (!allSameTopic) {
-					batchTopics = new Set();
-					for (let i = 0; i < events.length; i++) batchTopics.add(events[i].topic);
-				}
-				for (const ws of wsConnections) {
-					let ud;
-					try { ud = ws.getUserData(); } catch { continue; }
-					const subs = ud[WS_SUBSCRIPTIONS];
-					if (!subs || subs.size === 0) continue;
-					let touchesAny = false;
-					if (allSameTopic) {
-						touchesAny = subs.has(firstTopic);
-					} else {
-						let touchesAll = true;
-						for (const t of batchTopics) {
-							if (subs.has(t)) touchesAny = true;
-							else touchesAll = false;
-						}
-						if (touchesAny && !touchesAll) { allSeeAll = false; break; }
+			// One scope for the whole relayed receive, as production.
+			const fanout = deliveryAuthorization.begin();
+			try {
+				if (frame.kind === 'publishBatched') {
+					const events = frame.events;
+					if (!Array.isArray(events) || events.length === 0) return;
+					if (typeof events[0].topic !== 'string' || typeof events[0].env !== 'string') return;
+					const firstTopic = events[0].topic;
+					let allSameTopic = true;
+					for (let i = 1; i < events.length; i++) {
+						if (events[i].topic !== firstTopic) { allSameTopic = false; break; }
 					}
-					if (!touchesAny) continue;
-					const caps = ud[WS_CAPS];
-					if (!caps || !caps.has('batch')) { everyoneCapable = false; break; }
-				}
-				if ((!allSameTopic && !allSeeAll) || !everyoneCapable) {
+					let allSeeAll = true;
+					let everyoneCapable = true;
+					let batchTopics = null;
+					if (!allSameTopic) {
+						batchTopics = new Set();
+						for (let i = 0; i < events.length; i++) batchTopics.add(events[i].topic);
+					}
+					for (const ws of wsConnections) {
+						let ud;
+						try { ud = ws.getUserData(); } catch { continue; }
+						const subs = ud[WS_SUBSCRIPTIONS];
+						if (!subs || subs.size === 0) continue;
+						let touchesAny = false;
+						if (allSameTopic) {
+							touchesAny = subs.has(firstTopic);
+						} else {
+							let touchesAll = true;
+							for (const t of batchTopics) {
+								if (subs.has(t)) touchesAny = true;
+								else touchesAll = false;
+							}
+							if (touchesAny && !touchesAll) { allSeeAll = false; break; }
+						}
+						if (!touchesAny) continue;
+						const caps = ud[WS_CAPS];
+						if (!caps || !caps.has('batch')) { everyoneCapable = false; break; }
+					}
+					if ((!allSameTopic && !allSeeAll) || !everyoneCapable) {
+						if (resumeBuffersT.size > 0) for (let i = 0; i < events.length; i++) captureResumeFrameT(events[i].topic, events[i].seq, events[i].env);
+						for (let i = 0; i < events.length; i++) deliveryAuthorization.publish(app, wsConnections, events[i].topic, events[i].env, false, false);
+						return;
+					}
 					if (resumeBuffersT.size > 0) for (let i = 0; i < events.length; i++) captureResumeFrameT(events[i].topic, events[i].seq, events[i].env);
-					for (let i = 0; i < events.length; i++) app.publish(events[i].topic, events[i].env, false, false);
+					const relaySlice = new Array(events.length);
+					for (let i = 0; i < events.length; i++) relaySlice[i] = events[i].env;
+					const sharedBatchEnv = wrapBatchEnvelope(relaySlice);
+					const fanoutTopic = allSameTopic ? firstTopic : events[0].topic;
+					deliveryAuthorization.publish(app, wsConnections, fanoutTopic, sharedBatchEnv, false, false);
 					return;
 				}
-				if (resumeBuffersT.size > 0) for (let i = 0; i < events.length; i++) captureResumeFrameT(events[i].topic, events[i].seq, events[i].env);
-				const relaySlice = new Array(events.length);
-				for (let i = 0; i < events.length; i++) relaySlice[i] = events[i].env;
-				const sharedBatchEnv = wrapBatchEnvelope(relaySlice);
-				const fanoutTopic = allSameTopic ? firstTopic : events[0].topic;
-				app.publish(fanoutTopic, sharedBatchEnv, false, false);
-				return;
-			}
-			if (typeof frame.topic === 'string' && typeof frame.envelope === 'string' && frame.envelope.length > 0) {
-				// Codec-aware relay (mirrors handler/lifecycle.js relayPublish): when the
-				// origin carried a registered codec's capability, re-encode binary
-				// locally for this server's binary-capable subscribers (stamping the
-				// carried origin seq, never re-relaying); otherwise the JSON envelope.
-				if (frame.capability !== undefined &&
-					platform.relayPublishWire(frame.topic, frame.event, frame.data, frame.capability, frame.seq, frame.compress)) {
-					return;
+				if (typeof frame.topic === 'string' && typeof frame.envelope === 'string' && frame.envelope.length > 0) {
+					// Codec-aware relay (mirrors handler/lifecycle.js relayPublish): when the
+					// origin carried a registered codec's capability, re-encode binary
+					// locally for this server's binary-capable subscribers (stamping the
+					// carried origin seq, never re-relaying); otherwise the JSON envelope.
+					if (frame.capability !== undefined &&
+						platform.relayPublishWire(frame.topic, frame.event, frame.data, frame.capability, frame.seq, frame.compress)) {
+						return;
+					}
+					if (resumeBuffersT.size > 0) captureResumeFrameT(frame.topic, frame.seq, frame.envelope);
+					deliveryAuthorization.publish(app, wsConnections, frame.topic, frame.envelope, false, false);
 				}
-				if (resumeBuffersT.size > 0) captureResumeFrameT(frame.topic, frame.seq, frame.envelope);
-				app.publish(frame.topic, frame.envelope, false, false);
+			} finally {
+				deliveryAuthorization.finish(fanout);
 			}
 		}
 	};
@@ -2911,7 +3107,7 @@ export async function createTestServer(options = {}) {
 				fatal(permitRestored, 'ws.connection-permit-carrier', null);
 				if (!permitRestored) return;
 			}
-			userData[WS_SUBSCRIPTIONS] = new Set();
+			userData[WS_SUBSCRIPTIONS] = createUnaccountedSubscriptionRegistry();
 			// Promote the upgrade-time requestId into a per-connection platform
 			// clone and drop the carry slot, as the production handler does.
 			const wsPlatform = Object.create(platform);
@@ -3195,7 +3391,7 @@ export async function createTestServer(options = {}) {
 							}
 							try { ws.subscribe(msg.topic); }
 							catch { if (_cap) discardResumeCaptureT(_cap); closedWsAbortsT++; return; }
-							subs.add(msg.topic);
+							addLogicalSubscription(subs, msg.topic);
 							if (_cap) flushResumeTopicT(_cap, msg.topic, coveredSeqForT(_covered, msg.topic));
 							if (sharedTopicsT.has(msg.topic)) joinCohortT(ws, ws.getUserData(), msg.topic, sharedTopicsT.get(msg.topic));
 							sendSubscribedT(ws, msg.topic, ref);
@@ -3213,7 +3409,8 @@ export async function createTestServer(options = {}) {
 							// delivering private fan-out (and cursor keeps accepting writes).
 							releaseDerivedSubscriptions(ws, msg.topic);
 							ws.unsubscribe(msg.topic);
-							ws.getUserData()[WS_SUBSCRIPTIONS]?.delete(msg.topic);
+							const wireSubs = ws.getUserData()[WS_SUBSCRIPTIONS];
+							if (wireSubs) removeLogicalSubscription(wireSubs, msg.topic);
 							// Read access gone means write access gone, as production and the
 							// platform.unsubscribe above both do.
 							const udWireUnsub = ws.getUserData();
@@ -3381,76 +3578,82 @@ export async function createTestServer(options = {}) {
 									} catch (err) { console.error(adapterConsoleLine(ADAPTER_ERROR_IDS.RECOVER_HOOK), err); }
 								}
 							}
-							for (let i = 0; i < valid.length; i++) {
-								const topic = valid[i];
-								// Re-evaluated HERE against the current grant set, not from the
-								// reading taken before the awaits: the tombstone below fires only
-								// for revocation paths that bump the epoch, so a revocation that
-								// merely drops the membership would otherwise let a pre-await
-								// decision install a grant the server no longer authorizes.
-								// Mirrors the production landing in runtime/handler.js.
-								// Read once and handed to both decisions below; nothing between
-								// here and the subscribe mutates the set for this topic.
-								const held = udSubs.has(topic);
-								const denial = (authzDeniedT?.[i] ? 'FORBIDDEN' : null)
-									?? (deniesWireSubscribeLanding({ armed: SUBSCRIBE_AUTHZ_T, hasUserHook: _hasUserHookT && !SUBSCRIBE_AUTHZ_STRICT_T, held: held && heldSubscribeIsAuthorized(batchUd, topic, batchTokens[i]), topic }) ? 'FORBIDDEN' : null)
-									?? (batchDenials !== null
-										? (batchDenials[topic] ?? null)
-										: (perTopicDenials !== null ? perTopicDenials[i] : null));
-								if (denial !== null) {
-									// The hook denied, but it may have installed tracked membership
-									// (a plugin join) before deciding, and a revocation may have tombstoned
-									// this attempt mid-await. Settling blindly here left that membership
-									// standing: the held branch below defers to a sibling attempt still in
-									// flight, so when that sibling's hook denies too, every attempt leaves
-									// through this exit and nothing remains to judge the membership.
-									if (settleDeniedSubscribe(batchUd, topic, batchTokens[i], held) === 'deny-unwind') {
-										unwindRevokedMembership(ws, topic);
-										runUnsubscribeHook(handler.unsubscribe, ws, topic, { platform: batchUd[WS_PLATFORM] });
-									}
-									sendDeniedT(ws, topic, ref, denial);
-									continue;
-								}
-								if (held) {
-									// Same provenance read as the single lane: a revoked
-									// attempt whose own hook installed the membership must
-									// not ack it.
-									const heldVerdict = settleHeldSubscribe(batchUd, topic, batchTokens[i]);
-									if (heldVerdict === 'ack') {
-										sendSubscribedT(ws, topic, ref);
+							// One scope for every topic's resume flush in this batch.
+							const fanout = deliveryAuthorization.begin();
+							try {
+								for (let i = 0; i < valid.length; i++) {
+									const topic = valid[i];
+									// Re-evaluated HERE against the current grant set, not from the
+									// reading taken before the awaits: the tombstone below fires only
+									// for revocation paths that bump the epoch, so a revocation that
+									// merely drops the membership would otherwise let a pre-await
+									// decision install a grant the server no longer authorizes.
+									// Mirrors the production landing in runtime/handler.js.
+									// Read once and handed to both decisions below; nothing between
+									// here and the subscribe mutates the set for this topic.
+									const held = udSubs.has(topic);
+									const denial = (authzDeniedT?.[i] ? 'FORBIDDEN' : null)
+										?? (deniesWireSubscribeLanding({ armed: SUBSCRIBE_AUTHZ_T, hasUserHook: _hasUserHookT && !SUBSCRIBE_AUTHZ_STRICT_T, held: held && heldSubscribeIsAuthorized(batchUd, topic, batchTokens[i]), topic }) ? 'FORBIDDEN' : null)
+										?? (batchDenials !== null
+											? (batchDenials[topic] ?? null)
+											: (perTopicDenials !== null ? perTopicDenials[i] : null));
+									if (denial !== null) {
+										// The hook denied, but it may have installed tracked membership
+										// (a plugin join) before deciding, and a revocation may have tombstoned
+										// this attempt mid-await. Settling blindly here left that membership
+										// standing: the held branch below defers to a sibling attempt still in
+										// flight, so when that sibling's hook denies too, every attempt leaves
+										// through this exit and nothing remains to judge the membership.
+										if (settleDeniedSubscribe(batchUd, topic, batchTokens[i], held) === 'deny-unwind') {
+											unwindRevokedMembership(ws, topic);
+											runUnsubscribeHook(handler.unsubscribe, ws, topic, { platform: batchUd[WS_PLATFORM] });
+										}
+										sendDeniedT(ws, topic, ref, denial);
 										continue;
 									}
-									if (heldVerdict === 'deny-unwind') {
-										unwindRevokedMembership(ws, topic);
-										runUnsubscribeHook(handler.unsubscribe, ws, topic, { platform: batchUd[WS_PLATFORM] });
+									if (held) {
+										// Same provenance read as the single lane: a revoked
+										// attempt whose own hook installed the membership must
+										// not ack it.
+										const heldVerdict = settleHeldSubscribe(batchUd, topic, batchTokens[i]);
+										if (heldVerdict === 'ack') {
+											sendSubscribedT(ws, topic, ref);
+											continue;
+										}
+										if (heldVerdict === 'deny-unwind') {
+											unwindRevokedMembership(ws, topic);
+											runUnsubscribeHook(handler.unsubscribe, ws, topic, { platform: batchUd[WS_PLATFORM] });
+										}
+										sendDeniedT(ws, topic, ref, 'FORBIDDEN');
+										continue;
 									}
-									sendDeniedT(ws, topic, ref, 'FORBIDDEN');
-									continue;
+									if (exceedsSubscriptionCap({ held, size: udSubs.size, max: MAX_SUBSCRIPTIONS_PER_CONNECTION })) {
+										settlePendingSubscribe(batchUd, topic, batchTokens[i]);
+										sendDeniedT(ws, topic, ref, 'RATE_LIMITED');
+										continue;
+									}
+									// Revocation tombstone: a platform.unsubscribe that landed during
+									// the hook or resume awaits cancelled this topic - discard the
+									// grant and answer the client truthfully rather than acking it.
+									if (!settlePendingSubscribe(batchUd, topic, batchTokens[i], true)) {
+										sendDeniedT(ws, topic, ref, 'FORBIDDEN');
+										continue;
+									}
+									try { ws.subscribe(topic); }
+									catch { closedWsAbortsT++; continue; }
+									addLogicalSubscription(udSubs, topic);
+									if (_batchCap) {
+										// Batch: honor only a per-topic map watermark; a bare number is ambiguous
+										// across topics (it would apply one floor to all and could wrongly skip a
+										// lagging topic), so ignore it here - the pre-window floor covers that topic.
+										const _cov = (_batchCovered !== null && typeof _batchCovered === 'object') ? coveredSeqForT(_batchCovered, topic) : undefined;
+										flushResumeTopicT(_batchCap, topic, _cov);
+									}
+									if (sharedTopicsT.has(topic)) joinCohortT(ws, ws.getUserData(), topic, sharedTopicsT.get(topic));
+									sendSubscribedT(ws, topic, ref);
 								}
-								if (exceedsSubscriptionCap({ held, size: udSubs.size, max: MAX_SUBSCRIPTIONS_PER_CONNECTION })) {
-									settlePendingSubscribe(batchUd, topic, batchTokens[i]);
-									sendDeniedT(ws, topic, ref, 'RATE_LIMITED');
-									continue;
-								}
-								// Revocation tombstone: a platform.unsubscribe that landed during
-								// the hook or resume awaits cancelled this topic - discard the
-								// grant and answer the client truthfully rather than acking it.
-								if (!settlePendingSubscribe(batchUd, topic, batchTokens[i], true)) {
-									sendDeniedT(ws, topic, ref, 'FORBIDDEN');
-									continue;
-								}
-								try { ws.subscribe(topic); }
-								catch { closedWsAbortsT++; continue; }
-								udSubs.add(topic);
-								if (_batchCap) {
-									// Batch: honor only a per-topic map watermark; a bare number is ambiguous
-									// across topics (it would apply one floor to all and could wrongly skip a
-									// lagging topic), so ignore it here - the pre-window floor covers that topic.
-									const _cov = (_batchCovered !== null && typeof _batchCovered === 'object') ? coveredSeqForT(_batchCovered, topic) : undefined;
-									flushResumeTopicT(_batchCap, topic, _cov);
-								}
-								if (sharedTopicsT.has(topic)) joinCohortT(ws, ws.getUserData(), topic, sharedTopicsT.get(topic));
-								sendSubscribedT(ws, topic, ref);
+							} finally {
+								deliveryAuthorization.finish(fanout);
 							}
 							if (_batchCap) discardResumeCaptureT(_batchCap);
 							return;
@@ -3576,6 +3779,9 @@ export async function createTestServer(options = {}) {
 		},
 
 		drain(ws) {
+			// As production: a drain whose held frame was refused closed the
+			// connection, and nothing more runs for it.
+			if (!deliveryAuthorization.drain(ws)) return;
 			// As production: resume any sendCoalesced traffic held back by
 			// backpressure, then the app drain hook inside its boundary.
 			flushCoalescedForT(ws);
@@ -3583,6 +3789,7 @@ export async function createTestServer(options = {}) {
 		},
 
 		close(ws, code, message) {
+			deliveryAuthorization.closed(ws);
 			const ud = ws.getUserData() || {};
 			messageAdmission.close(ws);
 			const subscriptionSlot = ud[WS_SUBSCRIPTIONS];
@@ -3594,7 +3801,7 @@ export async function createTestServer(options = {}) {
 					try {
 						entry.reject(new Error(adapterErrorMessage(
 							ADAPTER_ERROR_IDS.REQUEST_CLOSED,
-							entry.sent
+							!entry.held && entry.status !== 2
 								? REQUEST_CLOSED_DETAIL.UNANSWERED
 								: REQUEST_CLOSED_DETAIL.NEVER_SENT
 						)));
@@ -3632,6 +3839,7 @@ export async function createTestServer(options = {}) {
 				// those connections; the finally cleanup still runs.
 				if (ud[WS_SESSION_ID] !== undefined) runCloseHook(handler, ws, ctx);
 			} finally {
+				accountClosedLogicalSubscriptions(subs);
 				if (ud[WS_CONNECTION_PERMIT]) {
 					ud[WS_CONNECTION_PERMIT] = undefined;
 					admission.releaseConnection();
@@ -3846,18 +4054,19 @@ export async function createTestServer(options = {}) {
 						res.cork(() => {
 							res.writeStatus(String(response.status));
 							let hasCTO = false;
+							const nominated = responseConnectionHeaders(response.headers);
 							for (const [k, v] of response.headers) {
-								if (k === 'content-length' || k === 'transfer-encoding' || k === 'set-cookie' || k === 'date') continue;
+								if (k === 'content-length' || k === 'set-cookie' || k === 'date' || isResponseHopHeader(k, nominated)) continue;
 								if (k === 'x-content-type-options') hasCTO = true;
-								res.writeHeader(k, v);
+								res.writeHeader(k, responseHeaderBytes(v));
 							}
 							if (!hasCTO) res.writeHeader('x-content-type-options', 'nosniff');
-							for (const c of response.headers.getSetCookie()) res.writeHeader('set-cookie', c);
+							for (const c of nominated?.has('set-cookie') ? [] : response.headers.getSetCookie()) res.writeHeader('set-cookie', responseHeaderBytes(c));
 							if (body && body.byteLength) {
 								if (headOnly) res.endWithoutBody(body.byteLength);
 								else res.end(body);
 							} else {
-								endBodyless(res, response.status, response.headers.get('content-length'), headOnly);
+								endBodyless(res, response.status, responseContentLength(response.headers), headOnly);
 							}
 						});
 					})
@@ -4076,8 +4285,25 @@ export async function createTestServer(options = {}) {
 					// inject a lightweight fake ws implementing only close(), so fall
 					// back to it when end() is absent.
 					for (const ws of [...wsConnections]) {
-						if (typeof ws.end === 'function') ws.end(1001, 'Test server closing');
+						if (typeof ws.end === 'function') deliveryAuthorization.end(ws, 1001, 'Test server closing');
 						else ws.close(1001, 'Test server closing');
+					}
+					// As production shutdown: a connection whose delivery policy still
+					// holds frames ends once they are out, each within timeoutMs, and
+					// never past the shutdown budget.
+					const heldEnds = deliveryAuthorization.ended();
+					if (heldEnds !== null) {
+						let budgetLeft = null;
+						const spent = deadline === null ? null : new Promise((resolve) => {
+							budgetLeft = setTimer(resolve, Math.max(0, deadline - wallEpoch()));
+						});
+						await (spent === null ? heldEnds : Promise.race([heldEnds, spent]));
+						if (budgetLeft !== null) clearTimer(budgetLeft);
+						// The budget is spent: a connection still waiting for held frames
+						// is closed outright, as production force-closes its app.
+						for (const ws of [...wsConnections]) {
+							if (typeof ws.end === 'function') { try { ws.close(); } catch { /* already gone */ } }
+						}
 					}
 					// Join the close callbacks those kicks fire, so a resolved
 					// close() means the sockets are gone, not merely told to go.

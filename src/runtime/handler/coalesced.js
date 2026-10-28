@@ -1,3 +1,4 @@
+import { deliveryAuthorization } from './delivery-authorization.js';
 /**
  * The per-connection queue behind `platform.sendCoalesced`: one pending value
  * per key, latest wins, flushed at once and again on every drain.
@@ -71,51 +72,56 @@ export function flushCoalescedFor(ws, callerEntry) {
 	let aborted = false;
 	/** @type {unknown} */
 	let callerError = null;
-	const yielded = drainCoalesced(pending, (/** @type {any} */ msg, key) => {
-		if (aborted) return SEND_DROPPED;
-		assert(typeof msg.topic === 'string', 'coalesce.entry-topic-type', null);
-		assert(typeof msg.event === 'string', 'coalesce.entry-event-type', null);
-		let payload;
-		let failure;
-		try {
-			const body = JSON.stringify(msg.data ?? null);
-			if (typeof body === 'string') payload = msg.prefix + body + '}';
-		} catch (err) { failure = err; }
-		// A serializer may have queued a newer value for this key.
-		if (pending.get(key) !== msg) return 1;
-		if (payload === undefined) {
-			const err = isNativeError(failure) ? failure : new TypeError('sendCoalesced data has no JSON form');
-			if (msg === callerEntry) callerError = err;
-			else {
-				reportCoalescedFailure(userData, msg, key, err);
+	const deliveryOperation = deliveryAuthorization.begin();
+	try {
+		const yielded = drainCoalesced(pending, (/** @type {any} */ msg, key) => {
+			if (aborted) return SEND_DROPPED;
+			assert(typeof msg.topic === 'string', 'coalesce.entry-topic-type', null);
+			assert(typeof msg.event === 'string', 'coalesce.entry-event-type', null);
+			let payload;
+			let failure;
+			try {
+				const body = JSON.stringify(msg.data ?? null);
+				if (typeof body === 'string') payload = msg.prefix + body + '}';
+			} catch (err) { failure = err; }
+			// A serializer may have queued a newer value for this key.
+			if (pending.get(key) !== msg) return 1;
+			if (payload === undefined) {
+				const err = isNativeError(failure) ? failure : new TypeError('sendCoalesced data has no JSON form');
+				if (msg === callerEntry) callerError = err;
+				else {
+					reportCoalescedFailure(userData, msg, key, err);
+				}
+				return 1;
 			}
-			return 1;
+			let result;
+			try {
+				result = deliveryAuthorization.armed
+				? deliveryAuthorization.sendReplaceable(ws, payload)
+				: ws.send(payload, false, false);
+			} catch {
+				// The socket closed mid-flush. No later drain will retry, so the
+				// rest of the queue goes too: BACKPRESSURE removes this entry and
+				// stops the loop, and the clear below takes the others.
+				wsCounters.closedWsAborts++;
+				aborted = true;
+				return SEND_BACKPRESSURE;
+			}
+			// The send result goes back to drainCoalesced as it is: SUCCESS removes
+			// the entry and continues, BACKPRESSURE (queued) removes it and stops,
+			// DROPPED keeps it for the next drain.
+			if (result !== SEND_DROPPED) bumpOut(ws, payload);
+			return result;
+		});
+		if (aborted) pending.clear();
+		else if (yielded && !coalescedContinuations.has(pending)) {
+			coalescedContinuations.add(pending);
+			setTimer(() => {
+				coalescedContinuations.delete(pending);
+				if (!wsConnections.has(ws)) { pending.clear(); return; }
+				flushCoalescedFor(ws);
+			}, 0);
 		}
-		let result;
-		try {
-			result = ws.send(payload, false, false);
-		} catch {
-			// The socket closed mid-flush. No later drain will retry, so the
-			// rest of the queue goes too: BACKPRESSURE removes this entry and
-			// stops the loop, and the clear below takes the others.
-			wsCounters.closedWsAborts++;
-			aborted = true;
-			return SEND_BACKPRESSURE;
-		}
-		// The send result goes back to drainCoalesced as it is: SUCCESS removes
-		// the entry and continues, BACKPRESSURE (queued) removes it and stops,
-		// DROPPED keeps it for the next drain.
-		if (result !== SEND_DROPPED) bumpOut(ws, payload);
-		return result;
-	});
-	if (aborted) pending.clear();
-	else if (yielded && !coalescedContinuations.has(pending)) {
-		coalescedContinuations.add(pending);
-		setTimer(() => {
-			coalescedContinuations.delete(pending);
-			if (!wsConnections.has(ws)) { pending.clear(); return; }
-			flushCoalescedFor(ws);
-		}, 0);
-	}
-	if (callerError !== null) throw callerError;
+		if (callerError !== null) throw callerError;
+	} finally { deliveryAuthorization.finish(deliveryOperation); }
 }

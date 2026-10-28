@@ -17,6 +17,7 @@
 // imports in turn. Keeping the budgeted send in ws.js would have made the
 // marker either uncharged or a cycle.
 
+import { deliveryAuthorization } from './delivery-authorization.js';
 import { SEND_DROPPED } from '../utils/send-result.js';
 import { CONTROL_FLOOD_CLOSE_CODE } from '../utils/control-frame.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
@@ -79,7 +80,7 @@ export function sendControl(ws, payload) {
 	}
 	let result;
 	try {
-		result = ws.send(payload, false, false);
+		result = deliveryAuthorization.control(ws, payload);
 	} catch {
 		wsCounters.closedWsAborts++;
 		return CONTROL_GONE;

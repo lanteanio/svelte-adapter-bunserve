@@ -7,8 +7,9 @@
 // unreachable), and the publishBatched frame-size warning (no publishBatched
 // lane exists here).
 
+import { deliveryAuthorization } from './delivery-authorization.js';
 import { computePressureReason, computeTopPublishers, applyCapacityReason } from '../utils/pressure.js';
-import { foldConnectionBackpressure, BACKPRESSURE_SAMPLE_CAP, BACKPRESSURE_SAMPLE_THRESHOLD_BYTES } from '../utils/backpressure.js';
+import { foldConnectionBackpressure, takeBackpressureDropWindow, BACKPRESSURE_SAMPLE_CAP, BACKPRESSURE_SAMPLE_THRESHOLD_BYTES } from '../utils/backpressure.js';
 import { DEFAULT_GRANT, leaseGrantSize, samplePressureValue } from '../utils/lease.js';
 import { now, setIntervalTimer, clearIntervalTimer, subscribeMemoryPressure } from '../runtime.js';
 import { createOsPressureSampler } from '../utils/os-pressure.js';
@@ -135,6 +136,10 @@ function samplePressure(thresholds, sources) {
 	wsCounters.egressRefusedTopicWindow = 0;
 	wsCounters.egressRefusedTenantWindow = 0;
 
+	const drops = takeBackpressureDropWindow(wsCounters);
+	pressureSnapshot.droppedFrames = drops.droppedFrames;
+	pressureSnapshot.droppedBytes = drops.droppedBytes;
+
 	const connections = wsConnections.size;
 	wsCounters.lastConnections = connections;
 	const subscriberRatio = connections > 0 ? wsCounters.totalSubscriptions / connections : 0;
@@ -149,7 +154,8 @@ function samplePressure(thresholds, sources) {
 	// holds facades, whose getBufferedAmount throws once closed - the fold
 	// counts a throw as 0, exactly the already-gone case.
 	const { maxBufferedBytes, backpressuredConnections } = foldConnectionBackpressure(
-		wsConnections, BACKPRESSURE_SAMPLE_CAP, BACKPRESSURE_SAMPLE_THRESHOLD_BYTES
+		wsConnections, BACKPRESSURE_SAMPLE_CAP, BACKPRESSURE_SAMPLE_THRESHOLD_BYTES,
+		deliveryAuthorization.armed ? deliveryAuthorization.pendingBytes : null
 	);
 
 	// Production reads the real process. Controlled runs inject both memory

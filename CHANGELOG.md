@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Delivery authorization checks recipients before application writes, preserves queued operation order and bounded shutdown, and exposes the same policy in native testing and Vite.
+
 - The standing leak lane shares workload plans and verdict thresholds with exported simulation rules, verifies retained state and includes a known-leak self-check.
 
 - Public entrypoints expose typed realtime, testing and simulation contracts with generated platform inventories and pinned lead-surface validation; Bun 1.4.4 is required.

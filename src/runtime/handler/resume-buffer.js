@@ -1,3 +1,4 @@
+import { deliveryAuthorization } from './delivery-authorization.js';
 // Live-frame buffering for the replay-to-live cutover. When a connection
 // gap-fills a topic on subscribe (a recover offset), the server reads the
 // backend, then subscribes the client to live. Between those two steps an
@@ -169,128 +170,129 @@ export function flushResumeTopic(handle, topic, coveredSeq) {
 	// and `gone` is what separates "refused" from "there is no socket any more".
 	// Only a refusal is worth signalling to, and only a dead socket must stop us
 	// closing the connection at the end.
-	let gone = false;
-	// Either the window overflowed the frame cap - the tail past the cap was
-	// never captured - or the caller marked this gap-fill incomplete because
-	// the resume hook did not finish. Both mean the same thing to the client,
-	// which has no gap detection: what follows is not the whole story, and
-	// trusting a partial flush would leave a silent hole. Signal the
-	// truncation on the replay channel FIRST - the same marker a replay backend emits
-	// for an uncoverable range - so this critical resync signal is not
-	// itself lost behind the backpressure the partial flush below would
-	// build. The client drops its stale per-topic offset and
-	// cold-resyncs; the partial frames are then a best-effort extra.
-	//
-	// `signalled` records that the marker was TAKEN, not that it was attempted.
-	// A window whose marker is itself refused has told the client nothing, and
-	// is escalated below like any other untold truncation.
-	let needsSignal = entry.buffer.overflow || entry.buffer.truncated;
-	let signalled = false;
-	if (needsSignal) {
-		const answer = sendTruncated(ws, topic);
-		signalled = answer === CONTROL_DELIVERED;
-		gone = answer === CONTROL_GONE;
-	}
-	// The dedup floor. A reported watermark is trusted only up to what this
-	// server has actually stamped for the topic: the floor is the hook's RETURN,
-	// echoing the client's own offset back is the natural hook shape, and the
-	// client controls that value - so without a bound an absurd offset becomes a
-	// floor that discards the entire held window.
-	//
-	// The mark and the frames measured against it are both drawn from the app's
-	// explicit seq lane, so the comparison stays inside one ordering. The adapter
-	// treats that lane as a single space; keeping it so across publishers is the
-	// app's business, and an explicit seq from some other authority poisons this
-	// bound exactly as it would poison the client's own offsets.
-	//
-	// The ceiling is the HIGHER of the topic's mark now and its mark at window
-	// open. The mark itself only moves up, so the one way the live value lands
-	// below the snapshot is the bounded-map eviction dropping the topic and a
-	// later publish re-seeding it low. The snapshot is still a seq this server
-	// stamped, so it remains a valid ceiling, and a ceiling below `entry.before`
-	// would make the fallback HIGHER than the value it rejected, dropping
-	// in-window frames the hook never covered. The comparison form is total: it
-	// needs no special case for an unmarked topic (`NO_MARK`) or for a value
-	// nothing orders.
-	//
-	// The fallback is the pre-window mark - the same floor a hook that reports
-	// nothing gets. Conservative, NOT lossless: a reordered explicit seq captured
-	// BELOW that mark is still deduped away. That is inherent to falling back to
-	// a high-water mark, and is the reason a cooperating backend reports its
-	// watermark instead. An unmarked topic falls back to `NO_MARK`, dedups
-	// nothing, and re-delivers the whole held window.
-	//
-	// A NaN coveredSeq is deliberately NOT screened out: `NaN > ceiling` is
-	// false, so it arrives below as a floor nothing is ever `<=` and every held
-	// frame flushes. A hook that reported nonsense has said nothing about what it
-	// covered.
-	const seen = maxAuthoritativeSeq.get(topic);
-	const ceiling = typeof seen === 'number' && seen > entry.before ? seen : entry.before;
-	const floor =
-		coveredSeq === undefined || coveredSeq > ceiling ? entry.before : coveredSeq;
-	for (const f of entry.buffer.frames) {
-		if (gone) break;
-		// Dedup ONLY explicit-seq frames against the floor: they share the
-		// floor's seq space. A counter-stamped live frame is always newer than
-		// the window, so comparing it to an explicit floor could only ever
-		// drop it wrongly - it always flushes.
-		if (f.authoritative && f.seq !== null && f.seq <= floor) continue;
-		const compress = ws_compression_on && f.compress;
-		let result;
-		try {
-			result = ws.send(f.envelope, false, compress);
-		} catch {
-			wsCounters.closedWsAborts++;
-			gone = true;
-			break;
+	const deliveryOperation = deliveryAuthorization.begin();
+	try {
+		let gone = false;
+		// Either the window overflowed the frame cap - the tail past the cap was
+		// never captured - or the caller marked this gap-fill incomplete because
+		// the resume hook did not finish. Both mean the same thing to the client,
+		// which has no gap detection: what follows is not the whole story, and
+		// trusting a partial flush would leave a silent hole. Signal the
+		// truncation on the replay channel FIRST - the same marker a replay backend emits
+		// for an uncoverable range - so this critical resync signal is not
+		// itself lost behind the backpressure the partial flush below would
+		// build. The client drops its stale per-topic offset and
+		// cold-resyncs; the partial frames are then a best-effort extra.
+		//
+		// `signalled` records that the marker was TAKEN, not that it was attempted.
+		// A window whose marker is itself refused has told the client nothing, and
+		// is escalated below like any other untold truncation.
+		let needsSignal = entry.buffer.overflow || entry.buffer.truncated;
+		let signalled = false;
+		if (needsSignal) {
+			const answer = sendTruncated(ws, topic);
+			signalled = answer === CONTROL_DELIVERED;
+			gone = answer === CONTROL_GONE;
 		}
-		if (result === SEND_DROPPED) {
-			// A refused gap-fill frame is the same silent hole the overflow
-			// branch guards against: the ack that follows tells the client to
-			// go live, with this frame missing and nothing to make it notice.
-			// Stop pushing frames the socket is refusing, and signal.
-			needsSignal = true;
-			break;
-		}
-		bumpOut(ws, f.envelope);
-	}
-	let closed = false;
-	// One marker per topic, not two: this is the up-front marker retried
-	// because it was refused, or the first one for a window that only turned
-	// out to be incomplete partway through the flush.
-	if (needsSignal && !signalled && !gone) {
-		const answer = sendTruncated(ws, topic);
-		signalled = answer === CONTROL_DELIVERED;
-		gone = answer === CONTROL_GONE;
-		if (!signalled && !gone) {
-			// The socket is refusing even this. There is no way left to tell the
-			// client it has a hole, and staying connected is the one outcome
-			// that leaves it silently wrong - the `subscribed` ack would follow
-			// and it would go live trusting a gap-fill it never received.
-			// Closing forces a reconnect, whose resume starts from the last seq
-			// the client actually received, so the missed tail is re-delivered
-			// rather than lost. 1013 is retry-class for the family client, not
-			// one of the codes it treats as terminal - but the client usually
-			// never reads it: a socket this saturated is torn down before the
-			// close frame gets out, and 1006 is what arrives (measured on both
-			// generations, probe/bun-api-facts.report.md
-			// close-under-backpressure). The guarantee here is the absent ack
-			// and the ended connection, not the number.
+		// The dedup floor. A reported watermark is trusted only up to what this
+		// server has actually stamped for the topic: the floor is the hook's RETURN,
+		// echoing the client's own offset back is the natural hook shape, and the
+		// client controls that value - so without a bound an absurd offset becomes a
+		// floor that discards the entire held window.
+		//
+		// The mark and the frames measured against it are both drawn from the app's
+		// explicit seq lane, so the comparison stays inside one ordering. The adapter
+		// treats that lane as a single space; keeping it so across publishers is the
+		// app's business, and an explicit seq from some other authority poisons this
+		// bound exactly as it would poison the client's own offsets.
+		//
+		// The ceiling is the HIGHER of the topic's mark now and its mark at window
+		// open. The mark itself only moves up, so the one way the live value lands
+		// below the snapshot is the bounded-map eviction dropping the topic and a
+		// later publish re-seeding it low. The snapshot is still a seq this server
+		// stamped, so it remains a valid ceiling, and a ceiling below `entry.before`
+		// would make the fallback HIGHER than the value it rejected, dropping
+		// in-window frames the hook never covered. The comparison form is total: it
+		// needs no special case for an unmarked topic (`NO_MARK`) or for a value
+		// nothing orders.
+		//
+		// The fallback is the pre-window mark - the same floor a hook that reports
+		// nothing gets. Conservative, NOT lossless: a reordered explicit seq captured
+		// BELOW that mark is still deduped away. That is inherent to falling back to
+		// a high-water mark, and is the reason a cooperating backend reports its
+		// watermark instead. An unmarked topic falls back to `NO_MARK`, dedups
+		// nothing, and re-delivers the whole held window.
+		//
+		// A NaN coveredSeq is deliberately NOT screened out: `NaN > ceiling` is
+		// false, so it arrives below as a floor nothing is ever `<=` and every held
+		// frame flushes. A hook that reported nonsense has said nothing about what it
+		// covered.
+		const seen = maxAuthoritativeSeq.get(topic);
+		const ceiling = typeof seen === 'number' && seen > entry.before ? seen : entry.before;
+		const floor =
+			coveredSeq === undefined || coveredSeq > ceiling ? entry.before : coveredSeq;
+		for (const f of entry.buffer.frames) {
+			if (gone) break;
+			// Dedup ONLY explicit-seq frames against the floor: they share the
+			// floor's seq space. A counter-stamped live frame is always newer than
+			// the window, so comparing it to an explicit floor could only ever
+			// drop it wrongly - it always flushes.
+			if (f.authoritative && f.seq !== null && f.seq <= floor) continue;
+			const compress = ws_compression_on && f.compress;
+			let result;
 			try {
-				ws.end(RESUME_INCOMPLETE_CLOSE_CODE, 'resume incomplete');
-				closed = true;
+				result = deliveryAuthorization.send(ws, f.envelope, false, compress);
 			} catch {
 				wsCounters.closedWsAborts++;
 				gone = true;
+				break;
+			}
+			if (result === SEND_DROPPED) {
+				// A refused gap-fill frame is the same silent hole the overflow
+				// branch guards against: the ack that follows tells the client to
+				// go live, with this frame missing and nothing to make it notice.
+				// Stop pushing frames the socket is refusing, and signal.
+				needsSignal = true;
+				break;
+			}
+			bumpOut(ws, f.envelope);
+		}
+		let closed = false;
+		// One marker per topic, not two: this is the up-front marker retried
+		// because it was refused, or the first one for a window that only turned
+		// out to be incomplete partway through the flush.
+		if (needsSignal && !signalled && !gone) {
+			const answer = sendTruncated(ws, topic);
+			signalled = answer === CONTROL_DELIVERED;
+			gone = answer === CONTROL_GONE;
+			if (!signalled && !gone) {
+				// The socket is refusing even this. There is no way left to tell the
+				// client it has a hole, and staying connected is the one outcome
+				// that leaves it silently wrong - the `subscribed` ack would follow
+				// and it would go live trusting a gap-fill it never received.
+				// Closing forces a reconnect, whose resume starts from the last seq
+				// the client actually received, so the missed tail is re-delivered
+				// rather than lost. 1013 is retry-class for the family client.
+				// Bun 1.4.4 delivered that close even under saturation in the
+				// close-under-backpressure probe; a transport failure can still
+				// prevent the close frame from reaching the client. The guarantee
+				// here is the absent ack and the ended connection, not the number.
+				try {
+					deliveryAuthorization.end(ws, RESUME_INCOMPLETE_CLOSE_CODE, 'resume incomplete');
+					closed = true;
+				} catch {
+					wsCounters.closedWsAborts++;
+					gone = true;
+				}
 			}
 		}
-	}
-	unregister(handle, entry);
-	// Drop the entry from the handle too, so a repeat flush for this topic is
-	// a no-op and a final-sweep discard only touches un-flushed topics.
-	const ei = handle.entries.indexOf(entry);
-	if (ei !== -1) handle.entries.splice(ei, 1);
-	return closed || gone;
+		unregister(handle, entry);
+		// Drop the entry from the handle too, so a repeat flush for this topic is
+		// a no-op and a final-sweep discard only touches un-flushed topics.
+		const ei = handle.entries.indexOf(entry);
+		if (ei !== -1) handle.entries.splice(ei, 1);
+		return closed || gone;
+	} finally { deliveryAuthorization.finish(deliveryOperation); }
 }
 
 /**

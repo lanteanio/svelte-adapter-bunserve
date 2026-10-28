@@ -48,21 +48,50 @@ export const BACKPRESSURE_SAMPLE_THRESHOLD_BYTES = 64 * 1024;
  * @param {Iterable<{ getBufferedAmount: () => number }>} connections
  * @param {number} cap  max connections to read this tick (bounds the cost)
  * @param {number} threshold  a reading strictly above this counts as backpressured
+ * @param {((ws: any) => number) | null} [heldBytes] payload bytes waiting at the delivery boundary
  * @returns {{ maxBufferedBytes: number, backpressuredConnections: number, sampled: number }}
  */
-export function foldConnectionBackpressure(connections, cap, threshold) {
+export function foldConnectionBackpressure(connections, cap, threshold, heldBytes = null) {
 	let maxBufferedBytes = 0;
 	let backpressuredConnections = 0;
 	let sampled = 0;
 	for (const ws of connections) {
 		if (sampled >= cap) break;
 		let amt;
-		try { amt = ws.getBufferedAmount(); } catch { amt = 0; }
+		try { amt = ws.getBufferedAmount() + (heldBytes === null ? 0 : heldBytes(ws)); } catch { amt = 0; }
 		if (amt > maxBufferedBytes) maxBufferedBytes = amt;
 		if (amt > threshold) backpressuredConnections++;
 		sampled++;
 	}
 	return { maxBufferedBytes, backpressuredConnections, sampled };
+}
+
+/**
+ * Record a refused direct delivery in the current pressure window.
+ * Retain only its encoded byte length, never the payload.
+ *
+ * @param {{ droppedFramesWindow: number, droppedBytesWindow: number }} target
+ * @param {{ byteLength: number }} message
+ */
+export function recordBackpressureDrop(target, message) {
+	target.droppedFramesWindow++;
+	target.droppedBytesWindow += message.byteLength;
+}
+
+/**
+ * Close and reset the exact drop window. Kept separate from the bounded queue
+ * sampler: a drop that drains before the next tick, or occurs beyond the
+ * sampler's 1,024-connection cap, must still be counted.
+ *
+ * @param {{ droppedFramesWindow: number, droppedBytesWindow: number }} target
+ * @returns {{ droppedFrames: number, droppedBytes: number }}
+ */
+export function takeBackpressureDropWindow(target) {
+	const droppedFrames = target.droppedFramesWindow;
+	const droppedBytes = target.droppedBytesWindow;
+	target.droppedFramesWindow = 0;
+	target.droppedBytesWindow = 0;
+	return { droppedFrames, droppedBytes };
 }
 
 // Only nested drains need a set; the ordinary synchronous call owns one slot.

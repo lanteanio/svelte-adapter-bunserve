@@ -17,6 +17,7 @@ const { WS_CAPS, WS_PLATFORM, WS_SHARED_COHORTS, WS_SUBSCRIPTIONS, capCounts, ma
 	await import('../../src/runtime/handler/ws-state.js');
 const { trackedSubscribe, trackedUnsubscribe } = await import('../../src/runtime/utils/ws-symbols.js');
 const { wireStatePoisoned } = await import('../../src/runtime/handler/wire-state.js');
+const { deliveryAuthorization } = await import('../../src/runtime/handler/delivery-authorization.js');
 const { leaveSharedCohort } = await import('../../src/runtime/handler/cohort.js');
 const { parseBinaryFrame } = await import('../../src/runtime/utils/wire.js');
 const { SHARED_WIRE_ID_BASE, _resetSharedWireIds, getSharedWireId } = await import(
@@ -1166,6 +1167,36 @@ test('a declined batch with no exclusion stamps every frame from the shared list
 		assert.equal(frames[1].seq, 2, 'entry 2 seq');
 	});
 });
+
+for (const armed of [false, true]) for (const dropped of ['announce', 'frame']) {
+	test(`a declined stateful batch preserves its JSON suffix after ${dropped} drop (${armed ? 'armed' : 'unarmed'})`, () => {
+		setServer(fakeServer());
+		const capable = fakeWs({ topics: ['room'], caps: [CAP], script: dropped === 'announce' ? [2, 1, 1, 1] : [1, 2, 1, 1] });
+		const peer = fakeWs({ topics: ['room'] });
+		for (const ws of [capable, peer]) ws.getBufferedAmount = () => 0;
+		const seen = new Map();
+		if (armed) platform.authorizeDelivery((_ws, context) => {
+			if (!context.binary) {
+				const key = context.data.x;
+				if (seen.has(key)) assert.equal(context, seen.get(key), 'suffix preserves the per-entry shared parse cache');
+				else seen.set(key, context);
+			}
+			return true;
+		});
+		const wire = { capability: CAP, schemaVersion: 1, state: { onAttach: () => ({}) },
+			encode: (event, data) => event.endsWith('-batch') ? null : new Uint8Array([data.x]) };
+		try {
+			withConnections([capable, peer], () => {
+				const before = wsCounters.closedWsAborts;
+				assert.equal(platform.publishWireBatch('room', 'value', [1, 2, 3].map(x => ({ data: { x } })), wire), true);
+				const json = capable.sent.filter(frame => typeof frame.payload === 'string').map(frame => JSON.parse(frame.payload)).filter(frame => !frame.type);
+				assert.deepEqual(json.map(frame => frame.data.x), dropped === 'announce' ? [1, 2, 3] : [2, 3]);
+				assert.equal(wireStatePoisoned(capable.ud, CAP), true);
+				assert.equal(wsCounters.closedWsAborts, before, 'a dropped frame must not become a caught indexing exception');
+			});
+		} finally { deliveryAuthorization.reset(); }
+	});
+}
 
 test('a fan-out that only drops frames reports no delivery', () => {
 	// A declining stateless codec with an exclusion takes publishWire's

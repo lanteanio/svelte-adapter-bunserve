@@ -80,7 +80,7 @@ const facades = new WeakMap();
  * @param {() => any} [getServer] - lazy native server access for publish
  * @returns {any} the facade
  */
-export function wsFacade(raw, getServer, getMetricHooks) {
+export function wsFacade(raw, getServer, getMetricHooks, recordDrop) {
 	const existing = facades.get(raw);
 	if (existing !== undefined) return existing;
 
@@ -182,11 +182,15 @@ export function wsFacade(raw, getServer, getMetricHooks) {
 			// false drop self-heals where a false delivery would not.
 			if (result === 0 && isEmptyPayload(payload)) {
 				const mapped = raw.getBufferedAmount() === 0 ? SEND_SUCCESS : SEND_DROPPED;
-				if (mapped === SEND_DROPPED) getMetricHooks?.()?.dropped(0);
+				if (mapped === SEND_DROPPED) { recordDrop?.(0); getMetricHooks?.()?.dropped(0); }
 				return mapped;
 			}
 			const mapped = mapSendResult(result);
-			if (mapped === SEND_DROPPED) getMetricHooks?.()?.dropped(typeof payload === 'string' ? Buffer.byteLength(payload) : payload.byteLength);
+			if (mapped === SEND_DROPPED) {
+				const bytes = typeof payload === 'string' ? Buffer.byteLength(payload) : payload.byteLength;
+				recordDrop?.(bytes);
+				getMetricHooks?.()?.dropped(bytes);
+			}
 			return mapped;
 		},
 

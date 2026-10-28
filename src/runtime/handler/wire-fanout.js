@@ -4,8 +4,8 @@ import { WS_CAPS, WS_SUBSCRIPTIONS } from '../utils.js';
 
 const SEND_THROWN = 3;
 
-function send(io, ws, value, binary) {
-	if (io.send) return io.send(ws, value, binary);
+function send(io, ws, value, binary, cache = io.cache) {
+	if (io.send) return io.send(ws, value, binary, io.topic, cache);
 	try { return ws.send(value, binary, io.compress); }
 	catch {
 		if (io.counters) io.counters.closedWsAborts++;
@@ -36,10 +36,11 @@ export function encodeStatelessWirePayload(wire, event, data) {
  *   ensureId: (ws: any, ud: any, topic: string) => number,
  *   isPoisoned: (ud: any, capability: string) => boolean,
  *   poison: (ws: any, ud: any, capability: string) => void,
- *   send?: (ws: any, value: string | Uint8Array, binary: boolean) => unknown,
+ *   send?: (ws: any, value: string | Uint8Array, binary: boolean, topic: string, cache?: object | null) => unknown,
  *   compress?: boolean,
  *   counters?: { closedWsAborts: number },
- *   buildFrame?: typeof buildBinaryFrame
+ *   buildFrame?: typeof buildBinaryFrame,
+ *   cache?: object | null
  * }} io
  */
 export function deliverStatelessWireFanout(wire, payload, io) {
@@ -93,7 +94,7 @@ export function deliverStatelessWireFanout(wire, payload, io) {
  *   topic: string,
  *   ensureId: (ws: any, ud: any, topic: string) => number,
  *   poison: (ws: any, ud: any, capability: string) => void,
- *   send?: (ws: any, value: string | Uint8Array, binary: boolean) => unknown,
+ *   send?: (ws: any, value: string | Uint8Array, binary: boolean, topic: string, cache?: object | null) => unknown,
  *   compress?: boolean,
  *   counters?: { closedWsAborts: number },
  *   buildFrame?: typeof buildBinaryFrame
@@ -115,7 +116,7 @@ export function deliverStatefulWireBatch(io) {
 	const sendJsonFrom = (start) => {
 		let result = 1;
 		for (let i = start; i < io.envelopes.length; i++) {
-			result = send(io, io.ws, io.envelopes[i], false);
+			result = send(io, io.ws, io.envelopes[i], false, io.caches?.[i]);
 			if (result === SEND_THROWN) break;
 		}
 		return result;
@@ -126,7 +127,7 @@ export function deliverStatefulWireBatch(io) {
 		for (let i = 0; i < io.datas.length; i++) {
 			const entryPayload = io.wire.encode(io.event, io.datas[i], io.state);
 			if (entryPayload == null) {
-				result = send(io, io.ws, io.envelopes[i], false);
+				result = send(io, io.ws, io.envelopes[i], false, io.caches?.[i]);
 				continue;
 			}
 			if (!isUint8Array(entryPayload)) throw new TypeError('wire.encode must return Uint8Array or null');

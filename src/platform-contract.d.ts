@@ -7,6 +7,7 @@
 export declare const PLATFORM_MEMBERS: readonly [
 	"adviseReconnect",
 	"assertions",
+	"authorizeDelivery",
 	"authorizeWireSubscribe",
 	"bufferedAmount",
 	"bumpTopicEpoch",

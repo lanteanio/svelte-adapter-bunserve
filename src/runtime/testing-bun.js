@@ -71,7 +71,13 @@ export function App() {
 							};
 							const response = {
 								writeStatus(value) { status = Number.parseInt(value, 10); return response; },
-								writeHeader(name, value) { headers.append(name, String(value)); return response; },
+								writeHeader(name, value) {
+									// Fetch header strings contain one code unit per byte.
+									const text = value instanceof ArrayBuffer || ArrayBuffer.isView(value)
+										? Buffer.from(asBytes(value)).toString('latin1') : String(value);
+									headers.append(name, text);
+									return response;
+								},
 								end(body, close = false) { if (close) headers.set('connection', 'close'); return finish(body); },
 								endWithoutBody(length, close = false) {
 									if (length !== undefined && status !== 204) headers.set('content-length', String(length));

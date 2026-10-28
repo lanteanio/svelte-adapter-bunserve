@@ -48,6 +48,57 @@ export interface StaticCacheControlRule {
 	cacheControl: string;
 }
 
+/**
+ * One logical message of an outbound frame, as `authorizeDelivery` sees it.
+ * A batch frame is checked once per event. The object is frozen (its `data`
+ * is not). A text frame an adapter call sends to several sockets is parsed
+ * once and the same object is shown for every recipient; a binary frame's
+ * descriptor is built per recipient. Branch on `kind` first.
+ */
+export interface DeliveryAuthorizationContext {
+	/**
+	 * Application topic. A replay-channel frame (`__replay:<topic>`, such as
+	 * the replay plugin's `msg` and `end`, whose data may carry
+	 * `truncated: true`) is shown under the topic it replays, with kind
+	 * `replay`. A `platform.request` frame is addressed by
+	 * the server to that one socket and has no topic (null), with kind
+	 * `request`: decide it on `event` and `data`, never on a topic.
+	 */
+	topic: string | null;
+	/** Event name, or null for a binary frame or an envelope that names none. */
+	event: string | null;
+	/** Parsed payload; undefined for a binary frame, whose topic is still named. */
+	data: unknown;
+	binary: boolean;
+	/** `message` for publishes and sends, `replay` for replay-channel frames, `request` for server requests. */
+	kind: 'message' | 'replay' | 'request';
+}
+
+/** Bounds for delivery authorization in each worker. */
+export interface DeliveryAuthorizationOptions {
+	/**
+	 * Bytes a socket may hold while decisions are pending or the transport is
+	 * backpressured, counted with the transport's own unflushed bytes. The
+	 * bound charges a held application text frame twice its encoded size (it
+	 * keeps its parse) and a held control or binary frame once, each plus a
+	 * fixed 128-byte entry; `bufferedAmount` reports the payload bytes held.
+	 * A frame offered once what is already held plus the unflushed transport
+	 * bytes exceed the bound is dropped (send status 2) and, in the production
+	 * runtime, counted in `platform.pressure.droppedFrames`; with
+	 * closeOnBackpressureLimit the connection is closed instead, once the
+	 * adapter call in progress finished. A frame is never refused for its own
+	 * size: one offered to an empty transport with nothing held is admitted.
+	 * Default: websocket.maxBackpressure (1 MiB).
+	 */
+	maxPendingBytes?: number;
+	/**
+	 * Longest a pending decision may take, in milliseconds, and how long an
+	 * adapter-initiated close, shutdown included, waits for held frames. At
+	 * most 2147483647. Default: 5000.
+	 */
+	timeoutMs?: number;
+}
+
 export interface AdapterOptions {
 	out?: string;
 	precompress?: boolean;
@@ -653,6 +704,61 @@ export interface Platform {
 	authorizeWireSubscribe(): 'legacy' | 'strict';
 	authorizeWireSubscribe(mode: 'legacy' | 'strict'): 'legacy' | 'strict';
 
+
+	/**
+	 * Install a worker-wide policy for outbound application delivery, once,
+	 * during init in every worker. A second installation throws. Re-read
+	 * authoritative session and membership state here when it can change after
+	 * subscribe; only a literal true admits a message.
+	 *
+	 * Every adapter-built frame carrying application data is checked per
+	 * recipient: sends, publishes, batches, replay, resume flushes, relayed
+	 * frames, requests and binary wire frames. Payload-free adapter markers
+	 * (gap, truncation) and protocol control frames are not checked. A
+	 * synchronous answer delivers at once; a promise or other thenable holds
+	 * that frame, and every later frame for the socket, control frames and
+	 * markers included, queues behind it in order. Frames held behind transport
+	 * backpressure are decided after drain. The payload bytes held count in
+	 * `bufferedAmount` and the pressure sample.
+	 *
+	 * With a policy installed a publish no longer uses the native topic
+	 * fan-out: it walks every local connection and sends to each subscriber
+	 * separately, so it costs O(connections) per publish. It still returns
+	 * true when the topic had a subscriber, whatever each send returned.
+	 *
+	 * A refusal ends the connection with 1013, a retry-class close: the bundled
+	 * client reconnects after its base reconnect delay (about 3 s; each
+	 * successful connection resets its backoff) and the admission hooks decide
+	 * again. Unsubscribe a connection when its access changes, or a hook that
+	 * still admits a refused topic repeats the refusal once per reconnect
+	 * interval. A throw, a non-boolean answer or a decision slower than
+	 * `timeoutMs` ends it with 1011. Both discard what it still held and emit
+	 * a `delivery-authorization.*` diagnostic whose `reason` tells them apart
+	 * (its `closeCode` is null when the connection was already closed when the
+	 * decision landed). A `request` whose frame was held and then refused
+	 * rejects as never sent. Every operation a policy issues through the adapter
+	 * while a policy call is running (send, publish, control frame, end) runs after the whole
+	 * platform call being decided, in the order issued, and none while a
+	 * policy call is running; a refused connection is closed once that call
+	 * finished. A nested publish or wire send queues its complete operation,
+	 * including serialization, codec state, sequence allocation and relay. Its
+	 * scalar options and entry references are captured at the call; keep payload
+	 * objects and codecs unchanged until the enclosing platform call returns.
+	 * A queued wire send returns 0; a publish reports current subscribers (or
+	 * relay), not eventual admission. A deferred serialization/codec throw fails
+	 * the policy recipient with 1011. A nested publishGame returns
+	 * { seq: null, delivered: 0 }: queued, with no sequence assigned yet.
+	 * Plugin helpers such as `replay.replay()` make one platform
+	 * call per frame. After a connection's close event, sends to it fail as on the
+	 * closed socket and publishes skip it.
+	 * A send followed by a direct `ws.end()` delivers only frames already
+	 * handed to the transport. Raw `ws.send` / `ws.publish` calls, and bytes
+	 * the transport already accepted, are outside the policy.
+	 */
+	authorizeDelivery(
+		authorize: (ws: WebSocket<unknown>, delivery: DeliveryAuthorizationContext) => boolean | PromiseLike<boolean>,
+		options?: DeliveryAuthorizationOptions
+	): void;
 
 	unsubscribe(ws: WebSocket<unknown>, topic: string): boolean;
 

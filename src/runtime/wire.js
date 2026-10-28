@@ -313,6 +313,17 @@ export function wireIdAnnounce(topic, id) {
 }
 
 /**
+ * Retire a topic id whose announcement was refused. A later attempt on the
+ * capability must allocate and announce a fresh id before sending binary.
+ * @param {any} ud
+ * @param {symbol} slotKey
+ * @param {string} topic
+ */
+export function retireWireId(ud, slotKey, topic) {
+	ud[slotKey]?.byName.delete(topic);
+}
+
+/**
  * Per-entry-point live capability accounting: how many connections have
  * advertised each capability token. Lets the binary publish path skip the
  * per-subscriber walk entirely when no connected client wants binary for a

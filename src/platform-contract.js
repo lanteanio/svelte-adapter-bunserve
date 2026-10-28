@@ -7,6 +7,7 @@
 export const PLATFORM_MEMBERS = Object.freeze([
 	"adviseReconnect",
 	"assertions",
+	"authorizeDelivery",
 	"authorizeWireSubscribe",
 	"bufferedAmount",
 	"bumpTopicEpoch",

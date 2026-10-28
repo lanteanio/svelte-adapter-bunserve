@@ -1,3 +1,5 @@
+import { deliveryAuthorization } from './delivery-authorization.js';
+import { recordBackpressureDrop } from '../utils/backpressure.js';
 import { emitOperationalEvent, diagnosticError } from '../diagnostic.js';
 /**
  * The WebSocket connection lifecycle and the built-in JSON control demux.
@@ -255,11 +257,13 @@ function settleSubscribeResult(ws, topic, ref, result) {
  * The Bun `websocket` handler set.
  */
 function getTransportMetricHooks() { return wsCounters.transportMetricHooks; }
+function recordTransportDrop(bytes) { recordBackpressureDrop(wsCounters, { byteLength: bytes }); }
+deliveryAuthorization.setIdleHandler(flushCoalescedFor);
 
 export const websocketHandlers = {
 	/** @param {any} raw */
 	open(raw) {
-		const ws = wsFacade(raw, getServer, getTransportMetricHooks);
+		const ws = wsFacade(raw, getServer, getTransportMetricHooks, recordTransportDrop);
 		// Guarded like every other userData read. A throw out of Bun's open
 		// callback would skip `wsConnections.add` below, leaving a live
 		// connection invisible to the registry for the rest of its life.
@@ -374,7 +378,7 @@ export const websocketHandlers = {
 	 * @param {string | Buffer} message
 	 */
 	async message(raw, message) {
-		const ws = wsFacade(raw, getServer, getTransportMetricHooks);
+		const ws = wsFacade(raw, getServer, getTransportMetricHooks, recordTransportDrop);
 		const messageDone = wsCounters.transportMetricHooks?.messageStart(ws, message);
 		let messageFailed = false;
 		const onMessageError = messageDone ? () => { messageFailed = true; } : undefined;
@@ -699,19 +703,22 @@ export const websocketHandlers = {
 						const verdicts = await runWireBatchGates(ws, fresh, tokens, preDenied);
 						const recovery = msg.recover && typeof msg.recover === 'object' && typeof wsModule.resume === 'function'
 							? await prepareBatchRecovery(ws, fresh, tokens, verdicts, msg.recover) : null;
-						for (let i = 0; i < fresh.length; i++) {
-							const topic = fresh[i];
-							// The stamp taken above travels into the landing rather than
-							// being settled here and re-taken. The landing reads what the
-							// record knows about this attempt - whether a revocation
-							// cancelled it, and whether live authority backs a membership
-							// the batch hook may have installed while it ran - and a fresh
-							// stamp would know neither. The topics after this one stay in
-							// flight while it lands, so a revocation reaching them now
-							// still cancels them.
-							const result = await gatedSubscribe(ws, topic, recovery ? recovery[i].denial : verdicts[i], undefined, tokens[i], recovery?.[i]);
-							settleSubscribeResult(ws, topic, ref, result);
-						}
+						const deliveryOperation = deliveryAuthorization.begin();
+						try {
+							for (let i = 0; i < fresh.length; i++) {
+								const topic = fresh[i];
+								// The stamp taken above travels into the landing rather than
+								// being settled here and re-taken. The landing reads what the
+								// record knows about this attempt - whether a revocation
+								// cancelled it, and whether live authority backs a membership
+								// the batch hook may have installed while it ran - and a fresh
+								// stamp would know neither. The topics after this one stay in
+								// flight while it lands, so a revocation reaching them now
+								// still cancels them.
+								const result = await gatedSubscribe(ws, topic, recovery ? recovery[i].denial : verdicts[i], undefined, tokens[i], recovery?.[i]);
+								settleSubscribeResult(ws, topic, ref, result);
+							}
+						} finally { deliveryAuthorization.finish(deliveryOperation); }
 					}
 					return;
 				}
@@ -736,13 +743,14 @@ export const websocketHandlers = {
 
 	/** @param {any} raw */
 	drain(raw) {
-		const ws = wsFacade(raw, getServer, getTransportMetricHooks);
+		const ws = wsFacade(raw, getServer, getTransportMetricHooks, recordTransportDrop);
 		let ud;
 		try {
 			ud = ws.getUserData();
 		} catch {
 			return;
 		}
+		if (!deliveryAuthorization.drain(ws)) return;
 		assert(ud[WS_PLATFORM], 'ws.platform-missing-in-drain', null);
 		// Resume any sendCoalesced traffic backpressure held back, before the
 		// app's own drain hook.
@@ -757,7 +765,7 @@ export const websocketHandlers = {
 	 * @param {string} message
 	 */
 	close(raw, code, message) {
-		const ws = wsFacade(raw, getServer, getTransportMetricHooks);
+		const ws = wsFacade(raw, getServer, getTransportMetricHooks, recordTransportDrop);
 		// Deregister FIRST, before anything that could throw. This is the one
 		// place where a throw would strand the facade in the live-connection
 		// registry permanently - `sendTo` and `forEachSubscriber` would then
@@ -766,6 +774,7 @@ export const websocketHandlers = {
 		wsConnections.delete(ws);
 		wsCounters.transportMetricHooks?.connectionClose(ws, code);
 		ws._markClosed();
+		deliveryAuthorization.closed(ws);
 
 		// Released beside the deregistration because they are the same
 		// obligation, and this callback is the only place that runs exactly once

@@ -1,3 +1,4 @@
+import { deliveryAuthorization, publishAuthorized } from './delivery-authorization.js';
 /** Realtime topic delivery, connection state, and request observability. */
 
 import { isUint8Array } from 'node:util/types';
@@ -153,7 +154,7 @@ function wireJsonSend(ws, topic, event, data, compress, seq) {
 	const json = completeEnvelope(envelopePrefix(topic, event), data, seq);
 	let result;
 	try {
-		result = ws.send(json, false, compress);
+		result = deliveryAuthorization.send(ws, json, false, compress);
 	} catch {
 		wsCounters.closedWsAborts++;
 		return SEND_DROPPED;
@@ -230,9 +231,9 @@ function throwBatchExplicitSeq(topic, seq) {
  * @param {boolean} compress
  * @returns {boolean} whether the frame reached the wire
  */
-function wireEnvelopeSend(ws, envelope, compress) {
+function wireEnvelopeSend(ws, envelope, compress, envelopeCache = null) {
 	try {
-		if (ws.send(envelope, false, compress) !== SEND_DROPPED) return true;
+		if (deliveryAuthorization.send(ws, envelope, false, compress, null, envelopeCache) !== SEND_DROPPED || deliveryAuthorization.armed) return true;
 	} catch {
 		wsCounters.closedWsAborts++;
 	}
@@ -689,6 +690,7 @@ function collapseByCoalesceKey(messages) {
 registerGameIngress();
 
 export const platform = {
+	authorizeDelivery(callback, options) { deliveryAuthorization.configure(callback, options); },
 	[WS_RELEASE_MEMBERSHIP](ws, ud, topic) {
 		try { ws.unsubscribe(topic); } catch { return null; }
 		return removeLogicalSubscription(ud[WS_SUBSCRIPTIONS], topic);
@@ -742,59 +744,73 @@ export const platform = {
 		const seqOpt = options ? options.seq : undefined;
 		const jitterOpt = options ? options.jitterMs : undefined;
 		const compressOpt = options ? options.compress : undefined;
-		// The egress decision comes BEFORE the stamp: a refused publish must
-		// leave no trace - no counter draw, no mark, no frame - or the refusal
-		// itself would poison the seq lane it protected. Recipients are read
-		// at the instant of the publish, which is the charge law's quantity,
-		// and getServer moving up here keeps every refusal ahead of every
-		// record exactly as the comment below requires.
-		const server = getServer();
-		const recipients = server.subscriberCount(topic);
-		const egressTenant = resolvePublishTenant(topic);
-		if (egressGate.armed && !options?.[EGRESS_ADMITTED] && !admitPublishEgress(topic, egressTenant, 1, recipients)) return false;
-		const body = envelopePrefix(topic, event) + envelopeData(data);
-		const seq = stampSeqValue(seqOpt, topic);
-		// Authority is decided from the same single read the stamp consumed.
-		const authoritative = typeof seqOpt === 'number';
-		// A de-herd window is carried verbatim so each client rolls its own
-		// delay. Rolling one server-side offset instead would defer every
-		// subscriber of this frame by the SAME amount, which is the stampede
-		// the option exists to prevent.
-		const jitterMs = typeof jitterOpt === 'number' && jitterOpt > 0 ? jitterOpt : null;
-		const envelope = completeSerializedEnvelope(body, seq, jitterMs);
-		// A zero-length frame at a send site would broadcast garbage to every
-		// subscriber - unrecoverable framing corruption. One length guard.
-		fatal(envelope.length > 0, 'envelope.empty', null);
-		// Everything that can still refuse this publish is resolved above this
-		// line: the egress ceilings and getServer above, stampSeq on a seq the
-		// wire cannot carry, completeEnvelope on a payload JSON cannot
-		// represent. Only then is anything recorded.
-		//
-		// The MARK is the load-bearing half. It is the resume dedup floor, so
-		// raising it for a frame that never went out makes the next gap-fill
-		// window discard the republished frame as already-seen - a silent gap.
-		// The count is the visible half: `publishCount` is documented as
-		// "publishes since boot" and drifts upward on the app's own bug in the
-		// one case where nothing was delivered to notice it by.
-		if (seq !== null) notePublishedSeq(topic, seq, authoritative);
-		wsCounters.publishCount++;
-		wsCounters.publishCountWindow++;
-		chargePublishEgress(
-			topic, egressTenant, 1, recipients, envelope.length,
-			envelopeWireBytes(envelope, recipients, egressGate.bytesArmed)
-		);
-		const compress = ws_compression_on && compressOpt !== false;
-		// A connection still gap-filling this topic (resume cutover in
-		// flight) is not yet subscribed to live, so hold the envelope it
-		// would have received; it flushes once its membership installs. One
-		// guarded size check on the path every publish takes.
-		if (resumeBuffers.size > 0) {
-			captureResumeFrame(topic, seq, envelope, compress, null, authoritative);
+		if (deliveryAuthorization.deciding) {
+			assertStampableSeq(seqOpt);
+			const captured = { seq: seqOpt, jitterMs: jitterOpt, compress: compressOpt };
+			if (options?.[EGRESS_ADMITTED]) captured[EGRESS_ADMITTED] = true;
+			deliveryAuthorization.deferOperation(() => platform.publish(topic, event, data, captured));
+			return getServer().subscriberCount(topic) > 0;
 		}
-		const result = server.publish(topic, envelope, compress);
-		const reached = publishReached(result);
-		wsCounters.transportMetricHooks?.publishOutcome(reached);
-		return reached;
+		const deliveryOperation = deliveryAuthorization.begin();
+		try {
+			// The egress decision comes BEFORE the stamp: a refused publish must
+			// leave no trace - no counter draw, no mark, no frame - or the refusal
+			// itself would poison the seq lane it protected. Recipients are read
+			// at the instant of the publish, which is the charge law's quantity,
+			// and getServer moving up here keeps every refusal ahead of every
+			// record exactly as the comment below requires.
+			const server = getServer();
+			const recipients = server.subscriberCount(topic);
+			const egressTenant = resolvePublishTenant(topic);
+			if (egressGate.armed && !options?.[EGRESS_ADMITTED] && !admitPublishEgress(topic, egressTenant, 1, recipients)) return false;
+			const body = envelopePrefix(topic, event) + envelopeData(data);
+			const seq = stampSeqValue(seqOpt, topic);
+			// Authority is decided from the same single read the stamp consumed.
+			const authoritative = typeof seqOpt === 'number';
+			// A de-herd window is carried verbatim so each client rolls its own
+			// delay. Rolling one server-side offset instead would defer every
+			// subscriber of this frame by the SAME amount, which is the stampede
+			// the option exists to prevent.
+			const jitterMs = typeof jitterOpt === 'number' && jitterOpt > 0 ? jitterOpt : null;
+			const envelope = completeSerializedEnvelope(body, seq, jitterMs);
+			// A zero-length frame at a send site would broadcast garbage to every
+			// subscriber - unrecoverable framing corruption. One length guard.
+			fatal(envelope.length > 0, 'envelope.empty', null);
+			// Everything that can still refuse this publish is resolved above this
+			// line: the egress ceilings and getServer above, stampSeq on a seq the
+			// wire cannot carry, completeEnvelope on a payload JSON cannot
+			// represent. Only then is anything recorded.
+			//
+			// The MARK is the load-bearing half. It is the resume dedup floor, so
+			// raising it for a frame that never went out makes the next gap-fill
+			// window discard the republished frame as already-seen - a silent gap.
+			// The count is the visible half: `publishCount` is documented as
+			// "publishes since boot" and drifts upward on the app's own bug in the
+			// one case where nothing was delivered to notice it by.
+			if (seq !== null) notePublishedSeq(topic, seq, authoritative);
+			wsCounters.publishCount++;
+			wsCounters.publishCountWindow++;
+			chargePublishEgress(
+				topic, egressTenant, 1, recipients, envelope.length,
+				envelopeWireBytes(envelope, recipients, egressGate.bytesArmed)
+			);
+			const compress = ws_compression_on && compressOpt !== false;
+			// A connection still gap-filling this topic (resume cutover in
+			// flight) is not yet subscribed to live, so hold the envelope it
+			// would have received; it flushes once its membership installs. One
+			// guarded size check on the path every publish takes.
+			if (resumeBuffers.size > 0) {
+				captureResumeFrame(topic, seq, envelope, compress, null, authoritative);
+			}
+			const result = deliveryAuthorization.armed
+				? publishAuthorized(server, wsConnections, topic, envelope, false, compress)
+				: server.publish(topic, envelope, compress);
+			const reached = publishReached(result);
+			wsCounters.transportMetricHooks?.publishOutcome(reached);
+			return reached;
+		} finally {
+			deliveryAuthorization.finish(deliveryOperation);
+		}
 	},
 
 	/**
@@ -832,7 +848,9 @@ export const platform = {
 		// backpressure-dropped, and count it in the closed lane so the two
 		// remain separable in telemetry.
 		try {
-			const result = ws.send(payload, false, compress);
+			const result = deliveryAuthorization.armed
+				? deliveryAuthorization.send(ws, payload, false, compress)
+				: ws.send(payload, false, compress);
 			// Queued and written frames count; dropped or throwing sends do not.
 			if (result !== SEND_DROPPED) bumpOut(ws, payload);
 			return result;
@@ -948,27 +966,33 @@ export const platform = {
 		) {
 			return 0;
 		}
-		let count = 0;
-		for (const ws of targets) {
-			let result;
-			try {
-				result = ws.send(envelope, false, compress);
-			} catch {
-				wsCounters.closedWsAborts++;
-				continue;
+		const envelopeCache = deliveryAuthorization.cache();
+		const deliveryOperation = deliveryAuthorization.begin();
+		try {
+			let count = 0;
+			for (const ws of targets) {
+				let result;
+				try {
+					result = deliveryAuthorization.send(ws, envelope, false, compress, null, envelopeCache);
+				} catch {
+					wsCounters.closedWsAborts++;
+					continue;
+				}
+				if (result !== SEND_DROPPED) bumpOut(ws, envelope);
+				count++;
 			}
-			if (result !== SEND_DROPPED) bumpOut(ws, envelope);
-			count++;
+			// Charge every non-throwing send, including a dropped status, once.
+			// Direct fan-out does not feed the publish-family runaway stats.
+			if (count > 0) {
+				chargeDirectEgress(
+					topic, egressTenant, count,
+					envelopeWireBytes(envelope, count, egressGate.bytesArmed)
+				);
+			}
+			return count;
+		} finally {
+			deliveryAuthorization.finish(deliveryOperation);
 		}
-		// Charge every non-throwing send, including a dropped status, once.
-		// Direct fan-out does not feed the publish-family runaway stats.
-		if (count > 0) {
-			chargeDirectEgress(
-				topic, egressTenant, count,
-				envelopeWireBytes(envelope, count, egressGate.bytesArmed)
-			);
-		}
-		return count;
 	},
 
 	/**
@@ -1022,90 +1046,336 @@ export const platform = {
 		const seqOpt = options ? options.seq : undefined;
 		const compressOpt = options ? options.compress : undefined;
 		const excludeOpt = options ? options.excludeWs : undefined;
-		// The egress decision first, as in publish() and for the same reason:
-		// a refused publish leaves no trace. An exclusion discounts a
-		// recipient only when the excluded socket actually holds the topic.
-		// EGRESS_ADMITTED marks a call whose batch already took this decision
-		// for all its entries at once; it still charges below.
-		const server = getServer();
-		const recipients =
-			server.subscriberCount(topic) - (excludedRecipient(excludeOpt, topic) ? 1 : 0);
-		const egressTenant = resolvePublishTenant(topic);
-		if (
-			egressGate.armed &&
-			!(options != null && options[EGRESS_ADMITTED]) &&
-			!admitPublishEgress(topic, egressTenant, 1, recipients)
-		) {
-			return false;
+		if (deliveryAuthorization.deciding) {
+			assertStampableSeq(seqOpt);
+			const captured = { seq: seqOpt, compress: compressOpt, excludeWs: excludeOpt };
+			if (options?.[EGRESS_ADMITTED]) captured[EGRESS_ADMITTED] = true;
+			deliveryAuthorization.deferOperation(() => platform.publishWire(topic, event, data, wire, captured));
+			return getServer().subscriberCount(topic) > 0;
 		}
-		const seq = stampSeqValue(seqOpt, topic);
-		// Authority is decided from the same single read the stamp consumed.
-		const authoritative = typeof seqOpt === 'number';
-		const envelope = completeEnvelope(envelopePrefix(topic, event), data, seq);
-		fatal(envelope.length > 0, 'envelope.empty', null);
-		// Past every refusal point before the mark or the count moves, as in
-		// publish() above and for the same reasons.
-		if (seq !== null) notePublishedSeq(topic, seq, authoritative);
-		wsCounters.publishCount++;
-		wsCounters.publishCountWindow++;
-		// Binary codec frames (and this call's JSON-fallback frames) compress
-		// only when the caller opts in with `{ compress: true }` AND a
-		// compressor is configured. One decision governs the whole call so a
-		// plugin's intent applies to its binary and JSON-fallback frames
-		// alike; off by default keeps the high-frequency path uncompressed.
-		const compress = ws_compression_on && compressOpt === true;
+		const deliveryOperation = deliveryAuthorization.begin();
+		try {
+			// The egress decision first, as in publish() and for the same reason:
+			// a refused publish leaves no trace. An exclusion discounts a
+			// recipient only when the excluded socket actually holds the topic.
+			// EGRESS_ADMITTED marks a call whose batch already took this decision
+			// for all its entries at once; it still charges below.
+			const server = getServer();
+			const recipients =
+				server.subscriberCount(topic) - (excludedRecipient(excludeOpt, topic) ? 1 : 0);
+			const egressTenant = resolvePublishTenant(topic);
+			if (
+				egressGate.armed &&
+				!(options != null && options[EGRESS_ADMITTED]) &&
+				!admitPublishEgress(topic, egressTenant, 1, recipients)
+			) {
+				return false;
+			}
+			const seq = stampSeqValue(seqOpt, topic);
+			// Authority is decided from the same single read the stamp consumed.
+			const authoritative = typeof seqOpt === 'number';
+			const envelope = completeEnvelope(envelopePrefix(topic, event), data, seq);
+			fatal(envelope.length > 0, 'envelope.empty', null);
+			// Past every refusal point before the mark or the count moves, as in
+			// publish() above and for the same reasons.
+			if (seq !== null) notePublishedSeq(topic, seq, authoritative);
+			wsCounters.publishCount++;
+			wsCounters.publishCountWindow++;
+			// Binary codec frames (and this call's JSON-fallback frames) compress
+			// only when the caller opts in with `{ compress: true }` AND a
+			// compressor is configured. One decision governs the whole call so a
+			// plugin's intent applies to its binary and JSON-fallback frames
+			// alike; off by default keeps the high-frequency path uncompressed.
+			const compress = ws_compression_on && compressOpt === true;
 
-		// Sender exclusion: when set, this one local socket must never receive
-		// the frame. The single native fan-out cannot skip a socket, so an
-		// excluding publish always takes the per-subscriber walk (the walk
-		// already hands caps-less connections the identical JSON envelope).
-		const excludeWs = excludeOpt || null;
+			// Sender exclusion: when set, this one local socket must never receive
+			// the frame. The single native fan-out cannot skip a socket, so an
+			// excluding publish always takes the per-subscriber walk (the walk
+			// already hands caps-less connections the identical JSON envelope).
+			const excludeWs = excludeOpt || null;
 
-		// A resuming connection is not yet on the live membership, so it
-		// would receive nothing from any branch below; hold the JSON envelope
-		// it would have received as a caps-less subscriber - but never for the
-		// socket this publish excluded.
-		if (resumeBuffers.size > 0) {
-			captureResumeFrame(topic, seq, envelope, compress, excludeWs, authoritative);
-		}
+			// A resuming connection is not yet on the live membership, so it
+			// would receive nothing from any branch below; hold the JSON envelope
+			// it would have received as a caps-less subscriber - but never for the
+			// socket this publish excluded.
+			if (resumeBuffers.size > 0) {
+				captureResumeFrame(topic, seq, envelope, compress, excludeWs, authoritative);
+			}
 
-		// JSON fast path: no live connection wants binary for this codec.
-		if (excludeWs === null && !capCounts.has(wire.capability)) {
-			// The one egress charge for this logical publish: every recipient
-			// gets the JSON envelope here.
+			// JSON fast path: no live connection wants binary for this codec.
+			if (excludeWs === null && !capCounts.has(wire.capability)) {
+				// The one egress charge for this logical publish: every recipient
+				// gets the JSON envelope here.
+				chargePublishEgress(
+					topic, egressTenant, 1, recipients, envelope.length,
+					envelopeWireBytes(envelope, recipients, egressGate.bytesArmed)
+				);
+				const result = deliveryAuthorization.armed
+				? publishAuthorized(server, wsConnections, topic, envelope, false, compress)
+				: server.publish(topic, envelope, compress);
+				return publishReached(result);
+			}
+
+			const seqOnWire = seq == null ? 0 : seq;
+			const envelopeCache = deliveryAuthorization.cache();
+
+			// Stateful codec (per-connection dictionary / delta baselines): the
+			// encoded payload depends on the recipient's state, so
+			// encode-once-send-many no longer holds for the binary recipients -
+			// each capable connection is encoded against its own state.
+			// Connections whose onAttach returned null (an older client that
+			// negotiated the stateless schema) share one encode at
+			// `wire.schemaVersion`, memoized by topic-id, so a mixed room keeps
+			// the single-encode fan-out for those clients.
+			if (wire.state) {
+				// The one egress charge for this logical publish. A stateful
+				// codec's frames are recipient-specific (each connection's
+				// dictionary shapes its own bytes), so the JSON envelope is the
+				// charged per-recipient size for this lane - the stable serialized
+				// form every degraded recipient actually receives.
+				chargePublishEgress(
+					topic, egressTenant, 1, recipients, envelope.length,
+					envelopeWireBytes(envelope, recipients, egressGate.bytesArmed)
+				);
+				let sharedPayload;
+				let sharedEncoded = false;
+				/** @type {Map<number, Uint8Array>} */
+				const sharedFrameById = new Map();
+				let delivered = false;
+				for (const ws of wsConnections) {
+					if (ws === excludeWs) continue;
+					let ud;
+					try {
+						ud = ws.getUserData();
+					} catch {
+						wsCounters.closedWsAborts++;
+						continue;
+					}
+					const subs = ud[WS_SUBSCRIPTIONS];
+					if (!subs || !subs.has(topic)) continue;
+					const caps = ud[WS_CAPS];
+					if (!caps || !caps.has(wire.capability)) {
+						delivered = wireEnvelopeSend(ws, envelope, compress, envelopeCache) || delivered;
+						continue;
+					}
+					const state = ensureWireState(ws, ud, wire);
+					if (state == null) {
+						// A poisoned capability is served exactly like a caps-less
+						// connection: the shared JSON envelope, never binary.
+						// Checked only on this null-state branch so the
+						// per-connection hot path pays nothing for it.
+						if (wireStatePoisoned(ud, wire.capability)) {
+							delivered = wireEnvelopeSend(ws, envelope, compress, envelopeCache) || delivered;
+							continue;
+						}
+						// Shared encode-once at the codec's baseline schema version.
+						if (!sharedEncoded) {
+							sharedPayload = wire.encode(event, data, null);
+							if (sharedPayload != null && !isUint8Array(sharedPayload)) {
+								throw new TypeError('wire.encode must return Uint8Array or null');
+							}
+							sharedEncoded = true;
+						}
+						if (sharedPayload == null) {
+							delivered = wireEnvelopeSend(ws, envelope, compress, envelopeCache) || delivered;
+							continue;
+						}
+						const id = ensureWireId(ws, ud, topic);
+						if (id === -1) {
+							// Dropped wire-id announce: the client can never resolve
+							// this topic's numeric id, so binary for this capability
+							// is permanently undecodable here. JSON for this frame,
+							// and poison.
+							poisonWireState(ws, ud, wire.capability);
+							delivered = wireEnvelopeSend(ws, envelope, compress, envelopeCache) || delivered;
+							continue;
+						}
+						let frame = sharedFrameById.get(id);
+						if (!frame) {
+							frame = buildBinaryFrame(wire.schemaVersion, id, seqOnWire, sharedPayload);
+							sharedFrameById.set(id, frame);
+						}
+						// A dropped shared frame needs no poisoning: the payload was
+						// encoded against no per-connection state, so the client's
+						// decoder stays in sync and the next frame is independent.
+						try {
+							if (deliveryAuthorization.send(ws, frame, true, compress, topic) !== SEND_DROPPED || deliveryAuthorization.armed) delivered = true;
+						} catch {
+							wsCounters.closedWsAborts++;
+						}
+					} else {
+						// Per-connection encode against this connection's state,
+						// stamped with the schema version that state negotiated.
+						const payload = wire.encode(event, data, state);
+						if (payload != null && !isUint8Array(payload)) {
+							throw new TypeError('wire.encode must return Uint8Array or null');
+						}
+						if (payload == null) {
+							delivered = wireEnvelopeSend(ws, envelope, compress, envelopeCache) || delivered;
+							continue;
+						}
+						const sv =
+							typeof state.schemaVersion === 'number' ? state.schemaVersion : wire.schemaVersion;
+						const id = ensureWireId(ws, ud, topic);
+						if (id === -1) {
+							// Dropped wire-id announce (see the shared branch above).
+							// The encode already advanced this connection's codec
+							// state for a frame that will never be sent, which is
+							// exactly the desync poisoning exists for.
+							poisonWireState(ws, ud, wire.capability);
+							delivered = wireEnvelopeSend(ws, envelope, compress, envelopeCache) || delivered;
+							continue;
+						}
+						const frame = buildBinaryFrame(sv, id, seqOnWire, payload);
+						let result;
+						try {
+							result = deliveryAuthorization.send(ws, frame, true, compress, topic);
+						} catch {
+							wsCounters.closedWsAborts++;
+							continue;
+						}
+						if (result !== SEND_DROPPED || deliveryAuthorization.armed) delivered = true;
+						// The encode above already mutated this connection's
+						// dictionary for the dropped frame, so the client decoder
+						// can never catch up - degrade to JSON until reconnect.
+						if (result === SEND_DROPPED) poisonWireState(ws, ud, wire.capability);
+					}
+				}
+				return delivered;
+			}
+
+			// Stateless codec: encode once, send many. A null payload (the codec
+			// declined this frame) falls through to the single native fan-out,
+			// instruction-identical to publish(). The codec payload is shared
+			// across recipients; only the tiny per-connection frame header
+			// (topic-id + seq) differs, memoized per distinct id so the common
+			// all-same-id case builds one frame and reuses it for every binary
+			// send.
+			const payload = wire.encode(event, data);
+			if (payload != null && !isUint8Array(payload)) {
+				throw new TypeError('wire.encode must return Uint8Array or null');
+			}
+			if (payload == null) {
+				// A declined frame serves everyone the envelope, whichever
+				// sub-branch delivers it.
+				chargePublishEgress(
+					topic, egressTenant, 1, recipients, envelope.length,
+					envelopeWireBytes(envelope, recipients, egressGate.bytesArmed)
+				);
+				if (excludeWs === null) {
+					const result = deliveryAuthorization.armed
+				? publishAuthorized(server, wsConnections, topic, envelope, false, compress)
+				: server.publish(topic, envelope, compress);
+					return publishReached(result);
+				}
+				// Declined frame with sender exclusion: the same JSON envelope the
+				// single fan-out would have sent, delivered per subscriber so the
+				// excluded socket is skipped.
+				let delivered = false;
+				for (const ws of wsConnections) {
+					if (ws === excludeWs) continue;
+					let ud;
+					try {
+						ud = ws.getUserData();
+					} catch {
+						wsCounters.closedWsAborts++;
+						continue;
+					}
+					const subs = ud[WS_SUBSCRIPTIONS];
+					if (!subs || !subs.has(topic)) continue;
+					try {
+						// Inside the guard: a frame refused past the backpressure
+						// limit never went out, so it is not delivery.
+						if (deliveryAuthorization.send(ws, envelope, false, compress, null, envelopeCache) !== SEND_DROPPED || deliveryAuthorization.armed) delivered = true;
+					} catch {
+						wsCounters.closedWsAborts++;
+					}
+				}
+				return delivered;
+			}
+
+			// Shared binary fan-out: a stateless codec marked `shared: true` fans
+			// out via cohort topics - the byte-identical 0x03 frame to
+			// `topic\0bin`, the JSON envelope to `topic\0json` - so this publish
+			// is two native fan-outs, not a per-connection walk. Eligible only
+			// with no sender exclusion (a single native publish cannot skip one
+			// socket; an excluding shared publish falls through to the walk
+			// below). The frame is identical for every binary subscriber because
+			// the topic-id is the server-wide shared id, announced when a
+			// connection joined the binary cohort.
+			if (wire.shared && excludeWs === null) {
+				// Lazy migration: the FIRST shared publish to a topic cohorts its
+				// current subscribers (a one-time walk, paid once per topic), then
+				// marks the topic shared so a later joiner is cohorted at
+				// subscribe time instead.
+				if (!sharedTopics.has(topic)) {
+					for (const ws of wsConnections) {
+						let ud;
+						try {
+							ud = ws.getUserData();
+						} catch {
+							wsCounters.closedWsAborts++;
+							continue;
+						}
+						const subs = ud[WS_SUBSCRIPTIONS];
+						if (!subs || !subs.has(topic)) continue;
+						joinSharedCohort(ws, ud, topic, wire.capability);
+					}
+					sharedTopics.set(topic, wire.capability);
+				}
+				const { bin, json } = cohortTopics(topic);
+				// The one egress charge for this logical publish, split by cohort:
+				// the binary cohort is charged its 0x03 frame, everyone else the
+				// envelope. The binary-cohort size is the shared wire-id refcount
+				// (one reference per cohorted socket), so the split is exact
+				// without a walk or a native read.
+				// The binary cohort exists only if a capable client joined it (its
+				// announce succeeded); otherwise this shared topic currently has
+				// only JSON subscribers and skips the binary fan-out entirely.
+				// Resolved BEFORE the charge, because the id is part of what the
+				// frame costs: it is a varint, so the 128th shared topic onward
+				// spends a second byte on every frame it sends.
+				const id = getSharedWireId(topic);
+				{
+					const binCount = Math.min(sharedWireIdRefs(topic), recipients);
+					chargePublishEgress(
+						topic, egressTenant, 1, recipients, envelope.length,
+						binaryFrameChargeBytes(payload.length, seqOnWire, id ?? 0) * binCount +
+							envelopeWireBytes(envelope, recipients - binCount, egressGate.bytesArmed)
+					);
+				}
+				let binBytes = 0;
+				if (id !== undefined) {
+					binBytes = publishAuthorized(server, wsConnections, bin, buildBinaryFrame(wire.schemaVersion, id, seqOnWire, payload), true, compress, topic);
+				}
+				const jsonBytes = publishAuthorized(server, wsConnections, json, envelope, false, compress);
+				// Either cohort reaching anyone is a delivery. `binBytes` stays 0
+				// when no binary cohort exists, which is the same "nobody" the
+				// runtime reports for an empty topic.
+				return publishReached(binBytes) || publishReached(jsonBytes);
+			}
+
+			// The one egress charge for this logical publish. Once a live
+			// connection advertises this codec's capability, the walk's encoded
+			// form is the binary frame and the charge reflects it for every
+			// recipient (a mixed room's JSON-degraded members ride at the same
+			// charged size - the documented approximation that keeps the charge
+			// O(1)); with no capable connection the walk exists only for the
+			// exclusion and every recipient gets the envelope.
 			chargePublishEgress(
 				topic, egressTenant, 1, recipients, envelope.length,
-				envelopeWireBytes(envelope, recipients, egressGate.bytesArmed)
+				capCounts.has(wire.capability)
+					// Topic ids are PER CONNECTION here, so there is no one id this
+					// O(1) charge could read - the charge is taken before the walk
+					// that would learn them. Charged at the one-byte id every
+					// connection's first 127 topics use, which is the same
+					// approximation the mixed-room case above already takes.
+					? binaryFrameChargeBytes(payload.length, seqOnWire, 1) * recipients
+					: envelopeWireBytes(envelope, recipients, egressGate.bytesArmed)
 			);
-			const result = server.publish(topic, envelope, compress);
-			return publishReached(result);
-		}
-
-		const seqOnWire = seq == null ? 0 : seq;
-
-		// Stateful codec (per-connection dictionary / delta baselines): the
-		// encoded payload depends on the recipient's state, so
-		// encode-once-send-many no longer holds for the binary recipients -
-		// each capable connection is encoded against its own state.
-		// Connections whose onAttach returned null (an older client that
-		// negotiated the stateless schema) share one encode at
-		// `wire.schemaVersion`, memoized by topic-id, so a mixed room keeps
-		// the single-encode fan-out for those clients.
-		if (wire.state) {
-			// The one egress charge for this logical publish. A stateful
-			// codec's frames are recipient-specific (each connection's
-			// dictionary shapes its own bytes), so the JSON envelope is the
-			// charged per-recipient size for this lane - the stable serialized
-			// form every degraded recipient actually receives.
-			chargePublishEgress(
-				topic, egressTenant, 1, recipients, envelope.length,
-				envelopeWireBytes(envelope, recipients, egressGate.bytesArmed)
-			);
-			let sharedPayload;
-			let sharedEncoded = false;
-			/** @type {Map<number, Uint8Array>} */
-			const sharedFrameById = new Map();
 			let delivered = false;
+			/** @type {Map<number, Uint8Array>} */
+			const frameById = new Map();
 			for (const ws of wsConnections) {
 				if (ws === excludeWs) continue;
 				let ud;
@@ -1118,266 +1388,37 @@ export const platform = {
 				const subs = ud[WS_SUBSCRIPTIONS];
 				if (!subs || !subs.has(topic)) continue;
 				const caps = ud[WS_CAPS];
-				if (!caps || !caps.has(wire.capability)) {
-					delivered = wireEnvelopeSend(ws, envelope, compress) || delivered;
-					continue;
-				}
-				const state = ensureWireState(ws, ud, wire);
-				if (state == null) {
-					// A poisoned capability is served exactly like a caps-less
-					// connection: the shared JSON envelope, never binary.
-					// Checked only on this null-state branch so the
-					// per-connection hot path pays nothing for it.
-					if (wireStatePoisoned(ud, wire.capability)) {
-						delivered = wireEnvelopeSend(ws, envelope, compress) || delivered;
-						continue;
-					}
-					// Shared encode-once at the codec's baseline schema version.
-					if (!sharedEncoded) {
-						sharedPayload = wire.encode(event, data, null);
-						if (sharedPayload != null && !isUint8Array(sharedPayload)) {
-							throw new TypeError('wire.encode must return Uint8Array or null');
-						}
-						sharedEncoded = true;
-					}
-					if (sharedPayload == null) {
-						delivered = wireEnvelopeSend(ws, envelope, compress) || delivered;
-						continue;
-					}
+				if (caps && caps.has(wire.capability) && !wireStatePoisoned(ud, wire.capability)) {
 					const id = ensureWireId(ws, ud, topic);
 					if (id === -1) {
-						// Dropped wire-id announce: the client can never resolve
-						// this topic's numeric id, so binary for this capability
-						// is permanently undecodable here. JSON for this frame,
-						// and poison.
+						// Dropped wire-id announce: the topic-id mapping is itself
+						// per-connection state the client now permanently lacks, so
+						// even a stateless codec's frames would be undecodable.
+						// JSON for this frame, and poison. A dropped binary FRAME
+						// below needs no such handling - the shared payload carries
+						// no per-connection state, so a lost frame cannot desync.
 						poisonWireState(ws, ud, wire.capability);
-						delivered = wireEnvelopeSend(ws, envelope, compress) || delivered;
+						delivered = wireEnvelopeSend(ws, envelope, compress, envelopeCache) || delivered;
 						continue;
 					}
-					let frame = sharedFrameById.get(id);
+					let frame = frameById.get(id);
 					if (!frame) {
-						frame = buildBinaryFrame(wire.schemaVersion, id, seqOnWire, sharedPayload);
-						sharedFrameById.set(id, frame);
+						frame = buildBinaryFrame(wire.schemaVersion, id, seqOnWire, payload);
+						frameById.set(id, frame);
 					}
-					// A dropped shared frame needs no poisoning: the payload was
-					// encoded against no per-connection state, so the client's
-					// decoder stays in sync and the next frame is independent.
 					try {
-						if (ws.send(frame, true, compress) !== SEND_DROPPED) delivered = true;
+						if (deliveryAuthorization.send(ws, frame, true, compress, topic) !== SEND_DROPPED || deliveryAuthorization.armed) delivered = true;
 					} catch {
 						wsCounters.closedWsAborts++;
 					}
 				} else {
-					// Per-connection encode against this connection's state,
-					// stamped with the schema version that state negotiated.
-					const payload = wire.encode(event, data, state);
-					if (payload != null && !isUint8Array(payload)) {
-						throw new TypeError('wire.encode must return Uint8Array or null');
-					}
-					if (payload == null) {
-						delivered = wireEnvelopeSend(ws, envelope, compress) || delivered;
-						continue;
-					}
-					const sv =
-						typeof state.schemaVersion === 'number' ? state.schemaVersion : wire.schemaVersion;
-					const id = ensureWireId(ws, ud, topic);
-					if (id === -1) {
-						// Dropped wire-id announce (see the shared branch above).
-						// The encode already advanced this connection's codec
-						// state for a frame that will never be sent, which is
-						// exactly the desync poisoning exists for.
-						poisonWireState(ws, ud, wire.capability);
-						delivered = wireEnvelopeSend(ws, envelope, compress) || delivered;
-						continue;
-					}
-					const frame = buildBinaryFrame(sv, id, seqOnWire, payload);
-					let result;
-					try {
-						result = ws.send(frame, true, compress);
-					} catch {
-						wsCounters.closedWsAborts++;
-						continue;
-					}
-					if (result !== SEND_DROPPED) delivered = true;
-					// The encode above already mutated this connection's
-					// dictionary for the dropped frame, so the client decoder
-					// can never catch up - degrade to JSON until reconnect.
-					if (result === SEND_DROPPED) poisonWireState(ws, ud, wire.capability);
+					delivered = wireEnvelopeSend(ws, envelope, compress, envelopeCache) || delivered;
 				}
 			}
 			return delivered;
+		} finally {
+			deliveryAuthorization.finish(deliveryOperation);
 		}
-
-		// Stateless codec: encode once, send many. A null payload (the codec
-		// declined this frame) falls through to the single native fan-out,
-		// instruction-identical to publish(). The codec payload is shared
-		// across recipients; only the tiny per-connection frame header
-		// (topic-id + seq) differs, memoized per distinct id so the common
-		// all-same-id case builds one frame and reuses it for every binary
-		// send.
-		const payload = wire.encode(event, data);
-		if (payload != null && !isUint8Array(payload)) {
-			throw new TypeError('wire.encode must return Uint8Array or null');
-		}
-		if (payload == null) {
-			// A declined frame serves everyone the envelope, whichever
-			// sub-branch delivers it.
-			chargePublishEgress(
-				topic, egressTenant, 1, recipients, envelope.length,
-				envelopeWireBytes(envelope, recipients, egressGate.bytesArmed)
-			);
-			if (excludeWs === null) {
-				const result = server.publish(topic, envelope, compress);
-				return publishReached(result);
-			}
-			// Declined frame with sender exclusion: the same JSON envelope the
-			// single fan-out would have sent, delivered per subscriber so the
-			// excluded socket is skipped.
-			let delivered = false;
-			for (const ws of wsConnections) {
-				if (ws === excludeWs) continue;
-				let ud;
-				try {
-					ud = ws.getUserData();
-				} catch {
-					wsCounters.closedWsAborts++;
-					continue;
-				}
-				const subs = ud[WS_SUBSCRIPTIONS];
-				if (!subs || !subs.has(topic)) continue;
-				try {
-					// Inside the guard: a frame refused past the backpressure
-					// limit never went out, so it is not delivery.
-					if (ws.send(envelope, false, compress) !== SEND_DROPPED) delivered = true;
-				} catch {
-					wsCounters.closedWsAborts++;
-				}
-			}
-			return delivered;
-		}
-
-		// Shared binary fan-out: a stateless codec marked `shared: true` fans
-		// out via cohort topics - the byte-identical 0x03 frame to
-		// `topic\0bin`, the JSON envelope to `topic\0json` - so this publish
-		// is two native fan-outs, not a per-connection walk. Eligible only
-		// with no sender exclusion (a single native publish cannot skip one
-		// socket; an excluding shared publish falls through to the walk
-		// below). The frame is identical for every binary subscriber because
-		// the topic-id is the server-wide shared id, announced when a
-		// connection joined the binary cohort.
-		if (wire.shared && excludeWs === null) {
-			// Lazy migration: the FIRST shared publish to a topic cohorts its
-			// current subscribers (a one-time walk, paid once per topic), then
-			// marks the topic shared so a later joiner is cohorted at
-			// subscribe time instead.
-			if (!sharedTopics.has(topic)) {
-				for (const ws of wsConnections) {
-					let ud;
-					try {
-						ud = ws.getUserData();
-					} catch {
-						wsCounters.closedWsAborts++;
-						continue;
-					}
-					const subs = ud[WS_SUBSCRIPTIONS];
-					if (!subs || !subs.has(topic)) continue;
-					joinSharedCohort(ws, ud, topic, wire.capability);
-				}
-				sharedTopics.set(topic, wire.capability);
-			}
-			const { bin, json } = cohortTopics(topic);
-			// The one egress charge for this logical publish, split by cohort:
-			// the binary cohort is charged its 0x03 frame, everyone else the
-			// envelope. The binary-cohort size is the shared wire-id refcount
-			// (one reference per cohorted socket), so the split is exact
-			// without a walk or a native read.
-			// The binary cohort exists only if a capable client joined it (its
-			// announce succeeded); otherwise this shared topic currently has
-			// only JSON subscribers and skips the binary fan-out entirely.
-			// Resolved BEFORE the charge, because the id is part of what the
-			// frame costs: it is a varint, so the 128th shared topic onward
-			// spends a second byte on every frame it sends.
-			const id = getSharedWireId(topic);
-			{
-				const binCount = Math.min(sharedWireIdRefs(topic), recipients);
-				chargePublishEgress(
-					topic, egressTenant, 1, recipients, envelope.length,
-					binaryFrameChargeBytes(payload.length, seqOnWire, id ?? 0) * binCount +
-						envelopeWireBytes(envelope, recipients - binCount, egressGate.bytesArmed)
-				);
-			}
-			let binBytes = 0;
-			if (id !== undefined) {
-				binBytes = server.publish(bin, buildBinaryFrame(wire.schemaVersion, id, seqOnWire, payload), compress);
-			}
-			const jsonBytes = server.publish(json, envelope, compress);
-			// Either cohort reaching anyone is a delivery. `binBytes` stays 0
-			// when no binary cohort exists, which is the same "nobody" the
-			// runtime reports for an empty topic.
-			return publishReached(binBytes) || publishReached(jsonBytes);
-		}
-
-		// The one egress charge for this logical publish. Once a live
-		// connection advertises this codec's capability, the walk's encoded
-		// form is the binary frame and the charge reflects it for every
-		// recipient (a mixed room's JSON-degraded members ride at the same
-		// charged size - the documented approximation that keeps the charge
-		// O(1)); with no capable connection the walk exists only for the
-		// exclusion and every recipient gets the envelope.
-		chargePublishEgress(
-			topic, egressTenant, 1, recipients, envelope.length,
-			capCounts.has(wire.capability)
-				// Topic ids are PER CONNECTION here, so there is no one id this
-				// O(1) charge could read - the charge is taken before the walk
-				// that would learn them. Charged at the one-byte id every
-				// connection's first 127 topics use, which is the same
-				// approximation the mixed-room case above already takes.
-				? binaryFrameChargeBytes(payload.length, seqOnWire, 1) * recipients
-				: envelopeWireBytes(envelope, recipients, egressGate.bytesArmed)
-		);
-		let delivered = false;
-		/** @type {Map<number, Uint8Array>} */
-		const frameById = new Map();
-		for (const ws of wsConnections) {
-			if (ws === excludeWs) continue;
-			let ud;
-			try {
-				ud = ws.getUserData();
-			} catch {
-				wsCounters.closedWsAborts++;
-				continue;
-			}
-			const subs = ud[WS_SUBSCRIPTIONS];
-			if (!subs || !subs.has(topic)) continue;
-			const caps = ud[WS_CAPS];
-			if (caps && caps.has(wire.capability) && !wireStatePoisoned(ud, wire.capability)) {
-				const id = ensureWireId(ws, ud, topic);
-				if (id === -1) {
-					// Dropped wire-id announce: the topic-id mapping is itself
-					// per-connection state the client now permanently lacks, so
-					// even a stateless codec's frames would be undecodable.
-					// JSON for this frame, and poison. A dropped binary FRAME
-					// below needs no such handling - the shared payload carries
-					// no per-connection state, so a lost frame cannot desync.
-					poisonWireState(ws, ud, wire.capability);
-					delivered = wireEnvelopeSend(ws, envelope, compress) || delivered;
-					continue;
-				}
-				let frame = frameById.get(id);
-				if (!frame) {
-					frame = buildBinaryFrame(wire.schemaVersion, id, seqOnWire, payload);
-					frameById.set(id, frame);
-				}
-				try {
-					if (ws.send(frame, true, compress) !== SEND_DROPPED) delivered = true;
-				} catch {
-					wsCounters.closedWsAborts++;
-				}
-			} else {
-				delivered = wireEnvelopeSend(ws, envelope, compress) || delivered;
-			}
-		}
-		return delivered;
 	},
 
 	/**
@@ -1534,323 +1575,336 @@ export const platform = {
 			}
 			entries = records;
 		}
-		// The egress decision, taken ONCE for the whole batch: N logical
-		// publishes, admitted whole or refused whole. Nothing has been stamped
-		// yet - the pre-pass above only validated - so a refused batch leaves
-		// no trace beyond the per-entry explicit-seq validation it already
-		// paid. Per-entry recipients are read here at the instant of the
-		// decision, each entry's exclusion discounted only when the excluded
-		// socket actually holds the topic.
-		const server = getServer();
-		const baseRecipients = server.subscriberCount(topic);
-		const entryRecipients = new Array(n);
-		let egressDeliveries = 0;
-		for (let i = 0; i < n; i++) {
-			const r = baseRecipients - (excludedRecipient(entries[i].excludeWs, topic) ? 1 : 0);
-			entryRecipients[i] = r;
-			egressDeliveries += r;
+		if (deliveryAuthorization.deciding) {
+			deliveryAuthorization.deferOperation(() => platform.publishWireBatch(topic, event, entries, wire, options));
+			return getServer().subscriberCount(topic) > 0;
 		}
-		const egressTenant = resolvePublishTenant(topic);
-		if (egressGate.armed) {
-			if (!admitPublishEgress(topic, egressTenant, n, egressDeliveries)) return false;
-			// The stateless reroute below hands each entry to publishWire, and
-			// each of those calls must charge its own weight without deciding
-			// again - the decision above covered them all. The symbol survives
-			// the per-entry option spreads.
-			options = { ...(options || {}), [EGRESS_ADMITTED]: true };
-		}
-
-		// A stateless codec gains nothing from a batched walk (encode-once
-		// already amortizes it) - route through the per-entry path unchanged.
-		//
-		// This lane is N independent publishes, so "whole batch or nothing"
-		// covers the SEQ only: every seq below comes from the pre-pass
-		// snapshot, already accepted, so no publish in this loop can throw on
-		// one - but a payload that fails to serialise partway through leaves
-		// the earlier entries already fanned out and counted. Making it atomic
-		// would mean serialising every entry up front and then again per
-		// publish, which is the cost this reroute exists to avoid. The
-		// stateful lane below builds all its envelopes first and so IS whole
-		// for both.
-		if (!wire || !wire.state) {
-			let ok = false;
+		const deliveryOperation = deliveryAuthorization.begin();
+		try {
+			// The egress decision, taken ONCE for the whole batch: N logical
+			// publishes, admitted whole or refused whole. Nothing has been stamped
+			// yet - the pre-pass above only validated - so a refused batch leaves
+			// no trace beyond the per-entry explicit-seq validation it already
+			// paid. Per-entry recipients are read here at the instant of the
+			// decision, each entry's exclusion discounted only when the excluded
+			// socket actually holds the topic.
+			const server = getServer();
+			const baseRecipients = server.subscriberCount(topic);
+			const entryRecipients = new Array(n);
+			let egressDeliveries = 0;
 			for (let i = 0; i < n; i++) {
-				// The private record from the pre-pass, not the caller's entry:
-				// by the second iteration, app toJSON code has already run
-				// inside the first entry's publish, and the caller's objects
-				// can no longer be trusted to say what this call was handed.
-				const entry = entries[i];
-				// Allocate a per-entry options object only when the entry
-				// actually overrides something, as the exclude-only form did.
-				let per = options;
-				// ownExclude, not the effective value: an entry that inherited
-				// the call-level exclusion already gets it from `options`, so the
-				// per-entry object is allocated only for a real override.
-				if (entry.ownExclude || entry.seq !== undefined) {
-					per = { ...(options || {}) };
-					if (entry.excludeWs !== undefined) per.excludeWs = entry.excludeWs;
-					if (entry.seq !== undefined) per.seq = entry.seq;
+				const r = baseRecipients - (excludedRecipient(entries[i].excludeWs, topic) ? 1 : 0);
+				entryRecipients[i] = r;
+				egressDeliveries += r;
+			}
+			const egressTenant = resolvePublishTenant(topic);
+			if (egressGate.armed) {
+				if (!admitPublishEgress(topic, egressTenant, n, egressDeliveries)) return false;
+				// The stateless reroute below hands each entry to publishWire, and
+				// each of those calls must charge its own weight without deciding
+				// again - the decision above covered them all. The symbol survives
+				// the per-entry option spreads.
+				options = { ...(options || {}), [EGRESS_ADMITTED]: true };
+			}
+
+			// A stateless codec gains nothing from a batched walk (encode-once
+			// already amortizes it) - route through the per-entry path unchanged.
+			//
+			// This lane is N independent publishes, so "whole batch or nothing"
+			// covers the SEQ only: every seq below comes from the pre-pass
+			// snapshot, already accepted, so no publish in this loop can throw on
+			// one - but a payload that fails to serialise partway through leaves
+			// the earlier entries already fanned out and counted. Making it atomic
+			// would mean serialising every entry up front and then again per
+			// publish, which is the cost this reroute exists to avoid. The
+			// stateful lane below builds all its envelopes first and so IS whole
+			// for both.
+			if (!wire || !wire.state) {
+				let ok = false;
+				for (let i = 0; i < n; i++) {
+					// The private record from the pre-pass, not the caller's entry:
+					// by the second iteration, app toJSON code has already run
+					// inside the first entry's publish, and the caller's objects
+					// can no longer be trusted to say what this call was handed.
+					const entry = entries[i];
+					// Allocate a per-entry options object only when the entry
+					// actually overrides something, as the exclude-only form did.
+					let per = options;
+					// ownExclude, not the effective value: an entry that inherited
+					// the call-level exclusion already gets it from `options`, so the
+					// per-entry object is allocated only for a real override.
+					if (entry.ownExclude || entry.seq !== undefined) {
+						per = { ...(options || {}) };
+						if (entry.excludeWs !== undefined) per.excludeWs = entry.excludeWs;
+						if (entry.seq !== undefined) per.seq = entry.seq;
+					}
+					ok = this.publishWire(topic, event, entry.data, wire, per) || ok;
 				}
-				ok = this.publishWire(topic, event, entry.data, wire, per) || ok;
+				return ok;
 			}
-			return ok;
-		}
-		const compress = ws_compression_on && !!(options && options.compress === true);
+			const compress = ws_compression_on && !!(options && options.compress === true);
 
-		// Per-entry seq and envelope - the exact bookkeeping N publishWire
-		// calls would have produced.
-		const envs = new Array(n);
-		// The seq AS STAMPED: a number, or null for an entry carrying none.
-		// Deliberately not the wire's 0 sentinel, which the frame builder wants
-		// but the resume capture must not see: 0 is a seq the explicit lane can
-		// legitimately issue, and collapsing it into "no seq" hands the capture a
-		// null that is never deduped, so the same event is deduped through
-		// publish() and re-delivered through here. The 0 is applied at the frame
-		// sites below, where it means "no seq" on the wire and nowhere else.
-		const seqs = new Array(n);
-		// Authority per entry, decided in the pre-pass and reused below. The
-		// records are private, so nothing an app toJSON does between here and
-		// delivery can change what they say.
-		const authoritative = new Array(n);
-		let anyExclude = false;
-		for (let i = 0; i < n; i++) {
-			const entry = entries[i];
-			// A per-entry explicit seq is cluster-authoritative exactly as the
-			// same value would be through publishWire, and already took the
-			// same wire-representability check in the pre-pass, whose record
-			// is stamped verbatim here. Anything else draws from this batch's
-			// shared options (the counter, or no seq at all).
-			// Every form but `undefined` is an OVERRIDE of the batch options for
-			// this entry: a number is its explicit authority, `true` draws the
-			// counter for it alone, `false` publishes it seq-less. The booleans
-			// go back through the shared stamp so the entry lane and the options
-			// lane cannot answer them differently.
-			const own = entry.seq;
-			const seq = own === undefined
-				? stampSeq(options, topic)
-				: (typeof own === 'number' ? own : stampSeqValue(own, topic));
-			// Only a NUMBER is authoritative: a counter draw is a different
-			// sequence space and no-seq has no value to be authoritative about.
-			// The pre-pass accepted it or threw, so there is no
-			// refused-but-published case left to tell apart, and no way for a
-			// toJSON run by an earlier iteration's completeEnvelope to swap in a
-			// value the pre-pass never saw.
-			authoritative[i] = typeof own === 'number';
-			seqs[i] = seq;
-			envs[i] = completeEnvelope(envelopePrefix(topic, event), entry.data, seq);
-			fatal(envs[i].length > 0, 'envelope.empty', null);
-			if (entry.excludeWs !== undefined && entry.excludeWs !== null) anyExclude = true;
-		}
-		// The topic's mark and the publish count both move only once EVERY entry
-		// has stamped AND serialized. completeEnvelope runs app code and throws
-		// on a payload JSON cannot carry, so doing either inside the loop above
-		// left a batch that put nothing on any wire with its authoritative mark
-		// already advanced for the entries it got through - and that mark is the
-		// resume dedup floor, so a later window would discard the republished
-		// frames as already-seen. Whole batch or nothing, the rule the per-entry
-		// seq pre-pass already enforces.
-		//
-		// ONE thing is not rolled back, deliberately: the `{ seq: true }` counter
-		// advanced in the loop above for every entry it stamped. It cannot be
-		// undone safely - completeEnvelope runs JSON.stringify, so a toJSON can
-		// publish re-entrantly and take the next value, and a rollback would then
-		// hand two frames the same seq. And it costs nothing: the counter is a
-		// separate space that is never deduped and never marks the topic, so a
-		// refused batch leaves a gap in that topic's counter numbering and
-		// nothing else. No contract anywhere calls that lane contiguous.
-		for (let i = 0; i < n; i++) {
-			// Never authoritative on the else-branch: a numeric batch-level
-			// seq threw above, so the captured options can only say counter
-			// (true) or nothing - and a counter seq only keeps the topic
-			// recent, it never writes the authoritative mark.
-			if (authoritative[i]) notePublishedSeq(topic, seqs[i], true);
-			else if (seqs[i] !== null) notePublishedSeq(topic, seqs[i], false);
-		}
-		wsCounters.publishCount += n;
-		wsCounters.publishCountWindow += n;
-		// One topic, one charge: the whole admitted batch, its envelope sizes
-		// summed once. The wire bytes take the stateful lane's rule - the
-		// envelope is the charged per-recipient size, each entry weighted by
-		// its own recipients as read at the decision.
-		{
-			let batchEnvelopeSize = 0;
-			let batchWireBytes = 0;
+			// Per-entry seq and envelope - the exact bookkeeping N publishWire
+			// calls would have produced.
+			const envs = new Array(n);
+			// The seq AS STAMPED: a number, or null for an entry carrying none.
+			// Deliberately not the wire's 0 sentinel, which the frame builder wants
+			// but the resume capture must not see: 0 is a seq the explicit lane can
+			// legitimately issue, and collapsing it into "no seq" hands the capture a
+			// null that is never deduped, so the same event is deduped through
+			// publish() and re-delivered through here. The 0 is applied at the frame
+			// sites below, where it means "no seq" on the wire and nowhere else.
+			const seqs = new Array(n);
+			// Authority per entry, decided in the pre-pass and reused below. The
+			// records are private, so nothing an app toJSON does between here and
+			// delivery can change what they say.
+			const authoritative = new Array(n);
+			let anyExclude = false;
 			for (let i = 0; i < n; i++) {
-				batchEnvelopeSize += envs[i].length;
-				batchWireBytes += envelopeWireBytes(envs[i], entryRecipients[i], egressGate.bytesArmed);
+				const entry = entries[i];
+				// A per-entry explicit seq is cluster-authoritative exactly as the
+				// same value would be through publishWire, and already took the
+				// same wire-representability check in the pre-pass, whose record
+				// is stamped verbatim here. Anything else draws from this batch's
+				// shared options (the counter, or no seq at all).
+				// Every form but `undefined` is an OVERRIDE of the batch options for
+				// this entry: a number is its explicit authority, `true` draws the
+				// counter for it alone, `false` publishes it seq-less. The booleans
+				// go back through the shared stamp so the entry lane and the options
+				// lane cannot answer them differently.
+				const own = entry.seq;
+				const seq = own === undefined
+					? stampSeq(options, topic)
+					: (typeof own === 'number' ? own : stampSeqValue(own, topic));
+				// Only a NUMBER is authoritative: a counter draw is a different
+				// sequence space and no-seq has no value to be authoritative about.
+				// The pre-pass accepted it or threw, so there is no
+				// refused-but-published case left to tell apart, and no way for a
+				// toJSON run by an earlier iteration's completeEnvelope to swap in a
+				// value the pre-pass never saw.
+				authoritative[i] = typeof own === 'number';
+				seqs[i] = seq;
+				envs[i] = completeEnvelope(envelopePrefix(topic, event), entry.data, seq);
+				fatal(envs[i].length > 0, 'envelope.empty', null);
+				if (entry.excludeWs !== undefined && entry.excludeWs !== null) anyExclude = true;
 			}
-			chargePublishEgress(topic, egressTenant, n, egressDeliveries, batchEnvelopeSize, batchWireBytes);
-		}
-		// Resume cutover in flight: hold the per-entry JSON envelopes a
-		// caps-less resuming subscriber would receive from this batch, each
-		// skipping the socket its own entry excluded.
-		if (resumeBuffers.size > 0) {
-			// Authority is per ENTRY here, not per call: an entry carrying its own
-			// explicit seq sits in the cluster space and is measured against the
-			// dedup floor, while a counter-stamped one is not. The call-level
-			// options cannot contribute authority - a numeric batch seq was
-			// refused above - so the entry is the whole answer, as decided in the
-			// stamping pass and carried in `authoritative` rather than read off
-			// the app's entries a second time.
+			// The topic's mark and the publish count both move only once EVERY entry
+			// has stamped AND serialized. completeEnvelope runs app code and throws
+			// on a payload JSON cannot carry, so doing either inside the loop above
+			// left a batch that put nothing on any wire with its authoritative mark
+			// already advanced for the entries it got through - and that mark is the
+			// resume dedup floor, so a later window would discard the republished
+			// frames as already-seen. Whole batch or nothing, the rule the per-entry
+			// seq pre-pass already enforces.
+			//
+			// ONE thing is not rolled back, deliberately: the `{ seq: true }` counter
+			// advanced in the loop above for every entry it stamped. It cannot be
+			// undone safely - completeEnvelope runs JSON.stringify, so a toJSON can
+			// publish re-entrantly and take the next value, and a rollback would then
+			// hand two frames the same seq. And it costs nothing: the counter is a
+			// separate space that is never deduped and never marks the topic, so a
+			// refused batch leaves a gap in that topic's counter numbering and
+			// nothing else. No contract anywhere calls that lane contiguous.
 			for (let i = 0; i < n; i++) {
-				captureResumeFrame(
-					topic,
-					seqs[i],
-					envs[i],
-					compress,
-					entries[i].excludeWs,
-					authoritative[i]
-				);
+				// Never authoritative on the else-branch: a numeric batch-level
+				// seq threw above, so the captured options can only say counter
+				// (true) or nothing - and a counter seq only keeps the topic
+				// recent, it never writes the authoritative mark.
+				if (authoritative[i]) notePublishedSeq(topic, seqs[i], true);
+				else if (seqs[i] !== null) notePublishedSeq(topic, seqs[i], false);
 			}
-		}
+			wsCounters.publishCount += n;
+			wsCounters.publishCountWindow += n;
+			// One topic, one charge: the whole admitted batch, its envelope sizes
+			// summed once. The wire bytes take the stateful lane's rule - the
+			// envelope is the charged per-recipient size, each entry weighted by
+			// its own recipients as read at the decision.
+			{
+				let batchEnvelopeSize = 0;
+				let batchWireBytes = 0;
+				for (let i = 0; i < n; i++) {
+					batchEnvelopeSize += envs[i].length;
+					batchWireBytes += envelopeWireBytes(envs[i], entryRecipients[i], egressGate.bytesArmed);
+				}
+				chargePublishEgress(topic, egressTenant, n, egressDeliveries, batchEnvelopeSize, batchWireBytes);
+			}
+			// Resume cutover in flight: hold the per-entry JSON envelopes a
+			// caps-less resuming subscriber would receive from this batch, each
+			// skipping the socket its own entry excluded.
+			if (resumeBuffers.size > 0) {
+				// Authority is per ENTRY here, not per call: an entry carrying its own
+				// explicit seq sits in the cluster space and is measured against the
+				// dedup floor, while a counter-stamped one is not. The call-level
+				// options cannot contribute authority - a numeric batch seq was
+				// refused above - so the entry is the whole answer, as decided in the
+				// stamping pass and carried in `authoritative` rather than read off
+				// the app's entries a second time.
+				for (let i = 0; i < n; i++) {
+					captureResumeFrame(
+						topic,
+						seqs[i],
+						envs[i],
+						compress,
+						entries[i].excludeWs,
+						authoritative[i]
+					);
+				}
+			}
 
-		// Declared here, before the helper that closes over it, so the two can
-		// be read together. The fast path below returns its own byte tally
-		// without consulting this flag.
-		let delivered = false;
+			// Declared here, before the helper that closes over it, so the two can
+			// be read together. The fast path below returns its own byte tally
+			// without consulting this flag.
+			let delivered = false;
 
-		const sendJson = (ws, list) => {
-			for (let i = 0; i < list.length; i++) {
+			const jsonCaches = deliveryAuthorization.armed ? envs.map(() => deliveryAuthorization.cache()) : null;
+			const sendJson = (ws, list, caches) => {
+				for (let i = 0; i < list.length; i++) {
+					try {
+						if (deliveryAuthorization.send(ws, list[i], false, compress, null, caches === null ? null : caches[i]) !== SEND_DROPPED || deliveryAuthorization.armed) delivered = true;
+					} catch {
+						wsCounters.closedWsAborts++;
+						return;
+					}
+				}
+			};
+
+			// JSON fast path: no live connection wants binary for this codec and
+			// no entry excludes a socket - N native fan-outs, byte-identical to N
+			// publishWire calls.
+			if (!anyExclude && !capCounts.has(wire.capability)) {
+				let anyBytes = false;
+				for (let i = 0; i < n; i++) {
+					const r = publishAuthorized(server, wsConnections, topic, envs[i], false, compress);
+					if (publishReached(r)) anyBytes = true;
+				}
+				return anyBytes;
+			}
+			for (const ws of wsConnections) {
+				let ud;
 				try {
-					if (ws.send(list[i], false, compress) !== SEND_DROPPED) delivered = true;
+					ud = ws.getUserData();
 				} catch {
 					wsCounters.closedWsAborts++;
-					return;
+					continue;
 				}
-			}
-		};
-
-		// JSON fast path: no live connection wants binary for this codec and
-		// no entry excludes a socket - N native fan-outs, byte-identical to N
-		// publishWire calls.
-		if (!anyExclude && !capCounts.has(wire.capability)) {
-			let anyBytes = false;
-			for (let i = 0; i < n; i++) {
-				const r = server.publish(topic, envs[i], compress);
-				if (publishReached(r)) anyBytes = true;
-			}
-			return anyBytes;
-		}
-		for (const ws of wsConnections) {
-			let ud;
-			try {
-				ud = ws.getUserData();
-			} catch {
-				wsCounters.closedWsAborts++;
-				continue;
-			}
-			const subs = ud[WS_SUBSCRIPTIONS];
-			if (!subs || !subs.has(topic)) continue;
-			// The subset this socket receives: entries not excluded for it.
-			// The no-exclusion common case reuses the shared arrays. The seq
-			// list is filtered ALONGSIDE them: the declined-batch lane below
-			// stamps per-entry frames from it, and indexing the unfiltered
-			// array with a subset index stamps one entry's payload with
-			// another's seq - the client then records a watermark that never
-			// matches the frame it holds.
-			let list = entries;
-			let envList = envs;
-			let seqList = seqs;
-			let lastSeq = seqs[n - 1];
-			if (anyExclude) {
-				list = [];
-				envList = [];
-				seqList = [];
-				for (let i = 0; i < n; i++) {
-					if (entries[i].excludeWs === ws) continue;
-					list.push(entries[i]);
-					envList.push(envs[i]);
-					seqList.push(seqs[i]);
-					lastSeq = seqs[i];
-				}
-				if (list.length === 0) continue;
-			}
-			const caps = ud[WS_CAPS];
-			if (!caps || !caps.has(wire.capability)) {
-				sendJson(ws, envList);
-				continue;
-			}
-			// A poisoned capability reads a null state and is served JSON,
-			// exactly like publishWire's null-state branch.
-			const state = ensureWireState(ws, ud, wire);
-			if (state == null) {
-				sendJson(ws, envList);
-				continue;
-			}
-			const updates = new Array(list.length);
-			for (let i = 0; i < list.length; i++) updates[i] = list[i].data;
-			const sv =
-				typeof state.schemaVersion === 'number' ? state.schemaVersion : wire.schemaVersion;
-			const payload = wire.encode(event + '-batch', { updates }, state);
-			if (payload != null && !isUint8Array(payload)) {
-				throw new TypeError('wire.encode must return Uint8Array or null');
-			}
-			if (payload == null) {
-				// The codec declined the batch (older codec, unrepresentable
-				// entry): per-entry encodes with per-entry JSON fallback - the
-				// N publishWire bodies this call replaces.
-				for (let i = 0; i < list.length; i++) {
-					const p = wire.encode(event, list[i].data, state);
-					if (p != null && !isUint8Array(p)) {
-						throw new TypeError('wire.encode must return Uint8Array or null');
+				const subs = ud[WS_SUBSCRIPTIONS];
+				if (!subs || !subs.has(topic)) continue;
+				// The subset this socket receives: entries not excluded for it.
+				// The no-exclusion common case reuses the shared arrays. The seq
+				// list is filtered ALONGSIDE them: the declined-batch lane below
+				// stamps per-entry frames from it, and indexing the unfiltered
+				// array with a subset index stamps one entry's payload with
+				// another's seq - the client then records a watermark that never
+				// matches the frame it holds.
+				let list = entries;
+				let envList = envs;
+				let cacheList = jsonCaches;
+				let seqList = seqs;
+				let lastSeq = seqs[n - 1];
+				if (anyExclude) {
+					list = [];
+					envList = [];
+					if (jsonCaches !== null) cacheList = [];
+					seqList = [];
+					for (let i = 0; i < n; i++) {
+						if (entries[i].excludeWs === ws) continue;
+						list.push(entries[i]);
+						envList.push(envs[i]);
+						if (cacheList !== null) cacheList.push(jsonCaches[i]);
+						seqList.push(seqs[i]);
+						lastSeq = seqs[i];
 					}
-					if (p == null) {
+					if (list.length === 0) continue;
+				}
+				const caps = ud[WS_CAPS];
+				if (!caps || !caps.has(wire.capability)) {
+					sendJson(ws, envList, cacheList);
+					continue;
+				}
+				// A poisoned capability reads a null state and is served JSON,
+				// exactly like publishWire's null-state branch.
+				const state = ensureWireState(ws, ud, wire);
+				if (state == null) {
+					sendJson(ws, envList, cacheList);
+					continue;
+				}
+				const updates = new Array(list.length);
+				for (let i = 0; i < list.length; i++) updates[i] = list[i].data;
+				const sv =
+					typeof state.schemaVersion === 'number' ? state.schemaVersion : wire.schemaVersion;
+				const payload = wire.encode(event + '-batch', { updates }, state);
+				if (payload != null && !isUint8Array(payload)) {
+					throw new TypeError('wire.encode must return Uint8Array or null');
+				}
+				if (payload == null) {
+					// The codec declined the batch (older codec, unrepresentable
+					// entry): per-entry encodes with per-entry JSON fallback - the
+					// N publishWire bodies this call replaces.
+					for (let i = 0; i < list.length; i++) {
+						const p = wire.encode(event, list[i].data, state);
+						if (p != null && !isUint8Array(p)) {
+							throw new TypeError('wire.encode must return Uint8Array or null');
+						}
+						if (p == null) {
+							try {
+								if (deliveryAuthorization.send(ws, envList[i], false, compress, null, cacheList === null ? null : cacheList[i]) !== SEND_DROPPED || deliveryAuthorization.armed) delivered = true;
+							} catch {
+								wsCounters.closedWsAborts++;
+								break;
+							}
+							continue;
+						}
+						const id = ensureWireId(ws, ud, topic);
+						if (id === -1) {
+							poisonWireState(ws, ud, wire.capability);
+							sendJson(ws, envList.slice(i), cacheList === null ? null : cacheList.slice(i));
+							break;
+						}
+						// 0 is the wire's "no seq" (see sendWire); the null lives only
+						// in seqs, where the resume capture can still read it.
+						const frame = buildBinaryFrame(sv, id, seqList[i] ?? 0, p);
+						let result;
 						try {
-							if (ws.send(envList[i], false, compress) !== SEND_DROPPED) delivered = true;
+							result = deliveryAuthorization.send(ws, frame, true, compress, topic);
 						} catch {
 							wsCounters.closedWsAborts++;
 							break;
 						}
-						continue;
+						if (result !== SEND_DROPPED || deliveryAuthorization.armed) delivered = true;
+						if (result === SEND_DROPPED) {
+							poisonWireState(ws, ud, wire.capability);
+							sendJson(ws, envList.slice(i + 1), cacheList === null ? null : cacheList.slice(i + 1));
+							break;
+						}
 					}
-					const id = ensureWireId(ws, ud, topic);
-					if (id === -1) {
-						poisonWireState(ws, ud, wire.capability);
-						sendJson(ws, envList.slice(i));
-						break;
-					}
-					// 0 is the wire's "no seq" (see sendWire); the null lives only
-					// in seqs, where the resume capture can still read it.
-					const frame = buildBinaryFrame(sv, id, seqList[i] ?? 0, p);
-					let result;
-					try {
-						result = ws.send(frame, true, compress);
-					} catch {
-						wsCounters.closedWsAborts++;
-						break;
-					}
-					if (result !== SEND_DROPPED) delivered = true;
-					if (result === SEND_DROPPED) {
-						poisonWireState(ws, ud, wire.capability);
-						sendJson(ws, envList.slice(i + 1));
-						break;
-					}
+					continue;
 				}
-				continue;
+				const id = ensureWireId(ws, ud, topic);
+				if (id === -1) {
+					// Dropped wire-id announce: binary is permanently undecodable
+					// here, and the batch encode already advanced this
+					// connection's dictionaries - the desync poisoning exists for.
+					poisonWireState(ws, ud, wire.capability);
+					sendJson(ws, envList, cacheList);
+					continue;
+				}
+				const frame = buildBinaryFrame(sv, id, lastSeq ?? 0, payload);
+				let result;
+				try {
+					result = deliveryAuthorization.send(ws, frame, true, compress, topic);
+				} catch {
+					wsCounters.closedWsAborts++;
+					continue;
+				}
+				if (result !== SEND_DROPPED || deliveryAuthorization.armed) delivered = true;
+				// The encode mutated the dictionaries for a frame the client
+				// never saw - JSON until reconnect.
+				if (result === SEND_DROPPED) poisonWireState(ws, ud, wire.capability);
 			}
-			const id = ensureWireId(ws, ud, topic);
-			if (id === -1) {
-				// Dropped wire-id announce: binary is permanently undecodable
-				// here, and the batch encode already advanced this
-				// connection's dictionaries - the desync poisoning exists for.
-				poisonWireState(ws, ud, wire.capability);
-				sendJson(ws, envList);
-				continue;
-			}
-			const frame = buildBinaryFrame(sv, id, lastSeq ?? 0, payload);
-			let result;
-			try {
-				result = ws.send(frame, true, compress);
-			} catch {
-				wsCounters.closedWsAborts++;
-				continue;
-			}
-			if (result !== SEND_DROPPED) delivered = true;
-			// The encode mutated the dictionaries for a frame the client
-			// never saw - JSON until reconnect.
-			if (result === SEND_DROPPED) poisonWireState(ws, ud, wire.capability);
+			return delivered;
+		} finally {
+			deliveryAuthorization.finish(deliveryOperation);
 		}
-		return delivered;
 	},
 
 	/**
@@ -1877,66 +1931,76 @@ export const platform = {
 		// envelope identically, so the client keys one watermark whichever form
 		// this connection negotiates.
 		const seq = resolveSendSeq(options != null ? options.seq : undefined);
-		let ud;
-		try {
-			ud = ws.getUserData();
-		} catch {
-			wsCounters.closedWsAborts++;
-			return SEND_DROPPED;
+		if (deliveryAuthorization.deciding) {
+			const captured = { seq: seq === null ? false : seq, compress: options?.compress };
+			deliveryAuthorization.deferOperation(() => platform.sendWire(ws, topic, event, data, wire, captured));
+			return 0;
 		}
-		const caps = ud[WS_CAPS];
-		// Binary codec frames compress only when the caller opts in with
-		// `{ compress: true }` AND a compressor is configured: the
-		// high-frequency paths this exists for are exactly the ones per-frame
-		// deflate would tax.
-		const compress = ws_compression_on && !!(options && options.compress === true);
-		let payload = null;
-		let schemaVersion = wire.schemaVersion;
-		// A poisoned capability is served exactly like a caps-less connection:
-		// the JSON envelope, never binary (see handler/wire-state.js).
-		if (caps && caps.has(wire.capability) && !wireStatePoisoned(ud, wire.capability)) {
-			if (wire.state) {
-				// Share the connection's codec state with publishWire so a
-				// snapshot CATALOG interns ids the following BULK (and every
-				// later broadcast) references against the same dictionary.
-				const state = ensureWireState(ws, ud, wire);
-				payload = wire.encode(event, data, state);
-				if (state != null && typeof state.schemaVersion === 'number') {
-					schemaVersion = state.schemaVersion;
-				}
-			} else {
-				payload = wire.encode(event, data);
+		const deliveryOperation = deliveryAuthorization.begin();
+		try {
+			let ud;
+			try {
+				ud = ws.getUserData();
+			} catch {
+				wsCounters.closedWsAborts++;
+				return SEND_DROPPED;
 			}
+			const caps = ud[WS_CAPS];
+			// Binary codec frames compress only when the caller opts in with
+			// `{ compress: true }` AND a compressor is configured: the
+			// high-frequency paths this exists for are exactly the ones per-frame
+			// deflate would tax.
+			const compress = ws_compression_on && !!(options && options.compress === true);
+			let payload = null;
+			let schemaVersion = wire.schemaVersion;
+			// A poisoned capability is served exactly like a caps-less connection:
+			// the JSON envelope, never binary (see handler/wire-state.js).
+			if (caps && caps.has(wire.capability) && !wireStatePoisoned(ud, wire.capability)) {
+				if (wire.state) {
+					// Share the connection's codec state with publishWire so a
+					// snapshot CATALOG interns ids the following BULK (and every
+					// later broadcast) references against the same dictionary.
+					const state = ensureWireState(ws, ud, wire);
+					payload = wire.encode(event, data, state);
+					if (state != null && typeof state.schemaVersion === 'number') {
+						schemaVersion = state.schemaVersion;
+					}
+				} else {
+					payload = wire.encode(event, data);
+				}
+			}
+			if (payload == null) {
+				return wireJsonSend(ws, topic, event, data, compress, seq);
+			}
+			if (!isUint8Array(payload)) throw new TypeError('wire.encode must return Uint8Array or null');
+			const id = ensureWireId(ws, ud, topic);
+			if (id === -1) {
+				// Dropped wire-id announce: the client can never resolve this
+				// topic's numeric id, so binary for this capability is permanently
+				// undecodable here. JSON for this frame, and poison so every later
+				// frame takes the JSON path too.
+				poisonWireState(ws, ud, wire.capability);
+				return wireJsonSend(ws, topic, event, data, compress, seq);
+			}
+			// 0 is the frame's "no seq" sentinel, which is what an unseq'd send means.
+			const frame = buildBinaryFrame(schemaVersion, id, seq ?? 0, payload);
+			let result;
+			try {
+				result = deliveryAuthorization.send(ws, frame, true, compress, topic);
+			} catch {
+				wsCounters.closedWsAborts++;
+				return SEND_DROPPED;
+			}
+			if (result !== SEND_DROPPED) bumpOut(ws, frame);
+			// A dropped STATEFUL frame poisons: the encode already mutated this
+			// connection's dictionary for a frame the client never saw, and that
+			// desync is unrecoverable in-band. Stateless payloads carry no
+			// per-connection state, so a drop costs only the frame.
+			if (result === SEND_DROPPED && wire.state) poisonWireState(ws, ud, wire.capability);
+			return result;
+		} finally {
+			deliveryAuthorization.finish(deliveryOperation);
 		}
-		if (payload == null) {
-			return wireJsonSend(ws, topic, event, data, compress, seq);
-		}
-		if (!isUint8Array(payload)) throw new TypeError('wire.encode must return Uint8Array or null');
-		const id = ensureWireId(ws, ud, topic);
-		if (id === -1) {
-			// Dropped wire-id announce: the client can never resolve this
-			// topic's numeric id, so binary for this capability is permanently
-			// undecodable here. JSON for this frame, and poison so every later
-			// frame takes the JSON path too.
-			poisonWireState(ws, ud, wire.capability);
-			return wireJsonSend(ws, topic, event, data, compress, seq);
-		}
-		// 0 is the frame's "no seq" sentinel, which is what an unseq'd send means.
-		const frame = buildBinaryFrame(schemaVersion, id, seq ?? 0, payload);
-		let result;
-		try {
-			result = ws.send(frame, true, compress);
-		} catch {
-			wsCounters.closedWsAborts++;
-			return SEND_DROPPED;
-		}
-		if (result !== SEND_DROPPED) bumpOut(ws, frame);
-		// A dropped STATEFUL frame poisons: the encode already mutated this
-		// connection's dictionary for a frame the client never saw, and that
-		// desync is unrecoverable in-band. Stateless payloads carry no
-		// per-connection state, so a drop costs only the frame.
-		if (result === SEND_DROPPED && wire.state) poisonWireState(ws, ud, wire.capability);
-		return result;
 	},
 
 	/**
@@ -1965,95 +2029,106 @@ export const platform = {
 	 */
 	sendWireBatch(ws, topic, event, entries, wire, options) {
 		if (!Array.isArray(entries) || entries.length === 0) return 1;
-		let ud;
+		if (deliveryAuthorization.deciding) {
+			const captured = entries.map((entry) => ({ data: entry.data }));
+			const capturedOptions = { compress: options?.compress };
+			deliveryAuthorization.deferOperation(() => platform.sendWireBatch(ws, topic, event, captured, wire, capturedOptions));
+			return 0;
+		}
+		const deliveryOperation = deliveryAuthorization.begin();
 		try {
-			ud = ws.getUserData();
-		} catch {
-			wsCounters.closedWsAborts++;
-			return SEND_DROPPED;
-		}
-		const caps = ud[WS_CAPS];
-		const compress = ws_compression_on && !!(options && options.compress === true);
-		const count = entries.length;
-		// `prior` is the status of the send this continues from, so a call whose
-		// last frame was dropped, with nothing left to send, still reports it.
-		const sendJsonFrom = (i, source, prior = 1) => {
-			let result = prior;
-			for (; i < count; i++) {
-				const data = source === null ? entries[i].data : source[i];
-				result = wireJsonSend(ws, topic, event, data, compress);
-				if (result === SEND_DROPPED && ws._closed) return SEND_DROPPED;
+			let ud;
+			try {
+				ud = ws.getUserData();
+			} catch {
+				wsCounters.closedWsAborts++;
+				return SEND_DROPPED;
 			}
-			return result;
-		};
-		if (!caps || !caps.has(wire.capability) || wireStatePoisoned(ud, wire.capability) || !wire.state) {
-			return sendJsonFrom(0, null);
-		}
-		const state = ensureWireState(ws, ud, wire);
-		if (state == null) return sendJsonFrom(0, null);
-		// Pin each payload once before calling application code. Every fallback
-		// uses the same references the batch encode saw, even if that encode
-		// replaces entries or their data accessors return another value later.
-		const datas = new Array(count);
-		for (let i = 0; i < count; i++) datas[i] = entries[i].data;
-		const schemaVersion =
-			typeof state.schemaVersion === 'number' ? state.schemaVersion : wire.schemaVersion;
-		const payload = wire.encode(event + '-batch', { updates: datas }, state);
-		if (payload != null && !isUint8Array(payload)) {
-			throw new TypeError('sendWireBatch: wire.encode must return Uint8Array or null');
-		}
-		if (payload == null) {
-			// The codec declined the batch (older codec, unrepresentable
-			// entry): the N sendWire bodies this call replaces.
-			let result = 1;
-			for (let i = 0; i < count; i++) {
-				const p = wire.encode(event, datas[i], state);
-				if (p != null && !isUint8Array(p)) {
-					throw new TypeError('sendWireBatch: wire.encode must return Uint8Array or null');
-				}
-				if (p == null) {
-					result = wireJsonSend(ws, topic, event, datas[i], compress);
+			const caps = ud[WS_CAPS];
+			const compress = ws_compression_on && !!(options && options.compress === true);
+			const count = entries.length;
+			// `prior` is the status of the send this continues from, so a call whose
+			// last frame was dropped, with nothing left to send, still reports it.
+			const sendJsonFrom = (i, source, prior = 1) => {
+				let result = prior;
+				for (; i < count; i++) {
+					const data = source === null ? entries[i].data : source[i];
+					result = wireJsonSend(ws, topic, event, data, compress);
 					if (result === SEND_DROPPED && ws._closed) return SEND_DROPPED;
-					continue;
 				}
-				const id = ensureWireId(ws, ud, topic);
-				if (id === -1) {
-					poisonWireState(ws, ud, wire.capability);
-					return sendJsonFrom(i, datas);
-				}
-				const frame = buildBinaryFrame(schemaVersion, id, 0, p);
-				try {
-					result = ws.send(frame, true, compress);
-				} catch {
-					wsCounters.closedWsAborts++;
-					return SEND_DROPPED;
-				}
-				if (result !== SEND_DROPPED) bumpOut(ws, frame);
-				if (result === SEND_DROPPED) {
-					poisonWireState(ws, ud, wire.capability);
-					return sendJsonFrom(i + 1, datas, SEND_DROPPED);
-				}
+				return result;
+			};
+			if (!caps || !caps.has(wire.capability) || wireStatePoisoned(ud, wire.capability) || !wire.state) {
+				return sendJsonFrom(0, null);
 			}
+			const state = ensureWireState(ws, ud, wire);
+			if (state == null) return sendJsonFrom(0, null);
+			// Pin each payload once before calling application code. Every fallback
+			// uses the same references the batch encode saw, even if that encode
+			// replaces entries or their data accessors return another value later.
+			const datas = new Array(count);
+			for (let i = 0; i < count; i++) datas[i] = entries[i].data;
+			const schemaVersion =
+				typeof state.schemaVersion === 'number' ? state.schemaVersion : wire.schemaVersion;
+			const payload = wire.encode(event + '-batch', { updates: datas }, state);
+			if (payload != null && !isUint8Array(payload)) {
+				throw new TypeError('sendWireBatch: wire.encode must return Uint8Array or null');
+			}
+			if (payload == null) {
+				// The codec declined the batch (older codec, unrepresentable
+				// entry): the N sendWire bodies this call replaces.
+				let result = 1;
+				for (let i = 0; i < count; i++) {
+					const p = wire.encode(event, datas[i], state);
+					if (p != null && !isUint8Array(p)) {
+						throw new TypeError('sendWireBatch: wire.encode must return Uint8Array or null');
+					}
+					if (p == null) {
+						result = wireJsonSend(ws, topic, event, datas[i], compress);
+						if (result === SEND_DROPPED && ws._closed) return SEND_DROPPED;
+						continue;
+					}
+					const id = ensureWireId(ws, ud, topic);
+					if (id === -1) {
+						poisonWireState(ws, ud, wire.capability);
+						return sendJsonFrom(i, datas);
+					}
+					const frame = buildBinaryFrame(schemaVersion, id, 0, p);
+					try {
+						result = deliveryAuthorization.send(ws, frame, true, compress, topic);
+					} catch {
+						wsCounters.closedWsAborts++;
+						return SEND_DROPPED;
+					}
+					if (result !== SEND_DROPPED) bumpOut(ws, frame);
+					if (result === SEND_DROPPED) {
+						poisonWireState(ws, ud, wire.capability);
+						return sendJsonFrom(i + 1, datas, SEND_DROPPED);
+					}
+				}
+				return result;
+			}
+			const id = ensureWireId(ws, ud, topic);
+			if (id === -1) {
+				// Dropped wire-id announce; the batch encode already advanced this
+				// connection's dictionaries - the desync the poisoning exists for.
+				poisonWireState(ws, ud, wire.capability);
+				return sendJsonFrom(0, datas);
+			}
+			const frame = buildBinaryFrame(schemaVersion, id, 0, payload);
+			let result;
+			try {
+				result = deliveryAuthorization.send(ws, frame, true, compress, topic);
+			} catch {
+				wsCounters.closedWsAborts++;
+				return SEND_DROPPED;
+			}
+			if (result !== SEND_DROPPED) bumpOut(ws, frame);
+			if (result === SEND_DROPPED) poisonWireState(ws, ud, wire.capability);
 			return result;
+		} finally {
+			deliveryAuthorization.finish(deliveryOperation);
 		}
-		const id = ensureWireId(ws, ud, topic);
-		if (id === -1) {
-			// Dropped wire-id announce; the batch encode already advanced this
-			// connection's dictionaries - the desync the poisoning exists for.
-			poisonWireState(ws, ud, wire.capability);
-			return sendJsonFrom(0, datas);
-		}
-		const frame = buildBinaryFrame(schemaVersion, id, 0, payload);
-		let result;
-		try {
-			result = ws.send(frame, true, compress);
-		} catch {
-			wsCounters.closedWsAborts++;
-			return SEND_DROPPED;
-		}
-		if (result !== SEND_DROPPED) bumpOut(ws, frame);
-		if (result === SEND_DROPPED) poisonWireState(ws, ud, wire.capability);
-		return result;
 	},
 
 	/**
@@ -2109,9 +2184,9 @@ export const platform = {
 		for (const ws of targets) {
 			try {
 				// Close after attempting the advisory; only accepted frames count.
-				const result = ws.send(frame, false, compress);
+				const result = deliveryAuthorization.control(ws, frame, compress);
 				if (result !== SEND_DROPPED) bumpOut(ws, frame);
-				if (doClose) ws.end(1001, 'Server draining');
+				if (doClose) deliveryAuthorization.end(ws, 1001, 'Server draining');
 			} catch { wsCounters.closedWsAborts++; continue; }
 			count++;
 		}
@@ -2255,150 +2330,161 @@ export const platform = {
 			msgRelays[i] = relayOption;
 		}
 
-		// Batch only when every interested subscriber sees the same event slice.
-		// Mixed membership or missing capabilities fall back to per-event publish.
-		const firstTopic = messages[0].topic;
-		let allSameTopic = true;
-		for (let i = 1; i < messages.length; i++) {
-			if (messages[i].topic !== firstTopic) { allSameTopic = false; break; }
-		}
-
-		// Combined detection pass: walk the subscriber set once to
-		// determine whether the batch qualifies for the fast path
-		// (single-topic or all-see-all) AND whether every interested
-		// connection has advertised the 'batch' capability. We need
-		// both: the shared-frame fast path is only safe when every
-		// recipient can decode the {type:'batch',...} envelope.
-		let allSeeAll = true;
-		let everyoneCapable = true;
-		/** @type {Set<string> | null} */
-		let batchTopics = null;
-		if (!allSameTopic) {
-			batchTopics = new Set();
-			for (let i = 0; i < messages.length; i++) batchTopics.add(messages[i].topic);
-		}
-		for (const ws of wsConnections) {
-			const ud = ws.getUserData();
-			const subs = ud[WS_SUBSCRIPTIONS];
-			if (!subs || subs.size === 0) continue;
-			let touchesAny = false;
-			if (allSameTopic) {
-				touchesAny = subs.has(firstTopic);
-			} else {
-				let touchesAll = true;
-				for (const t of /** @type {Set<string>} */ (batchTopics)) {
-					if (subs.has(t)) touchesAny = true;
-					else touchesAll = false;
-				}
-				if (touchesAny && !touchesAll) { allSeeAll = false; break; }
-			}
-			if (!touchesAny) continue;
-			const caps = ud[WS_CAPS];
-			if (!caps || !caps.has('batch')) { everyoneCapable = false; break; }
-		}
-
-		// Slow-path fallback: per-event publish() so the caller pays
-		// no penalty on small / disjoint shapes. Also the safe
-		// degradation when any interested subscriber is non-cap-able -
-		// they would otherwise receive an unparseable batch frame.
-		if ((!allSameTopic && !allSeeAll) || !everyoneCapable) {
-			// The batch is atomic on this path too: admitting per event would
-			// deliver a prefix and refuse the tail, which is the mid-batch
-			// shedding the budget forbids. Each topic carries its own
-			// recipient count here (the paths differ only in dispatch), and a
-			// tenant decides once on everything it owns in the batch.
-			if (egressGate.armed && !admitBatchEgress(messages, null)) return;
-			for (let i = 0; i < messages.length; i++) {
-				const m = messages[i];
-				// The snapshot, not a spread of the live object: publish() consumes
-				// exactly these fields, and the values it stamps must be the ones
-				// the atomic pre-pass above already judged.
-				platform.publish(m.topic, m.event, m.data, ({ [EGRESS_ADMITTED]: true,
-					seq: msgSeqs[i],
-					relay: msgRelays[i],
-					jitterMs: msgJitters[i],
-					compress: compressOptIn
-				}));
-			}
+		if (deliveryAuthorization.deciding) {
+			const captured = messages.map((message, i) => ({ topic: message.topic, event: message.event, data: message.data,
+				options: { seq: msgSeqs[i], relay: msgRelays[i], jitterMs: msgJitters[i] } }));
+			deliveryAuthorization.deferOperation(() => platform.publishBatched(captured, { compress: compressOptIn }));
 			return;
 		}
-
-		// Egress admission for the whole fast-path batch, before anything is
-		// stamped. In all-see-all every interested subscriber holds every batch
-		// topic, so the dispatch topic's tracked count IS the recipient set for
-		// every topic in the batch; a mixed-topic batch admits each distinct
-		// topic's own share and pools each tenant's, and one refusal refuses
-		// the whole batch (its atomicity contract). The slow path above takes
-		// the same decision through the same helper, reading each topic's own
-		// count, and marks its events so they charge without re-deciding.
-		const recipients = getServer().subscriberCount(messages[0].topic);
-		const gateArmed = egressGate.armed;
-		let egressTenant = null;
-		if (gateArmed) {
-			if (allSameTopic) {
-				egressTenant = resolvePublishTenant(firstTopic);
-				if (!admitPublishEgress(firstTopic, egressTenant, messages.length, messages.length * recipients)) return;
-			} else if (!admitBatchEgress(messages, recipients)) return;
-		}
-		// Fast path: build per-event envelopes (also stamps seq + charges the
-		// per-event egress), wrap into a shared batch frame, and hand
-		// fanout through Bun's native topic tree. In all-see-all
-		// every interested subscriber is subscribed to every batch
-		// topic, so dispatching on any one of them reaches them all.
-		/** @type {Array<{ topic: string, env: string, seq: number | null }>} */
-		const events = new Array(messages.length);
-		// A later serialization failure refuses the whole shared frame. Prepare
-		// every body before any entry advances its topic's sequence or seen mark.
-		for (let i = 0; i < messages.length; i++) {
-			const m = messages[i];
-			const topic = m.topic;
-			events[i] = { topic, env: envelopePrefix(topic, m.event) + envelopeData(m.data), seq: null };
-		}
-		for (let i = 0; i < events.length; i++) {
-			const entry = events[i];
-			wsCounters.publishCount++;
-			wsCounters.publishCountWindow++;
-			const seq = stampSeqValue(msgSeqs[i], entry.topic);
-			// Track the highest observed seq per topic (see platform.publish): the
-			// compare-free record for the monotonic in-memory counter, the
-			// monotone-max guard for an explicit numeric seq.
-			if (seq !== null) {
-				if (typeof msgSeqs[i] === 'number' || typeof msgSeqs[i] === 'bigint') notePublishedSeq(entry.topic, seq, true);
-				else notePublishedSeq(entry.topic, seq, false);
+		const deliveryOperation = deliveryAuthorization.begin();
+		try {
+			// Batch only when every interested subscriber sees the same event slice.
+			// Mixed membership or missing capabilities fall back to per-event publish.
+			const firstTopic = messages[0].topic;
+			let allSameTopic = true;
+			for (let i = 1; i < messages.length; i++) {
+				if (messages[i].topic !== firstTopic) { allSameTopic = false; break; }
 			}
-			const env = completeSerializedEnvelope(entry.env, seq);
-			entry.env = env;
-			entry.seq = seq;
-			// One egress charge per logical publish: each batched event is one,
-			// priced at its own envelope's UTF-8 bytes times the shared
-			// recipient set. The batch frame's wrapper bytes are uncharged
-			// overhead, so a tenant pays the same for N events whether the
-			// runtime batches them or not.
-			chargePublishEgress(entry.topic,
-				gateArmed ? (allSameTopic ? egressTenant : resolvePublishTenant(entry.topic)) : null,
-				1, recipients, env.length, envelopeWireBytes(env, recipients, egressGate.bytesArmed));
-		}
 
-		// Resume cutover in flight: a caps-less resuming connection receives these
-		// events as per-event JSON (the slow path this fast path stands in for), so
-		// hold each per-event envelope for any open buffer - NOT the wrapped batch
-		// frame, which a caps-less connection never decodes and which can span topics.
-		if (resumeBuffers.size > 0) {
-			for (let i = 0; i < events.length; i++) captureResumeFrame(events[i].topic, events[i].seq, events[i].env, compressOptIn);
-		}
+			// Combined detection pass: walk the subscriber set once to
+			// determine whether the batch qualifies for the fast path
+			// (single-topic or all-see-all) AND whether every interested
+			// connection has advertised the 'batch' capability. We need
+			// both: the shared-frame fast path is only safe when every
+			// recipient can decode the {type:'batch',...} envelope.
+			let allSeeAll = true;
+			let everyoneCapable = true;
+			/** @type {Set<string> | null} */
+			let batchTopics = null;
+			if (!allSameTopic) {
+				batchTopics = new Set();
+				for (let i = 0; i < messages.length; i++) batchTopics.add(messages[i].topic);
+			}
+			for (const ws of wsConnections) {
+				const ud = ws.getUserData();
+				const subs = ud[WS_SUBSCRIPTIONS];
+				if (!subs || subs.size === 0) continue;
+				let touchesAny = false;
+				if (allSameTopic) {
+					touchesAny = subs.has(firstTopic);
+				} else {
+					let touchesAll = true;
+					for (const t of /** @type {Set<string>} */ (batchTopics)) {
+						if (subs.has(t)) touchesAny = true;
+						else touchesAll = false;
+					}
+					if (touchesAny && !touchesAll) { allSeeAll = false; break; }
+				}
+				if (!touchesAny) continue;
+				const caps = ud[WS_CAPS];
+				if (!caps || !caps.has('batch')) { everyoneCapable = false; break; }
+			}
 
-		// Build the shared batch frame once.
-		const slice = new Array(events.length);
-		for (let i = 0; i < events.length; i++) slice[i] = events[i].env;
-		const sharedBatchEnv = wrapBatchEnvelope(slice);
-		assert(sharedBatchEnv.length > 0, 'envelope.batch-empty', { events: events.length });
-		// Hand fanout to Bun's native topic tree. Any batch topic works
-		// as the dispatch channel because every interested subscriber
-		// is subscribed to every batch topic in the all-see-all case
-		// (single-topic is the trivial sub-case).
-		const fanoutTopic = allSameTopic ? firstTopic : messages[0].topic;
-		const result = getServer().publish(fanoutTopic, sharedBatchEnv, ws_compression_on && compressOptIn);
-		wsCounters.transportMetricHooks?.publishOutcome(publishReached(result));
+			// Slow-path fallback: per-event publish() so the caller pays
+			// no penalty on small / disjoint shapes. Also the safe
+			// degradation when any interested subscriber is non-cap-able -
+			// they would otherwise receive an unparseable batch frame.
+			if ((!allSameTopic && !allSeeAll) || !everyoneCapable) {
+				// The batch is atomic on this path too: admitting per event would
+				// deliver a prefix and refuse the tail, which is the mid-batch
+				// shedding the budget forbids. Each topic carries its own
+				// recipient count here (the paths differ only in dispatch), and a
+				// tenant decides once on everything it owns in the batch.
+				if (egressGate.armed && !admitBatchEgress(messages, null)) return;
+				for (let i = 0; i < messages.length; i++) {
+					const m = messages[i];
+					// The snapshot, not a spread of the live object: publish() consumes
+					// exactly these fields, and the values it stamps must be the ones
+					// the atomic pre-pass above already judged.
+					platform.publish(m.topic, m.event, m.data, ({ [EGRESS_ADMITTED]: true,
+						seq: msgSeqs[i],
+						relay: msgRelays[i],
+						jitterMs: msgJitters[i],
+						compress: compressOptIn
+					}));
+				}
+				return;
+			}
+
+			// Egress admission for the whole fast-path batch, before anything is
+			// stamped. In all-see-all every interested subscriber holds every batch
+			// topic, so the dispatch topic's tracked count IS the recipient set for
+			// every topic in the batch; a mixed-topic batch admits each distinct
+			// topic's own share and pools each tenant's, and one refusal refuses
+			// the whole batch (its atomicity contract). The slow path above takes
+			// the same decision through the same helper, reading each topic's own
+			// count, and marks its events so they charge without re-deciding.
+			const recipients = getServer().subscriberCount(messages[0].topic);
+			const gateArmed = egressGate.armed;
+			let egressTenant = null;
+			if (gateArmed) {
+				if (allSameTopic) {
+					egressTenant = resolvePublishTenant(firstTopic);
+					if (!admitPublishEgress(firstTopic, egressTenant, messages.length, messages.length * recipients)) return;
+				} else if (!admitBatchEgress(messages, recipients)) return;
+			}
+			// Fast path: build per-event envelopes (also stamps seq + charges the
+			// per-event egress), wrap into a shared batch frame, and hand
+			// fanout through Bun's native topic tree. In all-see-all
+			// every interested subscriber is subscribed to every batch
+			// topic, so dispatching on any one of them reaches them all.
+			/** @type {Array<{ topic: string, env: string, seq: number | null }>} */
+			const events = new Array(messages.length);
+			// A later serialization failure refuses the whole shared frame. Prepare
+			// every body before any entry advances its topic's sequence or seen mark.
+			for (let i = 0; i < messages.length; i++) {
+				const m = messages[i];
+				const topic = m.topic;
+				events[i] = { topic, env: envelopePrefix(topic, m.event) + envelopeData(m.data), seq: null };
+			}
+			for (let i = 0; i < events.length; i++) {
+				const entry = events[i];
+				wsCounters.publishCount++;
+				wsCounters.publishCountWindow++;
+				const seq = stampSeqValue(msgSeqs[i], entry.topic);
+				// Track the highest observed seq per topic (see platform.publish): the
+				// compare-free record for the monotonic in-memory counter, the
+				// monotone-max guard for an explicit numeric seq.
+				if (seq !== null) {
+					if (typeof msgSeqs[i] === 'number' || typeof msgSeqs[i] === 'bigint') notePublishedSeq(entry.topic, seq, true);
+					else notePublishedSeq(entry.topic, seq, false);
+				}
+				const env = completeSerializedEnvelope(entry.env, seq);
+				entry.env = env;
+				entry.seq = seq;
+				// One egress charge per logical publish: each batched event is one,
+				// priced at its own envelope's UTF-8 bytes times the shared
+				// recipient set. The batch frame's wrapper bytes are uncharged
+				// overhead, so a tenant pays the same for N events whether the
+				// runtime batches them or not.
+				chargePublishEgress(entry.topic,
+					gateArmed ? (allSameTopic ? egressTenant : resolvePublishTenant(entry.topic)) : null,
+					1, recipients, env.length, envelopeWireBytes(env, recipients, egressGate.bytesArmed));
+			}
+
+			// Resume cutover in flight: a caps-less resuming connection receives these
+			// events as per-event JSON (the slow path this fast path stands in for), so
+			// hold each per-event envelope for any open buffer - NOT the wrapped batch
+			// frame, which a caps-less connection never decodes and which can span topics.
+			if (resumeBuffers.size > 0) {
+				for (let i = 0; i < events.length; i++) captureResumeFrame(events[i].topic, events[i].seq, events[i].env, compressOptIn);
+			}
+
+			// Build the shared batch frame once.
+			const slice = new Array(events.length);
+			for (let i = 0; i < events.length; i++) slice[i] = events[i].env;
+			const sharedBatchEnv = wrapBatchEnvelope(slice);
+			assert(sharedBatchEnv.length > 0, 'envelope.batch-empty', { events: events.length });
+			// Hand fanout to Bun's native topic tree. Any batch topic works
+			// as the dispatch channel because every interested subscriber
+			// is subscribed to every batch topic in the all-see-all case
+			// (single-topic is the trivial sub-case).
+			const fanoutTopic = allSameTopic ? firstTopic : messages[0].topic;
+			const result = publishAuthorized(getServer(), wsConnections, fanoutTopic, sharedBatchEnv, false, ws_compression_on && compressOptIn);
+			wsCounters.transportMetricHooks?.publishOutcome(publishReached(result));
+		} finally {
+			deliveryAuthorization.finish(deliveryOperation);
+		}
 	},
 
 	/**
@@ -2488,6 +2574,10 @@ export const platform = {
 		// independently as well. One I/O worker plus any number of compute workers
 		// is safe; more than one socket-owning worker needs an external authority.
 		assertGameLaneClusterSafe();
+		if (deliveryAuthorization.deciding) {
+			deliveryAuthorization.deferOperation(() => platform.publishGame(senderWs, topic, event, data, id));
+			return { seq: null, delivered: 0 };
+		}
 		// Egress: the sender is subscribed to its own room in the ordinary case
 		// and is excluded from the walk, so it is not a recipient. The game lane
 		// is the one publish with a socket in hand - its tenant is the SENDER's
@@ -2539,45 +2629,51 @@ export const platform = {
 		let sharedEncoded = false;
 		/** @type {Map<number, Uint8Array> | null} */
 		let sharedFrameById = null;
-		let delivered = 0;
-		for (const ws of wsConnections) {
-			if (ws === senderWs) continue;
-			let ud;
-			try { ud = ws.getUserData(); } catch { continue; }
-			const subs = ud[WS_SUBSCRIPTIONS];
-			if (!subs || !subs.has(topic)) continue;
-			const caps = wantBinary ? ud[WS_CAPS] : null;
-			if (caps && caps.has(GAME_FANOUT_CAP) && !wireStatePoisoned(ud, GAME_FANOUT_CAP)) {
-				if (!sharedEncoded) {
-					sharedPayload = encodeGameFanoutPayload(event, data, id);
-					sharedEncoded = true;
-					sharedFrameById = new Map();
-				}
-				const wid = ensureWireId(ws, ud, topic);
-				if (wid === -1) {
-					// Dropped wire-id announce: the client can never resolve this
-					// topic's numeric id, so binary is undecodable here from now on.
-					// JSON for this frame + poison to JSON until reconnect.
-					poisonWireState(ws, ud, GAME_FANOUT_CAP);
-					try { const result = ws.send(envelope, false, false); if (result !== 2) bumpOut(ws, envelope); delivered++; }
+		const envelopeCache = deliveryAuthorization.cache();
+		const deliveryOperation = deliveryAuthorization.begin();
+		try {
+			let delivered = 0;
+			for (const ws of wsConnections) {
+				if (ws === senderWs) continue;
+				let ud;
+				try { ud = ws.getUserData(); } catch { continue; }
+				const subs = ud[WS_SUBSCRIPTIONS];
+				if (!subs || !subs.has(topic)) continue;
+				const caps = wantBinary ? ud[WS_CAPS] : null;
+				if (caps && caps.has(GAME_FANOUT_CAP) && !wireStatePoisoned(ud, GAME_FANOUT_CAP)) {
+					if (!sharedEncoded) {
+						sharedPayload = encodeGameFanoutPayload(event, data, id);
+						sharedEncoded = true;
+						sharedFrameById = new Map();
+					}
+					const wid = ensureWireId(ws, ud, topic);
+					if (wid === -1) {
+						// Dropped wire-id announce: the client can never resolve this
+						// topic's numeric id, so binary is undecodable here from now on.
+						// JSON for this frame + poison to JSON until reconnect.
+						poisonWireState(ws, ud, GAME_FANOUT_CAP);
+						try { const result = deliveryAuthorization.send(ws, envelope, false, false, null, envelopeCache); if (result !== 2) bumpOut(ws, envelope); delivered++; }
+						catch { wsCounters.closedWsAborts++; }
+						continue;
+					}
+					let frame = sharedFrameById.get(wid);
+					if (!frame) {
+						frame = buildBinaryFrame(GAME_FANOUT_SCHEMA_VERSION, wid, seqOnWire, /** @type {Uint8Array} */ (sharedPayload));
+						sharedFrameById.set(wid, frame);
+					}
+					// A dropped shared frame needs no poisoning: the payload carries no
+					// per-connection state, so the client decoder stays in sync.
+					try { const result = deliveryAuthorization.send(ws, frame, true, false, topic); if (result !== 2) bumpOut(ws, frame); delivered++; }
 					catch { wsCounters.closedWsAborts++; }
 					continue;
 				}
-				let frame = sharedFrameById.get(wid);
-				if (!frame) {
-					frame = buildBinaryFrame(GAME_FANOUT_SCHEMA_VERSION, wid, seqOnWire, /** @type {Uint8Array} */ (sharedPayload));
-					sharedFrameById.set(wid, frame);
-				}
-				// A dropped shared frame needs no poisoning: the payload carries no
-				// per-connection state, so the client decoder stays in sync.
-				try { const result = ws.send(frame, true, false); if (result !== 2) bumpOut(ws, frame); delivered++; }
+				try { const result = deliveryAuthorization.send(ws, envelope, false, false, null, envelopeCache); if (result !== 2) bumpOut(ws, envelope); delivered++; }
 				catch { wsCounters.closedWsAborts++; }
-				continue;
 			}
-			try { const result = ws.send(envelope, false, false); if (result !== 2) bumpOut(ws, envelope); delivered++; }
-			catch { wsCounters.closedWsAborts++; }
+			return { seq, delivered };
+		} finally {
+			deliveryAuthorization.finish(deliveryOperation);
 		}
-		return { seq, delivered };
 	},
 
 	/**
@@ -2708,7 +2804,7 @@ export const platform = {
 	 */
 	bufferedAmount(ws) {
 		try {
-			return ws.getBufferedAmount();
+			return ws.getBufferedAmount() + deliveryAuthorization.pendingBytes(ws);
 		} catch {
 			return 0;
 		}

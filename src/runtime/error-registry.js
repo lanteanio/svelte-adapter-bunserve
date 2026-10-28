@@ -22,6 +22,9 @@
  *                here like every other failure.
  */
 export const ADAPTER_ERROR_IDS = Object.freeze({
+	DELIVERY_AUTHORIZATION_DENIED: 'ADAPTER-ERR-DELIVERY-AUTHORIZATION-DENIED',
+	DELIVERY_AUTHORIZATION_FAILED: 'ADAPTER-ERR-DELIVERY-AUTHORIZATION-FAILED',
+
 	LISTEN: 'ADAPTER-ERR-LISTEN',
 	VITE_LOAD: 'ADAPTER-ERR-VITE-LOAD',
 	VITE_RELOAD: 'ADAPTER-ERR-VITE-RELOAD',
@@ -697,6 +700,40 @@ export const ADAPTER_ERROR_REGISTRY = Object.freeze([
 		sources: Object.freeze(['src/runtime/handler/control-egress.js']),
 		anchor: 'adapter-err-control-egress-exhausted',
 		help: 'docs/errors.md#adapter-err-control-egress-exhausted'
+	}),
+	Object.freeze({
+		id: ADAPTER_ERROR_IDS.DELIVERY_AUTHORIZATION_DENIED,
+		code: null,
+		event: 'delivery-authorization.denied',
+		component: 'runtime.delivery-authorization',
+		severity: 'warn',
+		emission: 'direct',
+		problemPrefix: 'The delivery policy refused a frame and its connection is closed; closeCode is 1013, or null when it was already closed.',
+		messagePrefix: direct('runtime.delivery-authorization', 'delivery-authorization.denied', 'warn', 'The delivery policy refused a frame and its connection is closed; closeCode is 1013, or null when it was already closed.'),
+		cause: 'The callback installed with platform.authorizeDelivery returned false for one logical message of an outgoing frame: a publish, send, replay, relayed frame or request the connection was about to receive. Usually the application revoked a session or a membership after the subscription was admitted, which is what the policy exists to catch.',
+		consequence: 'That one connection was ended with 1013 and every frame still held for it was discarded, so nothing after the refused frame reached it. 1013 is a retry-class close: the bundled client reconnects after its base reconnect delay (about 3 s; each successful connection resets its backoff), and the authenticate, upgrade and subscribe hooks decide what the new connection may receive. The closeCode attribute is null when the connection was already closed when the decision landed (by the policy, the application or the client); nothing more was sent then. Other connections are unaffected.',
+		automaticRecovery: 'The client reconnects and is admitted again to what the admission hooks still allow. A fully revoked user is stopped by those hooks, for example a 4401 from authenticate.',
+		nextAction: 'Nothing when the refusal follows a deliberate revocation. If this repeats for the same user about once per reconnect interval, the subscribe hook still admits a topic the delivery policy refuses: make the two agree, and unsubscribe a connection when its access changes so the policy only catches the race.',
+		sources: Object.freeze(['src/runtime/utils/delivery-authorization.js']),
+		anchor: 'adapter-err-delivery-authorization-denied',
+		help: 'docs/errors.md#adapter-err-delivery-authorization-denied'
+	}),
+	Object.freeze({
+		id: ADAPTER_ERROR_IDS.DELIVERY_AUTHORIZATION_FAILED,
+		code: null,
+		event: 'delivery-authorization.failed',
+		component: 'runtime.delivery-authorization',
+		severity: 'error',
+		emission: 'direct',
+		problemPrefix: 'The delivery policy could not decide a frame and its connection is closed; closeCode is 1011, or null when it was already closed.',
+		messagePrefix: direct('runtime.delivery-authorization', 'delivery-authorization.failed', 'error', 'The delivery policy could not decide a frame and its connection is closed; closeCode is 1011, or null when it was already closed.'),
+		cause: 'The attribute reason names it. error: the platform.authorizeDelivery callback threw or its promise rejected (the error attribute carries it). invalid-result: it answered with something other than true or false. timeout: a pending decision outlived timeoutMs. unattributed: an outgoing frame could not be described for the policy (only the error class is reported, never the frame text). reset: the policy was removed while the connection still held frames.',
+		consequence: 'That one connection was ended with 1011 and every frame still held for it was discarded, because a frame the adapter cannot decide is never delivered. The closeCode attribute is null when the connection was already closed when the decision landed. The bundled client reconnects after its base reconnect delay (about 3 s, reset by each successful connection), so a policy that keeps failing closes each new connection on its first frame, once per reconnect interval.',
+		automaticRecovery: 'The client reconnects. Delivery succeeds again once the policy answers in time.',
+		nextAction: 'For error, fix the callback or the dependency it reads; resolve authorization from state the worker already holds where possible and keep remote lookups for misses. For invalid-result, return a boolean. For timeout, make the decision faster or raise timeoutMs within 2147483647. For unattributed, report it: every adapter frame can be described. For reset, install the policy once and let initialization finish.',
+		sources: Object.freeze(['src/runtime/utils/delivery-authorization.js']),
+		anchor: 'adapter-err-delivery-authorization-failed',
+		help: 'docs/errors.md#adapter-err-delivery-authorization-failed'
 	}),
 	Object.freeze({
 		id: ADAPTER_ERROR_IDS.ATTRIBUTION_HOOK,

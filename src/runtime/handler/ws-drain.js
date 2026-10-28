@@ -1,12 +1,13 @@
+import { deliveryAuthorization } from './delivery-authorization.js';
 /**
  * Managed WebSocket drain, run as its own shutdown step.
  *
  * This exists because Bun's graceful stop does NOT end WebSockets. Probed
  * behavior: after `server.stop()` an open socket still completes an echo
- * round-trip, and its close event never arrives; only `stop(true)` ends it, and
- * that cuts every client simultaneously with a 1006 and leaves no window for
- * the app's close hooks to run. So a deployment either hangs waiting for
- * sockets that will never leave, or guillotines them.
+ * round-trip, and its close event never arrives. Bun 1.4.4's `stop(true)` ends
+ * it with 1001 in the probe, but does not wait for asynchronous close hooks.
+ * The adapter therefore closes connections explicitly and joins those hooks
+ * before the server stops and the process exits.
  *
  * Draining explicitly fixes both halves: clients are told to come back on a
  * jittered schedule (each rolls its own delay, so a fleet does not return in
@@ -57,22 +58,22 @@ export async function drainWebSockets(windowMs) {
 			if (advised < live) {
 				// The difference is connections whose advisory could not be
 				// written - a client past its backpressure limit. They are still
-				// closed, but they never saw the reconnect window and their close
-				// frame cannot flush either, so they get a 1006. Say so rather
-				// than reporting them as advised.
+				// closed without the reconnect window. Bun 1.4.4 can deliver a
+				// close frame even after a saturated send, so a refused advisory
+				// does not determine which close code the client receives.
 				console.warn(
 					`${live - advised} of ${live} WebSocket connection(s) could not be sent the reconnect ` +
-					'advisory (client backpressure); they will see a 1006 rather than 1001.'
+					'advisory (client backpressure); they will close without the reconnect window.'
 				);
 			}
 		}
-		// Closed deliberately rather than left for stop(true), so close hooks
-		// run and clients see a real code. Snapshot first: end() runs the close
-		// handler synchronously, which removes the entry as this iterates.
+		// Close explicitly before waiting for the close hooks below. Snapshot
+		// first: end() runs the close handler synchronously, removing the entry
+		// as this iterates.
 		let closed = 0;
 		for (const ws of [...wsConnections]) {
 			try {
-				ws.end(1001, 'Server shutting down');
+				deliveryAuthorization.end(ws, 1001, 'Server shutting down');
 				closed++;
 			} catch {
 				/* already gone; the close handler has run */
@@ -97,6 +98,8 @@ export async function drainWebSockets(windowMs) {
 	// close hook that awaits (`await redis.srem(...)`): it returns to runCloseHook
 	// at its first await and was being killed a few milliseconds later by
 	// process.exit. Those promises are tracked for exactly this.
+	const held = deliveryAuthorization.ended();
+	if (held !== null) await held;
 	const deadline = wallEpoch() + CLOSE_SETTLE_TIMEOUT_MS;
 	while (
 		(wsConnections.size > 0 || pendingCloseHooks.size > 0) &&

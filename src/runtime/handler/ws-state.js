@@ -621,6 +621,8 @@ function seedRejectionCounts() {
 }
 
 export const wsCounters = {
+	droppedFramesWindow: 0,
+	droppedBytesWindow: 0,
 	transportMetricHooks: null,
 	/**
 	 * Sends and subscribes that were refused because the socket had already
@@ -854,6 +856,8 @@ export const topicPublishStats = new Map();
  * sample. Consumers relying on the live reference are part of the contract.
  */
 export const pressureSnapshot = {
+	droppedFrames: 0,
+	droppedBytes: 0,
 	active: false,
 	value: 0,
 	subscriberRatio: 0,
