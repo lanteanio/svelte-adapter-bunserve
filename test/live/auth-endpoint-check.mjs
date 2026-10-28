@@ -86,6 +86,8 @@ try {
 	check('a foreign origin is refused', foreign.status === 403, `got ${foreign.status}`);
 	const bare = await fetch(AUTH, { method: 'POST' });
 	check('a request with no evidence at all is refused', bare.status === 403, `got ${bare.status}`);
+	const oldHeader = await preflight(AUTH, { 'x-requested-with': 'svelte-adapter-uws' });
+	check('an unrecognized requested-with value is refused', oldHeader.status === 403, `got ${oldHeader.status}`);
 	const sameSite = await fetch(AUTH, { method: 'POST', headers: { 'sec-fetch-site': 'same-origin' } });
 	check('the browser-stamped header is accepted', sameSite.status === 204, `got ${sameSite.status}`);
 

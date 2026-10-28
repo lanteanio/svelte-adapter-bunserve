@@ -63,13 +63,25 @@ test('a client is admitted up to its limit and refused past it', async () => {
 	assert.equal(wsCounters.upgradeRejectedByReason.auth_rate_limit, 1, 'counted by reason');
 });
 
-test('the refusal says how long to wait, and it is the window', async () => {
-	fresh();
-	for (let i = 0; i < 4; i++) await post();
-	const refused = await post();
-	assert.equal(refused.headers.get('retry-after'), '10');
-	assert.match(refused.headers.get('content-type'), /text\/plain/);
-	assert.match(await refused.text(), /Too many authentication requests/);
+test('the refusal says how long to wait: about one window, jittered', async () => {
+	// The clients behind one address earn this 429 together, so a flat window
+	// would bring them all back in the same second. The band is the family
+	// jitter at a spread of 0.5: the window, plus up to half of it again.
+	const { resetRuntimeEnv, setRuntimeEnv } = await import('../../src/runtime/runtime.js');
+	try {
+		for (const [draw, expected] of [[0, '10'], [0.999, '14']]) {
+			setRuntimeEnv({ rng: { float: () => draw } });
+			fresh();
+			for (let i = 0; i < 4; i++) await post();
+			const refused = await post();
+			assert.equal(refused.status, 429);
+			assert.equal(refused.headers.get('retry-after'), expected, `draw ${draw}`);
+			assert.match(refused.headers.get('content-type'), /text\/plain/);
+			assert.match(await refused.text(), /Too many authentication requests/);
+		}
+	} finally {
+		resetRuntimeEnv();
+	}
 });
 
 test('one address spending its allowance does not spend another\'s', async () => {
@@ -88,14 +100,7 @@ test('a refusal is answered before the app hook can be reached', async () => {
 	assert.equal(calls, 3, 'ran for the admitted three and no further');
 });
 
-test('a refused ORIGIN is charged, like everything else that reaches this door', async () => {
-	// The sibling meters AFTER its origin check so a refused origin is not
-	// charged. That ordering does not survive contact with this door: passing the
-	// guard needs only `x-requested-with`, an unverified header any client can
-	// set, so an attacker spends the budget anyway - and the only thing the
-	// ordering bought was an UNMETERED path through a guard that reconstructs the
-	// origin from headers whenever ORIGIN is unset. So this door meters first,
-	// exactly like the upgrade door, and everything that reaches it is charged.
+test('a refused origin does not spend the authentication budget', async () => {
 	fresh();
 	for (let i = 0; i < 3; i++) {
 		const req = new Request(SELF + AUTH_PATH, {
@@ -105,7 +110,7 @@ test('a refused ORIGIN is charged, like everything else that reaches this door',
 		const res = await tryAuthEndpoint(req, { requestIP: () => ({ address: '203.0.113.7' }) }, AUTH_PATH);
 		assert.equal(res.status, 403, `refusal ${i + 1}`);
 	}
-	assert.equal((await post('203.0.113.7')).status, 429, 'the refusals spent the budget');
+	assert.equal((await post('203.0.113.7')).status, 204, 'refusals leave the budget intact');
 });
 
 test('the two doors have separate budgets', async () => {

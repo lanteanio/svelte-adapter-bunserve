@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Authentication and admin routes enforce bounded uploads, trusted request origins and exact mounts; configured canonical aliases redirect before rendering.
+
 - Request bodies enforce route budgets through bounded reads; responses preserve HEAD metadata, cancellation and detectable stream failures.
 
 - Static responses preserve representation validators, cache rules, encoded paths and configured base-path immutability.

@@ -60,6 +60,21 @@ test('nothing is mounted without an `authenticate` hook', async () => {
 	assert.equal(call(preflight()), null);
 });
 
+test('an invalid origin is refused before authentication even with the origin guard disabled', async () => {
+	let calls = 0;
+	__setHooks({ authenticate: () => { calls++; } });
+	const previous = WS_OPTIONS.authPathRequireOrigin;
+	WS_OPTIONS.authPathRequireOrigin = false;
+	try {
+		for (const host of ['a/path', 'a#fragment', 'a:80:80', 'h:99999']) {
+			assert.equal((await call(preflight({ host }))).status, 400, host);
+		}
+		assert.equal(calls, 0);
+	} finally {
+		WS_OPTIONS.authPathRequireOrigin = previous;
+	}
+});
+
 test('a request for another path is not this endpoint', () => {
 	__setHooks({ authenticate: () => undefined });
 	assert.equal(tryAuthEndpoint(preflight(), srv, '/ws'), null);
@@ -108,7 +123,7 @@ test('a returned Response is the answer verbatim', async () => {
 
 test('the hook may await, and reads the request it was given', async () => {
 	__setHooks({
-		authenticate: async (req) => {
+		authenticate: async ({ request: req }) => {
 			const body = await req.json();
 			return body.token === 'good' ? undefined : false;
 		}
@@ -125,7 +140,7 @@ test('a cookie the hook sets goes out on the 204', async () => {
 	// The whole reason this endpoint exists: the same Set-Cookie on a 101 is
 	// silently dropped by Cloudflare Tunnel and other strict edge proxies.
 	__setHooks({
-		authenticate: (req, { cookies }) => { cookies.set('sid', 'fresh', { path: '/' }); }
+		authenticate: ({ cookies }) => { cookies.set('sid', 'fresh', { path: '/' }); }
 	});
 	const res = await call(preflight());
 	assert.equal(res.status, 204);
@@ -134,14 +149,14 @@ test('a cookie the hook sets goes out on the 204', async () => {
 
 test('the hook reads the cookies the request carried', async () => {
 	let seen = null;
-	__setHooks({ authenticate: (req, { cookies }) => { seen = cookies.get('sid'); } });
+	__setHooks({ authenticate: ({ cookies }) => { seen = cookies.get('sid'); } });
 	await call(preflight({ cookie: 'sid=existing; theme=dark' }));
 	assert.equal(seen, 'existing');
 });
 
 test('cookies survive a rejection, so a stale session can be cleared', async () => {
 	__setHooks({
-		authenticate: (req, { cookies }) => {
+		authenticate: ({ cookies }) => {
 			cookies.delete('sid', { path: '/' });
 			return false;
 		}
@@ -154,7 +169,7 @@ test('cookies survive a rejection, so a stale session can be cleared', async () 
 test('a returned Response keeps its own cookies AND gets the jar\'s', async () => {
 	// Both APIs work together rather than one silently winning.
 	__setHooks({
-		authenticate: (req, { cookies }) => {
+		authenticate: ({ cookies }) => {
 			cookies.set('sid', 'fresh', { path: '/' });
 			return new Response(null, { status: 200, headers: { 'set-cookie': 'own=1; Path=/' } });
 		}
@@ -238,9 +253,13 @@ test('`authPathRequireOrigin: false` accepts the native client', async () => {
 test('the context carries a per-request platform identity', async () => {
 	/** @type {any} */
 	let ctx = null;
-	__setHooks({ authenticate: (req, c) => { ctx = c; } });
+	__setHooks({ authenticate: (c) => { ctx = c; } });
 	await call(preflight({ 'x-request-id': 'req-42' }));
 	assert.equal(ctx.platform.requestId, 'req-42');
+	assert.ok(ctx.request instanceof Request);
+	assert.equal(ctx.headers['x-request-id'], 'req-42');
+	assert.equal(ctx.url, AUTH_PATH);
+	assert.equal(ctx.remoteAddress, '203.0.113.7');
 	assert.equal(typeof ctx.platform.publish, 'function', 'and the whole platform behind it');
 
 	await call(preflight());
@@ -254,7 +273,7 @@ test('an unusable request id is replaced rather than carried into the logs', asy
 	// everything else the whitelist covers.
 	/** @type {any} */
 	let ctx = null;
-	__setHooks({ authenticate: (req, c) => { ctx = c; } });
+	__setHooks({ authenticate: (c) => { ctx = c; } });
 	for (const smuggled of ['x'.repeat(200), 'has a space', 'tab\there']) {
 		await call(preflight({ 'x-request-id': smuggled }));
 		assert.notEqual(ctx.platform.requestId, smuggled, JSON.stringify(smuggled));
@@ -264,7 +283,7 @@ test('an unusable request id is replaced rather than carried into the logs', asy
 
 test('the context resolves the client address', async () => {
 	let address = null;
-	__setHooks({ authenticate: (req, { getClientAddress }) => { address = getClientAddress(); } });
+	__setHooks({ authenticate: ({ getClientAddress }) => { address = getClientAddress(); } });
 	await call(preflight());
 	assert.equal(address, '203.0.113.7');
 });
@@ -302,7 +321,7 @@ test('the body reaches the hook unread, so the hook can read it', async () => {
 	let sawUnused = null;
 	let payload = null;
 	__setHooks({
-		authenticate: async (request) => {
+		authenticate: async ({ request }) => {
 			sawUnused = request.bodyUsed === false;
 			payload = await request.json();
 		}
@@ -314,4 +333,15 @@ test('the body reaches the hook unread, so the hook can read it', async () => {
 	assert.equal(res.status, 204);
 	assert.equal(sawUnused, true, 'the adapter has not touched the body before the hook');
 	assert.deepEqual(payload, { token: 'abc12' }, 'and the hook reads what the client sent');
+});
+
+
+test('returned Responses leave transfer framing to the outgoing server', async () => {
+	for (const body of ['payload', null]) {
+		__setHooks({ authenticate: () => new Response(body, { headers: { 'transfer-encoding': 'chunked', 'x-app': 'yes' } }) });
+		const response = await call(preflight());
+		assert.equal(response.headers.get('transfer-encoding'), null);
+		assert.equal(response.headers.get('x-app'), 'yes');
+		assert.equal(await response.text(), body ?? '');
+	}
 });

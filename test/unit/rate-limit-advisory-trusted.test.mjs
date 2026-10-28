@@ -24,7 +24,6 @@ globalThis.WS_PATH = '/ws';
 globalThis.WS_OPTIONS = normalizeWsOptions({
 	path: '/ws',
 	handler: 'src/ws-handler.js',
-	allowUnauthenticatedSubscribe: true
 }).options;
 
 /** @type {string[]} */

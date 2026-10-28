@@ -164,10 +164,10 @@ export const authRateLimitWindowSeconds = authWindowMs / 1000;
 // both adapters or neither.
 if (address_header && !trusted_proxies && (upgradeRateLimiter !== null || authRateLimiter !== null)) {
 	console.warn(
-		`[adapter] ADDRESS_HEADER is set to \`${address_header}\` and TRUSTED_PROXIES is not, so the\n` +
+		`[adapter] ${ENV_PREFIX}ADDRESS_HEADER is set to \`${address_header}\` and ${ENV_PREFIX}TRUSTED_PROXIES is not, so the\n` +
 		'  rate limiters key on a value any client can choose. A client can spend a fresh key per\n' +
 		'  request and never reach a limit, or send another client\'s address and spend theirs. Set\n' +
-		'  TRUSTED_PROXIES to your proxy\'s address or CIDR range, so the header is honoured only\n' +
+		`  ${ENV_PREFIX}TRUSTED_PROXIES to your proxy's address or CIDR range, so the header is honoured only\n` +
 		'  where it was written by something you run.'
 	);
 }
@@ -300,11 +300,11 @@ export function warnRateLimitProxyCollapse(source, address, door) {
 		cause =
 			`the \`${address_header}\` value this request carried was empty, so it keyed on nothing.\n` +
 			'  Every client sending an empty one shares that bucket. The header is honoured from\n' +
-			'  whoever sends it unless TRUSTED_PROXIES names your proxies.';
+			`  whoever sends it unless ${ENV_PREFIX}TRUSTED_PROXIES names your proxies.`;
 	} else if (source === 'header-absent') {
 		kind = 'header-absent';
 		cause =
-			`ADDRESS_HEADER is set to \`${address_header}\`, but this request did not carry it, so the\n` +
+			`${ENV_PREFIX}ADDRESS_HEADER is set to \`${address_header}\`, but this request did not carry it, so the\n` +
 			'  socket peer was metered instead. Behind a proxy that is one bucket for everyone;\n' +
 			'  check that the proxy sets the header on the WebSocket route as well as on ordinary\n' +
 			'  requests.';
@@ -312,9 +312,9 @@ export function warnRateLimitProxyCollapse(source, address, door) {
 		kind = 'header-unusable';
 		cause =
 			`the \`${address_header}\` value this request carried could not be read at the configured\n` +
-			'  depth, so the socket peer was metered instead. A chain shorter than XFF_DEPTH, or one\n' +
+			`  depth, so the socket peer was metered instead. A chain shorter than ${ENV_PREFIX}XFF_DEPTH, or one\n` +
 			'  past the 8 KiB ceiling, does both silently: behind a proxy EVERY client then meters as\n' +
-			'  the gateway and the limit below is one global cap. Check XFF_DEPTH against the number\n' +
+			`  the gateway and the limit below is one global cap. Check ${ENV_PREFIX}XFF_DEPTH against the number\n` +
 			'  of proxies that actually append to the chain.';
 	} else if (source === 'header-untrusted') {
 		// Ordinary for a genuinely direct client on a server that is also
@@ -325,7 +325,7 @@ export function warnRateLimitProxyCollapse(source, address, door) {
 		kind = 'header-untrusted';
 		cause =
 			`this request carried \`${address_header}\`, but its peer (${address || 'unknown'}) is not in\n` +
-			'  TRUSTED_PROXIES, so the claim was ignored and the peer was metered. That is correct for\n' +
+			`  ${ENV_PREFIX}TRUSTED_PROXIES, so the claim was ignored and the peer was metered. That is correct for\n` +
 			'  a client connecting directly. If it is your proxy, the allowlist does not name it - and\n' +
 			'  then EVERY client meters as that one address.';
 	} else if (address === '') {
@@ -338,7 +338,7 @@ export function warnRateLimitProxyCollapse(source, address, door) {
 		if (scope !== 'loopback' && scope !== 'private') return;
 		kind = 'peer-' + scope;
 		cause =
-			`the client address is ${scope} (${address}) and ADDRESS_HEADER is unset. If this server\n` +
+			`the client address is ${scope} (${address}) and ${ENV_PREFIX}ADDRESS_HEADER is unset. If this server\n` +
 			'  runs behind a reverse proxy, a load balancer, or docker\'s userland-proxy, every\n' +
 			'  client arrives as the same address and the limit below is really one GLOBAL cap.';
 	}
@@ -355,8 +355,8 @@ export function warnRateLimitProxyCollapse(source, address, door) {
 	console.warn(
 		`[ws] refused ${door.what} (429), and ${cause}\n` +
 		`  The limit is \`${door.knob}\` (${door.limit} per ${door.windowSeconds}s).\n` +
-		'  Restore real client addresses with ADDRESS_HEADER=x-forwarded-for (plus XFF_DEPTH for\n' +
-		'  the trusted hop count) and TRUSTED_PROXIES, or set docker `userland-proxy: false`, or\n' +
+		`  Restore real client addresses with ${ENV_PREFIX}ADDRESS_HEADER=x-forwarded-for (plus ${ENV_PREFIX}XFF_DEPTH for\n` +
+		`  the trusted hop count) and ${ENV_PREFIX}TRUSTED_PROXIES, or set docker \`userland-proxy: false\`, or\n` +
 		`  set ${door.knob}: 0 if you throttle upstream.`
 	);
 }

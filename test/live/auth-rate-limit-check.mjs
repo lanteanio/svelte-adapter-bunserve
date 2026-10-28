@@ -65,10 +65,17 @@ try {
 
 	const refused = await preflight();
 	check('everything past the limit is 429', refused.status === 429, `got ${refused.status}`);
-	check('the refusal says how long to wait', refused.headers.get('retry-after') === '10',
-		String(refused.headers.get('retry-after')));
 	check('and says what happened', (await refused.text()).includes('Too many authentication'),
 		'body');
+	// About one window, jittered: every value in the 10..14 band, and not one
+	// flat value - a flat window would bring every client behind the address
+	// back in the same second. Thirteen draws from five values all landing on
+	// one is a few in a billion.
+	const waits = [Number(refused.headers.get('retry-after'))];
+	for (let i = 0; i < 12; i++) waits.push(Number((await preflight()).headers.get('retry-after')));
+	check('the refusal says how long to wait: about one window',
+		waits.every((w) => Number.isInteger(w) && w >= 10 && w <= 14), JSON.stringify(waits));
+	check('and the wait is jittered, not one flat value', new Set(waits).size >= 2, JSON.stringify(waits));
 
 	// The separate-budget property: this address has spent its whole preflight
 	// allowance, and its upgrade allowance is untouched.

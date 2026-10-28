@@ -12,21 +12,21 @@
  * the path falls through to ordinary routing rather than answering 405 for a
  * feature it never asked for.
  *
- * On Bun most of the sibling's machinery is unnecessary. It reads the body
- * itself against a stack-allocated request that dies when the callback returns,
- * tracks aborts, and writes the response field by field; here the hook is handed
- * the real `Request` and whatever it answers with becomes the response.
+ * The hook receives an application Request whose body preserves streaming
+ * backpressure while enforcing the endpoint's effective byte budget. Its signal
+ * and response remain registered through transport completion.
  */
 
 import { platform } from './platform.js';
 import { wsModule } from '../ws-handler-bridge.js';
 import { createCookies } from '../utils/cookies.js';
+import { requestTarget } from '../utils/request-target.js';
 import { isAuthOriginAccepted } from '../utils/ws-origin.js';
 import { resolveRequestId } from '../utils/request-id.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
 import { processMonotonicNow, randomUuid } from '../runtime.js';
-import { response413, response500 } from './http-helpers.js';
-import { auth_path, get_origin, origin, ws_options } from './config.js';
+import { response400, response413, response500 } from './http-helpers.js';
+import { auth_path, get_origin, origin, ws_options, bodyLimitFor } from './config.js';
 import {
 	authRateLimiter,
 	authRateLimitExceeded,
@@ -37,8 +37,8 @@ import {
 	AUTH_DOOR
 } from './rate-limit.js';
 import { isDraining, recordUpgradeRejection } from './ws-state.js';
-import { counters } from './state.js';
-import { requestDone } from './lifecycle.js';
+import { jitterRetryAfter } from '../utils/upgrade-admission.js';
+import { openRequestLifetime } from './request-lifetime.js';
 
 /**
  * Whether this server serves the endpoint at all.
@@ -55,19 +55,7 @@ export function authEndpointMounted() {
 	return ws_options !== null && typeof wsModule.authenticate === 'function';
 }
 
-/**
- * Largest body this door accepts, by the `content-length` it declares.
- *
- * Most preflights carry no body at all - the hook reads the `Cookie` header -
- * so a small cap makes a hostile payload cheap to refuse before the app's
- * credential check is reached. It is the sibling's number.
- *
- * A request that declares no length is bounded by `BODY_SIZE_LIMIT` instead,
- * which the runtime enforces before this handler is entered. So this cap
- * tightens the declared case only, and it is deliberately not enforced by
- * reading the body here: the hook owns the body, and consuming it to measure it
- * would take `await request.json()` away from the app.
- */
+/** Authentication keeps its small body budget even when the global ceiling is larger. */
 const AUTH_BODY_LIMIT = 64 * 1024;
 
 /** Hook throws, throttled with decay. */
@@ -103,16 +91,20 @@ function forbiddenOrigin() {
 
 /**
  * What a client over its per-address preflight limit gets. `429`, and a
- * `retry-after` naming the window it has to wait out - the honest number here,
- * because the limiter knows exactly when the allowance comes back.
+ * `retry-after` of about one limiter window, jittered so the clients behind
+ * one address - an office, a school, a carrier NAT, which earn this together -
+ * do not all come back in the same second. The window is rounded up to whole
+ * seconds first: the header takes an integer delay, and the option accepts a
+ * fraction.
  *
  * @returns {Response}
  */
 function rateLimitedResponse() {
+	const retryAfter = jitterRetryAfter(Math.max(1, Math.ceil(authRateLimitWindowSeconds)), 0.5);
 	return new Response('Too many authentication requests', {
 		status: 429,
 		headers: {
-			'retry-after': String(Math.max(1, Math.ceil(authRateLimitWindowSeconds))),
+			'retry-after': String(retryAfter),
 			'content-type': 'text/plain'
 		}
 	});
@@ -174,41 +166,6 @@ export function tryAuthEndpoint(req, srv, pathname) {
 		});
 	}
 
-	// METERED FIRST, ahead of the origin guard, which is the order the upgrade
-	// door uses and the OPPOSITE of the sibling's at this door.
-	//
-	// The sibling meters second so that refused origins are not charged, on the
-	// argument that hostile traffic behind a shared NAT would otherwise spend the
-	// legitimate clients' whole budget. That argument does not survive contact
-	// with this door: `x-requested-with: XMLHttpRequest` is an unverified header
-	// any client can set, and setting it passes the guard - so an attacker simply
-	// spends the budget anyway, and the only thing the ordering bought was an
-	// UNMETERED path. It is not even a cheap one. With no ORIGIN configured -
-	// the zero-config default - the guard reconstructs the origin from headers,
-	// which allocates and can throw and be caught, per request, unbilled.
-	//
-	// So every request that reaches this endpoint is charged, refused or not,
-	// and the budget is spent on whoever is actually driving the door.
-	if (authRateLimiter !== null) {
-		const peer = srv.requestIP(req);
-		const { address, source } = resolveRateLimitAddress(req, peer ? peer.address : '');
-		if (authRateLimitExceeded(address)) {
-			// Not counted for a client that has already gone, exactly as the
-			// upgrade door declines to count one: a connect-then-drop fleet would
-			// otherwise write its own noise into the numbers an operator reads to
-			// decide whether the app is turning people away.
-			// The advisory takes the same guard as the counter one line up, and for
-			// the same reason: `requestIP` answers null for a socket already gone,
-			// so a connect-then-drop fleet would otherwise make a healthy server
-			// announce that no client address can be resolved.
-			if (!req.signal.aborted) {
-				recordUpgradeRejection('auth_rate_limit');
-				warnRateLimitProxyCollapse(source, address, AUTH_DOOR);
-			}
-			return rateLimitedResponse();
-		}
-	}
-
 	// The self-origin this request is judged against, resolved exactly as the
 	// upgrade door resolves it: a configured ORIGIN wins, and without one the
 	// origin is reconstructed from the request, whose host the client chose.
@@ -224,7 +181,7 @@ export function tryAuthEndpoint(req, srv, pathname) {
 		try {
 			selfOrigin = get_origin(req.headers);
 		} catch {
-			selfOrigin = '';
+			return response400();
 		}
 	}
 
@@ -252,32 +209,41 @@ export function tryAuthEndpoint(req, srv, pathname) {
 		}
 	}
 
+	// Only accepted origins spend the per-address authentication budget.
+	if (authRateLimiter !== null) {
+		const peer = srv.requestIP(req);
+		const { address, source } = resolveRateLimitAddress(req, peer ? peer.address : '');
+		if (authRateLimitExceeded(address)) {
+			// Not counted for a client that has already gone, exactly as the
+			// upgrade door declines to count one: a connect-then-drop fleet would
+			// otherwise write its own noise into the numbers an operator reads to
+			// decide whether the app is turning people away.
+			// The advisory takes the same guard as the counter one line up, and for
+			// the same reason: `requestIP` answers null for a socket already gone,
+			// so a connect-then-drop fleet would otherwise make a healthy server
+			// announce that no client address can be resolved.
+			if (!req.signal.aborted) {
+				recordUpgradeRejection('auth_rate_limit');
+				warnRateLimitProxyCollapse(source, address, AUTH_DOOR);
+			}
+			return rateLimitedResponse();
+		}
+	}
+
 	// Oversize is refused before the hook, for the reason the cap exists: a
 	// preflight normally carries nothing, so a large body is not a client this
 	// door needs to spend a credential check on.
+	const bodyLimit = bodyLimitFor(req.method, requestTarget(req), AUTH_BODY_LIMIT);
 	const declaredHeader = req.headers.get('content-length');
-	if (declaredHeader === null) {
-		// A body with no declared length cannot be capped without reading it, and
-		// reading it here would take `await request.json()` away from the hook. So
-		// it is REFUSED rather than waved through: an undeclared body is the one
-		// shape that would make the cap decoration, since a client need only omit
-		// the header to send an endless one. The family client always declares a
-		// length, and a preflight with no body at all is unaffected.
-		if (req.headers.get('transfer-encoding') !== null) {
-			return new Response('Length Required', {
-				status: 411,
-				headers: { 'content-type': 'text/plain' }
-			});
-		}
-	} else {
+	if (declaredHeader !== null) {
 		const declared = Number(declaredHeader);
-		// A length that is not a number at all is refused too: it is not a request
-		// any client this endpoint serves produces, and waving it through would
-		// leave the cap deciding nothing.
-		if (!Number.isFinite(declared) || declared > AUTH_BODY_LIMIT) return response413();
+		if (!Number.isFinite(declared) || declared > bodyLimit) {
+			const response = response413();
+			response.headers.set('connection', 'close');
+			return response;
+		}
 	}
-
-	return runAuthenticate(req, srv, selfOrigin);
+	return runAuthenticate(req, srv, selfOrigin, bodyLimit);
 }
 
 /**
@@ -293,9 +259,16 @@ export function tryAuthEndpoint(req, srv, pathname) {
  *   not be resolved
  * @returns {Promise<Response>}
  */
-function runAuthenticate(req, srv, selfOrigin) {
-	counters.inFlightCount++;
-	return authenticateRequest(req, srv, selfOrigin).finally(requestDone);
+async function runAuthenticate(req, srv, selfOrigin, bodyLimit) {
+	const lifetime = openRequestLifetime(req, bodyLimit);
+	try {
+		return lifetime.response(await lifetime.guard(authenticateRequest(req, srv, selfOrigin, lifetime)));
+	} catch (error) {
+		if (lifetime.bodyLimitExceeded) return lifetime.response(response413(), true);
+		lifetime.abort(error);
+		lifetime.finish();
+		throw error;
+	}
 }
 
 /**
@@ -304,7 +277,7 @@ function runAuthenticate(req, srv, selfOrigin) {
  * @param {string} selfOrigin
  * @returns {Promise<Response>}
  */
-async function authenticateRequest(req, srv, selfOrigin) {
+async function authenticateRequest(req, srv, selfOrigin, lifetime) {
 	const requestId = resolveRequestId(req.headers.get('x-request-id')) ?? randomUuid();
 	// Prototype-linked, exactly as the SSR path builds its own: one object per
 	// request carrying this request's identity, with every method still
@@ -318,10 +291,16 @@ async function authenticateRequest(req, srv, selfOrigin) {
 	// to localhost, every session cookie would go out without `Secure`. The path
 	// still comes from the request, because that is what a relative cookie path
 	// resolves against.
-	const jarUrl = selfOrigin
-		? selfOrigin + new URL(req.url).pathname
-		: req.url;
-	const cookies = createCookies(req.headers.get('cookie'), jarUrl);
+	const target = requestTarget(req);
+	let hookRequest;
+	let cookies;
+	try {
+		const jarUrl = new URL(selfOrigin + target).href;
+		hookRequest = lifetime.request(jarUrl);
+		cookies = createCookies(req.headers.get('cookie'), jarUrl);
+	} catch {
+		return response400();
+	}
 
 	const peer = srv.requestIP(req);
 	// Resolved exactly as the limiter's key is, and never throwing for the same
@@ -332,12 +311,17 @@ async function authenticateRequest(req, srv, selfOrigin) {
 
 	let result;
 	try {
-		result = await wsModule.authenticate(req, {
+		result = await wsModule.authenticate({
+			request: hookRequest,
+			headers: Object.fromEntries(req.headers),
+			url: target,
+			remoteAddress: address,
 			platform: authPlatform,
 			cookies,
 			getClientAddress: () => address
 		});
 	} catch (err) {
+		if (lifetime.bodyLimitExceeded) return response413();
 		// Throttled like every other hook-error site, and for the sharpest
 		// version of the reason: this door is plain HTTP with no socket and no
 		// Origin needed, so a hook that throws on malformed input is the cheapest
@@ -370,10 +354,13 @@ async function authenticateRequest(req, srv, selfOrigin) {
 			);
 		}
 
-		// A Response from the hook IS the answer, verbatim - status, headers, body
-		// - with the jar's cookies merged in, so `cookies.set()` and a returned
-		// Response work together rather than one silently winning.
-		if (result instanceof Response) return withCookies(new Response(result.body, result), cookies);
+		// Preserve the hook's response and cookies; Bun owns transfer framing.
+		if (result instanceof Response) {
+			const headers = new Headers(result.headers);
+			headers.delete('transfer-encoding');
+			headers.delete('date');
+			return withCookies(new Response(result.body, { status: result.status, statusText: result.statusText, headers }), cookies);
+		}
 
 		// Anything else is success, including the `undefined` a hook that only
 		// refreshes a cookie returns.
