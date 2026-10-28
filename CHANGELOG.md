@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added typed cursor plugin entries with portable and native regression coverage.
+
 - Added typed crdt plugin entries with portable and native regression coverage.
 
 - Added typed channels plugin entries with portable and native regression coverage.
