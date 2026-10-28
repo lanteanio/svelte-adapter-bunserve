@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added typed presence plugin entries with portable and native regression coverage.
+
 - Added typed middleware plugin entries with portable and native regression coverage.
 
 - Added typed lock plugin entries with portable and native regression coverage.
