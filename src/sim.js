@@ -23,6 +23,7 @@ import {
 import { createInMemoryApp, SIM_ORIGIN } from './runtime/sim-inmemory.js';
 import { setRuntimeEnv, resetRuntimeEnv } from './runtime/runtime.js';
 import { checkSubscriptionBookkeeping } from './runtime/invariants.js';
+import { readAssertionCounts } from './runtime/utils/assertions.js';
 import { createConsistencyAuditor } from './runtime/auditor.js';
 import { runSteadyState, faultClasses } from './runtime/steadystate.js';
 
@@ -37,11 +38,9 @@ globalThis.ENV_PREFIX ??= '';
 globalThis.WS_PATH ??= '/ws';
 // A REAL normalized options object, not null: tryUpgrade refuses the upgrade
 // lane entirely when ws_options is null, and the sim's whole point is driving
-// that lane. allowUnauthenticatedSubscribe matches the posture the sibling
-// adapter's sim runs under (its no-gate default allows), so the shared
-// default scenario produces comparable structure; a sim run exercising the
-// DENY posture passes its own subscribe hook instead.
-globalThis.WS_OPTIONS ??= normalizeWsOptions({ allowUnauthenticatedSubscribe: true }).options;
+// that lane. Stock defaults otherwise; the subscribe posture is a HOOK
+// question, and createSimServer answers it.
+globalThis.WS_OPTIONS ??= normalizeWsOptions({}).options;
 // A resolvable, fixed server origin: config.js reads ORIGIN once at import,
 // the same-origin default compares upgrades against it, and the sim's clients
 // send the matching Origin header exactly as a browser or the family client
@@ -147,7 +146,6 @@ function resetSimState() {
 	// from a corpus run.
 	_resetRateLimitForSim();
 	wsCounters.closedWsAborts = 0;
-	wsCounters.droppedReleaseRecords = 0;
 	wsCounters.publishCount = 0;
 	wsCounters.totalSubscriptions = 0;
 	wsCounters.sendToAsyncWarned = false;
@@ -159,8 +157,8 @@ function resetSimState() {
 	wsCounters.publishCountWindow = 0;
 	wsCounters.lastPublishCount = 0;
 	wsCounters.lastConnections = 0;
+	wsCounters.lastMeasuredHeapUsedRatio = null;
 	wsCounters.lastHeapUsedRatio = 0;
-	wsCounters.lastResidentBytes = 0;
 	wsCounters.lastBasePressureReason = 'NONE';
 	wsCounters.lastSampleWallMs = 0;
 	wsCounters.leaseSaturationPeak = 0;
@@ -201,6 +199,27 @@ function resetSimState() {
 }
 
 /**
+ * Install a run's app hooks with the sim's default subscribe posture.
+ *
+ * A scenario that brings no subscribe gate runs the PERMISSIVE one, which is
+ * what the sibling adapter's sim gets from its own no-hook default, so the
+ * shared scenarios produce comparable structure. A scenario exercising the DENY
+ * posture, or the grant gate, brings its own hooks and keeps them.
+ *
+ * Every scenario installs through here, including the ones that swap their
+ * hooks mid-run: a second `__setSimHooks` call replaces the whole set, so a
+ * scenario that reached past this would silently be running a different
+ * subscribe posture than the one it was written against.
+ *
+ * @param {Record<string, any>} hooks
+ */
+function installSimHooks(hooks) {
+	__setSimHooks(
+		hooks.subscribe || hooks.subscribeBatch ? hooks : { ...hooks, subscribe: () => null }
+	);
+}
+
+/**
  * Boot the real dispatch over the injected app double for one run: reset the
  * module state, install the run's app hooks, and point the platform at the
  * double's server.
@@ -210,7 +229,7 @@ function resetSimState() {
  */
 function createSimServer(config, app) {
 	resetSimState();
-	__setSimHooks(config.handler || {});
+	installSimHooks(config.handler || {});
 	setServer(app._server);
 	return {
 		platform,
@@ -350,9 +369,9 @@ async function defaultScenario(api, opts) {
 async function admissionScenario(api, opts) {
 	/** @type {Array<() => void>} resolvers for the handshakes parked in the app hook */
 	const parked = [];
-	__setSimHooks({
-		upgrade(req) {
-			const mode = new URL(req.url).searchParams.get('mode') || 'plain';
+	installSimHooks({
+		upgrade({ url }) {
+			const mode = new URL(url, 'http://localhost').searchParams.get('mode') || 'plain';
 			// An app hook that AWAITS - a session lookup, a token check, a rate
 			// limiter - is what holds a handshake open long enough for its client
 			// to leave inside it. Without one the abort branch is unreachable,
@@ -504,6 +523,7 @@ export async function runSim(config = {}) {
 	setRuntimeEnv(scheduler.buildEnv(rng), { force: true });
 	resetProcessEpoch(config.startEpoch ?? FIXED_EPOCH);
 	try {
+		const assertionsBefore = new Map(readAssertionCounts());
 		const app = createInMemoryApp({
 			scheduler,
 			faultEngine,
@@ -520,6 +540,10 @@ export async function runSim(config = {}) {
 			if (!seen.has(key)) { seen.add(key); violations.push(v); }
 		}
 		const auditor = createSimAuditor(() => app);
+		// The framework's own checks (utils/assertions.js), read as growth over
+		// this run. One that fires inside a boundary that contains it - the
+		// upgrade's catch, an app hook's - leaves no other trace in the result,
+		// in test mode or not, so the count is what makes it this run's violation.
 
 		/** @type {number[]} */
 		const clockSamples = [];
@@ -591,6 +615,13 @@ export async function runSim(config = {}) {
 
 		await server.close();
 		totalSteps += await scheduler.run({ maxSteps, onStep: checkInvariants });
+		// By name, not in the Map's order: that is the order categories first
+		// fired in the PROCESS, so a seed run inside a swarm and the same seed
+		// replayed alone would record the same violations in different orders.
+		for (const category of [...readAssertionCounts().keys()].sort()) {
+			const grew = (readAssertionCounts().get(category) ?? 0) - (assertionsBefore.get(category) ?? 0);
+			if (grew > 0) recordViolation({ category, context: { assertions: grew } });
+		}
 
 		return {
 			seed,

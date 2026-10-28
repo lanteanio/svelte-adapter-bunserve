@@ -273,13 +273,19 @@ export function createInMemoryApp(opts) {
 			}
 		};
 
-		const headers = {
+		// A complete handshake, as a browser sends one: the upgrade path refuses
+		// anything less before capacity, origin or the app's hook. A scenario's
+		// own header replaces the default of the same name in any letter case,
+		// rather than being joined to it as a second line.
+		const headers = new Headers({
 			upgrade: 'websocket',
 			connection: 'Upgrade',
+			'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==',
+			'sec-websocket-version': '13',
 			host: SIM_HOST,
-			origin: SIM_ORIGIN,
-			...(connectOpts.headers || {})
-		};
+			origin: SIM_ORIGIN
+		});
+		for (const [name, value] of Object.entries(connectOpts.headers || {})) headers.set(name, value);
 		const url = SIM_ORIGIN + wsPath + (connectOpts.query ? '?' + connectOpts.query : '');
 		// Carries a signal so a scenario can model the client that LEAVES
 		// mid-handshake. Without one, `req.signal` never aborts and the

@@ -16,7 +16,10 @@
 // Lives under scripts/, outside the determinism seam, so it may read the
 // clock and environment. The pure comparison lives in src/sim.js.
 //
-// Usage:
+// Usage - always with the sim condition, which resolves the handler stub, and
+// the test-mode preload, as `npm run sim:golden` runs it:
+// `node -C bunserve-sim --import ./test/helpers/test-env.mjs scripts/sim-golden.js`
+// with these flags (shortened below to `node scripts/sim-golden.js`):
 //   node scripts/sim-golden.js                     verify HEAD against the committed corpus (exit 1 on drift)
 //   node scripts/sim-golden.js --update            regenerate + bless the corpus (refuses a broken/nondeterministic swarm)
 //   node scripts/sim-golden.js --against <corpus>  additionally require fingerprint equality with a sibling corpus file
@@ -91,7 +94,6 @@ const CORPORA = {
 			allowedOrigins: 'any',
 			path: '/ws',
 			handler: 'src/ws-handler.js',
-			allowUnauthenticatedSubscribe: true,
 			// OFF, and it has to be. A virtual clock does not wait out a timeout,
 			// it JUMPS to it: with any bound armed, the scheduler's next move from
 			// a parked handshake is to advance time to the moment it expires. Every
@@ -404,7 +406,7 @@ async function verify() {
 	try {
 		corpus = JSON.parse(readFileSync(CORPUS_PATH, 'utf8'));
 	} catch (err) {
-		console.error(`sim-golden: cannot read corpus ${CORPUS_LABEL} (${err.message}). Run \`node scripts/sim-golden.js --update\`.`);
+		console.error(`sim-golden: cannot read corpus ${CORPUS_LABEL} (${err.message}). Run \`node -C bunserve-sim --import ./test/helpers/test-env.mjs scripts/sim-golden.js --corpus ${CONFIG.name} --update\`.`);
 		return false;
 	}
 	const swarm = corpus.swarm || {};
@@ -433,7 +435,7 @@ async function verify() {
 		if (d.kind === 'missing') console.error(`  seed ${d.seed}: MISSING from run`);
 		else console.error(`  seed ${d.seed}: ${d.golden.fingerprint} -> ${d.actual.fingerprint} (violations ${d.golden.digest.violations}->${d.actual.digest.violations})`);
 	}
-	console.error('  If this change is intentional, re-bless with `node scripts/sim-golden.js --update` and commit the corpus diff.');
+	console.error(`  If this change is intentional, re-bless with \`node -C bunserve-sim --import ./test/helpers/test-env.mjs scripts/sim-golden.js --corpus ${CONFIG.name} --update\` and commit the corpus diff.`);
 	return false;
 }
 

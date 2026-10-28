@@ -22,7 +22,6 @@ globalThis.WS_OPTIONS = {
 	allowedOrigins: 'any',
 	path: '/ws',
 	handler: 'src/ws-handler.js',
-	allowUnauthenticatedSubscribe: true,
 	upgradeRateLimit: 2,
 	upgradeRateLimitWindow: 10
 };

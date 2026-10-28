@@ -23,7 +23,6 @@ globalThis.WS_OPTIONS = normalizeWsOptions({
 	allowedOrigins: 'any',
 	path: '/ws',
 	handler: 'src/ws-handler.js',
-	allowUnauthenticatedSubscribe: true,
 	upgradeTimeout: 5,
 	upgradeAdmission: { maxConcurrent: 2, maxConnections: 2 }
 }).options;

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Native test servers and deterministic simulators share connection lifecycle, tracing, fault injection, subscription and multiworker assertions.
+
 - Runtime pressure, memory limits, warmup and repeated shutdown signals respect process budgets and wait for contained lifecycle cleanup.
 
 - Realtime delivery preserves wire codecs, sequence and replay boundaries, hook containment and native send accounting across socket lifecycle transitions.

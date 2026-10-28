@@ -18,6 +18,7 @@
 /** @type {any} */ export let drain;
 /** @type {any} */ export let upgrade;
 /** @type {any} */ export let authenticate;
+export let attribution;
 /** @type {any} */ export let resume;
 /** @type {any} */ export let init;
 /** @type {any} */ export let shutdown;
@@ -43,6 +44,7 @@ export function __setSimHooks(hooks = {}) {
 	// a unit test that assembles the sim graph and installs one cannot leave it
 	// mounted for the next.
 	authenticate = hooks.authenticate;
+	attribution = hooks.attribution;
 	resume = hooks.resume;
 	init = hooks.init;
 	shutdown = hooks.shutdown;

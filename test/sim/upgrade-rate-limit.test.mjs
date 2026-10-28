@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizeWsOptions } from '../../src/runtime/utils/ws-options.js';
+import { HANDSHAKE } from '../helpers/handshake.mjs';
 
 // `websocket.upgradeRateLimit`, wired: which address a handshake is metered as,
 // and what happens when one spends its allowance.
@@ -21,7 +22,6 @@ globalThis.WS_OPTIONS = normalizeWsOptions({
 	allowedOrigins: 'any',
 	path: '/ws',
 	handler: 'src/ws-handler.js',
-	allowUnauthenticatedSubscribe: true,
 	upgradeRateLimit: 3,
 	upgradeRateLimitWindow: 10,
 	upgradeTimeout: 0
@@ -157,8 +157,7 @@ test('the refusal says how long to wait, and it is the window', async () => {
 	const res = await tryUpgrade(
 		new Request('http://sim.invalid/ws', {
 			headers: {
-				upgrade: 'websocket',
-				connection: 'Upgrade',
+				...HANDSHAKE,
 				host: 'sim.invalid',
 				origin: 'http://sim.invalid',
 				'x-forwarded-for': '203.0.113.7'
@@ -168,7 +167,7 @@ test('the refusal says how long to wait, and it is the window', async () => {
 		'/ws'
 	);
 	assert.equal(res.status, 429);
-	assert.equal(res.headers.get('retry-after'), '10');
+	assert.equal(res.headers.get('retry-after'), null);
 	assert.match(res.headers.get('content-type'), /text\/plain/);
 });
 

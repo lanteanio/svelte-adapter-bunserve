@@ -31,7 +31,6 @@ globalThis.WS_OPTIONS = normalizeWsOptions({
 	allowedOrigins: 'any',
 	path: '/ws',
 	handler: 'src/ws-handler.js',
-	allowUnauthenticatedSubscribe: true,
 	// A parked hook is the whole point of the hang-up test below, and a virtual
 	// clock jumps to a timeout rather than waiting it out - so a bound armed here
 	// would answer the handshake before the client could leave inside it.

@@ -27,7 +27,6 @@ globalThis.WS_OPTIONS = normalizeWsOptions({
 	allowedOrigins: 'any',
 	path: '/ws',
 	handler: 'src/ws-handler.js',
-	allowUnauthenticatedSubscribe: true,
 	// The corpus server's own setting, and for its reason: a virtual clock jumps
 	// to a timeout rather than waiting it out, so any bound armed here would
 	// answer every parked handshake before a client could leave inside one.
@@ -112,6 +111,7 @@ test('the committed workload drives all three orderings, and every client reache
 	let open = 0;
 	for (const seed of seeds) {
 		const r = await runSeed(seed);
+		assert.equal(r.reasons.hook_error ?? 0, 0, `seed ${seed} runs the upgrade hook successfully`);
 		assert.equal(r.total, BASE.clients, `seed ${seed} connected every client`);
 		// No client may end in a state none of these describe. `connecting` here
 		// would mean a handshake that never resolved, which the run would also
