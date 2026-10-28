@@ -83,6 +83,28 @@ export interface SmoothAuthorityOptions<State = any, Command = any> {
 	maxCommandsPerTick?: number;
 }
 
+/** Committed output from one authoritative tick or its successful prefix. */
+export interface SmoothDrainResult<State = any> {
+	updates: Array<{ key: string; state: State; ws: any; commanded: boolean }>;
+	acks: Array<{ key: string; ws: any; id: number; state: State }>;
+	events: Array<{ type: string; key: string; data: any; id: number; opts: any; ws: any; commanded: boolean }>;
+	idle: boolean;
+}
+
+/**
+ * Synchronous drain failure. Publish `partial` through the same path as a
+ * successful result, then handle `cause` according to the application's policy.
+ * Failed batch output is excluded and retained commands can be retried. The
+ * original thrown value is preserved as cause; it is never inspected or changed.
+ */
+export class SmoothDrainError<State = any> extends Error {
+	constructor(cause: unknown, partial: SmoothDrainResult<State>);
+	readonly code: 'SMOOTH_DRAIN_FAILED';
+	readonly cause: unknown;
+	/** Non-enumerable because results carry live sockets and application state. */
+	readonly partial: SmoothDrainResult<State>;
+}
+
 export interface SmoothAuthority<State = any, Command = any> {
 	/**
 	 * Bind (or re-bind) an entity to its owning connection, creating it with
@@ -123,15 +145,14 @@ export interface SmoothAuthority<State = any, Command = any> {
 	/**
 	 * Run one authoritative tick, retaining commands beyond maxCommandsPerTick.
 	 * The caller publishes `updates` (excluding
-	 * each entity's owner when echo suppression is on) and sends each ack to
-	 * its owner AFTER this returns - subscribers observe a tick atomically.
+	 * each entity's owner for commanded updates) and sends each ack to its
+	 * owner after this returns.
+	 * A failed callback throws SmoothDrainError: publish its committed `partial`
+	 * result once before handling its original `cause`. Do not call drain again
+	 * to recover that output. Failed batches stay queued; callback side effects
+	 * are not rolled back, so apply must continue to return immutable state.
 	 */
-	drain(): {
-		updates: Array<{ key: string; state: State; ws: any; commanded: boolean }>;
-		acks: Array<{ key: string; ws: any; id: number; state: State }>;
-		events: Array<{ type: string; key: string; data: any; id: number; opts: any; ws: any; commanded: boolean }>;
-		idle: boolean;
-	};
+	drain(): SmoothDrainResult<State>;
 	/** Drop one entity. True when it existed. */
 	remove(key: string): boolean;
 	/** Drop every entity owned by a closing connection; returns their keys. */

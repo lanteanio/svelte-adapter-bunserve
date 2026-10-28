@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `SmoothDrainError` exposes committed updates, acknowledgements and events when
+  an authority callback fails, preserving its exact cause and bounded retries
+  without replaying output already returned.
+
 - Native testing servers share delivery authorization, operation ordering and
   tracing with production; response bridges preserve exact header bytes.
 

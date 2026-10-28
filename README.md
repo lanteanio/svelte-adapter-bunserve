@@ -71,6 +71,14 @@ raw TCP failure boundary on supported Bun runtimes.
 
 ## Smoothing controls
 
+`drain()` wraps callback failures in `SmoothDrainError` with code
+`SMOOTH_DRAIN_FAILED`, the exact thrown `cause`, and a non-enumerable `partial`
+result. Deliver that committed result once through the normal update, owner
+acknowledgement and event routes before handling the failure. Failed batches
+remain queued within `queueCap`; later drains do not replay committed output.
+See the [authority delivery guide](docs/smooth-authority.md) for `publishWire`
+and `sendWire` routing and callback failure handling.
+
 `createSmoothAuthority({ maxCommandsPerTick })` limits the commands applied to
 one entity during one tick. It must be a positive safe integer. Omit it to drain
 the entire available queue. A bounded drain preserves the ordered tail and

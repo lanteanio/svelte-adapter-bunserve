@@ -1,11 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { WebSocket } from 'ws';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { createTestServer } from '../../src/testing.js';
-import { createSmoothAuthority } from '../../src/plugins/smooth/server.js';
+import { createSmoothAuthority, createSmoothWireCodec, SmoothDrainError, SMOOTH_TOPIC_PREFIX } from '../../src/plugins/smooth/server.js';
+import { createProductionTestServer } from '../helpers/smooth-production-server.mjs';
 
 let server;
 let clients;
 let nonce = 0;
+const WIRE_TOPIC = SMOOTH_TOPIC_PREFIX + 'room';
+function thrownValue(kind, message) {
+	if (kind === 'undefined') return undefined;
+	if (kind === 'null') return null;
+	if (kind === 'primitive') return 42;
+	if (kind === 'symbol') return Symbol('failure');
+	if (kind === 'proxy') return new Proxy({}, { get() { throw new Error('do not inspect cause'); }, getPrototypeOf() { throw new Error('do not inspect cause'); } });
+	if (kind === 'revoked') { const pair = Proxy.revocable({}, {}); pair.revoke(); return pair.proxy; }
+	return Object.freeze(new Error(message));
+}
 async function connect() {
 	const ws = new WebSocket(server.wsUrl);
 	const frames = [];
@@ -29,37 +42,97 @@ async function command(client, operation, values = {}) {
 function batch(count, start = 1) {
 	return Array.from({ length: count }, (_, index) => ({ id: start + index, cmd: { dx: 1, label: start + index } }));
 }
-describe('smooth authority command budget over actual sockets', () => {
+function deliveredBefore(client, reply, from = 0) {
+	const end = client.frames.findIndex(frame => frame.event === 'reply' && frame.data.nonce === reply.nonce);
+	expect(end).toBeGreaterThanOrEqual(from);
+	return client.frames.slice(from, end).filter(frame => frame.topic === 'smooth' || frame.topic === WIRE_TOPIC);
+}
+const productionChild = process.env.BUNSERVE_SMOOTH_PRODUCTION_CHILD === '1';
+if (!productionChild) it('production drain failures preserve committed output over real sockets', () => {
+	const root = fileURLToPath(new URL('../../', import.meta.url));
+	const result = spawnSync(process.execPath, [
+		'test', '--conditions=bunserve-test', '--preload', './test/helpers/test-env.mjs',
+		'./test/public-native/smooth-drain-budget-real.test.js'
+	], {
+		cwd: root, encoding: 'utf8', timeout: 15000, windowsHide: true,
+		env: { ...process.env, BUNSERVE_SMOOTH_PRODUCTION_CHILD: '1' }
+	});
+	const output = result.stdout + result.stderr;
+	expect(result.error, output || result.error?.message).toBeUndefined();
+	expect(result.status, output).toBe(0);
+	expect(output).toContain('45 pass');
+	expect(output).toContain('0 fail');
+}, 20000);
+const surfaces = productionChild ? [['production', createProductionTestServer]] : [['testing', createTestServer]];
+for (const [surface, startServer] of surfaces) describe('smooth authority command budget over actual ' + surface + ' sockets', () => {
 	beforeEach(async () => {
 		clients = [];
 		let authority;
 		const failed = new Set();
-		server = await createTestServer({ handler: {
-			message(ws, { data, platform }) {
+		let lastThrown;
+		let failureMessage;
+		let wire = false;
+		const codec = createSmoothWireCodec();
+		const emitTick = (tick, platform) => {
+			if (wire) {
+				for (const update of tick.updates) platform.publishWire(WIRE_TOPIC, 'update', { key: update.key, data: update.state }, codec, update.commanded ? { excludeWs: update.ws } : undefined);
+				for (const ack of tick.acks) platform.sendWire(ack.ws, WIRE_TOPIC, 'ack', { id: ack.id, state: ack.state }, codec);
+				for (const event of tick.events) platform.publishWire(WIRE_TOPIC, 'applied', { key: event.key, data: event.data }, codec, !event.commanded || event.opts?.toAuthor ? undefined : { excludeWs: event.ws });
+				return;
+			}
+			for (const ack of tick.acks) platform.send(ack.ws, 'smooth', 'ack', { key: ack.key, id: ack.id, state: ack.state });
+			for (const update of tick.updates) platform.send(update.ws, 'smooth', 'update', { key: update.key, state: update.state });
+			for (const event of tick.events) platform.send(event.ws, 'smooth', 'applied', { key: event.key, data: event.data });
+		};
+		server = await startServer({ handler: {
+			async message(ws, { data, platform }) {
 				const msg = JSON.parse(Buffer.from(data).toString());
 				let result;
 				if (msg.operation === 'configure') {
 					try {
+						wire = msg.wire === true;
 						authority = createSmoothAuthority({
 							...msg.options,
 							apply(state, cmd, ctx) {
 								if (cmd.append) authority.enqueue(ctx.key, cmd.append);
-								ctx.emitEvent('applied', cmd.label);
-								if (cmd.failOnce && !failed.has(cmd.label)) { failed.add(cmd.label); throw new Error('apply failed once'); }
+								ctx.emitEvent('applied', cmd.label, { toAuthor: cmd.toAuthor });
+								if ((cmd.failOnce && !failed.has(cmd.label)) || cmd.failAlways) {
+									failed.add(cmd.label);
+									failureMessage = 'apply failed once';
+									lastThrown = thrownValue(cmd.throwKind, failureMessage);
+									throw lastThrown;
+								}
 								return { x: state.x + cmd.dx, trail: [...state.trail, cmd.label] };
 							},
-							onMissing: msg.missing ? (state, lastCommand) => ({ x: state.x + 10, trail: [...state.trail, msg.missing === 'lastCommand' ? lastCommand?.label : 'missing'] }) : undefined
+							onMissing: msg.missing ? (state, lastCommand) => {
+								if (msg.missing === 'throws' && state.trail.includes('missing-fails')) {
+									failureMessage = 'missing failed';
+									lastThrown = thrownValue(msg.missingThrowKind, failureMessage);
+									throw lastThrown;
+								}
+								return { x: state.x + 10, trail: [...state.trail, msg.missing === 'lastCommand' ? lastCommand?.label : 'missing'] };
+							} : undefined
 						});
 						result = { configured: true };
 					} catch (error) { result = { error: error.message }; }
-				} else if (msg.operation === 'join') result = authority.ensure(msg.key, ws, { x: 0, trail: [] });
+				} else if (msg.operation === 'join') result = authority.ensure(msg.key, ws, msg.initial || { x: 0, trail: [] }, { active: msg.active });
+				else if (msg.operation === 'watch') result = { subscribed: await platform.subscribe(ws, WIRE_TOPIC) };
+				else if (msg.operation === 'barrier') result = { barrier: true };
 				else if (msg.operation === 'queue') result = { accepted: authority.enqueue(msg.key, msg.commands) };
 				else if (msg.operation === 'inject') result = { accepted: authority.inject(msg.key, msg.command) };
 				else if (msg.operation === 'tick') {
 					let tick;
 					try { tick = authority.drain(); }
-					catch (error) { platform.send(ws, 'probe', 'reply', { error: error.message, nonce: msg.nonce }); return; }
-					for (const ack of tick.acks) platform.send(ack.ws, 'smooth', 'ack', { key: ack.key, id: ack.id, state: ack.state });
+					catch (error) {
+						if (!(error instanceof SmoothDrainError)) throw error;
+						emitTick(error.partial, platform);
+						platform.send(ws, 'probe', 'reply', {
+							error: failureMessage, code: error.code, causeSame: error.cause === lastThrown,
+							idle: error.partial.idle, nonce: msg.nonce
+						});
+						return;
+					}
+					emitTick(tick, platform);
 					result = {
 						idle: tick.idle,
 						eventKeys: tick.events.map(event => event.key),
@@ -208,7 +281,142 @@ describe('smooth authority command budget over actual sockets', () => {
 			const missing = await command(replacement, 'tick');
 			expect(missing.updates[0].state).toEqual({ x: 11, trail: [1, 1] });
 		});
+
+		it('delivers committed owner output before an injected failure and does not replay it: ' + JSON.stringify(options), async () => {
+			const client = await connect();
+			await command(client, 'configure', { options });
+			await command(client, 'join', { key: 'a' });
+			await command(client, 'queue', { key: 'a', commands: batch(3) });
+			await command(client, 'inject', { key: 'a', command: { dx: 10, label: 'injected', failOnce: true } });
+			const failed = await command(client, 'tick');
+			expect(failed).toMatchObject({ code: 'SMOOTH_DRAIN_FAILED', causeSame: true, idle: false });
+			const count = options.maxCommandsPerTick || 3;
+			const committed = deliveredBefore(client, failed);
+			expect(committed.map(frame => frame.event)).toEqual(['ack', 'update', ...Array(count).fill('applied')]);
+			expect(committed[0].data).toEqual({ key: 'a', id: count, state: { x: count, trail: batch(count).map(c => c.id) } });
+			expect(committed.filter(frame => frame.event === 'applied').map(frame => frame.data.data)).toEqual(batch(count).map(c => c.id));
+			const from = client.frames.length;
+			const retry = await command(client, 'tick');
+			expect(retry.updates[0].state).toEqual({ x: 13, trail: [1, 2, 3, 'injected'] });
+			expect(retry.acks.map(ack => ack.id)).toEqual(count === 2 ? [3] : []);
+			expect(deliveredBefore(client, retry, from).filter(frame => frame.event === 'applied').map(frame => frame.data.data)).toEqual(count === 2 ? [3, 'injected'] : ['injected']);
+			expect((await command(client, 'tick')).updates).toEqual([]);
+		});
 	}
+
+	it.each(['undefined', 'primitive', 'frozen', 'proxy'])('delivers committed output once even when injection keeps throwing %s', async throwKind => {
+		const client = await connect();
+		await command(client, 'configure', { options: {} });
+		await command(client, 'join', { key: 'a' });
+		await command(client, 'queue', { key: 'a', commands: batch(2) });
+		await command(client, 'inject', { key: 'a', command: { dx: 10, label: 'failure', failAlways: true, throwKind } });
+		const first = await command(client, 'tick');
+		expect(first).toMatchObject({ code: 'SMOOTH_DRAIN_FAILED', causeSame: true, idle: false });
+		expect(deliveredBefore(client, first).map(frame => frame.event)).toEqual(['ack', 'update', 'applied', 'applied']);
+		const from = client.frames.length;
+		const second = await command(client, 'tick');
+		expect(second).toMatchObject({ code: 'SMOOTH_DRAIN_FAILED', causeSame: true, idle: false });
+		expect(deliveredBefore(client, second, from)).toEqual([]);
+		expect(await command(client, 'join', { key: 'a' })).toMatchObject({ state: { x: 2, trail: [1, 2] }, lastAckedId: 2 });
+	});
+
+	it.each(['owner', 'injected', 'missing'])('retains earlier entity outputs when a later %s phase fails', async phase => {
+		const client = await connect();
+		await command(client, 'configure', { options: {}, missing: phase === 'missing' ? 'throws' : undefined });
+		await command(client, 'join', { key: 'first' });
+		await command(client, 'join', { key: 'later', initial: { x: 0, trail: ['missing-fails'] }, active: true });
+		await command(client, 'queue', { key: 'first', commands: batch(1) });
+		if (phase === 'owner') {
+			await command(client, 'queue', { key: 'later', commands: [
+				{ id: 1, cmd: { dx: 1, label: 'uncommitted' } },
+				{ id: 2, cmd: { dx: 1, label: 'failure', failOnce: true } }
+			] });
+		} else if (phase === 'injected') {
+			await command(client, 'inject', { key: 'later', command: { dx: 1, label: 'uncommitted' } });
+			await command(client, 'inject', { key: 'later', command: { dx: 1, label: 'failure', failOnce: true } });
+		}
+		const failed = await command(client, 'tick');
+		expect(failed).toMatchObject({ code: 'SMOOTH_DRAIN_FAILED', causeSame: true, idle: false });
+		const frames = deliveredBefore(client, failed);
+		expect(frames.map(frame => frame.event)).toEqual(['ack', 'update', 'applied']);
+		expect(frames[0].data).toMatchObject({ key: 'first', id: 1, state: { x: 1 } });
+		expect(frames[1].data).toMatchObject({ key: 'first', state: { x: 1 } });
+		expect(frames[2].data).toEqual({ key: '1:0', data: 1 });
+		expect(await command(client, 'join', { key: 'later' })).toMatchObject({ state: { x: 0, trail: ['missing-fails'] }, lastAckedId: 0 });
+		const from = client.frames.length;
+		const next = await command(client, 'tick');
+		expect(deliveredBefore(client, next, from).filter(frame => frame.event === 'ack').map(frame => frame.data.key)).toEqual(phase === 'owner' ? ['later'] : []);
+		expect(deliveredBefore(client, next, from).filter(frame => frame.event === 'applied').map(frame => frame.data.data)).toEqual(phase === 'missing' ? [] : ['uncommitted', 'failure']);
+	});
+
+	for (const phase of ['owner', 'missing']) it.each(['undefined', 'null', 'primitive', 'frozen', 'symbol', 'proxy', 'revoked'])(
+		'preserves an opaque cause and committed prefix through repeated ' + phase + ' failures: %s', async throwKind => {
+			const client = await connect();
+			await command(client, 'configure', { options: { maxCommandsPerTick: 2 }, missing: phase === 'missing' ? 'throws' : undefined, missingThrowKind: throwKind });
+			await command(client, 'join', { key: 'first' });
+			await command(client, 'join', { key: 'later', initial: { x: 0, trail: ['missing-fails'] }, active: true });
+			await command(client, 'queue', { key: 'first', commands: batch(1) });
+			if (phase === 'owner') await command(client, 'queue', { key: 'later', commands: [
+				{ id: 1, cmd: { dx: 1, label: 'uncommitted' } },
+				{ id: 2, cmd: { dx: 1, label: 'failure', failAlways: true, throwKind } }
+			] });
+			const failed = await command(client, 'tick');
+			expect(failed).toMatchObject({ code: 'SMOOTH_DRAIN_FAILED', causeSame: true, idle: false });
+			expect(deliveredBefore(client, failed).filter(frame => frame.event === 'ack').map(frame => frame.data.key)).toEqual(['first']);
+			expect(deliveredBefore(client, failed).filter(frame => frame.event === 'applied').map(frame => frame.data.data)).toEqual([1]);
+			const from = client.frames.length;
+			const again = await command(client, 'tick');
+			expect(again).toMatchObject({ code: 'SMOOTH_DRAIN_FAILED', causeSame: true });
+			expect(deliveredBefore(client, again, from).filter(frame => frame.event === 'ack' || frame.event === 'applied')).toEqual([]);
+			expect(await command(client, 'join', { key: 'later' })).toMatchObject({ state: { x: 0, trail: ['missing-fails'] }, lastAckedId: 0 });
+		}
+	);
+
+	it('delivers committed onMissing motion when the following injection fails', async () => {
+		const client = await connect();
+		await command(client, 'configure', { options: {}, missing: true });
+		await command(client, 'join', { key: 'a', active: true });
+		await command(client, 'inject', { key: 'a', command: { dx: 1, label: 'failure', failOnce: true } });
+		const failed = await command(client, 'tick');
+		expect(deliveredBefore(client, failed).map(frame => [frame.event, frame.data])).toEqual([
+			['update', { key: 'a', state: { x: 10, trail: ['missing'] } }]
+		]);
+		const retry = await command(client, 'tick');
+		expect(retry.updates).toEqual([{ key: 'a', state: { x: 21, trail: ['missing', 'missing', 'failure'] }, commanded: false }]);
+		expect(retry.acks).toEqual([]);
+	});
+
+	it.each(['owner', 'missing'])('routes committed %s output to its author and observer through the public wire API', async phase => {
+		const author = await connect(), observer = await connect();
+		await command(author, 'configure', { options: {}, wire: true, missing: phase === 'missing' });
+		await command(author, 'watch');
+		await command(observer, 'watch');
+		await command(author, 'join', { key: 'a', active: phase === 'missing' });
+		if (phase === 'owner') {
+			const commands = batch(2);
+			commands[1].cmd.toAuthor = true;
+			await command(author, 'queue', { key: 'a', commands });
+		}
+		await command(author, 'inject', { key: 'a', command: { dx: 1, label: 'injected', failOnce: true } });
+		const failed = await command(author, 'tick');
+		const observed = await command(observer, 'barrier');
+		const ownFrames = deliveredBefore(author, failed), otherFrames = deliveredBefore(observer, observed);
+		expect(ownFrames.map(frame => frame.event)).toEqual(phase === 'owner' ? ['ack', 'applied'] : ['update']);
+		expect(otherFrames.map(frame => frame.event)).toEqual(phase === 'owner' ? ['update', 'applied', 'applied'] : ['update']);
+		if (phase === 'owner') {
+			expect(ownFrames[0].data).toEqual({ id: 2, state: { x: 2, trail: [1, 2] } });
+			expect(ownFrames[1].data.data).toBe(2);
+		} else expect(ownFrames[0].data).toEqual({ key: 'a', data: { x: 10, trail: ['missing'] } });
+		expect(otherFrames[0].data.data.x).toBe(phase === 'owner' ? 2 : 10);
+		const authorFrom = author.frames.length, observerFrom = observer.frames.length;
+		const retry = await command(author, 'tick');
+		const observedRetry = await command(observer, 'barrier');
+		for (const frames of [deliveredBefore(author, retry, authorFrom), deliveredBefore(observer, observedRetry, observerFrom)]) {
+			expect(frames.map(frame => frame.event)).toEqual(['update', 'applied']);
+			expect(frames[0].data.data.x).toBe(phase === 'owner' ? 3 : 21);
+			expect(frames[1].data.data).toBe('injected');
+		}
+	});
 
 	it('discards scratch events when an injected command throws before its state commits', async () => {
 		const client = await connect();

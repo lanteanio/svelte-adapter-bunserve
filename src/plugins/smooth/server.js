@@ -44,8 +44,11 @@
  * timers, no publishes - the caller owns the tick cadence and delivers the
  * drain result. That is also the ordering contract the broadcast needs:
  * `apply` is pure state -> state, so nothing can publish mid-drain, and the
- * caller publishes updates and acknowledgements only after the drain
- * returns - subscribers always observe a tick's effects atomically.
+ * caller publishes updates, acknowledgements and events after the drain
+ * returns. A callback failure throws SmoothDrainError with the committed
+ * prefix in `partial`; the caller delivers that result before handling the
+ * original `cause`. Failed batch output is excluded; committed output is
+ * not retained for later drains.
  *
  * @module svelte-adapter-bunserve/plugins/smooth/server
  */
@@ -71,6 +74,26 @@ export { registerIngress } from '../../runtime/handler/ingress.js';
 // subscribers. Consumed by the realtime smooth server (per-cell publish) and the
 // smooth client (decode). See ./cell-codec.js.
 export { createCellWireCodec, decodeCell, CELL_CAPABILITY, CELL_SCHEMA_VERSION, CELL_TOPIC_PREFIX } from './cell-codec.js';
+
+/**
+ * A failed drain's committed output. Publish `partial` exactly as a successful
+ * drain result, then handle `cause` according to the application's error policy.
+ * The original thrown value is retained without inspecting or mutating it.
+ */
+export class SmoothDrainError extends Error {
+	/**
+	 * @param {unknown} cause
+	 * @param {ReturnType<ReturnType<typeof createSmoothAuthority>['drain']>} partial
+	 */
+	constructor(cause, partial) {
+		super('An application callback failed during smooth drain.', { cause });
+		this.name = 'SmoothDrainError';
+		this.code = 'SMOOTH_DRAIN_FAILED';
+		// Results carry live sockets and application state, so generic error
+		// serialization must not copy them into a log or response.
+		Object.defineProperty(this, 'partial', { value: partial });
+	}
+}
 
 /** Per-entity command queue bound: drop-oldest beyond it. A client that
  * floods faster than the tick drains loses its oldest samples and recovers
@@ -138,7 +161,9 @@ export function createSmoothAuthority(options) {
 	ctx.emitEvent = (type, data, opts) => {
 		const key = opts && opts.key != null ? String(opts.key) : currentId + ':' + eventOrdinal;
 		eventOrdinal++;
-		eventSink.push({ type: String(type), key, data, id: currentId, opts: opts || null });
+		// Complete attribution after apply returns, then move this same event
+		// into the result instead of allocating a second event object.
+		eventSink.push({ type: String(type), key, data, id: currentId, opts: opts || null, ws: null, commanded: false });
 		return key;
 	};
 
@@ -281,6 +306,8 @@ export function createSmoothAuthority(options) {
 		 *   are the discrete one-shot actions emitted via `ctx.emitEvent` this
 		 *   tick, each tagged with its owning `ws` so the broadcast can exclude
 		 *   the author's already-predicted copy.
+		 * @throws {SmoothDrainError} Contains the original thrown value as `cause`
+		 *   and only committed updates, acknowledgements and events as `partial`.
 		 */
 		drain() {
 			const updates = [];
@@ -296,6 +323,7 @@ export function createSmoothAuthority(options) {
 				if (e.queue.length > 0) {
 					let s = e.state;
 					let lastAckedId, lastCommand;
+					const eventCheckpoint = events.length;
 					// The default keeps its dynamic full-drain behavior. A bounded
 					// tick owns its prefix before apply can enqueue more work, so
 					// queueCap eviction can only change the waiting tail.
@@ -311,12 +339,15 @@ export function createSmoothAuthority(options) {
 							lastCommand = c.cmd;
 							for (let j = 0; j < eventSink.length; j++) {
 								const ev = eventSink[j];
-								events.push({ type: ev.type, key: ev.key, data: ev.data, id: ev.id, opts: ev.opts, ws: e.ws, commanded: true });
+								ev.ws = e.ws;
+								ev.commanded = true;
+								events.push(ev);
 							}
 							eventSink.length = 0;
 						}
 					} catch (error) {
 						eventSink.length = 0;
+						events.length = eventCheckpoint;
 						if (queue !== e.queue) {
 							// State is committed only after the whole prefix succeeds.
 							// Restore it for retry, subject to the usual drop-oldest cap;
@@ -325,7 +356,7 @@ export function createSmoothAuthority(options) {
 							const overflow = e.queue.length - queueCap;
 							if (overflow > 0) e.queue.splice(0, overflow);
 						}
-						throw error;
+						throw new SmoothDrainError(error, { updates, acks, events, idle: false });
 					}
 					if (queue === e.queue) e.queue.length = 0;
 					e.state = s;
@@ -334,7 +365,12 @@ export function createSmoothAuthority(options) {
 					e.active = true;
 					commanded = true;
 				} else if (e.active && onMissing) {
-					const s = onMissing(e.state, e.lastCommand);
+					let s;
+					try { s = onMissing(e.state, e.lastCommand); }
+					catch (error) {
+						eventSink.length = 0;
+						throw new SmoothDrainError(error, { updates, acks, events, idle: false });
+					}
 					if (s === undefined || s === e.state) {
 						e.active = false;
 					} else {
@@ -351,6 +387,7 @@ export function createSmoothAuthority(options) {
 				let injected = false;
 				if (e.serverQueue !== undefined && e.serverQueue.length > 0) {
 					let s = e.state;
+					const eventCheckpoint = events.length;
 					try {
 						for (let i = 0; i < e.serverQueue.length; i++) {
 							const c = e.serverQueue[i];
@@ -360,13 +397,19 @@ export function createSmoothAuthority(options) {
 							s = apply(s, c.cmd, ctx);
 							for (let j = 0; j < eventSink.length; j++) {
 								const ev = eventSink[j];
-								events.push({ type: ev.type, key: ev.key, data: ev.data, id: ev.id, opts: ev.opts, ws: e.ws, commanded: false });
+								ev.ws = e.ws;
+								events.push(ev);
 							}
 							eventSink.length = 0;
 						}
 					} catch (error) {
 						eventSink.length = 0;
-						throw error;
+						events.length = eventCheckpoint;
+						// The owner or onMissing phase already committed. Expose its
+						// result before stopping, without replaying it on the retry.
+						if (commanded) acks.push({ key, ws: e.ws, id: e.lastAckedId, state: e.state });
+						if (e.state !== before) updates.push({ key, state: e.state, ws: e.ws, commanded });
+						throw new SmoothDrainError(error, { updates, acks, events, idle: false });
 					}
 					e.serverQueue.length = 0;
 					e.state = s;

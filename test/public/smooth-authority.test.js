@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { createSmoothAuthority } from '../../src/plugins/smooth/server.js';
+import { createSmoothAuthority, SmoothDrainError } from '../../src/plugins/smooth/server.js';
 import { createSharedRandom } from '../../src/plugins/smooth/random.js';
 import { mockWs } from './_helpers.js';
 
@@ -20,6 +20,18 @@ function recordingApply() {
 	};
 	return { apply, calls };
 }
+
+it('keeps a failed drain cause and committed result out of generic error serialization', () => {
+	const cause = Object.freeze(new Error('application failed'));
+	const partial = { updates: [], acks: [], events: [], idle: false };
+	const error = new SmoothDrainError(cause, partial);
+	expect(error).toBeInstanceOf(Error);
+	expect(error.name).toBe('SmoothDrainError');
+	expect(error.code).toBe('SMOOTH_DRAIN_FAILED');
+	expect(error.cause).toBe(cause);
+	expect(error.partial).toBe(partial);
+	expect(JSON.parse(JSON.stringify(error))).toEqual({ name: 'SmoothDrainError', code: 'SMOOTH_DRAIN_FAILED' });
+});
 
 describe('createSmoothAuthority - ensure', () => {
 	it('creates an entity with its initial state and a zero watermark', () => {
