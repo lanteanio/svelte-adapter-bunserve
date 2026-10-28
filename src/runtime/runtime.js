@@ -4,9 +4,8 @@
 // native primitives with zero measurable overhead; a controlled harness can
 // install seeded virtual implementations to make behavior reproducible.
 //
-// The helper surface is deliberately identical to svelte-adapter-uws's seam
-// (src/runtime/runtime.js there), so the deterministic simulation layers and a
-// later shared-core extraction see one shape in both adapters.
+// The clock, RNG, timer, and timezone helpers match the family runtime seam.
+// Controlled environments never subscribe to host memory pressure events.
 //
 // Use `import { performance } from 'node:perf_hooks'` and
 // `import { randomUUID, randomBytes } from 'node:crypto'` so the module never
@@ -51,6 +50,7 @@ const defaultEnv = Object.freeze({
 		setImmediate: (cb, ...a) => setImmediate(cb, ...a),
 		clear: (h) => clearTimeout(h),
 		clearInterval: (h) => clearInterval(h),
+		clearImmediate: (h) => clearImmediate(h),
 		queueMicrotask: (cb) => queueMicrotask(cb)
 	}),
 	tz: undefined // effective timezone; undefined = real local TZ
@@ -63,6 +63,7 @@ let current = defaultEnv;
 export const now = () => current.clock.now();
 export const monotonicNow = () => current.clock.monotonic();
 export const wallEpoch = () => current.clock.wallEpoch();
+export const wallIso = () => new Date(wallEpoch()).toISOString();
 
 /**
  * A monotonic reading on the timeline the WHOLE PROCESS shares. The raw
@@ -82,8 +83,19 @@ export const setIntervalTimer = (cb, ms, ...a) => current.timers.setInterval(cb,
 export const setImmediateTimer = (cb, ...a) => current.timers.setImmediate(cb, ...a);
 export const clearTimer = (h) => current.timers.clear(h);
 export const clearIntervalTimer = (h) => current.timers.clearInterval(h);
+export const clearImmediateTimer = (h) => current.timers.clearImmediate(h);
 export const microtask = (cb) => current.timers.queueMicrotask(cb);
 export const effectiveTimeZone = () => current.tz;
+
+/**
+ * Native notifications are sampler hints. Even a partial clock override never installs a host
+ * memory listener. The returned cleanup belongs to the sampler lifecycle.
+ */
+export function subscribeMemoryPressure(listener) {
+	if (current !== defaultEnv) return () => {};
+	process.on('memoryPressure', listener);
+	return () => { process.removeListener('memoryPressure', listener); };
+}
 
 // Install a virtual environment (the simulator/test harness only). Refuses in
 // production unless explicitly forced, so a stray call can never swap the

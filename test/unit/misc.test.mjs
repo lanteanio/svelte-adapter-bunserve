@@ -19,7 +19,7 @@ test('resolveRequestId rejects absent, empty, oversized, and non-printable input
 });
 
 test('mimeLookup maps known extensions case-insensitively and falls back to octet-stream', () => {
-	assert.equal(mimeLookup('app.js'), 'text/javascript');
+	assert.equal(mimeLookup('app.js'), 'text/javascript; charset=utf-8');
 	assert.equal(mimeLookup('IMAGE.PNG'), 'image/png');
 	assert.equal(mimeLookup('archive.tar.gz'), 'application/gzip');
 	assert.equal(mimeLookup('noextension'), 'application/octet-stream');

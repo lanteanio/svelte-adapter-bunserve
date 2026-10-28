@@ -258,35 +258,81 @@ test('starting twice replaces the timer rather than stacking samplers', () => {
 	} finally { done(); }
 });
 
+test('the window has narrowed to half the base by the time the signal names MEMORY', () => {
+	// The documented relation between the two numbers: the ramp starts before
+	// the alarm and is halfway down when the alarm fires, so the band where
+	// windows are smaller while the surface still reads NONE is bounded.
+	// Moving either number moves this.
+	const prevRatio = wsCounters.lastHeapUsedRatio;
+	const prevSubs = wsCounters.totalSubscriptions;
+	try {
+		wsCounters.totalSubscriptions = 0;
+		const threshold = resolvePressureThresholds(undefined).memoryHeapUsedRatio;
+		wsCounters.lastHeapUsedRatio = 0;
+		const base = grantSizeFor().count;
+		wsCounters.lastHeapUsedRatio = threshold;
+		assert.equal(grantSizeFor().count, Math.round(base / 2));
+	} finally {
+		wsCounters.lastHeapUsedRatio = prevRatio;
+		wsCounters.totalSubscriptions = prevSubs;
+	}
+});
+
 test('grantSizeFor wires the LIVE readings into the sizing math', () => {
-	// The window must be a function of per-connection subscriber load - and of
-	// nothing else on this engine, whose idle heap ratio would otherwise
-	// collapse it. Computing the expectation from the same inputs the
-	// implementation reads makes this exact rather than a range check: a
-	// forgotten division, swapped arguments, or a constant return all fail.
+	// The window is a function of BOTH readings the sizer takes: per-connection
+	// subscriber load, and the sampler's cached distance to the nearest memory
+	// wall. Computing the expectation from the same inputs the implementation
+	// reads makes this exact rather than a range check: a forgotten division,
+	// swapped arguments, or a constant return all fail.
 	const before = wsConnections.size;
 	try {
 		wsConnections.clear();
 		for (let i = 0; i < 4; i++) wsConnections.add({ getBufferedAmount: () => 0 });
 		wsCounters.totalSubscriptions = 400;
+		wsCounters.lastHeapUsedRatio = 0;
 
 		const g = grantSizeFor();
 		assert.equal(g.count, leaseGrantSize({ heapRatio: 0, subscriberRatio: 100 }),
-			'sized from subscriptions PER CONNECTION, with no heap term on this engine');
+			'sized from subscriptions PER CONNECTION');
 		assert.equal(g.ttlMs, 10000);
 
-		// The heap term is deliberately absent: this engine reports 0.9+ on an
-		// idle process, and feeding that to the 0.7 knee would collapse an
-		// unloaded server's window. An idle server must get the full base.
+		// An unloaded worker hands out the full base. The cached ratio is what
+		// makes that true: it is distance to a memory wall, which idles near
+		// zero, where arena fullness on this engine idles at 0.9 and would put
+		// every healthy server past the sizer's 0.7 knee.
 		wsCounters.totalSubscriptions = 0;
-		assert.equal(grantSizeFor().count, 256,
-			'an idle server hands out the FULL window, whatever the live heap reads');
+		assert.equal(grantSizeFor().count, 256, 'an idle server hands out the FULL window');
+
+		// Near a wall the window narrows, and by the sizer's own arithmetic.
+		// This is the wiring the pure-function tests cannot see: passing a
+		// constant 0 here would leave every assertion above green.
+		wsCounters.lastHeapUsedRatio = 0.9;
+		assert.equal(grantSizeFor().count, leaseGrantSize({ heapRatio: 0.9, subscriberRatio: 0 }),
+			'the cached wall ratio reaches the sizer');
+		assert.ok(grantSizeFor().count < 256, 'a worker near a wall hands out less than the base');
+		wsCounters.lastHeapUsedRatio = 0;
 		wsCounters.totalSubscriptions = 400;
 
 		// A heavier fan-out must narrow the window: the ratio is the input,
 		// so the same subscription total over fewer connections grants less.
 		wsCounters.totalSubscriptions = 4000;
 		assert.ok(grantSizeFor().count < g.count, 'ten times the fan-out narrows the window');
+
+		// Both readings narrow the same window, so the worse of the two cannot
+		// be masked by the healthier one. The pair is chosen to land clear of
+		// the sizer's 0.05 scale clamp, where two narrowings meet at the same
+		// floor and the second could not be observed whatever it did: at
+		// subscriberRatio 50 the fan-out term is 0.5, and a heap reading of 0.71
+		// is a ramp term of 0.967, leaving 0.483 and a window of 124 - under the
+		// fan-out's own 128 and well above the 13 the clamp gives at 0.99.
+		wsCounters.totalSubscriptions = 200;
+		wsCounters.lastHeapUsedRatio = 0.71;
+		const bothNarrow = grantSizeFor().count;
+		assert.ok(bothNarrow < leaseGrantSize({ heapRatio: 0, subscriberRatio: 50 }),
+			'memory narrows a window fan-out had already narrowed');
+		assert.ok(bothNarrow > leaseGrantSize({ heapRatio: 0.99, subscriberRatio: 50 }),
+			'and the magnitude is the sizer arithmetic, not the scale clamp');
+		wsCounters.lastHeapUsedRatio = 0;
 
 		// With no connections at all the divisor floors at 1 rather than
 		// producing Infinity or NaN.
@@ -301,17 +347,49 @@ test('grantSizeFor wires the LIVE readings into the sizing math', () => {
 	} finally {
 		wsConnections.clear();
 		wsCounters.totalSubscriptions = 0;
+		wsCounters.lastHeapUsedRatio = 0;
+	}
+});
+
+test('the sampler keeps the cache the window sizer reads current', () => {
+	// One reading, four consumers - the MEMORY reason, the value fold, the
+	// gauge and the send-gate window - is the family contract. The test above
+	// holds the sizer to the cache; this holds the SAMPLER to it, which is the
+	// half nothing else here covers: a sampler that stopped writing would
+	// leave the sizer reading whatever was last there, forever, and every
+	// other test in this file would still pass.
+	//
+	// The planted 0.9 is what makes that observable. It cannot be checked
+	// through the window sizes instead: the reading is distance to a memory
+	// wall, a test host in no container has none, so the sample is 0 and every
+	// size below is the base whatever the sizer read.
+	const s = sampler(QUIET);
+	try {
+		wsConnections.clear();
+		wsCounters.totalSubscriptions = 0;
+		wsCounters.lastHeapUsedRatio = 0.9;
+		s.tick();
+		assert.ok(wsCounters.lastHeapUsedRatio < 0.7,
+			'the sample overwrote the planted value; a test process is not against a memory wall');
+		assert.equal(grantSizeFor().count, leaseGrantSize({
+			heapRatio: wsCounters.lastHeapUsedRatio, subscriberRatio: 0
+		}), 'and the sizer reads what the sample left');
+	} finally {
+		done();
+		wsCounters.lastHeapUsedRatio = 0;
 	}
 });
 
 test('resolvePressureThresholds pins all ten defaults and clamps the interval both ways', () => {
 	const d = resolvePressureThresholds(undefined);
 	assert.deepEqual(d, {
-		// OFF by default here, unlike the sibling's 0.85: this engine idles
-		// with its heap mostly full (0.90-0.94 measured on Bun 1.3.14, 0.81
-		// on 1.4.0), so the family threshold fires or flaps on a healthy
-		// process. Pinned so the divergence can never become accidental.
-		memoryHeapUsedRatio: false,
+		// The FAMILY value, same on both adapters. It was off here while the
+		// reading was arena fullness (this engine idles with its heap mostly
+		// full - 0.90-0.94 on Bun 1.3.14, 0.81 on 1.4.0 - so 0.85 fired or
+		// flapped on a healthy process). The basis is distance to the nearest
+		// memory wall now, which idles near zero on both engines, so the
+		// divergence is gone rather than pinned.
+		memoryHeapUsedRatio: 0.85,
 		publishRatePerSec: 10000,
 		subscriberRatio: 50,
 		sampleIntervalMs: 1000,

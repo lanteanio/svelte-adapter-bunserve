@@ -47,33 +47,42 @@ export async function drainWebSockets(windowMs) {
 	// close hook outstanding, which `process.exit(0)` then killed.
 	if (live === 0 && pendingCloseHooks.size === 0) return;
 
-	if (live > 0 && windowMs > 0) {
-		const advised = platform.adviseReconnect({ windowMs, close: true });
-		if (advised < live) {
-			// The difference is connections whose advisory could not be written -
-			// a client past its backpressure limit. They are still closed, but
-			// they never saw the reconnect window and their close frame cannot
-			// flush either, so they get a 1006. Say so rather than reporting them
-			// as advised.
-			console.warn(
-				`${live - advised} of ${live} WebSocket connection(s) could not be sent the reconnect ` +
-				'advisory (client backpressure); they will see a 1006 rather than 1012.'
-			);
+	if (live > 0) {
+		// Advise first, without closing: the advisory is a buffered send that
+		// the close below flushes ahead of its close frame, so every connection
+		// gets the same close, 1001 "Server shutting down", as on
+		// svelte-adapter-uws.
+		if (windowMs > 0) {
+			const advised = platform.adviseReconnect({ windowMs, close: false });
+			if (advised < live) {
+				// The difference is connections whose advisory could not be
+				// written - a client past its backpressure limit. They are still
+				// closed, but they never saw the reconnect window and their close
+				// frame cannot flush either, so they get a 1006. Say so rather
+				// than reporting them as advised.
+				console.warn(
+					`${live - advised} of ${live} WebSocket connection(s) could not be sent the reconnect ` +
+					'advisory (client backpressure); they will see a 1006 rather than 1001.'
+				);
+			}
 		}
-		console.log(`Draining ${advised} WebSocket connection(s) over a ${windowMs}ms reconnect window...`);
-	} else if (live > 0) {
-		// Advisory disabled: still close deliberately rather than leaving them
-		// for stop(true), so close hooks run and clients see a real code.
+		// Closed deliberately rather than left for stop(true), so close hooks
+		// run and clients see a real code. Snapshot first: end() runs the close
+		// handler synchronously, which removes the entry as this iterates.
 		let closed = 0;
 		for (const ws of [...wsConnections]) {
 			try {
-				ws.end(1012, 'server draining');
+				ws.end(1001, 'Server shutting down');
 				closed++;
 			} catch {
-				/* already gone; the close handler has run or is about to */
+				/* already gone; the close handler has run */
 			}
 		}
-		console.log(`Closed ${closed} WebSocket connection(s) (reconnect advisory disabled).`);
+		console.log(
+			windowMs > 0
+				? `Draining ${closed} WebSocket connection(s) over a ${windowMs}ms reconnect window...`
+				: `Closed ${closed} WebSocket connection(s) (reconnect advisory disabled).`
+		);
 	}
 
 	// Give the close handlers a bounded moment. Not awaited forever: a socket
@@ -85,7 +94,7 @@ export async function drainWebSockets(windowMs) {
 	// `wsConnections` is already empty the moment the loop above returns - a
 	// poll watching only the registry exits on its first test and the whole
 	// settle window is unreachable. What actually needs the window is an app
-	// close hook that awaits (`await redis.srem(...)`): it returns to callHook
+	// close hook that awaits (`await redis.srem(...)`): it returns to runCloseHook
 	// at its first await and was being killed a few milliseconds later by
 	// process.exit. Those promises are tracked for exactly this.
 	const deadline = wallEpoch() + CLOSE_SETTLE_TIMEOUT_MS;

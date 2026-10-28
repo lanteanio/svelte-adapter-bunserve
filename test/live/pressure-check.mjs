@@ -71,15 +71,19 @@ try {
 	if (first) {
 		check('the sampler ran and reported this process, not zeros',
 			first.memoryMB > 1, `memoryMB=${first.memoryMB}`);
-		// The reason this adapter ships memoryHeapUsedRatio disabled. The
-		// engine keeps heapTotal fitted close to heapUsed, so the ratio idles
-		// high on every generation measured - 0.90 to 0.94 on Bun 1.3.14,
-		// 0.81 on 1.4.0 - and a threshold like the family's 0.85 either fires
-		// permanently or flaps on ordinary churn. If this ever reads genuinely
-		// low, the heap accounting changed and the divergence should be
-		// revisited rather than kept out of habit.
+		// Why arena fullness is NOT the memory basis on any engine, measured
+		// here rather than asserted in prose. This figure is the fixture's own
+		// heapUsed/heapTotal, independent of the adapter's signal: the engine
+		// keeps heapTotal fitted close to heapUsed, so it idles high on every
+		// generation measured - 0.90 to 0.94 on Bun 1.3.14, 0.81 on 1.4.0.
+		// Against the family's 0.85 threshold that reading would fire
+		// permanently or flap on ordinary churn.
 		check('this engine really does sit with its heap mostly full when idle',
 			first.heapRatio > 0.75, `heapRatio=${first.heapRatio}`);
+		// And the adapter reports NO pressure at the same instant, on the
+		// family's 0.85 default. That pair is the whole point of the wall
+		// basis: the same idle process that reads 0.9 arena-full is a few
+		// percent of the way to the nearest wall it can actually die at.
 		check('and a healthy idle server therefore reports NO pressure',
 			first.active === false && first.reason === 'NONE', `reason=${first.reason}`);
 		check('platform.protection reads the zero-config posture',
@@ -158,9 +162,10 @@ try {
 		lease.every((g) => Number.isInteger(g.count) && g.count >= 8 && g.count <= 256 && g.ttlMs === 10000),
 		JSON.stringify(lease));
 	// One connection with one subscription is nowhere near the fan-out knee,
-	// so a healthy server must hand out the FULL window. This is what the
-	// engine's idle heap ratio silently broke before grantSizeFor stopped
-	// feeding it into the sizing math.
+	// and a test host is nowhere near a memory wall, so a healthy server must
+	// hand out the FULL window. Both of the sizer's readings are asserted by
+	// this one number: an arena-fullness reading reaching it would collapse
+	// the window on this idle server.
 	check('an unloaded server grants the full base window, not a collapsed one',
 		lease.every((g) => g.count === 256), JSON.stringify(lease.map((g) => g.count)));
 

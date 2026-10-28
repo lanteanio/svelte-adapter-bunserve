@@ -114,10 +114,27 @@ test('leasePressureValue: direction, clamp, and the no-window fallback', () => {
 	assert.equal(leasePressureValue({ granted: 0, available: 0 }), 0, 'fallback defaults to 0');
 });
 
+test('leaseGrantSize narrows along a ramp, never in a step', () => {
+	// A step at the knee handed out the full window at one reading and under
+	// a third of it a hair above, which no client pacing can follow. Across
+	// the whole range a thousandth of a ratio moves the window by at most
+	// what the ramp's slope allows, and never upward.
+	let previous = leaseGrantSize({ heapRatio: 0, subscriberRatio: 1 });
+	const slope = Math.ceil((256 * 0.001) / 0.3) + 1;
+	for (let i = 1; i <= 1000; i++) {
+		const window = leaseGrantSize({ heapRatio: i / 1000, subscriberRatio: 1 });
+		assert.ok(window <= previous, `at ${i / 1000}`);
+		assert.ok(previous - window <= slope, `step at ${i / 1000}`);
+		previous = window;
+	}
+	assert.equal(leaseGrantSize({ heapRatio: 0.7, subscriberRatio: 1 }), 256, 'full at the knee');
+});
+
 test('leaseGrantSize: full base when healthy, shrinks under load, always floors', () => {
 	assert.equal(leaseGrantSize({ heapRatio: 0.2, subscriberRatio: 1 }), DEFAULT_GRANT.requestCount);
-	// Heap over 0.7 scales by remaining headroom: 0.9 -> 10% of base.
-	assert.equal(leaseGrantSize({ heapRatio: 0.9, subscriberRatio: 1 }), Math.round(256 * 0.1));
+	// Heap over the 0.7 knee ramps the window down: 0.9 is two thirds of the
+	// way from the knee to the wall, so a third of the base.
+	assert.equal(leaseGrantSize({ heapRatio: 0.9, subscriberRatio: 1 }), Math.round(256 * (0.1 / 0.3)));
 	// Subscriber ratio over 25 scales by 25/ratio: 50 -> half the base.
 	assert.equal(leaseGrantSize({ heapRatio: 0.2, subscriberRatio: 50 }), 128);
 	// The combined scale is floored at 0.05, and the count at `floor`.
@@ -294,13 +311,14 @@ test('os-pressure: psi and cpu.stat parse, deltas baseline at zero, failed probe
 
 test('resolvePressureThresholds: defaults, override merge, interval clamp', () => {
 	const d = resolvePressureThresholds(undefined);
-	// Disabled by default on this engine (see pressure-metrics.js): an idle
-	// server measures 0.90-0.94 on Bun 1.3.14 and 0.81 on 1.4.0, so the
-	// family's 0.85 fires or flaps on a healthy process. Opting back in is
-	// one option key.
-	assert.equal(d.memoryHeapUsedRatio, false);
-	assert.equal(resolvePressureThresholds({ memoryHeapUsedRatio: 0.85 }).memoryHeapUsedRatio, 0.85,
-		'the sibling threshold is one option away');
+	// The FAMILY default, on both adapters. It was disabled here while the
+	// reading underneath it was arena fullness - an idle server measured
+	// 0.90-0.94 on Bun 1.3.14 and 0.81 on 1.4.0, so 0.85 fired or flapped on a
+	// healthy process - and the basis is distance to the nearest memory wall
+	// now, which idles near zero on both engines.
+	assert.equal(d.memoryHeapUsedRatio, 0.85);
+	assert.equal(resolvePressureThresholds({ memoryHeapUsedRatio: false }).memoryHeapUsedRatio, false,
+		'and every signal stays disableable');
 	assert.equal(d.publishRatePerSec, 10000);
 	assert.equal(d.subscriberRatio, 50);
 	assert.equal(d.sampleIntervalMs, 1000);
@@ -477,4 +495,32 @@ test('os-pressure: the throttle delta counts periods as well as time', () => {
 	const s = sampler.sample(1000);
 	assert.equal(s.cpuThrottle.nrThrottledDelta, 3, 'three new throttled periods');
 	assert.equal(s.cpuThrottle.throttledRatio, 0.25, 'a quarter of the window suspended');
+});
+
+test('reported saturation is clamped, advisory, and absent means none', async () => {
+	const { leaseReportedSaturation, MAX_QUEUED_REQUESTS } = await import('../../src/runtime/utils/lease.js');
+	// The client is the only side that knows how many sends its spent window
+	// left waiting - the server never consumes a permit, so its own mirror reads
+	// 0 while unexpired and 1 once the TTL lapses, which marks an IDLE client.
+	assert.equal(leaseReportedSaturation(0), 0, 'a healthy low-water replenish reports none');
+	assert.equal(leaseReportedSaturation(MAX_QUEUED_REQUESTS / 2), 0.5);
+	assert.equal(leaseReportedSaturation(MAX_QUEUED_REQUESTS), 1);
+	assert.equal(leaseReportedSaturation(MAX_QUEUED_REQUESTS * 100), 1, 'clamped: a client controls this');
+	// Advisory and untrusted, so every shape that is not a positive integer
+	// reads as no backlog rather than as anything the peak could be steered by.
+	for (const bad of [undefined, null, -1, 1.5, NaN, Infinity, '256', true, {}, []]) {
+		assert.equal(leaseReportedSaturation(/** @type {any} */ (bad)), 0, `no backlog: ${String(bad)}`);
+	}
+});
+
+
+test('live connection ceilings drive siege independently of handshake concurrency', () => {
+ for (const admission of [{ maxConcurrent: 0, maxConnections: 1 }, { maxConcurrent: 100, maxConnections: 1 }]) {
+  const posture = createPosture({ admission, getThresholds: () => ({ sampleIntervalMs: 1000 }) });
+  for (let tick = 0; tick < 100; tick++) {
+   for (let i = 0; i < 20; i++) posture.recordCapacityReject();
+   posture.tick({ active: true });
+  }
+  assert.equal(posture.level, 'siege');
+ }
 });

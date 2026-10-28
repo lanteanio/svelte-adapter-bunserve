@@ -1,9 +1,9 @@
-import { counters } from './state.js';
+import { counters, requestSignals } from './state.js';
 
 /** @type {Array<() => void>} */
 let drainResolvers = [];
 
-/** Called when an SSR request handler settles (see counters.inFlightCount). */
+/** Called when an SSR render or streaming response settles (see counters.inFlightCount). */
 export function requestDone() {
 	counters.inFlightCount--;
 	if (counters.inFlightCount === 0 && drainResolvers.length > 0) {
@@ -19,6 +19,35 @@ export function requestDone() {
 export function drain() {
 	if (counters.inFlightCount === 0) return Promise.resolve();
 	return new Promise((resolve) => { drainResolvers.push(resolve); });
+}
+
+/**
+ * The boot window between the listener coming up and the instance being fit to
+ * receive traffic: the app's init hook, then the SSR warmup.
+ *
+ * Readiness reports 503 throughout, which is what makes the warmup a GATE
+ * rather than a race. The listener is already accepting - it has to be, because
+ * the init hook is documented to run with the platform live and able to publish
+ * - so without this the readiness probe would answer 200 the instant the socket
+ * bound, a load balancer would route immediately, and the first real client
+ * would land on the cold render the warmup exists to absorb. Liveness stays 200
+ * the whole time: the process is up, it is simply not ready.
+ */
+let starting = true;
+
+/** @returns {boolean} */
+export function isStarting() {
+	return starting;
+}
+
+/**
+ * Commit readiness. Called once, after the init hook and the warmup pass have
+ * both settled - including when either failed, because neither is a
+ * correctness gate and an instance that never reports ready is worse than one
+ * whose first render is cold.
+ */
+export function markReady() {
+	starting = false;
 }
 
 /**
@@ -40,4 +69,11 @@ export function isDraining() {
  */
 export function markDraining() {
 	counters.draining = true;
+}
+
+/** Abort requests still active when shutdown stops waiting. */
+export function abortInFlightRequests() {
+	const reason = new DOMException('The server shut down before the request finished', 'AbortError');
+	for (const controller of requestSignals) controller.abort(reason);
+	requestSignals.clear();
 }

@@ -1,3 +1,5 @@
+import { ADAPTER_ERROR_IDS, adapterConsoleLine } from '../error-registry.js';
+
 /**
  * Resolve which pressure signal (if any) is firing for a given sample.
  *
@@ -96,19 +98,20 @@ export function applyCapacityReason(reason, protection) {
  * cannot flap around a threshold.
  *
  * The reject accounting is deliberately minimal: a single decayed integer that
- * counts only the over-capacity (maxConcurrent) reject. It is never a per-IP
+ * counts only real admission-capacity rejects (`maxConcurrent`, cursor lane,
+ * `maxConnections`, or a full deferred-upgrade queue). It is never a per-IP
  * structure, so it cannot itself be grown into a DoS vector. The per-IP
  * rate-limit reject feeds a separate, intentionally inert counter - it is an
  * attack signal, not a capacity signal, and must never drive escalation.
  *
  * @param {{
- *   admission: { maxConcurrent: number },
+ *   admission: { maxConcurrent: number, maxConnections?: number, maxDeferred?: number },
  *   getThresholds: () => { sampleIntervalMs?: number },
  *   pin?: 'normal' | 'elevated' | 'siege',
  *   onTransition?: (from: 'normal' | 'elevated' | 'siege', to: 'normal' | 'elevated' | 'siege') => void
  * }} cfg
- *   admission: the live admission gate; its `maxConcurrent` is the per-sample
- *     admit ceiling and the basis for the over-capacity escalation threshold.
+ *   admission: the live admission gate; the smallest enabled handshake/live
+ *     ceiling is the basis for the over-capacity escalation threshold.
  *   getThresholds: resolver for the live pressure thresholds (read lazily so the
  *     posture always reflects the gate's current settings).
  *   pin: when set, freezes the level; `.tick` then only runs the reject decay.
@@ -138,7 +141,7 @@ export function createPosture(cfg) {
 	const onTransition = typeof cfg.onTransition === 'function' ? cfg.onTransition : null;
 
 	let level = pin !== null ? pin : 'normal';
-	// Single decayed integer. Counts ONLY the maxConcurrent reject (the true
+	// Single decayed integer. Counts ONLY admission-capacity rejects (the true
 	// over-capacity signal). NOT the per-IP rate-limit rejects, NOT a per-IP
 	// map, so it can never itself be a DoS vector. Incremented at the reject
 	// site; folded into a rolling rate once per tick.
@@ -156,11 +159,15 @@ export function createPosture(cfg) {
 
 	// elevated -> siege fires when over-capacity rejects run at >= 2x what the
 	// gate admits per sample, sustained across the siege dwell. Derived from the
-	// ceiling, never a magic number. With no ceiling (0) the gate never emits the
-	// maxConcurrent reject, so the threshold is Infinity and siege is unreachable
-	// via auto resolution (a pinned siege still works).
+	// enabled ceiling, never a magic number. With neither ceiling enabled the
+	// gate never emits a capacity reject, so the threshold is Infinity and siege
+	// is unreachable via auto resolution (a pinned siege still works).
 	function siegeRejectRate() {
-		const ceiling = (admission && admission.maxConcurrent) || 0;
+		const handshakeCeiling = (admission && admission.maxConcurrent) || 0;
+		const connectionCeiling = (admission && admission.maxConnections) || 0;
+		const ceiling = handshakeCeiling > 0 && connectionCeiling > 0
+			? Math.min(handshakeCeiling, connectionCeiling)
+			: Math.max(handshakeCeiling, connectionCeiling);
 		return ceiling > 0 ? ceiling * 2 : Infinity;
 	}
 
@@ -176,7 +183,7 @@ export function createPosture(cfg) {
 		get rejectedPerSecond() { return rejectAccum + rejectedPerSecond; },
 
 		/**
-		 * Increment at the maxConcurrent reject site. One integer add, no
+		 * Increment at an admission-capacity reject site. One integer add, no
 		 * argument, so there is no per-IP key to record.
 		 */
 		recordCapacityReject() { rejectAccum++; },
@@ -258,7 +265,7 @@ export function createPosture(cfg) {
 				try {
 					onTransition(prev, level);
 				} catch (err) {
-					console.error('[ws] posture transition observer threw:', err);
+					console.error(adapterConsoleLine(ADAPTER_ERROR_IDS.POSTURE_OBSERVER), err);
 				}
 			}
 		}
@@ -274,10 +281,15 @@ export function createPosture(cfg) {
  * Pure: no I/O, no globals, does not mutate the input. The caller is
  * responsible for clearing the source map after sampling.
  *
- * @param {Map<string, { m: number, b: number }>} stats
+ * `deliveriesPerSec` is additive: entries whose stats never carried the
+ * egress deliveries dimension read `0`, `messagesPerSec` and `bytesPerSec`
+ * keep their meanings, and no threshold reads the new dimension - the
+ * over-threshold set is exactly what it was.
+ *
+ * @param {Map<string, { m: number, b: number, d?: number }>} stats
  * @param {number} intervalSec
  * @param {{ topicPublishRatePerSec: number | false, topicPublishBytesPerSec: number | false }} thresholds
- * @returns {{ topPublishers: { topic: string, messagesPerSec: number, bytesPerSec: number }[], overThreshold: { topic: string, messagesPerSec: number, bytesPerSec: number }[] }}
+ * @returns {{ topPublishers: { topic: string, messagesPerSec: number, bytesPerSec: number, deliveriesPerSec: number }[], overThreshold: { topic: string, messagesPerSec: number, bytesPerSec: number, deliveriesPerSec: number }[] }}
  */
 export function computeTopPublishers(stats, intervalSec, thresholds) {
 	const topicRates = [];

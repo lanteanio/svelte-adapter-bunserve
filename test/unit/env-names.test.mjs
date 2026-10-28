@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 
 // `env.js` refuses to boot when a prefixed deployment sets a variable the
 // adapter does not recognise, which is a good check with one failure mode: a
@@ -15,6 +16,22 @@ import { fileURLToPath } from 'node:url';
 
 const path = (rel) => fileURLToPath(new URL(rel, import.meta.url));
 const read = (rel) => readFileSync(path(rel), 'utf8');
+
+test('untrusted peer warnings name the configured prefix once', () => {
+	const moduleUrl = new URL('../../src/runtime/handler/config.js', import.meta.url).href;
+	const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
+		globalThis.ENV_PREFIX = 'MY_APP_';
+		globalThis.WS_OPTIONS = null;
+		globalThis.WS_PATH = '/ws';
+		console.warn = (...args) => console.log(...args);
+		const { warnUntrustedClaim } = await import(${JSON.stringify(moduleUrl)});
+		warnUntrustedClaim('127.0.0.2', 'x-forwarded-for');
+		warnUntrustedClaim('127.0.0.3', 'x-forwarded-for');
+	`], { encoding: 'utf8' });
+	assert.equal(output.trim().split('\n').length, 1);
+	assert.match(output, /not in MY_APP_TRUSTED_PROXIES/);
+	assert.match(output, /to MY_APP_TRUSTED_PROXIES\./);
+});
 
 /**
  * The names between a marker and the end of its array literal.

@@ -9,7 +9,7 @@ import path from 'node:path';
 // lane's whole design is "everything expensive happened at index time" - one
 // Map lookup, one Headers, one Response per request - and these gates are what
 // keep that true. The counters wrap the late-bound globals the lane actually
-// calls (Response, Headers, Bun.file, decodeURIComponent), so a regression
+// calls (Response, Headers, Bun.file, decodeURIComponent, decodeURI), so a regression
 // that adds a per-request disk touch, an extra header build, or a lost cache
 // shows up as a changed COUNT under load, deterministically.
 //
@@ -18,7 +18,8 @@ import path from 'node:path';
 // branches that go unexercised are exactly where a per-response cost creeps
 // in unnoticed: the compressed representations (which is what a real browser
 // negotiates), the disk lane past the identity GET, ranges, HEAD, the
-// canonical-form redirect, and the malformed-path refusal.
+// canonical-form redirect, the malformed-path refusal, and the lookup of an
+// asset by its encoded name.
 //
 // AND THE COUNT IS NOT THE ONLY THING ASSERTED. A budget of one Headers and
 // one Response says nothing about WHICH representation came back, so the
@@ -28,8 +29,8 @@ import path from 'node:path';
 // own bytes and its own status beside its budget.
 //
 // WHAT IS NOT COVERED, and the boundary is exact:
-//   - Only four globals are counted: Response, Headers, Bun.file and
-//     decodeURIComponent. Any other per-request allocation - an array rebuilt
+//   - Only five globals are counted: Response, Headers, Bun.file,
+//     decodeURIComponent and decodeURI, the last two together as decodes. Any other per-request allocation - an array rebuilt
 //     inside entryHeaders, say - is free as far as these numbers go, and so is
 //     the Map lookup the opening line of this comment promises.
 //   - Per-response socket writes. Bun.serve owns the transmit path: the
@@ -79,6 +80,13 @@ globalThis.decodeURIComponent = (s) => {
 	counts.decode++;
 	return realDecode(s);
 };
+// The encoded-name lookup decodes with decodeURI, and its decodes land in the
+// same count: a decode is a decode, whichever function the lane reached for.
+const realDecodeUri = globalThis.decodeURI;
+globalThis.decodeURI = (s) => {
+	counts.decode++;
+	return realDecodeUri(s);
+};
 // The overflow lane hands Bun.file's return straight to Response as the body,
 // and a range slices it first; a string is a valid BodyInit under Node and
 // answers .slice, so the count is taken and the Response still constructs.
@@ -101,7 +109,7 @@ if (typeof Bun === 'undefined') {
 	Bun.file = countingFile;
 }
 
-const { cacheDir, serveStatic, tryPrerendered, DECODE_CACHE_MAX } = await import(
+const { cacheDir, encodedStaticEntry, serveStatic, tryPrerendered, DECODE_CACHE_MAX } = await import(
 	'../../src/runtime/handler/static-assets.js'
 );
 const { staticCache, decodeCache } = await import('../../src/runtime/handler/state.js');
@@ -368,10 +376,10 @@ test('a 304 carries what a cache needs, and nothing that describes a body', () =
 	const full = serveStatic(small, NO_HEADERS);
 	const res = serveStatic(small, CONDITIONAL);
 	assert.equal(res.status, 304);
-	for (const name of ['etag', 'cache-control', 'vary', 'last-modified']) {
+	for (const name of ['etag', 'cache-control', 'vary', 'last-modified', 'accept-ranges', 'x-content-type-options']) {
 		assert.equal(res.headers.get(name), full.headers.get(name), name);
 	}
-	for (const name of ['content-type', 'content-encoding', 'accept-ranges', 'content-length']) {
+	for (const name of ['content-type', 'content-encoding', 'content-disposition', 'content-length']) {
 		assert.equal(res.headers.get(name), null, `${name} describes a body this response has not got`);
 	}
 });
@@ -482,6 +490,22 @@ test('a malformed encoded path decodes once and refuses', () => {
 		{ response: SCALE, headers: 0, bunFile: 0, decode: 0 },
 		'a refused path is remembered, not re-decoded'
 	);
+});
+
+test('an asset found by its encoded name costs one decode, one Headers and one Response', () => {
+	// The lookup for a file whose name a browser encodes, asked for that way.
+	// Its decode is NOT cached, as svelte-adapter-uws's is not: it runs only for
+	// a GET or HEAD carrying a `%` that the fast path and the prerendered
+	// lookup both missed, so the budget is one decodeURI per such request.
+	const spaced = path.join(dir, 'My Report.txt');
+	fs.writeFileSync(spaced, 'spaced');
+	cacheDir(dir, '', false, null);
+	const per = { response: 1, headers: 1, bunFile: 0, decode: 1 };
+	/** @type {any} */
+	let res;
+	assert.deepEqual(cost(() => { res = serveStatic(encodedStaticEntry('/My%20Report.txt'), NO_HEADERS); }), per);
+	assert.equal(res.status, 200);
+	assert.deepEqual(costAtScale(() => serveStatic(encodedStaticEntry('/My%20Report.txt'), NO_HEADERS)), scaled(per));
 });
 
 test('a path with no percent-encoding never decodes at all', () => {

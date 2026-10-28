@@ -64,3 +64,70 @@ export function foldConnectionBackpressure(connections, cap, threshold) {
 	}
 	return { maxBufferedBytes, backpressuredConnections, sampled };
 }
+
+// Only nested drains need a set; the ordinary synchronous call owns one slot.
+let drainingCoalesced = null;
+const parentDrains = new Set();
+
+/**
+ * Drain a coalesce-by-key buffer.
+ *
+ * Iterates entries in insertion order and calls `send` for each, using the
+ * uWS send-status contract (see platform.js): 1 = sent clean, 0 = enqueued
+ * behind backpressure (accepted and delivered in order, but the socket is
+ * now under pressure), 2 = dropped past maxBackpressure. A sent (1) or
+ * enqueued (0) entry is removed from the map; a dropped (2) entry is retained
+ * for a later flush. The drain continues while sends land clean and STOPS the
+ * moment the socket signals pressure - the first enqueued-behind-backpressure
+ * (0) or dropped (2) result - so a backpressured socket is never pushed
+ * harder and a healthy one drains all of its pending keys in one pass.
+ *
+ * Reentrant calls for the same map only enqueue. The active drain retains
+ * replacements made by `send` and retries a new value once before later keys.
+ * Repeated replacement or growth yields after bounded work. A true return
+ * asks the caller to schedule a continuation.
+ *
+ * Map insertion order is preserved across overwrites: setting an existing
+ * key replaces the value but keeps the original slot. Latest value wins,
+ * order is stable.
+ *
+ * @template T
+ * @param {Map<unknown, T>} pending
+ * @param {(value: T, key: unknown) => number} send  uWS send status: 1 sent clean, 0 enqueued-under-backpressure, 2 dropped
+ * @returns {boolean | undefined} true when reentrant work needs a continuation
+ */
+export function drainCoalesced(pending, send) {
+	const previous = drainingCoalesced;
+	if (previous !== null) {
+		if (previous === pending || parentDrains.has(pending)) return;
+		parentDrains.add(previous);
+	}
+	drainingCoalesced = pending;
+	let remaining = pending.size * 2;
+	let yielded = false;
+	try {
+		for (const [key, first] of pending) {
+			let value = first;
+			let retried = false;
+			for (;;) {
+				if (remaining-- === 0) return true;
+				const result = send(value, key);
+				if (result === 2) return;
+				if (Object.is(pending.get(key), value)) {
+					pending.delete(key);
+					if (result === 0) return;
+					break;
+				}
+				if (result === 0) return;
+				if (!pending.has(key)) break;
+				if (retried) { yielded = true; break; }
+				retried = true;
+				value = pending.get(key);
+			}
+		}
+		return yielded;
+	} finally {
+		drainingCoalesced = previous;
+		if (previous !== null) parentDrains.delete(previous);
+	}
+}

@@ -1,7 +1,7 @@
 // The graceful-shutdown SIGNAL path, which nothing else exercises.
 //
 // The shutdown LOGIC is reachable through the fixture's /drain route, so
-// ws-smoke covers the advisory frames and the 1012 close. What no other test
+// ws-smoke covers the advisory frames and the 1001 close. What no other test
 // touches is the path FROM the signal handler: whether SIGTERM reaches
 // `graceful_shutdown` at all, whether the app's `shutdown` hook is called from
 // it and in the right order relative to the drain, whether a close hook's
@@ -135,9 +135,12 @@ try {
 	);
 
 	// (b) A real close code, not the 1006 a bare stop(true) produces.
+	// The server sends 1001 (close-frame-check reads it off a raw socket); Bun's
+	// own client reports a 1001 as 1000 (probe/bun-api-facts.report.md,
+	// close-vs-terminate). The reason is what proves the close frame arrived.
 	check(
-		'every client closes with 1012, not 1006',
-		closes.every((c) => c.code === 1012),
+		'every client closes with the shutdown close, not 1006',
+		closes.every((c) => (c.code === 1001 || c.code === 1000) && c.reason === 'Server shutting down'),
 		JSON.stringify(closes)
 	);
 
@@ -259,9 +262,9 @@ try {
 		/\[fixture\] shutdown connections=/.test(hangOut),
 		JSON.stringify(hangOut.slice(-400))
 	);
-	// SHUTDOWN_TIMEOUT=4 puts the hook's share of the budget at 3s (a quarter
-	// is reserved for the SSR drain), so a run released by the deadline lands
-	// near that mark: well past an instant exit that never awaited the hook,
+	// SHUTDOWN_TIMEOUT=4 gives every shutdown stage one shared four-second
+	// budget, so a run released by the deadline lands near that mark:
+	// well past an instant exit that never awaited the hook,
 	// and well short of the 15s race that catches a process the hook holds
 	// open.
 	check(
@@ -270,8 +273,8 @@ try {
 		`exit=${hangExit} elapsed=${hangElapsed}ms`
 	);
 	check(
-		'shutdown still reports completion with the hook hung',
-		/Shutdown complete\./.test(hangOut),
+		'shutdown reports the expired budget with the hook hung',
+		/Shutdown budget expired or cleanup failed\./.test(hangOut),
 		JSON.stringify(hangOut.slice(-200))
 	);
 } catch (err) {

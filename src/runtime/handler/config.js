@@ -1,7 +1,11 @@
+import { normalizeBodyLimits, requestBodyLimit } from '../utils/body-limits.js';
 import { env } from '../env.js';
+import { parseCanonicalHostAliases } from '../utils/canonical-host.js';
 import { parse_as_bytes, parse_idle_timeout, parse_origin } from '../utils/parse.js';
 import { createTrustedProxyMatcher } from '../utils/trusted-proxies.js';
+import { originFromHeaders, OriginHeaderError, refusedHeaderSetting } from '../utils/request-origin.js';
 
+/* global BODY_LIMIT_RULES */
 /* global WS_OPTIONS */
 /* global WS_PATH */
 /* global ENV_PREFIX */
@@ -25,6 +29,7 @@ export const ws_path = WS_PATH;
  * before the options exist.
  */
 export const auth_path = ws_options?.authPath ?? '/__ws/auth';
+export const admin_path = ws_options?.adminPath ?? '/__realtime';
 
 /** True when a compressor is configured, so publish/send can deflate by default. */
 export const ws_compression_on = Boolean(ws_options && ws_options.compression);
@@ -44,16 +49,19 @@ export const allow_non_ascii_topics = ws_options?.allowNonAsciiTopics === true;
 export const allow_system_topic_subscribe = ws_options?.allowSystemTopicSubscribe === true;
 
 /**
- * Allow clients to subscribe when the app exports no `subscribe` hook.
+ * The build-time arming of the server-grant gate, read with `=== true` and
+ * `=== 'strict'` for the same reason the option refuses a value it cannot
+ * read: a restrictive flag that coerces arms nothing while reading as armed.
  *
- * Off by default, which is a deliberate departure from arriving at "any client
- * may read any topic" by omission. A realtime app typically publishes on
- * per-entity topics (`user:<id>`, `order:<uuid>`), and without a gate anyone
- * who can open a socket can name those topics and receive them - no session, no
- * cookie, nothing to detect. Export a `subscribe` hook, or set this to true to
- * state that every topic really is public.
+ * These are the BOOT values. The live arming is `subscribeAuth` in
+ * handler/ws-state.js, which these seed and `platform.authorizeWireSubscribe()`
+ * can raise later.
  */
-export const allow_unauthenticated_subscribe = ws_options?.allowUnauthenticatedSubscribe === true;
+export const authorize_wire_subscribe = ws_options?.authorizeWireSubscribe === true ||
+	ws_options?.authorizeWireSubscribe === 'strict';
+
+/** Whether the boot arming was the conjunctive `'strict'` posture. */
+export const authorize_wire_subscribe_strict = ws_options?.authorizeWireSubscribe === 'strict';
 
 /**
  * How long the app's `upgrade` hook may take before the handshake is refused,
@@ -76,7 +84,9 @@ export const ssl_key = env('SSL_KEY', '');
 
 export const is_tls = !!(ssl_cert && ssl_key);
 
-export const origin = parse_origin(env('ORIGIN', undefined));
+const originEnv = env('ORIGIN', undefined);
+export const origin = parse_origin(originEnv);
+export const canonical_host_aliases = parseCanonicalHostAliases(env('CANONICAL_HOST_ALIASES', ''), originEnv);
 
 export const xff_depth = parseInt(env('XFF_DEPTH', '1'), 10);
 
@@ -128,6 +138,10 @@ export const host_header = env('HOST_HEADER', '').toLowerCase();
 export const port_header = env('PORT_HEADER', '').toLowerCase();
 
 export const body_size_limit = parse_as_bytes(env('BODY_SIZE_LIMIT', '512K'));
+const bodyLimits = normalizeBodyLimits(typeof BODY_LIMIT_RULES === 'undefined' ? undefined : BODY_LIMIT_RULES);
+export const bodyLimitFor = (method, target, ceiling = Infinity) => requestBodyLimit(
+	bodyLimits, method, target, Math.min(body_size_limit === 0 ? Infinity : body_size_limit, ceiling)
+);
 
 /**
  * Seconds a connection may go idle before Bun closes it.
@@ -163,8 +177,8 @@ export function warnUntrustedClaim(directIp, kind) {
 	warnedUntrustedClaim = true;
 	console.warn(
 		`[adapter] Ignored a ${kind} client-address claim from untrusted peer ${directIp}: ` +
-		'the peer is not in TRUSTED_PROXIES, so the socket address was used instead. ' +
-		'If this peer is a legitimate proxy, add its address (or CIDR range) to TRUSTED_PROXIES.'
+		`the peer is not in ${ENV_PREFIX}TRUSTED_PROXIES, so the socket address was used instead. ` +
+		`If this peer is a legitimate proxy, add its address (or CIDR range) to ${ENV_PREFIX}TRUSTED_PROXIES.`
 	);
 }
 
@@ -178,34 +192,23 @@ export function warnUntrustedClaim(directIp, kind) {
  * @param {Headers} headers
  * @returns {string}
  */
+const ORIGIN_SOURCE = Object.freeze({
+	isTls: is_tls, protocolHeader: protocol_header, hostHeader: host_header, portHeader: port_header
+});
+let warnedRefusedProxyHeader = false;
+
 export function get_origin(headers) {
-	// Default protocol matches the server type: 'https' when TLS is configured.
-	const default_protocol = is_tls ? 'https' : 'http';
-	const protocol = protocol_header
-		? decodeURIComponent(headers.get(protocol_header) || default_protocol)
-		: default_protocol;
-
-	if (protocol !== 'http' && protocol !== 'https') {
-		throw new Error(
-			`The ${protocol_header} header specified '${protocol}' which is not a valid protocol. Only 'http' and 'https' are supported.`
-		);
+	try {
+		return originFromHeaders(headers, ORIGIN_SOURCE);
+	} catch (err) {
+		if (!warnedRefusedProxyHeader && err instanceof OriginHeaderError) {
+			const setting = refusedHeaderSetting(err.header, ORIGIN_SOURCE, ENV_PREFIX);
+			if (setting !== null) {
+				warnedRefusedProxyHeader = true;
+				console.warn(`[svelte-adapter-bunserve] Answered a request 400 Bad Request: ${err.message} ` +
+					`${setting} names it; if every request is refused, check what the proxy in front writes into it.`);
+			}
+		}
+		throw err;
 	}
-
-	const host = (host_header && headers.get(host_header)) || headers.get('host');
-	if (!host) {
-		throw new Error('Could not determine host. The request must have a host header.');
-	}
-
-	const port = port_header ? headers.get(port_header) : undefined;
-	if (port && isNaN(+port)) {
-		throw new Error(
-			`The ${port_header} header specified ${port} which is an invalid port.`
-		);
-	}
-
-	// Strip existing port from host before appending PORT_HEADER value
-	// (the Host header often includes the port, e.g. "example.com:3000")
-	const hostWithoutPort = port ? host.replace(/:\d+$/, '') : host;
-
-	return port ? `${protocol}://${hostWithoutPort}:${port}` : `${protocol}://${host}`;
 }

@@ -176,6 +176,9 @@ export function leasePressureValue(w) {
 	return r < 0 ? 0 : r > 1 ? 1 : r;
 }
 
+/** Heap ratio above which the send-gate window starts to narrow. See leaseGrantSize. */
+const HEAP_KNEE = 0.7;
+
 /**
  * Size the next send-gate window from the worker's current posture. Heap
  * headroom and subscriber load narrow the window so a tightening worker hands
@@ -185,8 +188,19 @@ export function leasePressureValue(w) {
  * Pure so the sizing direction (shrinks under load, floors) is testable without
  * reaching into process state. The caller supplies the live readings.
  *
+ * THE HEAP KNEE SITS BELOW THE MEMORY THRESHOLD ON PURPOSE. Against the wall
+ * basis 0.7 means 70% of the way to an out-of-memory kill, and a window that
+ * starts narrowing there is backpressure applied before the alarm, not after.
+ * The window ramps down linearly from the full base at the knee - never a step
+ * - to half of it at the MEMORY reason's default threshold (0.85) and to the
+ * scale floor as the ratio nears 1. Between the knee and that threshold the
+ * pressure surface still reads NONE while windows are already smaller; the
+ * window is a pure function of `heap_used_ratio` and of subscriptions per
+ * connection, both exported, so the band is readable from them.
+ *
  * @param {{ heapRatio: number, subscriberRatio: number, base?: number, floor?: number }} w
- *   `heapRatio` is heapUsed/heapTotal (0..1); `subscriberRatio` is total
+ *   `heapRatio` is the used fraction of the effective memory ceiling (0..1,
+ *   the MEMORY signal's nearest-wall basis); `subscriberRatio` is total
  *   subscriptions per connection; `base` is the full window (default
  *   {@link DEFAULT_GRANT}.requestCount); `floor` is the smallest window handed
  *   out (default 8).
@@ -198,7 +212,7 @@ export function leaseGrantSize(w) {
 	const heapRatio = typeof w.heapRatio === 'number' && w.heapRatio > 0 ? w.heapRatio : 0;
 	const subRatio = typeof w.subscriberRatio === 'number' && w.subscriberRatio > 0 ? w.subscriberRatio : 0;
 	let scale = 1;
-	if (heapRatio > 0.7) scale *= (1 - heapRatio);
+	if (heapRatio > HEAP_KNEE) scale *= (1 - heapRatio) / (1 - HEAP_KNEE);
 	if (subRatio > 25) scale *= 25 / subRatio;
 	if (scale < 0.05) scale = 0.05;
 	else if (scale > 1) scale = 1;
@@ -257,4 +271,27 @@ export function samplePressureValue(sample, thresholds, leaseSaturationPeak) {
 	}
 	if (value < 0) value = 0; else if (value > 1) value = 1;
 	return value;
+}
+
+/**
+ * The saturation a client REPORTS for its spent window, from the `queued` field
+ * of its `request-n` frame.
+ *
+ * The mirror gate cannot answer this. A grant-and-observe server never consumes
+ * a permit, so the server-side window reads 0 while unexpired and 1 once the
+ * TTL lapses - and a lapsed TTL marks an idle client resuming, which is the
+ * OPPOSITE of saturation. The client is the only side that knows how many sends
+ * its spent window left waiting, so it is the side that reports.
+ *
+ * ADVISORY AND UNTRUSTED: a client controls the number, so it is clamped to
+ * 0..1 here and no grant decision requires it. A healthy low-water replenish
+ * reports none and leaves the peak untouched; absent, zero, negative,
+ * fractional and non-numeric all read as no backlog.
+ *
+ * @param {unknown} raw - the frame's `queued` field
+ * @returns {number} 0..1
+ */
+export function leaseReportedSaturation(raw) {
+	if (typeof raw !== 'number' || !Number.isInteger(raw) || raw <= 0) return 0;
+	return raw >= MAX_QUEUED_REQUESTS ? 1 : raw / MAX_QUEUED_REQUESTS;
 }

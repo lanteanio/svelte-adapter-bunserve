@@ -1,10 +1,9 @@
-// Regression: an app with NO WebSocket handler must build and serve with no
+// Regression: an app with WebSockets disabled must build and serve with no
 // upgrade lane, no websocket option on Bun.serve, and the HTTP surface
-// untouched. Runs against the fixture's NO_WS build (build-no-ws), which sets
-// no websocket options and points websocketHandler at a file the fixture does
-// not have - the same no-handler state as an app that never opted in.
+// untouched. The fixture's NO_WS build sets websocket:false while retaining
+// src/hooks.ws.js and the Vite plugin, so neither may enable the endpoint.
 
-import { assertPortFree, buildPath, serverEnv, waitForServer } from './harness.mjs';
+import { assertPortFree, buildPath, rawExchange, serverEnv, waitForServer } from './harness.mjs';
 
 const PORT = 8803;
 const BUILD = buildPath('build-no-ws');
@@ -44,42 +43,26 @@ try {
 	const prerendered = await fetch(`http://127.0.0.1:${PORT}/about/`);
 	check('prerendered pages still serve', prerendered.status === 200, `got ${prerendered.status}`);
 
-	// The observability members are documented as being on EVERY instance, and
-	// a scrape route is the most likely reason an app with no realtime tier
-	// reaches for `platform` at all. The route is the fixture's own
-	// `/metrics`, compiled into this build like any other: before the platform
-	// carried these without a WebSocket handler it answered 500 with
-	// `platform.metricsSnapshot is not a function`.
+	// websocket:false has no configured registry. The members remain callable.
 	const metrics = await fetch(`http://127.0.0.1:${PORT}/metrics`);
-	const metricsBody = metrics.status === 200 ? await metrics.text() : '';
-	check('the scrape route serves without a realtime tier', metrics.status === 200, `got ${metrics.status}`);
-	check(
-		'the document it serves is the Prometheus one',
-		metricsBody.includes('# TYPE ') && /^resident_memory_bytes \d+$/m.test(metricsBody),
-		JSON.stringify(metricsBody.slice(0, 160))
-	);
-	// And it describes THIS build. A server with no upgrade path has not admitted
-	// zero upgrades and is not holding zero subscriptions - it has no upgrade door
-	// and no subscriptions at all, and a flat zero series for each would read on a
-	// dashboard exactly like a realtime tier that nobody is using.
-	const realtimeFamilies = ['upgrade_admitted_total', 'upgrade_rejected_total', 'ws_connections',
-		'ws_subscriptions', 'ws_publishes_total', 'pressure_saturation'];
-	const leaked = realtimeFamilies.filter((n) => metricsBody.includes(n));
-	check(
-		'and says nothing about a realtime tier this build does not have',
-		leaked.length === 0,
-		JSON.stringify(leaked)
-	);
+	const metricsBody = await metrics.text();
+	check('an unconfigured snapshot is handled without a server error', metrics.status === 503, `got ${metrics.status}`);
+	check('the route reports an absent registry', metricsBody === 'metrics not configured', metricsBody);
 
-	// With no handler configured the ws path is not special: it falls through
-	// to the normal routing, which has no /ws route, so SvelteKit 404s.
-	const wsPath = await fetch(`http://127.0.0.1:${PORT}/ws`);
-	check('the ws path is NOT hijacked when no handler is configured', wsPath.status === 404, `got ${wsPath.status}`);
+	// With WebSockets disabled the ws path is not special: it falls through
+	// to the normal routing, where the fixture's /ws route answers it. Asked with
+	// `Upgrade: websocket`, because a plain GET goes to the app with or without
+	// an endpoint, and a request the endpoint would keep is the one that shows
+	// whether there is one.
+	const wsPath = await fetch(`http://127.0.0.1:${PORT}/ws`, {
+		headers: { upgrade: 'websocket', connection: 'Upgrade' }
+	});
+	check('the ws path is NOT hijacked when WebSockets are disabled', (await wsPath.text()) === 'app GET', `got ${wsPath.status}`);
 
 	// And a REAL handshake does not connect. `fetch` with upgrade headers never
 	// surfaces a 101 to its caller, so asserting `status !== 101` on one passes
 	// for every outcome including a successful upgrade - it proved nothing. A
-	// genuine WebSocket client can tell the difference: with no handler the
+	// genuine WebSocket client can tell the difference: with WebSockets disabled the
 	// endpoint does not exist, so the connection must fail rather than open.
 	const upgradeOutcome = await new Promise((resolve) => {
 		const probe = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
@@ -94,6 +77,16 @@ try {
 		probe.onclose = () => settle('refused');
 	});
 	check('a real handshake does not connect', upgradeOutcome === 'refused', `got ${upgradeOutcome}`);
+
+	// The request-target rule does not depend on a realtime tier.
+	const fragment = await rawExchange(PORT, [], { path: '/healthz#x' });
+	check('a target carrying a # is refused 400 here too', fragment.status === 400, `got ${fragment.status}`);
+	// Disabling WebSockets also disables the auth endpoint, so its path and its spellings are the
+	// app's: SvelteKit answers the data request 404, where a mounted path is
+	// refused 400.
+	const authData = await fetch(`http://127.0.0.1:${PORT}/__ws/auth/__data.json`);
+	check('the auth path\'s data request is the app\'s when nothing is mounted there', authData.status === 404,
+		`got ${authData.status}`);
 } catch (err) {
 	failed++;
 	failures.push('THREW: ' + (err?.message ?? String(err)));

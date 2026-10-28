@@ -15,7 +15,7 @@
  *
  * `headers` holds the identity representation's response headers; `brHeaders`
  * / `gzHeaders` hold each coding's, precomputed at index time (own validator,
- * no `accept-ranges` - see variantHeaders). The `*NotModified` lists are the
+ * coding and range support - see variantHeaders). The `*NotModified` lists are the
  * subset a 304 for that representation carries, baked alongside them.
  *
  * @typedef {{
@@ -32,6 +32,7 @@
  *   brEtag?: string,
  *   gzEtag?: string,
  *   mtimeSec?: number,
+ *   lastModified?: string,
  *   hasBr?: boolean,
  *   hasGz?: boolean,
  *   headers: [string, string][],
@@ -60,13 +61,7 @@ export const prerenderedDirStyle = new Set();
 export const decodeCache = new Map();
 
 export const counters = {
-	/**
-	 * SSR requests admitted to handleSSR whose handler has not yet returned a
-	 * Response. Note the boundary: this counts SSR compute (render, dedup,
-	 * finalize), not response-body transmission - a streaming body that is
-	 * still flushing after the handler returned is drained by Bun's graceful
-	 * `server.stop()`, which lets in-flight HTTP complete (probed fact).
-	 */
+	/** SSR renders and streaming responses still producing or awaiting cancellation. */
 	inFlightCount: 0,
 
 	/**
@@ -75,3 +70,6 @@ export const counters = {
 	 */
 	draining: false
 };
+
+/** Abort controllers retained until their HTTP response completes. */
+export const requestSignals = new Set();
