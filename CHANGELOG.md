@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added typed URL and address validation for outbound HTTP requests.
+
 ### Removed
 
 - **BREAKING** Seven option keys svelte-adapter-uws does not declare:
