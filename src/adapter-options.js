@@ -28,6 +28,9 @@ export const KNOWN_ADAPTER_OPTIONS = [
 	'readinessCheckPath',
 	'staticDotfiles',
 	'staticHeaders',
+	'staticCacheControl',
+	'warmup',
+	'bodyLimits',
 	'websocket'
 ];
 
@@ -150,7 +153,10 @@ export function assertScalarOptions(opts) {
 		);
 	}
 
-	for (const key of ['out', 'envPrefix']) {
+	if (opts.envPrefix !== undefined && typeof opts.envPrefix !== 'string') {
+		throw new TypeError('envPrefix must be a string.');
+	}
+	for (const key of ['out']) {
 		if (key in opts && typeof opts[key] !== 'string') {
 			throw new Error(
 				`adapter option \`${key}\` must be a string - got ${describeValue(opts[key])}.`

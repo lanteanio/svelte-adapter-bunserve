@@ -3,6 +3,7 @@
 // unit-testable in isolation - the build flow in index.js wires their output
 // into the placeholder replace map.
 
+import path from 'node:path';
 import { RESERVED_STATIC_HEADER_KEYS } from './runtime/utils/static-headers.js';
 import { readableCopy } from './runtime/utils/ws-options.js';
 
@@ -88,4 +89,106 @@ export function normalizeStaticHeaders(input) {
 		headers[key] = value;
 	}
 	return { headers: Object.keys(headers).length ? headers : null, dropped };
+}
+
+/**
+ * What to tell the developer about imports the server bundle could not
+ * resolve, judged by where each importer lives. The WebSocket handler's own
+ * graph is read straight from project source with no Vite pass, so a
+ * SvelteKit virtual module cannot resolve there. A file SvelteKit's server
+ * build wrote - its own output, or a `__` entry a Vite plugin added to it -
+ * has been through Vite already, and so has nothing a dependency ships, so
+ * what is missing there is a package.
+ *
+ * @param {string[]} importers - each unresolved import's importer, as Rollup
+ *   reports it (an absolute path, or 'unknown')
+ * @param {string[]} serverOutputDirs - the server output directory under every
+ *   spelling an importer can carry (as given, and its real path)
+ * @returns {string[]} one paragraph per cause present, handler advice first
+ */
+export function unresolvedImportAdvice(importers, serverOutputDirs) {
+	/** @param {string} file */
+	const missingPackage = (file) =>
+		file.split(/[\\/]/).includes('node_modules') ||
+		serverOutputDirs.some((dir) => {
+			const rel = path.relative(dir, file);
+			return rel !== '' && rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
+		});
+	const advice = [];
+	if (importers.some((file) => !missingPackage(file))) {
+		advice.push(
+			'The WebSocket handler is bundled straight from project source with no Vite ' +
+			"pass, so SvelteKit's virtual modules ($app/*, $env/*) are not available to it. " +
+			'Install the svelte-adapter-bunserve/vite build plugin, read process.env, or move code using those ' +
+			'modules into a file the SvelteKit server bundle already includes and import it from there.'
+		);
+	}
+	if (importers.some(missingPackage)) {
+		advice.push(
+			"SvelteKit's server build, a __ entry a Vite plugin added to it, or a dependency imports a " +
+			'package that cannot be found from this project: install the package it names.'
+		);
+	}
+	return advice;
+}
+
+/**
+ * Validate and normalize path-specific Cache-Control rules. A rule without a
+ * trailing slash matches one exact asset path; a trailing slash matches that
+ * directory tree. Patterns are relative to SvelteKit's configured base path.
+ *
+ * @param {unknown} input - the raw `staticCacheControl` option value
+ * @returns {{ pattern: string, cacheControl: string }[] | null}
+ */
+export function normalizeStaticCacheControl(input) {
+	if (input == null) return null;
+	if (!Array.isArray(input)) {
+		throw new Error(
+			"adapter option `staticCacheControl` must be an array of { pattern, cacheControl } rules."
+		);
+	}
+
+	/** @type {{ pattern: string, cacheControl: string }[]} */
+	const rules = [];
+	const seen = new Set();
+	for (let index = 0; index < input.length; index++) {
+		const rule = input[index];
+		if (!rule || typeof rule !== 'object' || Array.isArray(rule)) {
+			throw new Error(`adapter option \`staticCacheControl[${index}]\` must be an object.`);
+		}
+
+		const record = /** @type {Record<string, unknown>} */ (rule);
+		const unknown = Object.keys(record).filter((key) => key !== 'pattern' && key !== 'cacheControl');
+		if (unknown.length) {
+			throw new Error(
+				`adapter option \`staticCacheControl[${index}]\` has unknown key(s): ${unknown.join(', ')}.`
+			);
+		}
+
+		const pattern = record.pattern;
+		if (typeof pattern !== 'string' || pattern[0] !== '/' ||
+			/[\\?#*\u0000-\u001f\u007f]/.test(pattern) || /(^|\/)\.{1,2}(\/|$)/.test(pattern)) {
+			throw new Error(
+				`adapter option \`staticCacheControl[${index}].pattern\` must be an absolute, ` +
+				"literal, query-free asset path such as '/fonts/' or '/logo.v2.svg'."
+			);
+		}
+		if (seen.has(pattern)) {
+			throw new Error(`adapter option \`staticCacheControl\` contains duplicate pattern '${pattern}'.`);
+		}
+
+		const cacheControl = record.cacheControl;
+		if (typeof cacheControl !== 'string' || !cacheControl.trim() || /[\u0000-\u001f\u007f]/.test(cacheControl)) {
+			throw new Error(
+				`adapter option \`staticCacheControl[${index}].cacheControl\` must be a non-empty, single-line string.`
+			);
+		}
+
+		seen.add(pattern);
+		rules.push({ pattern, cacheControl: cacheControl.trim() });
+	}
+
+	// Resolve the most specific directory first regardless of declaration order.
+	rules.sort((left, right) => right.pattern.length - left.pattern.length);
+	return rules.length ? rules : null;
 }

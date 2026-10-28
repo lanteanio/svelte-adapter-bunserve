@@ -204,7 +204,16 @@ test('a non-boolean for a boolean option THROWS, and says why coercion is refuse
 
 test('a non-string for a string option throws', () => {
 	assert.throws(() => assertScalarOptions({ out: 42 }), /`out` must be a string/);
-	assert.throws(() => assertScalarOptions({ envPrefix: null }), /`envPrefix` must be a string/);
+	assert.throws(() => assertScalarOptions({ envPrefix: null }), { name: 'TypeError', message: 'envPrefix must be a string.' });
+});
+
+test('envPrefix rejects non-strings with the public TypeError contract', () => {
+	for (const envPrefix of [null, false, 1, {}, [], Symbol('prefix')]) {
+		assert.throws(() => adapter({ envPrefix }), { name: 'TypeError', message: 'envPrefix must be a string.' });
+	}
+	assert.doesNotThrow(() => adapter({ envPrefix: undefined }));
+	assert.doesNotThrow(() => adapter({ envPrefix: '' }));
+	assert.doesNotThrow(() => adapter({ envPrefix: 'MY_APP_' }));
 });
 
 test('the websocket-nested options are validated where they now live', () => {
@@ -359,4 +368,133 @@ test('a throwing getter on the bag lands in the refusal, not in the walk', () =>
 			return true;
 		}
 	);
+});
+
+test('a bag that is not a plain object is refused by name, whatever it is', async () => {
+	// `null` reached the destructuring and threw natively - "Cannot read
+	// properties of null (reading 'out')" - naming neither the adapter nor the
+	// option. The primitives were worse: they destructured to nothing, so
+	// `adapter('build')`, plainly meaning `{ out: 'build' }`, built a server on
+	// silent defaults and reported no problem at all.
+	const { default: adapter } = await import('../../src/index.js');
+	for (const bad of [null, 'build', 7, true, false, 1n, Symbol('x'), ['a']]) {
+		assert.throws(
+			() => adapter(/** @type {any} */ (bad)),
+			/adapter options must be a plain object of options/,
+			`refused: ${String(bad)}`
+		);
+	}
+	// A callable keeps its own branch: `typeof` reports 'function' for a revoked
+	// Proxy over one, so it cannot be copied blind.
+	assert.throws(() => adapter(/** @type {any} */ (() => {})), /plain object of options/);
+	// And the two shapes that must still build.
+	assert.doesNotThrow(() => adapter());
+	assert.doesNotThrow(() => adapter({}));
+});
+
+test('every option the factory inspects is read exactly once', async () => {
+	// The boundary is a promise the factory makes in prose - "the whole bag is
+	// read ONCE into a plain copy before anything inspects it" - and prose has
+	// no oracle. A second read is what lets a getter answer the validator with
+	// a legal value and the consumer with anything at all, so the property is
+	// pinned here rather than left to survive on comment.
+	const { default: adapter } = await import('../../src/index.js');
+	/** @type {Record<string, number>} */
+	const reads = {};
+	/** @param {Record<string, unknown>} props */
+	const counting = (props) => {
+		/** @type {Record<string, unknown>} */
+		const o = {};
+		for (const [k, v] of Object.entries(props)) {
+			reads[k] = 0;
+			Object.defineProperty(o, k, {
+				enumerable: true,
+				configurable: true,
+				get() { reads[k]++; return v; }
+			});
+		}
+		return o;
+	};
+
+	const nested = counting({
+		maxPayloadLength: 1024,
+		idleTimeout: 30,
+		allowedOrigins: 'any',
+		upgradeAdmission: { maxConcurrent: 10 },
+		egress: { topic: { messages: 5 } },
+		pressure: { sampleIntervalMs: 200 }
+	});
+	const top = counting({
+		out: 'build',
+		precompress: true,
+		envPrefix: '',
+		staticDotfiles: false,
+		healthCheckPath: '/healthz',
+		readinessCheckPath: '/readyz'
+	});
+	Object.defineProperty(top, 'websocket', {
+		enumerable: true,
+		configurable: true,
+		get() { reads.websocket = (reads.websocket || 0) + 1; return nested; }
+	});
+
+	adapter(/** @type {any} */ (top));
+	for (const [key, count] of Object.entries(reads)) {
+		assert.equal(count, 1, `\`${key}\` was read ${count} times, not once`);
+	}
+});
+
+test('the first read of an option is the one the adapter acts on', async () => {
+	// The consequence the single read exists to prevent, stated as behaviour: a
+	// getter that answers legally once and illegally afterwards cannot get its
+	// second answer into the build, because there is no second read to give it.
+	const { default: adapter } = await import('../../src/index.js');
+	let n = 0;
+	const flip = {};
+	Object.defineProperty(flip, 'out', {
+		enumerable: true,
+		configurable: true,
+		get() { return n++ === 0 ? 'build' : 42; }
+	});
+	assert.doesNotThrow(() => adapter(/** @type {any} */ (flip)),
+		'the legal first answer is what validation saw');
+	assert.equal(n, 1, 'and nothing asked again');
+});
+
+test('warmup takes true, false, or { paths }, and refuses everything else', async () => {
+	// Declared surface both family adapters carry, so an app that configures it
+	// moves between them unchanged. Validated at factory time, because a
+	// misshaped value would otherwise mean "warm nothing" silently - and the
+	// whole point of the option is that the first client after a deploy does not
+	// pay a cold render.
+	const { default: adapter } = await import('../../src/index.js');
+	assert.doesNotThrow(() => adapter({}), 'absent is on, warming /');
+	assert.doesNotThrow(() => adapter({ warmup: true }));
+	assert.doesNotThrow(() => adapter({ warmup: false }));
+	assert.doesNotThrow(() => adapter({ warmup: { paths: [] } }), 'an empty list warms nothing');
+	assert.doesNotThrow(() => adapter({ warmup: { paths: ['/', '/dashboard'] } }));
+
+	// Absolute pathnames only: a relative one could never be rendered, and a
+	// full URL would warm someone else's origin.
+	for (const paths of [['dashboard'], ['https://example.com/'], [''], [null], [42], ['/ok', 'bad']]) {
+		assert.throws(
+			() => adapter({ warmup: { paths } }),
+			/warmup\.paths must be an array of absolute pathname strings/,
+			`refused: ${JSON.stringify(paths)}`
+		);
+	}
+	// And the option itself has three shapes, not any truthy value.
+	for (const bad of ['/', 1, 0, null, ['/'], { path: '/' }, { paths: '/' }]) {
+		assert.throws(
+			() => adapter({ warmup: /** @type {any} */ (bad) }),
+			/warmup must be true, false, or an object like/,
+			`refused: ${JSON.stringify(bad)}`
+		);
+	}
+});
+
+test('warmup is a known option, so it does not warn as a typo', async () => {
+	const { KNOWN_ADAPTER_OPTIONS, unknownOptionWarnings } = await import('../../src/adapter-options.js');
+	assert.ok(KNOWN_ADAPTER_OPTIONS.includes('warmup'));
+	assert.deepEqual([...unknownOptionWarnings({ warmup: true })], []);
 });

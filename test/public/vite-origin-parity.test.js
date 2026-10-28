@@ -1,0 +1,216 @@
+// Vite must apply the same fixed-ORIGIN authority as production at the actual
+// auth and upgrade boundaries. Helper-only tests cannot prove the plugin passed
+// `pinnedOrigin` into either call site.
+
+import { describe, it, expect, afterEach } from 'vitest';
+import { request as httpRequest } from 'node:http';
+import { WebSocket } from 'ws';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { bootViteDev } from '../helpers/vite-dev.js';
+
+const originalOrigin = process.env.ORIGIN;
+const servers = [];
+const clients = [];
+
+afterEach(async () => {
+	for (const ws of clients.splice(0)) {
+		try { ws.terminate(); } catch { /* already closed */ }
+	}
+	for (const server of servers.splice(0).reverse()) await server.close();
+	if (originalOrigin === undefined) delete process.env.ORIGIN;
+	else process.env.ORIGIN = originalOrigin;
+});
+
+async function bootDev({ origin, handler = {}, ready } = {}) {
+	if (origin === undefined) delete process.env.ORIGIN;
+	else process.env.ORIGIN = origin;
+	const server = await bootViteDev({ pluginOptions: { allowedOrigins: 'same-origin' }, handler, ready });
+	servers.push(server);
+	return { port: server.port };
+}
+
+function postAuth(port, origin, host = 'attacker.example') {
+	return new Promise((resolve, reject) => {
+		const req = httpRequest({
+		host: '127.0.0.1',
+			port,
+			path: '/__ws/auth',
+			method: 'POST',
+			headers: { host, origin, 'content-length': '0' }
+		}, (res) => {
+			res.resume();
+			res.once('end', () => resolve(res.statusCode));
+		});
+		req.once('error', reject);
+		req.end();
+	});
+}
+
+function connect(port, { origin, host = 'attacker.example' } = {}) {
+	return new Promise((resolve, reject) => {
+		const headers = { host };
+		if (origin !== undefined) headers.origin = origin;
+		const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers });
+		clients.push(ws);
+		let settled = false;
+		const finish = (value) => {
+			if (settled) return;
+			settled = true;
+			resolve(value);
+		};
+		ws.once('open', () => finish(101));
+		ws.once('unexpected-response', (_req, res) => {
+			res.resume();
+			finish(res.statusCode);
+		});
+		ws.once('error', (err) => { if (!settled) reject(err); });
+	});
+}
+
+describe('Vite fixed-origin parity', () => {
+	it('uses ORIGIN rather than attacker-controlled Host on auth and upgrade', async () => {
+		let authenticated = 0;
+		const { port } = await bootDev({
+			origin: 'https://pinned.example',
+			handler: {
+				authenticate() { authenticated++; },
+				open() {}
+			}
+		});
+		// Let the handler module's promise settle before exercising the boundary;
+		// the separate race test below deliberately does the opposite.
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		// Without pinnedOrigin these attacker-supplied values agree and both
+		// requests pass the `same-origin` Host fallback.
+		expect(await postAuth(port, 'http://attacker.example')).toBe(403);
+		expect(await connect(port, { origin: 'http://attacker.example' })).toBe(403);
+
+		// The fixed deployment origin is authoritative even when Host disagrees.
+		expect(await postAuth(port, 'https://pinned.example')).toBe(204);
+		expect(await connect(port, { origin: 'https://pinned.example' })).toBe(101);
+		expect(authenticated).toBe(1);
+	});
+
+	it('waits for the handler before deciding whether a missing Origin is allowed', async () => {
+		let releaseLoad;
+		const loading = new Promise((resolve) => { releaseLoad = resolve; });
+		const { port } = await bootDev({
+			origin: undefined,
+			handler: { upgrade: () => ({ id: 'hook-authenticated' }) },
+			ready: loading
+		});
+
+		const connecting = connect(port, { origin: undefined });
+		setTimeout(releaseLoad, 20);
+		// Production knows its static handler before it checks Origin and permits
+		// an Origin-less native client when upgrade() performs authentication.
+		// Dev previously observed an empty userHandlers object while the module
+		// was still loading and returned 403 before the hook existed.
+		expect(await connecting).toBe(101);
+	});
+
+	it('refuses a Host that is not an authority on auth, as production does', async () => {
+		let ran = 0;
+		const { port } = await bootDev({
+			origin: undefined,
+			handler: {
+				authenticate() { ran++; }
+			}
+		});
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		/** @param {string} host */
+		const post = (host) => new Promise((resolve, reject) => {
+			const req = httpRequest({
+				host: '127.0.0.1',
+				port,
+				path: '/__ws/auth',
+				method: 'POST',
+				headers: { host, 'x-requested-with': 'XMLHttpRequest', 'content-length': '0' }
+			}, (res) => {
+				res.resume();
+				res.once('end', () => resolve(res.statusCode));
+			});
+			req.once('error', reject);
+			req.end();
+		});
+
+		// node's parser hands each of these on; the last one passes the
+		// grammar and is refused by the URL parser.
+		for (const host of ['a/other?', 'a#', 'a b', 'xn--zz']) {
+			expect(await post(host), JSON.stringify(host)).toBe(400);
+		}
+		expect(ran, 'the hook ran for a refused Host').toBe(0);
+		expect(await post('127.0.0.1')).toBe(204);
+		expect(ran).toBe(1);
+	});
+
+	it('builds the auth request on ORIGIN and reads no Host, as production does', async () => {
+		/** @type {string[]} */
+		const origins = [];
+		const { port } = await bootDev({
+			origin: 'https://pinned.example',
+			handler: {
+				authenticate({ request }) { origins.push(new URL(request.url).origin); }
+			}
+		});
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		for (const host of ['127.0.0.1', 'attacker.example', 'a/other?']) {
+			expect(await postAuth(port, 'https://pinned.example', host), host).toBe(204);
+		}
+		expect(origins).toEqual(['https://pinned.example', 'https://pinned.example', 'https://pinned.example']);
+	});
+
+	it('refuses an absolute-form target on auth, which production never routes', async () => {
+		// Concatenated onto the origin, `http://evil.example/__ws/auth` puts its
+		// scheme into the host and its own host into the path
+		// (`http://127.0.0.1http//evil.example/__ws/auth`).
+		for (const origin of [undefined, 'https://pinned.example']) {
+			let ran = 0;
+			const { port } = await bootDev({
+				origin,
+				handler: { authenticate() { ran++; } }
+			});
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			const status = await new Promise((resolve, reject) => {
+				const req = httpRequest({
+					host: '127.0.0.1',
+					port,
+					path: 'http://evil.example/__ws/auth',
+					method: 'POST',
+					headers: { host: '127.0.0.1', 'x-requested-with': 'XMLHttpRequest', 'content-length': '0' }
+				}, (res) => {
+					res.resume();
+					res.once('end', () => resolve(res.statusCode));
+				});
+				req.once('error', reject);
+				req.end();
+			});
+			expect(status, String(origin)).toBe(400);
+			expect(ran, String(origin)).toBe(0);
+		}
+	});
+});
+
+// A fresh Node process lets SvelteKit load the real fixture configuration and
+// handler through Vite's module runner, including the resolved adapter metadata.
+describe('Vite reads the adapter environment prefix', () => {
+	it.each(['prefixed', 'bare-only'])('uses the real consolidated adapter config for %s ORIGIN', async (mode) => {
+		const runner = fileURLToPath(new URL('../helpers/vite-env-prefix-runner.js', import.meta.url));
+		const result = await new Promise((resolve, reject) => {
+			const child = spawn(process.execPath, [runner, mode], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+			let output = '';
+			child.stdout.on('data', chunk => { output += chunk; });
+			child.stderr.on('data', chunk => { output += chunk; });
+			let timedOut = false;
+			const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, 60000);
+			child.once('error', error => { clearTimeout(timer); reject(error); });
+			child.once('close', code => { clearTimeout(timer); resolve({ code, output, timedOut }); });
+		});
+		expect(result.timedOut, result.output).toBe(false);
+		expect(result.code, result.output).toBe(0);
+		expect(result.output).toContain('vite-env-prefix: ' + mode + ' passed');
+	}, 65000);
+});

@@ -1,14 +1,19 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { detectSetCookieOnUpgrade } from './upgrade-cookie-scan.js';
+import { existsSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { rollup } from 'rollup';
 import { nodeResolve } from '@rollup/plugin-node-resolve';
 import commonjs from '@rollup/plugin-commonjs';
 import json from '@rollup/plugin-json';
-import { normalizeStaticHeaders } from './build-config.js';
+import { handlerTypescript } from './handler-typescript.js';
+import { assertHandlerExists, discoverHandler, legacyHandlerWarning, resolveHandler, sameHandler } from './handler-entry.js';
+import { normalizeStaticCacheControl, normalizeStaticHeaders, unresolvedImportAdvice } from './build-config.js';
 import { listExcludedDotPaths } from './static-scan.js';
+import { writeAndCloseRollupBundle, extraEntryImports } from './build-rollup-lifecycle.js';
 import { assertScalarOptions, unknownOptionWarnings } from './adapter-options.js';
 import { describeValue, normalizeWsOptions, readableCopy } from './runtime/utils/ws-options.js';
+import { normalizeBodyLimits, serializeBodyLimits } from './runtime/utils/body-limits.js';
 
 const runtimeDir = fileURLToPath(new URL('./runtime', import.meta.url).href);
 
@@ -45,15 +50,26 @@ export default function (opts = {}) {
 			`adapter options must be a plain object of options, got ${describeValue(opts)}.`
 		);
 	}
-	if (opts !== null && typeof opts === 'object') {
-		const copied = readableCopy(opts);
-		if (copied === null || Array.isArray(copied)) {
-			throw new Error(
-				`adapter options must be a plain object of options, got ${describeValue(opts)}.`
-			);
-		}
-		opts = /** @type {any} */ (copied);
+	// EVERY other non-object is refused here too, by name. `null` and the
+	// primitives used to reach the destructuring below untouched: `null` threw
+	// natively there ("Cannot read properties of null (reading 'out')", which
+	// names neither the adapter nor the option), and a string, number or boolean
+	// destructured to nothing at all - so `adapter('build')`, plainly meaning
+	// `{ out: 'build' }`, built a server on silent defaults and reported no
+	// problem. That is the same failure the callable branch above exists to
+	// prevent, and the array branch below already refused its half of it.
+	if (opts === null || typeof opts !== 'object') {
+		throw new Error(
+			`adapter options must be a plain object of options, got ${describeValue(opts)}.`
+		);
 	}
+	const copied = readableCopy(opts);
+	if (copied === null || Array.isArray(copied)) {
+		throw new Error(
+			`adapter options must be a plain object of options, got ${describeValue(opts)}.`
+		);
+	}
+	opts = /** @type {any} */ (copied);
 	// Unusable VALUES fail here, before any option is read: an option the
 	// adapter cannot honour is not a forward-compatibility question, and the
 	// factory is the closest point to the config that set it. Unknown KEYS are
@@ -71,6 +87,35 @@ export default function (opts = {}) {
 		websocket
 	} = opts;
 
+	// Readiness-gated boot warmup: render the configured paths once during the
+	// `starting` window so the SSR render path is warm before the readiness
+	// probe reports ready. A load balancer routes the first real client the
+	// moment readiness turns green, and a cold render costs about twenty times
+	// a warm one - measured on THIS runtime, not carried over: 16.1-18.0 ms
+	// cold against a 0.75-0.92 ms settled mean on Bun 1.3.14, 17-24x across
+	// runs. Default on, warming '/'; `false` disables it; `{ paths }` names the
+	// routes. Baked to the list of paths (empty when disabled).
+	const warmupOption = opts.warmup === undefined ? true : opts.warmup;
+	/** @type {string[]} */
+	let warmupPaths;
+	if (warmupOption === false) {
+		warmupPaths = [];
+	} else if (warmupOption === true) {
+		warmupPaths = ['/'];
+	} else if (warmupOption && typeof warmupOption === 'object' && Array.isArray(warmupOption.paths)) {
+		if (!warmupOption.paths.every((p) => typeof p === 'string' && p[0] === '/')) {
+			throw new Error(
+				"warmup.paths must be an array of absolute pathname strings starting with '/' " +
+				`(e.g. ['/', '/dashboard']), got ${describeValue(warmupOption.paths)}.`
+			);
+		}
+		warmupPaths = warmupOption.paths.slice();
+	} else {
+		throw new Error(
+			`warmup must be true, false, or an object like { paths: ['/'] }, got ${describeValue(warmupOption)}.`
+		);
+	}
+
 	// Transport tuning for the WebSocket endpoint, plus the endpoint's own path
 	// and handler module. Validated at factory time so a value Bun would refuse
 	// (an idleTimeout above its 960s ceiling, say) fails the build with an
@@ -81,15 +126,9 @@ export default function (opts = {}) {
 	// mean the same thing in both adapters to be portable between them.
 	const wsResult = normalizeWsOptions(websocket);
 	const websocketPath = wsResult.options.path;
-	const websocketHandler = wsResult.options.handler;
 	const compressCredentialedResponses = wsResult.options.compressCredentialedResponses;
 
-	// Whether the app asked for a realtime endpoint AT ALL, as opposed to just
-	// saying where one would live. `handler` and `path` are addresses, not
-	// intent - see the WS_OPTIONS decision below.
-	const wsTransportConfigured =
-		websocket !== undefined &&
-		Object.keys(websocket).some((key) => key !== 'handler' && key !== 'path' && key !== 'authPath');
+	const wsTransportConfigured = Boolean(websocket);
 
 	if (websocketPath === healthCheckPath || websocketPath === readinessCheckPath) {
 		throw new Error(
@@ -133,11 +172,21 @@ export default function (opts = {}) {
 	// build work. The reserved-key warning needs builder.log, so it is emitted
 	// inside adapt(); the throw-on-bad-shape path runs here at factory time.
 	const staticHeadersResult = normalizeStaticHeaders(opts.staticHeaders);
+	const staticCacheControl = normalizeStaticCacheControl(opts.staticCacheControl);
+	const bodyLimits = normalizeBodyLimits(opts.bodyLimits);
 
 	return {
 		name: 'adapter-bunserve',
+		envPrefix,
+		bodyLimits,
+		websocketHandler: websocket?.handler ?? null,
+		websocketPath: websocket?.path ?? null,
+		websocketAuthPath: websocket?.authPath ?? null,
+		websocketMetrics: websocket?.metrics ?? null,
+		websocketEnabled: Boolean(websocket),
 
 		async adapt(builder) {
+			const kitConfig = builder.config.paths ? builder.config : builder.config.kit;
 			// Unknown top-level keys: warned, never fatal, so an app pinning an
 			// older adapter than its config was written for still builds. Emitted
 			// here rather than at factory time because this is where the builder's
@@ -151,8 +200,8 @@ export default function (opts = {}) {
 			builder.mkdirp(tmp);
 
 			builder.log.minor('Copying assets');
-			builder.writeClient(`${out}/client${builder.config.kit.paths.base}`);
-			builder.writePrerendered(`${out}/prerendered${builder.config.kit.paths.base}`);
+			builder.writeClient(`${out}/client${kitConfig.paths.base}`);
+			builder.writePrerendered(`${out}/prerendered${kitConfig.paths.base}`);
 
 			if (precompress) {
 				builder.log.minor('Compressing assets');
@@ -171,7 +220,8 @@ export default function (opts = {}) {
 				[
 					`export const manifest = ${builder.generateManifest({ relativePath: './' })};`,
 					`export const prerendered = new Set(${JSON.stringify(builder.prerendered.paths)});`,
-					`export const base = ${JSON.stringify(builder.config.kit.paths.base)};`
+					`export const base = ${JSON.stringify(kitConfig.paths.base)};`,
+					`export const appPath = ${JSON.stringify(builder.getAppPath())};`
 				].join('\n\n')
 			);
 
@@ -183,42 +233,35 @@ export default function (opts = {}) {
 				manifest: `${tmp}/manifest.js`
 			};
 
-			// The WebSocket handler module. Zero-config: drop a src/ws-handler.js
-			// into the project and the realtime surface turns on. When the file
-			// is absent a stub is bundled instead, because the runtime's bridge
-			// imports the module unconditionally - an absent import would be a
-			// build error rather than "no websockets configured".
-			// Resolved ONCE, and reported, because this is a silent fork: taking
-			// the wrong branch ships a stub and the app boots with a realtime
-			// endpoint that denies everything. A relative path resolves against
-			// the current working directory - the same base SvelteKit resolves
-			// its own `kit.files.*` against - so a build invoked from somewhere
-			// other than the project root can miss a handler that is really
-			// there. Naming the absolute path checked is what makes that
-			// diagnosable instead of mysterious.
-			const wsHandlerPath = path.resolve(websocketHandler);
-			const hasWsHandler = existsSync(wsHandlerPath);
-			if (!hasWsHandler && websocket !== undefined) {
-				builder.log.warn(
-					`[adapter-bunserve] no WebSocket handler at ${wsHandlerPath}, but \`websocket\` ` +
-					'options are configured. The endpoint will be served with no app hooks, so every ' +
-					'subscribe is denied SUBSCRIBE_NOT_CONFIGURED. Check the path (it resolves against ' +
-					'the current working directory) or pass `websocket.handler` explicitly.'
-				);
-			}
-			if (hasWsHandler) {
+			const legacyWarning = websocket !== false ? legacyHandlerWarning(process.cwd(), websocket?.handler) : null;
+			if (legacyWarning) builder.log.warn(legacyWarning);
+			const wsHandlerPath = websocket ? discoverHandler(process.cwd(), websocket?.handler, {
+				$lib: kitConfig.files.lib,
+				...kitConfig.alias
+			}) : null;
+			const viteHandler = path.join(tmp, 'ws-handler.js');
+			const hasViteHandler = Boolean(websocket) && existsSync(viteHandler);
+			const hasWsHandler = hasViteHandler || wsHandlerPath !== null;
+			if (!hasViteHandler && websocket?.handler) assertHandlerExists(wsHandlerPath, websocket.handler, 'websocket.handler');
+			if (hasViteHandler) {
+				const originFile = path.join(tmp, 'ws-handler.origin.json');
+				if (existsSync(originFile) && websocket?.handler) {
+					const built = JSON.parse(readFileSync(originFile, 'utf8'));
+					if (typeof built.absolute !== 'string' || !sameHandler(wsHandlerPath, built.absolute)) {
+						throw new Error('The bundled WebSocket handler does not match websocket.handler.');
+					}
+				}
+				if (!existsSync(originFile)) builder.log.warn('The bundled WebSocket handler has no origin metadata; its configured source cannot be verified.');
+				input['ws-handler'] = viteHandler;
+			} else if (hasWsHandler) {
 				input['ws-handler'] = wsHandlerPath;
+				builder.log.warn('Add svelte-adapter-bunserve/vite to the Vite plugins to share modules between hooks.ws and server routes.');
 			} else {
-				writeFileSync(
-					`${tmp}/ws-handler.js`,
-					'// No WebSocket handler configured. The built-in subscribe/unsubscribe\n' +
-					'// demux still runs; this module simply exports no app hooks.\n'
-				);
-				input['ws-handler'] = `${tmp}/ws-handler.js`;
+				writeFileSync(viteHandler, '// No WebSocket handler configured.\n');
+				input['ws-handler'] = viteHandler;
+				if (websocket?.handler) builder.log.warn('No WebSocket handler at ' + wsHandlerPath);
 			}
-			if (hasWsHandler) {
-				builder.log.minor(`Bundling WebSocket handler ${wsHandlerPath}`);
-			}
+			if (hasWsHandler) builder.log.minor('WebSocket handler: ' + (hasViteHandler ? 'built by Vite' : wsHandlerPath));
 			for (const warning of wsResult.warnings) {
 				builder.log.warn(`[adapter-bunserve] ${warning}`);
 			}
@@ -229,8 +272,46 @@ export default function (opts = {}) {
 				);
 			}
 
+			const metricsPath = websocket?.metrics;
+			const metricsEntry = path.join(tmp, 'metrics-registry.js');
+			if (metricsPath) {
+				const resolved = resolveHandler(process.cwd(), metricsPath, { $lib: kitConfig.files.lib, ...kitConfig.alias });
+				if (existsSync(metricsEntry)) {
+					const originFile = path.join(tmp, 'metrics-registry.origin.json');
+					if (existsSync(originFile)) {
+						const origin = JSON.parse(readFileSync(originFile, 'utf8'));
+						if (typeof origin.absolute !== 'string' || !sameHandler(resolved, origin.absolute)) {
+							throw new Error('The bundled metrics registry does not match websocket.metrics.');
+						}
+					} else builder.log.warn('The bundled metrics registry has no origin metadata; its configured source cannot be verified.');
+				} else {
+					if (!existsSync(resolved)) throw new Error(`websocket.metrics module does not exist: ${resolved}`);
+					writeFileSync(metricsEntry, `import * as m from ${JSON.stringify(resolved.replaceAll('\\', '/'))};\nconst pick = ns => ns.default ?? ns.metrics ?? ns.registry ?? null;\nexport default pick(m);\n`);
+					builder.log.warn('websocket.metrics was bundled standalone. Scrape platform.metrics, or add svelte-adapter-bunserve/vite to share its registry with server routes.');
+				}
+			} else writeFileSync(metricsEntry, 'export default null;\n');
+			input['metrics-registry'] = metricsEntry;
+
 			if (builder.hasServerInstrumentationFile?.()) {
 				input['instrumentation.server'] = `${tmp}/instrumentation.server.js`;
+			}
+
+			// Include extra entry files written by Vite plugins (e.g. __live-registry.js).
+			// Only picks up __-prefixed files to avoid bundling SvelteKit internals.
+			// Known entries are compared by full path, not by file name: the
+			// WebSocket handler entry is the project's own file, outside tmp, and a
+			// handler that happened to be named like an extra entry must not hide it.
+			const knownEntries = new Set(Object.values(input).map(f => path.resolve(f)));
+			/** @type {string[]} */
+			const extraEntries = [];
+			// Sorted, so the entries load in the same order on every filesystem: the
+			// directory listing order is the filesystem's, and NTFS and ext4 disagree.
+			for (const file of readdirSync(tmp).sort()) {
+				if (file.startsWith('__') && file.endsWith('.js') && !knownEntries.has(path.resolve(tmp, file))) {
+					const name = file.replace(/\.js$/, '');
+					input[name] = `${tmp}/${file}`;
+					extraEntries.push(name);
+				}
 			}
 
 			/** @type {{ source: string, importer: string }[]} */
@@ -249,6 +330,7 @@ export default function (opts = {}) {
 					/^bun(:.+)?$/
 				],
 				plugins: [
+					...(!hasViteHandler ? [handlerTypescript()] : []),
 					// SvelteKit's `$lib` alias. The server bundle produced by
 					// writeServer has already had its aliases resolved by Vite,
 					// but the WebSocket handler is a project source file rollup
@@ -257,7 +339,7 @@ export default function (opts = {}) {
 						name: 'adapter-bunserve-kit-alias',
 						resolveId(source) {
 							if (source === '$lib' || source.startsWith('$lib/')) {
-								const libDir = builder.config.kit.files.lib;
+								const libDir = kitConfig.files.lib;
 								const rest = source === '$lib' ? '' : source.slice('$lib/'.length);
 								return this.resolve(path.resolve(libDir, rest), undefined, { skipSelf: true });
 							}
@@ -265,7 +347,7 @@ export default function (opts = {}) {
 							// handler importing through a configured alias resolves to
 							// nothing, gets externalized, and fails at BOOT instead of
 							// at build.
-							for (const [from, to] of Object.entries(builder.config.kit.alias || {})) {
+							for (const [from, to] of Object.entries(kitConfig.alias || {})) {
 								const prefix = from.endsWith('/') ? from : from + '/';
 								if (source === from) {
 									return this.resolve(path.resolve(to), undefined, { skipSelf: true });
@@ -280,7 +362,8 @@ export default function (opts = {}) {
 					},
 					nodeResolve({
 						preferBuiltins: true,
-						exportConditions: ['bun', 'node']
+						exportConditions: ['bun', 'node'],
+						extensions: ['.mjs', '.js', '.json', '.node', '.ts', '.mts', '.cts', '.tsx']
 					}),
 					commonjs({ strictRequires: true }),
 					json()
@@ -289,7 +372,7 @@ export default function (opts = {}) {
 				// the build would report success and the output would fail at
 				// boot with a bare unresolved specifier. That is the worst place
 				// to find out. `$app/*` and `$env/*` are the realistic cases in a
-				// WebSocket handler - there is no esbuild/Vite fallback here, so
+				// WebSocket handler without the Vite plugin - virtual modules
 				// they genuinely cannot be resolved - and this turns each into a
 				// build error naming the file and the fix.
 				onwarn(warning, handler) {
@@ -305,25 +388,38 @@ export default function (opts = {}) {
 			});
 
 			if (unresolvedImports.length) {
+				try {
+					await bundle.close();
+				} catch {
+					// The unresolved imports are the error worth reporting.
+				}
 				const list = unresolvedImports
 					.map((u) => `  "${u.source}" imported by ${u.importer}`)
 					.join('\n');
+				// Both spellings of tmp, since a resolver reports an importer by its
+				// real path.
+				const advice = unresolvedImportAdvice(
+					unresolvedImports.map((u) => u.importer),
+					[path.resolve(tmp), realpathSync(tmp)]
+				);
 				throw new Error(
 					`[adapter-bunserve] ${unresolvedImports.length} import(s) could not be resolved:\n${list}\n\n` +
 					'These would be left as bare specifiers in the output and crash at startup rather than ' +
-					'failing here. The WebSocket handler is bundled straight from project source with no Vite ' +
-					"or esbuild pass, so SvelteKit's virtual modules ($app/*, $env/*) are not available to it. " +
-					'Read configuration from process.env in the handler, or move the code that needs those ' +
-					'modules into a file the SvelteKit server bundle already includes and import it from there.'
+					`failing here. ${advice.join(' ')}`
 				);
 			}
 
-			await bundle.write({
+			const written = await writeAndCloseRollupBundle(bundle, {
 				dir: `${out}/server`,
 				format: 'esm',
 				sourcemap: true,
 				chunkFileNames: 'chunks/[name]-[hash].js'
 			});
+
+			const handlerChunk = written.output.find(chunk => chunk.type === 'chunk' && chunk.fileName === 'ws-handler.js');
+			if (handlerChunk && detectSetCookieOnUpgrade(handlerChunk.code)) {
+				builder.log.warn('[adapter-bunserve] Your upgrade() hook attaches Set-Cookie to the 101 response via upgradeResponse(). This fails silently behind Cloudflare Tunnel and other strict edge proxies: the WebSocket opens, then closes with code 1006 before frames are exchanged. Move session cookie refreshes to authenticate() and opt in with connect({ auth: true }). This warning is safe to ignore if you do not deploy behind Cloudflare.');
+			}
 
 			// staticHeaders: app-chosen response headers for static and prerendered
 			// assets (CSP, HSTS, X-Frame-Options, ...). These bypass the SvelteKit
@@ -336,7 +432,8 @@ export default function (opts = {}) {
 					`[adapter-bunserve] staticHeaders ignored: ${staticHeadersResult.dropped.join(', ')}. ` +
 					'These transfer/caching/range headers are managed by the static file ' +
 					'handler and cannot be overridden (content-type, content-encoding, etag, ' +
-					'cache-control, vary, accept-ranges, ...). Every other header is applied.'
+					'cache-control, vary, accept-ranges, ...). Use staticCacheControl for ' +
+					'path-specific cache policies. Every other header is applied.'
 				);
 			}
 
@@ -344,7 +441,7 @@ export default function (opts = {}) {
 			// dot-path in the output would 404 in production with nothing saying
 			// why. Say so here, where the file is still in front of the developer.
 			if (!staticDotfiles) {
-				const outBase = builder.config.kit.paths.base;
+				const outBase = kitConfig.paths.base;
 				const refused = [...new Set([
 					...listExcludedDotPaths(`${out}/client${outBase}`),
 					...listExcludedDotPaths(`${out}/prerendered${outBase}`)
@@ -365,10 +462,13 @@ export default function (opts = {}) {
 				filter: (file) => !SIM_LANE_FILES.has(path.basename(file)),
 				replace: {
 					ENV_PREFIX: JSON.stringify(envPrefix),
+					BODY_LIMIT_RULES: serializeBodyLimits(bodyLimits),
 					PRECOMPRESS: JSON.stringify(precompress),
 					HEALTH_CHECK_PATH: JSON.stringify(healthCheckPath),
 					READINESS_CHECK_PATH: JSON.stringify(readinessCheckPath),
+					WARMUP_PATHS: JSON.stringify(warmupPaths),
 					STATIC_HEADERS: JSON.stringify(staticHeadersResult.headers),
+					STATIC_CACHE_CONTROL: JSON.stringify(staticCacheControl),
 					STATIC_CACHE_MAX: JSON.stringify(STATIC_CACHE_MAX_FILE_SIZE),
 					STATIC_DOTFILES: JSON.stringify(staticDotfiles),
 					HTTP_OPTIONS: JSON.stringify({
@@ -380,13 +480,8 @@ export default function (opts = {}) {
 					// per-connection bookkeeping. An app with no handler and no
 					// explicit `websocket` config pays nothing for realtime.
 					//
-					// Measured on the KEYS, not on `websocket !== undefined`.
-					// Since `handler` and `path` moved into this block to match
-					// svelte-adapter-uws, naming only those is how an app says
-					// WHERE the endpoint would be - not that it wants one. An app
-					// pointing `handler` at a file it does not have is opting OUT,
-					// and reading that as opting in served the endpoint with no
-					// hooks, denying every subscribe.
+					// Boolean true and an options object without a handler enable the built-in
+					// control protocol even when no hooks module exists.
 					WS_OPTIONS: hasWsHandler || wsTransportConfigured
 						? JSON.stringify(wsResult.options)
 						: 'null'
@@ -411,7 +506,8 @@ export default function (opts = {}) {
 						imports: {
 							'#server': './server/index.js',
 							'#manifest': './server/manifest.js',
-							'#ws-handler': './server/ws-handler.js'
+							'#ws-handler': './server/ws-handler.js',
+						'#metrics-registry': './server/metrics-registry.js'
 						}
 					},
 					null,
@@ -433,6 +529,15 @@ export default function (opts = {}) {
 				`${out}/meta/protocol.schema.json`,
 				readFileSync(fileURLToPath(new URL('../protocol.schema.json', import.meta.url)))
 			);
+
+			// Import discovered __-prefixed entries so they execute at startup
+			if (extraEntries.length > 0) {
+				const entryImports = extraEntryImports(written, tmp, extraEntries);
+				const indexPath = `${out}/index.js`;
+				const indexContent = readFileSync(indexPath, 'utf8');
+				writeFileSync(indexPath, entryImports + '\n' + indexContent);
+				builder.log.minor(`Extra entries: ${extraEntries.join(', ')}`);
+			}
 
 			if (builder.hasServerInstrumentationFile?.()) {
 				builder.instrument?.({
