@@ -81,7 +81,7 @@ try {
 	check('everything past the limit is 429',
 		refused.every((r) => r.status === 429),
 		JSON.stringify(refused.map((r) => r.status)));
-	check('the refusal says how long to wait', refused[0].retryAfter === '10',
+	check('the refusal carries no Retry-After', refused[0].retryAfter === null,
 		String(refused[0].retryAfter));
 	check('and says what happened', refused[0].body.includes('Too many'),
 		JSON.stringify(refused[0].body.slice(0, 50)));

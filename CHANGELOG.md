@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WebSocket upgrades validate request identity and handshake fields, preserve authorized response headers and enforce bounded admission before opening.
+
 - Connection slots share tracked membership across bundles; unsubscribe cleanup settles safely after membership removal and closing connections cannot regain subscriptions.
 
 - Builds preserve shared handler modules and configured routes; Vite development supports authentication, origins, delivery policies and bounded request bodies.

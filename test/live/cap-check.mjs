@@ -1,23 +1,15 @@
-// Live regression test for the per-connection subscription cap.
-//
-// The cap has to hold against pipelining. A limit read before the app's
-// authorization gate and never re-checked after it is not a bound: an async
-// gate lets a client pipeline subscribe frames that ALL pass the check at the
-// pre-await size and ALL install - 500 installed against a cap of 20.
-//
-// This asserts the bound holds on the path that broke it, which requires a
-// genuinely async hook - microtask-only awaits still serialize under Bun, so a
-// synchronous fixture gate cannot reach the defect. The fixture's `subscribe`
-// awaits 40ms for `slow:` topics and the fixture build sets the cap to 20.
-//
-// Run the whole live lane with: npm run test:live
+// Live regression for the shared 4096 pending-subscribe attempt bound.
+// A fixture barrier holds every admitted hook until an ordered application
+// message releases it. The bound therefore does not depend on machine speed.
+// The separate 65536 landed cap is covered by subscribe-gate.test.mjs.
 
 import { assertPortFree, buildPath, serverEnv, waitForServer } from './harness.mjs';
 
 const PORT = 8805;
 const BUILD = buildPath();
-const CAP = 20;
-const BLAST = 500;
+// Literal contract value: a compiled runtime must not agree with its own typo.
+const CAP = 4096;
+const BLAST = CAP + 1;
 
 let passed = 0;
 let failed = 0;
@@ -49,15 +41,12 @@ try {
 
 	const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
 	const acks = { subscribed: 0, denied: 0, rateLimited: 0 };
-	// WHICH topics installed, not just how many. The gates resolve concurrently,
-	// so the winners are the first 20 gates to SETTLE, which is not necessarily
-	// topics 0..19 - releasing an assumed range would release topics the
-	// connection never held, return no headroom, and fail against a server that
-	// behaved correctly.
 	const installed = [];
+	const released = [];
 	ws.onmessage = (e) => {
 		let msg;
 		try { msg = JSON.parse(e.data); } catch { return; }
+		if (msg.event === 'subscribe-gates-released') released.push(msg.data.count);
 		if (msg.type === 'subscribed') {
 			acks.subscribed++;
 			if (typeof msg.topic === 'string') installed.push(msg.topic);
@@ -72,60 +61,37 @@ try {
 		ws.onerror = () => reject(new Error('ws error'));
 	});
 
-	// Pipeline the whole blast without awaiting anything: every frame lands in
-	// Bun's message handler before the first gate resolves. This is the exact
-	// shape that defeated the old check.
+	async function until(predicate, label) {
+		const deadline = Date.now() + 15000;
+		while (!predicate()) {
+			if (Date.now() > deadline) throw new Error(`Timed out: ${label}`);
+			await Bun.sleep(10);
+		}
+	}
 	for (let i = 0; i < BLAST; i++) {
-		ws.send(JSON.stringify({ type: 'subscribe', topic: `slow:room${i}`, ref: i }));
+		ws.send(JSON.stringify({ type: 'subscribe', topic: `held:room${i}`, ref: i }));
 	}
+	await until(() => acks.denied > 0, 'pending overflow reply');
+	check('overflow is refused before the held hooks are released',
+		acks.subscribed === 0 && acks.denied === 1 && acks.rateLimited === 1,
+		JSON.stringify(acks));
+	ws.send(JSON.stringify({ type: 'fixture-release-subscribes' }));
+	await until(() => acks.subscribed + acks.denied === BLAST, 'all pending replies');
+	check(`exactly ${CAP} concurrent attempts reach the application hook`,
+		released.length === 1 && released[0] === CAP, JSON.stringify(released));
+	check(`exactly ${CAP} held attempts install after authorization`,
+		acks.subscribed === CAP && acks.denied === 1, JSON.stringify(acks));
+	check('every installed topic is unique and within the admitted prefix',
+		new Set(installed).size === CAP && installed.every(topic => /^held:room\d+$/.test(topic) && Number(topic.slice(9)) < CAP));
 
-	// Long enough for all 500 gates (40ms each, concurrent) to settle.
-	await Bun.sleep(3000);
-
-	const answered = acks.subscribed + acks.denied;
-	check(
-		`every one of the ${BLAST} pipelined subscribes is answered`,
-		answered === BLAST,
-		`subscribed=${acks.subscribed} denied=${acks.denied} total=${answered}`
-	);
-	// EXACTLY the cap, not at most it. The correct outcome is deterministic -
-	// 500 pipelined frames against a cap of 20 install 20 - so an upper bound
-	// alone is satisfied by a regression that refuses every subscribe, which
-	// also satisfies every other check in this file.
-	check(
-		`installed subscriptions fill the cap of ${CAP} exactly`,
-		acks.subscribed === CAP,
-		`installed ${acks.subscribed}, cap ${CAP}`
-	);
-	check(
-		'the overflow is refused as RATE_LIMITED, not silently dropped',
-		acks.rateLimited === BLAST - acks.subscribed,
-		`rateLimited=${acks.rateLimited} expected=${BLAST - acks.subscribed}`
-	);
-
-	// The cap must not be a one-way latch: releasing subscriptions has to give
-	// the headroom back, or a long-lived connection degrades permanently.
-	// Release exactly what installed, read off the acks.
-	const held = installed.slice();
-	check(
-		'the acks name every installed topic',
-		held.length === acks.subscribed,
-		`named ${held.length} of ${acks.subscribed}`
-	);
-	for (const topic of held) {
-		ws.send(JSON.stringify({ type: 'unsubscribe', topic }));
-	}
-	await Bun.sleep(300);
-	// Captured after the releases have settled, so a late ack cannot shift the
-	// baseline out from under the comparison.
-	const before = acks.subscribed;
-	ws.send(JSON.stringify({ type: 'subscribe', topic: 'slow:after-release', ref: 'r' }));
-	await Bun.sleep(500);
-	check(
-		'headroom returns once subscriptions are released',
-		acks.subscribed === before + 1,
-		`installed went ${before} -> ${acks.subscribed}`
-	);
+	// Pending capacity returns when authorization settles, even while all
+	// existing memberships remain landed on the connection.
+	ws.send(JSON.stringify({ type: 'subscribe', topic: 'held:after-settlement', ref: 'next' }));
+	ws.send(JSON.stringify({ type: 'fixture-release-subscribes' }));
+	await until(() => acks.subscribed === CAP + 1, 'returned pending capacity');
+	check('settled attempts return pending capacity without unsubscribing',
+		released.length === 2 && released[1] === 1 && acks.denied === 1,
+		JSON.stringify({ released, acks }));
 
 	ws.close();
 	await Bun.sleep(200);

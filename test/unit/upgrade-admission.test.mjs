@@ -1,8 +1,54 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createUpgradeAdmission, isCursorLaneUpgrade } from '../../src/runtime/utils/upgrade-admission.js';
+import {
+	buildAccessibleCapacityRefusalPage,
+	createUpgradeAdmission,
+	isCursorLaneUpgrade,
+	negotiateRejection
+} from '../../src/runtime/utils/upgrade-admission.js';
 import { normalizeWsOptions } from '../../src/runtime/utils/ws-options.js';
+import { monotonicNow } from '../../src/runtime/runtime.js';
+
+/**
+ * One turn of the loop, waited on the way the drain is scheduled.
+ *
+ * The deferral is a `setImmediate`, and immediates run FIFO inside the check
+ * phase, so one queued here cannot run before a drain queued earlier. A
+ * wall-clock sleep is NOT the same wait and cannot be substituted: the timers
+ * phase precedes the check phase within an iteration, so a process that stalls
+ * past the sleep - a loaded runner, another suite on the same machine - runs
+ * the sleeping test's continuation BEFORE the drain it was waiting for, and
+ * the assertion reads a queue that has not moved.
+ */
+const turn = () => new Promise((r) => setImmediate(r));
+
+/**
+ * Turns until the queue is empty, bounded so a drain that stops rescheduling
+ * fails the test rather than hanging it. Each turn runs at most one tick
+ * budget, so a queue needs as many turns as it has budgets' worth of entries.
+ *
+ * @param {{ deferredDepth: number }} a
+ */
+async function drained(a, maxTurns = 64) {
+	let previous = a.deferredDepth;
+	let stalled = false;
+	for (let i = 0; i < maxTurns && a.deferredDepth > 0; i++) {
+		await turn();
+		// Which of the two reasons the bound was reached, since they call for
+		// opposite responses: a drain that stopped rescheduling is the defect
+		// this bound exists to catch, while a queue simply larger than 64
+		// budgets' worth is a case that needs a bigger bound, not a fix.
+		if (a.deferredDepth >= previous) stalled = true;
+		previous = a.deferredDepth;
+	}
+	assert.equal(a.deferredDepth, 0, stalled
+		? `the queue stopped draining with ${a.deferredDepth} left: a turn made no progress`
+		: `the queue was still draining after ${maxTurns} turns, ${a.deferredDepth} left; it needs a larger bound`);
+	// One more, so the turn that resets the spent per-tick counter has run too:
+	// a drain that emptied the queue schedules exactly one further empty turn.
+	await turn();
+}
 
 // Admission control for the upgrade path. These pin the CONTRACT rather than
 // the implementation, because the contract is shared: svelte-adapter-uws
@@ -79,7 +125,7 @@ test('perTickBudget runs its budget synchronously and defers the rest to a later
 	assert.equal(a.admit(() => ran.push(2)), false, 'past the budget, deferred');
 	assert.deepEqual(ran, [0, 1], 'the third has not run yet');
 	assert.equal(a.deferredDepth, 1);
-	await new Promise((r) => setTimeout(r, 20));
+	await turn();
 	assert.deepEqual(ran, [0, 1, 2], 'and runs on a later tick, in order');
 	assert.equal(a.deferredDepth, 0);
 });
@@ -171,15 +217,13 @@ test('the deferred observer is fed the right numbers, in the right order', () =>
 	assert.deepEqual(seen.at(-1)?.[2], 1, 'and the refusal is counted');
 });
 
-test('the reported age of the oldest deferred callback is real, not a constant', async () => {
+test('an empty queue reports no age at all', () => {
+	// The zero that means "nothing waiting", as opposed to the zero a broken
+	// age would report for an entry that has been waiting a while. Only this
+	// half can be asserted without a queued entry; the other half is pinned
+	// below, against an entry held in the queue for a measured interval.
 	const a = createUpgradeAdmission({ perTickBudget: 1, maxDeferred: 4 });
 	assert.equal(a.deferredOldestAgeMs, 0, 'nothing queued, no age');
-	a.admit(() => {});
-	a.admit(() => {});
-	await new Promise((r) => setTimeout(r, 25));
-	// The queue drains on a later tick, so read before that happens is not
-	// guaranteed; what IS guaranteed is that a queued entry ages.
-	if (a.deferredDepth > 0) assert.ok(a.deferredOldestAgeMs > 0, 'a queued entry ages');
 });
 
 test('an observer that throws cannot refuse a connection', () => {
@@ -198,7 +242,7 @@ test('deferred callbacks run FIFO and stay within the tick budget', async () => 
 	const ran = [];
 	for (let i = 0; i < 6; i++) a.admit(() => ran.push(i));
 	assert.deepEqual(ran, [0, 1], 'only the budget runs synchronously');
-	await new Promise((r) => setTimeout(r, 60));
+	await drained(a);
 	assert.deepEqual(ran, [0, 1, 2, 3, 4, 5], 'the rest follow in the order they arrived');
 });
 
@@ -224,9 +268,9 @@ test('every accepted callback runs, in order, across a wrapping ring', async () 
 			const id = n++;
 			if (a.admit(() => ran.push(id)) !== null) accepted.push(id);
 		}
-		await new Promise((r) => setImmediate(r));
+		await turn();
 	}
-	await new Promise((r) => setTimeout(r, 60));
+	await drained(a);
 	assert.deepEqual(ran, accepted, 'every accepted callback ran once, in arrival order');
 	assert.ok(accepted.length > 8, `the run has to be long enough to wrap, accepted ${accepted.length}`);
 });
@@ -240,10 +284,16 @@ test('a drain turn runs at most the tick budget, not the whole queue', async () 
 	for (let i = 0; i < 8; i++) a.admit(() => ran.push(i));
 	assert.deepEqual(ran, [0, 1], 'this tick spends its budget and no more');
 	// One turn of the loop. The drain was scheduled before this, so it runs
-	// first; anything past the budget having run means the budget is not held.
-	await new Promise((r) => setImmediate(r));
-	assert.ok(ran.length <= 4, `a single drain turn ran ${ran.length}, past the budget of 2`);
-	await new Promise((r) => setTimeout(r, 60));
+	// first, and exactly one drain has happened when this reads - so the count
+	// is EXACT rather than bounded. Both directions matter and only one of
+	// them is obvious: a turn that ran more than the budget starves the loop
+	// the way the unpaced path would, and a turn that ran less cuts upgrade
+	// throughput under exactly the storm the pacer exists for. A ceiling alone
+	// is satisfied by a drain that has quietly lost the configured budget and
+	// runs one callback per turn.
+	await turn();
+	assert.equal(ran.length, 4, `a single drain turn ran ${ran.length}, and the budget is 2`);
+	await drained(a);
 	assert.equal(ran.length, 8, 'and the rest still arrive');
 });
 
@@ -255,10 +305,16 @@ test('the age of a queued callback is measured, not reported as zero', async () 
 	a.admit(() => {});
 	a.admit(() => {});
 	assert.equal(a.deferredDepth, 1, 'one is queued and nothing has yielded');
-	const spun = Date.now();
-	while (Date.now() - spun < 12) { /* hold the turn so the entry ages */ }
+	// Spun on the SAME clock the age is measured against. Holding the turn by
+	// wall time would compare two different clocks: a coarse `Date.now` - 15.6ms
+	// on a Windows host without the precise timer, and on some VM guests - can
+	// report the full interval elapsed on its first tick, ending the spin after
+	// no monotonic time at all, and a forward clock step does the same. Either
+	// way the entry has not aged and a correct getter fails.
+	const spun = monotonicNow();
+	while (monotonicNow() - spun < 12) { /* hold the turn so the entry ages */ }
 	assert.ok(a.deferredOldestAgeMs >= 10, `expected a real age, got ${a.deferredOldestAgeMs}`);
-	await new Promise((r) => setTimeout(r, 40));
+	await drained(a);
 });
 
 test('a drain that empties the queue still frees the following tick', async () => {
@@ -269,7 +325,7 @@ test('a drain that empties the queue still frees the following tick', async () =
 	// that ended minutes ago.
 	const a = createUpgradeAdmission({ perTickBudget: 2, maxDeferred: 8 });
 	for (let i = 0; i < 4; i++) a.admit(() => {});
-	await new Promise((r) => setTimeout(r, 60));
+	await drained(a);
 	assert.equal(a.deferredDepth, 0, 'the queue drained');
 	assert.equal(a.admit(() => {}), true, 'and the next tick runs synchronously again');
 });
@@ -488,4 +544,38 @@ test('the cursor lane needs the main ceiling to have room, not just its own', ()
 	assert.equal(a.tryAcquire(), true, 'main ceiling now full');
 	assert.equal(a.tryAcquireCursor(), false, 'refused although the sub-budget is untouched');
 	assert.equal(a.cursorInFlight, 0, 'and nothing was consumed by the refusal');
+});
+
+test('a refusal is HTML only for an explicitly acceptable text/html on a non-WebSocket request', () => {
+	for (const [accept, expected] of [
+		['text/html', 'html'],
+		['TEXT/HTML; charset=utf-8', 'html'],
+		['text/html;q=0.5,application/json', 'html'],
+		['text/html;q=0', 'retry'],
+		['text/html;q=0.000', 'retry'],
+		['text/html;q=bogus', 'retry'],
+		['text/html;profile="a,b";q=0', 'retry'],
+		['text/html;profile=";q=1";q=0', 'retry'],
+		['text/html;profile="unterminated;q=1', 'retry'],
+		['application/nottext/html', 'retry'],
+		['text/*,*/*', 'retry'],
+		['application/json', 'retry']
+	]) {
+		assert.equal(negotiateRejection(accept), expected, accept);
+	}
+	assert.equal(negotiateRejection(null), 'retry');
+	assert.equal(negotiateRejection(''), 'retry');
+	// An actual WebSocket handshake never gets HTML, in any letter case or list.
+	assert.equal(negotiateRejection('text/html', 'websocket'), 'retry');
+	assert.equal(negotiateRejection('text/html', 'h2c, WebSocket'), 'retry');
+	assert.equal(negotiateRejection('text/html', 'h2c'), 'html');
+});
+
+test('the capacity refusal page is one document with an announced status and a way to retry', () => {
+	const page = buildAccessibleCapacityRefusalPage();
+	assert.match(page, /^<!doctype html><html lang="en" dir="ltr">/);
+	assert.match(page, /<title>Service unavailable<\/title>/);
+	assert.match(page, /<p role="status" aria-live="polite" aria-atomic="true">/);
+	assert.match(page, /<form method="get"><button type="submit">Try again<\/button><\/form>/);
+	assert.doesNotMatch(page, /<script/i, 'it polls nothing');
 });

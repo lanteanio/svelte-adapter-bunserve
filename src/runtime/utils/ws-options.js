@@ -35,9 +35,12 @@ const DEFAULTS = {
 	// widen later than to claw back once clients depend on it.
 	allowNonAsciiTopics: false,
 	allowSystemTopicSubscribe: false,
-	// When no `subscribe` hook is exported, every topic is readable by every
-	// client. That has to be opted into rather than arrived at by omission.
-	allowUnauthenticatedSubscribe: false,
+	// The server-grant gate. `true` honours a client-initiated subscribe only
+	// for a topic the server already authorized for that connection through
+	// `platform.subscribe`; `'strict'` requires that grant AND an app hook
+	// allow. Off by default, matching uws: arming it is a posture an app opts
+	// into, not one it arrives at by upgrading.
+	authorizeWireSubscribe: false,
 	// Pressure-sampler thresholds (see handler/pressure-metrics.js for the
 	// defaults and each signal's meaning). undefined means "sampler defaults";
 	// the sampler always runs when the WS surface exists, so this only TUNES.
@@ -70,9 +73,7 @@ const DEFAULTS = {
 	// exactly as uws spells it so a config carried between the adapters
 	// bounds the same quantities in both.
 	egress: undefined,
-	// The path to an operator's metrics module, as uws declares it. ACCEPTED so a
-	// carried config builds, and NOT LOADED - see the validator for why a module
-	// cannot own the registry on this runtime.
+	// Optional operator registry module, bundled in the server graph.
 	metrics: undefined,
 	// Build-time rather than transport tuning, and nested HERE rather than at the
 	// top level because that is where svelte-adapter-uws declares them. The two
@@ -81,7 +82,7 @@ const DEFAULTS = {
 	// `websocketPath` at the top level made a carried-over config silently not
 	// apply, since the other adapter reads the key it does not find and warns
 	// about the one it does.
-	handler: 'src/ws-handler.js',
+	handler: null,
 	path: '/ws',
 	// Where the auth preflight POST is served, when the handler exports an
 	// `authenticate` hook. uws's path, because the family client store is the
@@ -89,6 +90,8 @@ const DEFAULTS = {
 	// prefix is what makes it obviously not a page; Cloudflare Access is the
 	// documented reason an app would move it.
 	authPath: '/__ws/auth',
+	adminPath: '/__realtime',
+	adminAuthAcknowledged: false,
 	// Preflights one client address may make per window, and how long that window
 	// is in seconds. Both uws's numbers, and the limit is HIGHER than the upgrade
 	// door's on purpose: every reconnect that preflights also upgrades, so this
@@ -123,7 +126,7 @@ export const KNOWN_WS_OPTION_KEYS = new Set(Object.keys(DEFAULTS));
  *
  * @type {ReadonlySet<string>}
  */
-export const INERT_WS_OPTION_KEYS = new Set(['metrics']);
+export const INERT_WS_OPTION_KEYS = new Set();
 
 /**
  * Render a rejected option value for a message that must not itself fail.
@@ -710,10 +713,11 @@ function requirePressureThresholds(value, warnings) {
  * @returns {NormalizedWsOptions}
  */
 export function normalizeWsOptions(input) {
+	if (input === true || input === false) input = undefined;
 	const copied = input != null && typeof input === 'object' ? readableCopy(input) : null;
 	if (input != null && (typeof input !== 'object' || copied === null || Array.isArray(copied))) {
 		throw new Error(
-			'adapter option `websocket` must be an object, e.g. ' +
+			'adapter option `websocket` must be true, false, or an object, e.g. ' +
 			`{ maxPayloadLength: 1048576, idleTimeout: 120 } - got ${describeValue(input)}.`
 		);
 	}
@@ -875,8 +879,26 @@ export function normalizeWsOptions(input) {
 	if (raw.allowSystemTopicSubscribe !== undefined) {
 		options.allowSystemTopicSubscribe = requireBoolean(raw.allowSystemTopicSubscribe, 'allowSystemTopicSubscribe');
 	}
-	if (raw.allowUnauthenticatedSubscribe !== undefined) {
-		options.allowUnauthenticatedSubscribe = requireBoolean(raw.allowUnauthenticatedSubscribe, 'allowUnauthenticatedSubscribe');
+	if (raw.authorizeWireSubscribe !== undefined) {
+		// NOT requireBoolean, and NOT coerced. This flag RESTRICTS access, so
+		// every value that is not one of the three it declares has to be a build
+		// error rather than a silent "off": `authorizeWireSubscribe:
+		// process.env.WS_AUTHZ` is the natural way to write it and is a string
+		// when the variable is set, so coercing would arm nothing while the
+		// config reads as armed. The unknown-KEY check cannot catch that - the
+		// key is known and only the value is wrong.
+		if (
+			raw.authorizeWireSubscribe !== true &&
+			raw.authorizeWireSubscribe !== false &&
+			raw.authorizeWireSubscribe !== 'strict'
+		) {
+			throw new Error(
+				'adapter option `websocket.authorizeWireSubscribe` must be `true`, `false` or ' +
+				`'strict' - got ${describeValue(raw.authorizeWireSubscribe)}. It gates who may ` +
+				'subscribe, so a value it cannot read is refused rather than treated as off.'
+			);
+		}
+		options.authorizeWireSubscribe = raw.authorizeWireSubscribe;
 	}
 	if (raw.pressure !== undefined) {
 		options.pressure = requirePressureThresholds(raw.pressure, warnings);
@@ -894,10 +916,10 @@ export function normalizeWsOptions(input) {
 		);
 	}
 	if (raw.handler !== undefined) {
-		if (typeof raw.handler !== 'string' || raw.handler.length === 0) {
+		if (typeof raw.handler !== 'string') {
 			throw new Error(
 				'adapter option `websocket.handler` must be a path to the module exporting your ' +
-				`WebSocket hooks (e.g. 'src/ws-handler.js') - got ${describeValue(raw.handler)}.`
+				`WebSocket hooks (e.g. 'src/hooks.ws.js') - got ${describeValue(raw.handler)}.`
 			);
 		}
 		options.handler = raw.handler;
@@ -920,29 +942,7 @@ export function normalizeWsOptions(input) {
 				`metrics registry (e.g. './src/lib/metrics.js') - got ${describeValue(raw.metrics)}.`
 			);
 		}
-		// NOT STORED. The type check above is worth doing wherever the value was
-		// going to be read, but keeping the value would leave one `ws_options.metrics`
-		// read between here and a build that honours the option - at which point
-		// the key would be honoured, the warning would still fire, and the parity
-		// list would still call it a gap. An inert key that holds nothing cannot
-		// become live by accident.
-		// ACCEPTED AND NAMED, exactly as `upgradeAdmission.waitingRoom` is, and for
-		// a sharper reason: honouring it would produce a server that LOOKS
-		// instrumented and is not. On this runtime a module imported by both a
-		// SvelteKit route and the WebSocket handler is two separate copies in the
-		// build - SvelteKit's server bundle is bundled before the adapter's own
-		// pass reads the handler - so the adapter would write into one instance
-		// while the app's scrape route rendered the other, with every adapter
-		// family stuck at zero and nothing to say why. This adapter owns the
-		// registry instead, and the app reaches THAT one through the platform.
-		warnings.push(
-			'adapter option `websocket.metrics` names a module, and this adapter does not load it: it owns ' +
-			'the metrics registry itself, because a module imported by both a route and the WebSocket ' +
-			'handler is two separate instances in the built output - the adapter would write to one and ' +
-			'your scrape route would render the other. Reach the registry through `platform.metrics` ' +
-			'(register your own instruments on it) and serve `await platform.metricsSnapshot()` from a ' +
-			'route. Remove the option to silence this.'
-		);
+		options.metrics = raw.metrics;
 	}
 	if (raw.authPath !== undefined) {
 		if (typeof raw.authPath !== 'string' || raw.authPath[0] !== '/') {
@@ -955,16 +955,23 @@ export function normalizeWsOptions(input) {
 	}
 	// Checked against the RESOLVED pair, so it fires whether the collision was
 	// written out or arrived by moving only one of the two onto the other's
-	// default. The upgrade lane is matched first, so an auth path equal to it
-	// would never be reached and an app would see its preflight answered with a
-	// 426 - a failure with nothing in it that names this option.
+	// default. svelte-adapter-uws refuses the same pair, so a config that builds
+	// on one adapter builds on the other.
 	if (options.authPath === options.path) {
 		throw new Error(
 			`adapter option \`websocket.authPath\` ('${options.authPath}') must differ from ` +
-			`\`websocket.path\` ('${options.path}'). The WebSocket endpoint is matched first, so the ` +
-			'auth preflight would never be reached.'
+			`\`websocket.path\` ('${options.path}').`
 		);
 	}
+	let adminPath = raw.adminPath ?? '/__realtime';
+	if (adminPath !== false) {
+		if (typeof adminPath !== 'string' || adminPath[0] !== '/') throw new Error("websocket.adminPath must be an absolute path string starting with '/', or false to disable the auto-mounted admin route.");
+		adminPath = adminPath.replace(/\/+$/, '');
+		if (adminPath === '') throw new Error("websocket.adminPath cannot be '/' or empty - use a non-root prefix like '/__realtime', or false to disable.");
+		if (adminPath === options.path || adminPath === options.authPath) throw new Error(`websocket.adminPath ('${adminPath}') must differ from websocket.path ('${options.path}') and websocket.authPath ('${options.authPath}').`);
+	}
+	options.adminPath = adminPath;
+	options.adminAuthAcknowledged = raw.adminAuthAcknowledged === true;
 	if (raw.authPathRequireOrigin !== undefined) {
 		options.authPathRequireOrigin = requireBoolean(raw.authPathRequireOrigin, 'authPathRequireOrigin');
 	}
@@ -1060,10 +1067,9 @@ export function normalizeWsOptions(input) {
  * An explicit allowlist, so an adapter-level option can never leak into Bun's
  * socket config. Deliberately absent: `allowedOrigins` (an upgrade decision, see
  * utils/ws-origin.js), `allowNonAsciiTopics` / `allowSystemTopicSubscribe` /
- * `allowUnauthenticatedSubscribe` (wire and gate policy),
- * `maxSubscriptionsPerConnection`, `maxConcurrentSubscribeGates`,
- * `maxConcurrentUnsubscribeHooks`, `maxQueuedUnsubscribeHooks` and
- * `maxControlEgressBytes` (per-connection bounds this adapter enforces itself).
+ * `authorizeWireSubscribe` (wire and gate policy),
+ * Internal subscription, unsubscribe-hook and control-egress bounds are not
+ * Bun websocket options.
  *
  * @param {Record<string, any>} options - output of normalizeWsOptions().options
  * @returns {Record<string, any>}

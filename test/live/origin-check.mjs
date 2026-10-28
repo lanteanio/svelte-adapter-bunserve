@@ -5,12 +5,11 @@
 // origin and every legitimate upgrade would 403. That failure pushes operators
 // to allowedOrigins:'any', turning a fail-closed bug into a fail-open config.
 //
-// Discrimination used below: a DENIED origin returns 403. An ALLOWED origin
-// gets past the check and reaches server.upgrade(), which refuses a plain fetch
-// that is not a real handshake and yields 400. So 400 means "the origin check
-// passed", which is exactly what this needs to prove.
+// Discrimination used below: each is a complete handshake over a raw socket,
+// so a DENIED origin is answered 403 and an ALLOWED one opens: 101.
 
-import { assertPortFree, buildPath, serverEnv, waitForServer } from './harness.mjs';
+import { HANDSHAKE } from '../helpers/handshake.mjs';
+import { assertPortFree, buildPath, rawExchange, serverEnv, waitForServer } from './harness.mjs';
 
 const PORT = 8804;
 const BUILD = buildPath();
@@ -33,31 +32,29 @@ const proc = Bun.spawn([process.execPath, BUILD], {
 	stderr: 'pipe'
 });
 
-const upgradeHeaders = (origin) => ({
-	upgrade: 'websocket',
-	connection: 'Upgrade',
-	...(origin ? { origin } : {})
-});
+/** @param {string | null} origin */
+const handshakeStatus = async (origin) =>
+	(await rawExchange(PORT, Object.entries({ ...HANDSHAKE, ...(origin ? { origin } : {}) }))).status;
 
 try {
 	await waitForServer(proc, PORT);
 
-	const matching = await fetch(`http://127.0.0.1:${PORT}/ws`, { headers: upgradeHeaders(ORIGIN) });
+	const matching = await handshakeStatus(ORIGIN);
 	check('an Origin matching the configured ORIGIN is allowed through',
-		matching.status !== 403, `got ${matching.status} (403 means the regression is back)`);
+		matching === 101, `got ${matching} (403 means the regression is back)`);
 
-	const foreign = await fetch(`http://127.0.0.1:${PORT}/ws`, { headers: upgradeHeaders('https://evil.example') });
-	check('a foreign Origin is still refused', foreign.status === 403, `got ${foreign.status}`);
+	const foreign = await handshakeStatus('https://evil.example');
+	check('a foreign Origin is still refused', foreign === 403, `got ${foreign}`);
 
 	// The host-derived origin http://127.0.0.1:PORT must NOT be accepted once
 	// ORIGIN is configured, or the configured value is decorative.
-	const derived = await fetch(`http://127.0.0.1:${PORT}/ws`, { headers: upgradeHeaders(`http://127.0.0.1:${PORT}`) });
+	const derived = await handshakeStatus(`http://127.0.0.1:${PORT}`);
 	check('the header-derived origin is not silently accepted instead',
-		derived.status === 403, `got ${derived.status}`);
+		derived === 403, `got ${derived}`);
 
-	const absent = await fetch(`http://127.0.0.1:${PORT}/ws`, { headers: upgradeHeaders(null) });
+	const absent = await handshakeStatus(null);
 	check('a missing Origin is still allowed (non-browser clients)',
-		absent.status !== 403, `got ${absent.status}`);
+		absent === 101, `got ${absent}`);
 } catch (err) {
 	failed++;
 	failures.push('THREW: ' + (err?.message ?? String(err)));

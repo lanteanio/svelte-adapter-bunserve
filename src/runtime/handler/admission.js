@@ -9,19 +9,9 @@
 import { ws_options } from './config.js';
 import { createUpgradeAdmission } from '../utils/upgrade-admission.js';
 
-/**
- * Marks a socket whose handshake reserved a connection permit, so `close`
- * releases exactly the permits that were taken.
- *
- * A Symbol rather than the string key uws needs: uWebSockets.js does not
- * preserve Symbol keys across `res.upgrade()`, so it has to launder a string
- * through userData and promote it in `open`. Bun hands the same `data` object
- * to the socket untouched, so the collision-safe key works directly - and a
- * Symbol cannot be overwritten by a hook that spreads parsed client JSON into
- * its userData, which is the exact hazard the string form has to defend
- * against.
- */
-export const WS_CONNECTION_PERMIT = Symbol('adapter.connectionPermit');
+// Declared with the other per-connection slots, so the upgrade's userData copy
+// can tell every one of them from an application key.
+export { WS_CONNECTION_PERMIT } from './ws-state.js';
 
 /**
  * Whether a block actually gates anything. A ceiling of zero is the documented

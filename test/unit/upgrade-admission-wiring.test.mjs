@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { HANDSHAKE } from '../helpers/handshake.mjs';
+
 // THE WIRING, not the counters.
 //
 // `createUpgradeAdmission` had thorough unit tests and `admission-check.mjs`
@@ -46,7 +48,7 @@ function fakeServer() {
  * @param {{ cursor?: boolean }} [opts]
  */
 function upgradeRequest(opts = {}) {
-	const headers = { upgrade: 'websocket', connection: 'Upgrade' };
+	const headers = { ...HANDSHAKE };
 	if (opts.cursor) headers['sec-websocket-protocol'] = CURSOR_LANE_SUBPROTOCOL;
 	return new Request('http://127.0.0.1/ws', { headers });
 }
@@ -179,7 +181,7 @@ test('a handshake parked by pacing is refused if a drain begins while it waits',
 	// `perTickBudget: 1` guarantees the second arrival of a tick is queued. The
 	// drain latch is taken synchronously on SIGTERM, so without a re-check after
 	// the wait the parked socket lands on a process that has already walked its
-	// live connections - no advisory, no 1012, and a 1006 when stop(true) comes.
+	// live connections - no advisory, no 1001, and a 1006 when stop(true) comes.
 	const srv = fakeServer();
 	// ONE subject, so the assertion cannot be satisfied by some other arrival
 	// being refused somewhere else. This tick's budget is spent directly on the

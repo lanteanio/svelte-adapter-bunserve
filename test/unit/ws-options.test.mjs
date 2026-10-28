@@ -39,7 +39,7 @@ test('the bounds the README documents are the bounds an app gets', () => {
 	// documented as false, and each is a widening if it flips.
 	assert.equal(options.allowNonAsciiTopics, false);
 	assert.equal(options.allowSystemTopicSubscribe, false);
-	assert.equal(options.allowUnauthenticatedSubscribe, false);
+	assert.equal(options.authorizeWireSubscribe, false);
 	// Echo policy is not an option either: the native projection pins it, so a
 	// connection-level publish excludes its own socket the way uWS does.
 	assert.equal(options.publishToSelf, undefined);
@@ -119,21 +119,11 @@ test('an unusable rate limit fails the build rather than disabling itself', () =
 	}
 });
 
-test('`metrics` is accepted, named, and not loaded', () => {
-	// The key builds, because a config carried from the sibling has to. What it
-	// MEANS differs, and honouring it would produce a server that looks
-	// instrumented and is not - so the difference is said out loud at build time
-	// rather than discovered from a dashboard of zeroes.
-	const { options, warnings, unknownKeys } = normalizeWsOptions({ metrics: './src/lib/metrics.js' });
-	assert.deepEqual(unknownKeys, [], 'not an unknown key - it is a known one with different semantics');
-	// And nothing is kept. A stored value is a key that becomes honoured the day
-	// some module reads it, with the warning still firing and the parity list
-	// still calling it a gap.
-	assert.equal(options.metrics, undefined);
-	assert.equal(warnings.length, 1);
-	assert.match(warnings[0], /does not load it/);
-	assert.match(warnings[0], /platform\.metrics/);
-	assert.match(warnings[0], /platform\.metricsSnapshot/);
+test('`metrics` retains the external registry module path', () => {
+ const { options, warnings, unknownKeys } = normalizeWsOptions({ metrics: './src/lib/metrics.js' });
+ assert.deepEqual(unknownKeys, []);
+ assert.equal(options.metrics, './src/lib/metrics.js');
+ assert.deepEqual(warnings, []);
 });
 
 test('a `metrics` value that is not a module path still fails the build', () => {
@@ -158,8 +148,7 @@ test('the auth preflight has its own path, guard and budget', () => {
 test('an authPath that is not an absolute path, or collides with the WS path, fails the build', () => {
 	assert.throws(() => normalizeWsOptions({ authPath: 'ws-auth' }), /authPath.*starting with/s);
 	assert.throws(() => normalizeWsOptions({ authPath: 42 }), /authPath.*absolute path string/s);
-	// The WebSocket lane is matched first, so an app would see its preflight
-	// answered with a 426 and nothing naming the option.
+	// svelte-adapter-uws refuses the same pair.
 	assert.throws(
 		() => normalizeWsOptions({ authPath: '/ws' }),
 		/authPath.*must differ from.*websocket.path/s
@@ -317,8 +306,8 @@ test('unknown keys are reported rather than silently ignored', () => {
 });
 
 test('a non-object websocket option is rejected', () => {
-	assert.throws(() => normalizeWsOptions('yes'), /must be an object/);
-	assert.throws(() => normalizeWsOptions([]), /must be an object/);
+	assert.throws(() => normalizeWsOptions('yes'), /must be true, false, or an object/);
+	assert.throws(() => normalizeWsOptions([]), /must be true, false, or an object/);
 });
 
 test('translation to Bun renames exactly the three renamed keys', () => {
@@ -540,4 +529,13 @@ test('and renders the shapes JSON has no answer for', () => {
 			}
 		);
 	}
+});
+
+
+test('admin prefix defaults, relocation, disabling and collisions match the handler mount', () => {
+ assert.equal(normalizeWsOptions({}).options.adminPath, '/__realtime');
+ assert.equal(normalizeWsOptions({ adminPath: '/private///' }).options.adminPath, '/private');
+ assert.equal(normalizeWsOptions({ adminPath: false }).options.adminPath, false);
+ for (const adminPath of ['/', '', 'relative', '/ws', '/__ws/auth']) assert.throws(() => normalizeWsOptions({ adminPath }), /adminPath/);
+ assert.equal(normalizeWsOptions({ adminAuthAcknowledged: true }).options.adminAuthAcknowledged, true);
 });

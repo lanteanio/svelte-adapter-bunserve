@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { HANDSHAKE } from '../helpers/handshake.mjs';
+
 // WHAT A SHED UPGRADE LEAVES BEHIND, driven through `tryUpgrade`.
 //
 // A refusal used to be entirely silent: no counter, no log line, nothing an
@@ -57,7 +59,7 @@ function releaseHooks() {
 
 /** @param {{ cursor?: boolean }} [opts] */
 function upgradeRequest(opts = {}) {
-	const headers = { upgrade: 'websocket', connection: 'Upgrade' };
+	const headers = { ...HANDSHAKE };
 	if (opts.cursor) headers['sec-websocket-protocol'] = CURSOR_LANE_SUBPROTOCOL;
 	return new Request('http://127.0.0.1/ws', { headers });
 }

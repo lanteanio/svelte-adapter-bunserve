@@ -99,6 +99,95 @@ export function jitterRetryAfter(baseSeconds, spread) {
 }
 
 /**
+ * Decide the shape of an at-capacity request rejection. Only an explicitly
+ * acceptable `text/html` media range on a non-WebSocket request gets HTML.
+ * Lookalike media types, q=0 exclusions, library requests, and actual
+ * WebSocket handshakes keep the bare retry response.
+ *
+ * @param {string | undefined | null} accept
+ * @param {string | undefined | null} [upgrade]
+ * @returns {'html' | 'retry'}
+ */
+export function negotiateRejection(accept, upgrade) {
+	if (typeof upgrade === 'string' && upgrade.split(',').some((token) => token.trim().toLowerCase() === 'websocket')) {
+		return 'retry';
+	}
+	if (typeof accept !== 'string' || accept.length === 0) return 'retry';
+	const ranges = splitHttpHeaderValue(accept, ',');
+	if (ranges === null) return 'retry';
+	for (const range of ranges) {
+		const rawSegments = splitHttpHeaderValue(range, ';');
+		if (rawSegments === null) continue;
+		const segments = rawSegments.map((segment) => segment.trim());
+		if (segments.shift()?.toLowerCase() !== 'text/html') continue;
+		const quality = segments.find((segment) => /^q\s*=/i.test(segment));
+		if (quality === undefined) return 'html';
+		const raw = quality.slice(quality.indexOf('=') + 1).trim();
+		if (!/^(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)$/.test(raw)) continue;
+		if (Number(raw) > 0) return 'html';
+	}
+	return 'retry';
+}
+
+/**
+ * Split an HTTP list only at delimiters outside quoted strings. Accept
+ * parameters may legally quote commas and semicolons; treating those bytes as
+ * separators can hide a later q=0 exclusion. Malformed unclosed quotes fail
+ * closed instead of selecting HTML.
+ *
+ * @param {string} value
+ * @param {',' | ';'} delimiter
+ * @returns {string[] | null}
+ */
+function splitHttpHeaderValue(value, delimiter) {
+	const parts = [];
+	let start = 0;
+	let quoted = false;
+	let escaped = false;
+	for (let index = 0; index < value.length; index++) {
+		const character = value[index];
+		if (quoted && escaped) {
+			escaped = false;
+			continue;
+		}
+		if (quoted && character === '\\') {
+			escaped = true;
+			continue;
+		}
+		if (character === '"') {
+			quoted = !quoted;
+			continue;
+		}
+		if (!quoted && character === delimiter) {
+			parts.push(value.slice(start, index));
+			start = index + 1;
+		}
+	}
+	if (quoted || escaped) return null;
+	parts.push(value.slice(start));
+	return parts;
+}
+
+/**
+ * Minimal accessible document for an HTML navigation when the interactive
+ * waiting room is disabled. It intentionally remains a 503 and performs no
+ * polling; the manual form is the recovery path, while the persistent status
+ * region gives the refusal one announced state instead of a plain-text orphan.
+ *
+ * @returns {string}
+ */
+export function buildAccessibleCapacityRefusalPage() {
+	return '<!doctype html><html lang="en" dir="ltr"><head>' +
+		'<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">' +
+		'<title>Service unavailable</title></head><body><main>' +
+		'<h1>Server at capacity</h1>' +
+		'<p role="status" aria-live="polite" aria-atomic="true">' +
+		'New connections cannot be opened right now. Try again later.</p>' +
+		'<form method="get"><button type="submit">Try again</button></form>' +
+		'</main></body></html>';
+}
+
+/**
  * Build a self-contained admission controller for WebSocket upgrades.
  *
  * Four independent layers, all opt-in (zero or unset = disabled):

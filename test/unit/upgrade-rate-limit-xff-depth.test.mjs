@@ -19,7 +19,6 @@ globalThis.WS_OPTIONS = normalizeWsOptions({
 	allowedOrigins: 'any',
 	path: '/ws',
 	handler: 'src/ws-handler.js',
-	allowUnauthenticatedSubscribe: true
 }).options;
 
 const { rateLimitAddress } = await import('../../src/runtime/handler/rate-limit.js');

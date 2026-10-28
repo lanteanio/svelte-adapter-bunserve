@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { HANDSHAKE } from '../helpers/handshake.mjs';
+
 // REFUSALS THAT ARE NOT CAPACITY, on a server with NO admission block at all.
 //
 // This fixture is the point of the file. The counters could have lived on the
@@ -43,7 +45,7 @@ const srv = { taken: 0, upgrade() { srv.taken++; return true; } };
 
 /** @param {string} [origin] */
 function upgradeRequest(origin) {
-	const headers = { upgrade: 'websocket', connection: 'Upgrade' };
+	const headers = { ...HANDSHAKE };
 	if (origin) headers.origin = origin;
 	return new Request('http://127.0.0.1/ws', { headers });
 }
@@ -110,10 +112,7 @@ test('an unusable handshake header from the hook is counted the same way', async
 	// same answer, so the same label rather than a spelling only this adapter
 	// uses.
 	__setHooks({
-		upgrade: (_req, { headers }) => {
-			headers['x-user'] = 'name\r\nset-cookie: stolen=1';
-			return {};
-		}
+		upgrade: () => ({ __upgradeResponse: true, userData: {}, headers: { 'x-user': 'name\r\nset-cookie: stolen=1' } })
 	});
 	try {
 		const before = upgradeRejectionCounts();
@@ -126,19 +125,19 @@ test('an unusable handshake header from the hook is counted the same way', async
 	}
 });
 
-test('a hook that returns a Response is counted too, which is the documented spelling', async () => {
-	// The README leads with this form and treats `false` as the shorthand, and
-	// the live fixture's own `deny=1` uses it. Counting only `false` would have
-	// meant the counter reading zero on exactly the servers that reject most.
-	__setHooks({ upgrade: () => new Response('nope', { status: 403 }) });
+test('a Response object is userData rather than a custom HTTP refusal', async () => {
+	const result = new Response('not an HTTP refusal', { status: 403 });
+	result.marker = 'application data';
+	__setHooks({ upgrade: () => result });
 	try {
 		const before = upgradeRejectionCounts();
-		const res = await quietly(() => tryUpgrade(upgradeRequest('https://allowed.example'), srv, '/ws'));
-		assert.ok(res && res.status === 403, `the hook's own response goes out, got ${res && res.status}`);
-		assert.equal(upgradeRejectionCounts().auth_rejected, before.auth_rejected + 1);
-	} finally {
-		__setHooks({});
-	}
+		let data;
+		const server = { upgrade(_req, options) { data = options.data; return true; } };
+		const res = await quietly(() => tryUpgrade(upgradeRequest('https://allowed.example'), server, '/ws'));
+		assert.equal(res, undefined);
+		assert.equal(data.marker, 'application data');
+		assert.deepEqual(upgradeRejectionCounts(), before);
+	} finally { __setHooks({}); }
 });
 
 test('a refusal for a client that already left is not counted at all', async () => {
@@ -151,7 +150,7 @@ test('a refusal for a client that already left is not counted at all', async () 
 		const gone = new AbortController();
 		gone.abort();
 		const req = new Request('http://127.0.0.1/ws', {
-			headers: { upgrade: 'websocket', connection: 'Upgrade', origin: 'https://allowed.example' },
+			headers: { ...HANDSHAKE, origin: 'https://allowed.example' },
 			signal: gone.signal
 		});
 		const before = upgradeRejectionCounts();
@@ -183,6 +182,39 @@ test('an unknown reason counts nowhere, and a snapshot is a copy', () => {
 	snapshot.bad_origin = 999;
 	assert.notEqual(upgradeRejectionCounts().bad_origin, 999, 'a held copy cannot write back');
 });
+
+test('throwing upgrade result accessors produce one contained hook error', async () => {
+	const cases = [
+		{ get __upgradeResponse() { throw Error('marker'); } },
+		{ __upgradeResponse: true, get headers() { throw Error('headers'); } },
+		{ __upgradeResponse: true, get userData() { throw Error('data'); } },
+		{ __upgradeResponse: true, headers: { get value() { throw Error('value'); } } },
+		{ get user() { throw Error('user'); } }
+	];
+	for (const value of cases) {
+		__setHooks({ upgrade: () => value });
+		const before = upgradeRejectionCounts().hook_error;
+		const response = await quietly(() => tryUpgrade(upgradeRequest('https://allowed.example'), srv, '/ws'));
+		assert.equal(response.status, 500);
+		assert.equal(upgradeRejectionCounts().hook_error, before + 1);
+	}
+	__setHooks({});
+});
+
+
+for (const headers of [{ 'sec-websocket-accept': 'wrong' }, { 'x-number': 7 }]) {
+	test('runtime rejects a hand-built wrapper before native upgrade: ' + JSON.stringify(headers), async () => {
+		__setHooks({ upgrade: () => ({ __upgradeResponse: true, userData: {}, headers }) });
+		try {
+			const before = upgradeRejectionCounts().hook_error;
+			const taken = srv.taken;
+			const res = await quietly(() => tryUpgrade(upgradeRequest('https://allowed.example'), srv, '/ws'));
+			assert.equal(res.status, 500);
+			assert.equal(upgradeRejectionCounts().hook_error, before + 1);
+			assert.equal(srv.taken, taken, 'unsafe headers never reach server.upgrade');
+		} finally { __setHooks({}); }
+	});
+}
 
 test('a refusal because the server is draining is counted as such', async () => {
 	// LAST in the file: `beginDraining()` is a one-way latch, so every test after

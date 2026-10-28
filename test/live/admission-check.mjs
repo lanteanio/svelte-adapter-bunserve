@@ -15,7 +15,8 @@
 
 import { connect as tcpConnect } from 'node:net';
 
-import { assertPortFree, buildPath, serverEnv, waitForServer } from './harness.mjs';
+import { HANDSHAKE } from '../helpers/handshake.mjs';
+import { assertPortFree, buildPath, rawExchange, serverEnv, waitForServer } from './harness.mjs';
 
 const PORT = 8805;
 const BUILD = buildPath('build-admission');
@@ -27,6 +28,13 @@ const check = (name, cond, detail) => {
 	if (cond) { passed++; console.log(`  ok  ${name}`); }
 	else { failed++; failures.push(name + (detail ? ' :: ' + detail : '')); console.log(`FAIL  ${name}${detail ? ' :: ' + detail : ''}`); }
 };
+
+/**
+ * A complete handshake over a raw socket, answered with its status and
+ * headers: 503 where the ceiling holds, and a 101 a check can report where it
+ * does not, which `fetch` would turn into a thrown connection error.
+ */
+const handshake = () => rawExchange(PORT, Object.entries(HANDSHAKE));
 
 /** Open a socket and resolve once it is actually open, or reject on refusal. */
 function connect() {
@@ -115,6 +123,20 @@ const open = [];
 try {
 	await waitForServer(proc, PORT);
 
+	// A GET on the path that is not a handshake, under a ceiling with room: it
+	// is told to upgrade, as uws tells it. Every other method is the app's, the
+	// fixture's /ws route answering it, ceiling or not.
+	const navigation = await fetch(`${BASE}/ws`);
+	check(
+		'a plain GET under a ceiling with room is told to upgrade',
+		navigation.status === 426 && (await navigation.text()) === 'WebSocket upgrade required',
+		`got ${navigation.status}`
+	);
+	const post = await fetch(`${BASE}/ws`, { method: 'POST' });
+	check('a POST on the path reaches the app under a ceiling', (await post.text()) === 'app POST', `got ${post.status}`);
+	const head = await fetch(`${BASE}/ws`, { method: 'HEAD' });
+	check('and so does a HEAD', head.headers.get('x-app-route') === 'ws', `got ${head.status}`);
+
 	// THE HANG-UP WINDOW, first, while the gate is still empty.
 	//
 	// Two handshakes held inside the app's upgrade hook hold both permits. The
@@ -129,9 +151,7 @@ try {
 	// hold it was under half a second, which a loaded box can eat.
 	const abandoned = [beginHandshake('?hold=4000'), beginHandshake('?hold=4000')];
 	await Bun.sleep(250);
-	const whileHeld = await fetch(`${BASE}/ws`, {
-		headers: { upgrade: 'websocket', connection: 'Upgrade' }
-	});
+	const whileHeld = await handshake();
 	check(
 		'two handshakes inside the hook hold the whole ceiling',
 		whileHeld.status === 503,
@@ -192,21 +212,61 @@ try {
 	// refused upgrade surfaces to a WS client as an opaque error event, and
 	// this lane's claim is specifically that a crossed ceiling answers 503 with
 	// retry-after rather than hanging up or accepting a socket it cannot serve.
-	const shed = await fetch(`${BASE}/ws`, {
-		headers: { upgrade: 'websocket', connection: 'Upgrade' }
-	});
+	const shed = await handshake();
 	check('a crossed ceiling answers 503', shed.status === 503, `got ${shed.status}`);
 	// A RANGE, not a value, because the expression is uws's and the range is
 	// what the two adapters have to agree on. This server runs at the normal
 	// posture, so the band is 2..3; the widening to 2..4 under siege is pinned
 	// in the unit lane, where an injected RNG can put the draw on a band edge
 	// instead of hoping a real one lands there.
-	const retryAfter = Number(shed.headers.get('retry-after'));
+	const retryAfter = Number(shed.headers['retry-after']);
 	check(
 		'and says how long to wait, jittered as uws jitters it',
 		retryAfter >= 2 && retryAfter <= 3,
-		`got ${shed.headers.get('retry-after')}`
+		`got ${shed.headers['retry-after']}`
 	);
+
+	// A browser navigating to the path at capacity gets the accessible page uws
+	// serves with its waiting room off; a client that does not ask for HTML
+	// gets the shed upgrade's bare 503. The app still has the other methods.
+	const page = await fetch(`${BASE}/ws`, { headers: { accept: 'text/html,application/xhtml+xml' } });
+	const pageBody = await page.text();
+	check(
+		'a navigation at capacity gets the accessible 503 page',
+		page.status === 503 &&
+			page.headers.get('content-type') === 'text/html; charset=utf-8' &&
+			page.headers.get('cache-control') === 'no-store' &&
+			page.headers.get('content-language') === 'en' &&
+			pageBody.includes('<p role="status" aria-live="polite" aria-atomic="true">'),
+		`got ${page.status} ${page.headers.get('content-type')}`
+	);
+	const pageRetry = Number(page.headers.get('retry-after'));
+	check('and says how long to wait', pageRetry >= 2 && pageRetry <= 3, `got ${page.headers.get('retry-after')}`);
+	const bare = await fetch(`${BASE}/ws`, { headers: { accept: 'application/json' } });
+	check(
+		'a GET at capacity that does not ask for HTML gets the bare 503',
+		bare.status === 503 && (await bare.text()) === 'Server is at upgrade capacity, please retry' &&
+			Number(bare.headers.get('retry-after')) >= 2,
+		`got ${bare.status}`
+	);
+	// A handshake no one could complete is judged before capacity: refused as
+	// what it is, not shed as load.
+	const keyless = await fetch(`${BASE}/ws`, { headers: { upgrade: 'websocket', connection: 'Upgrade' } });
+	check('at capacity, a handshake with no key is still answered 400', keyless.status === 400, `got ${keyless.status}`);
+	const version8 = await fetch(`${BASE}/ws`, { headers: { ...HANDSHAKE, 'sec-websocket-version': '8' } });
+	check(
+		'and one asking for version 8 is still answered 426 naming 13',
+		version8.status === 426 && version8.headers.get('sec-websocket-version') === '13',
+		`got ${version8.status}`
+	);
+	const postAtCapacity = await fetch(`${BASE}/ws`, { method: 'POST' });
+	check('a POST at capacity still reaches the app', (await postAtCapacity.text()) === 'app POST', `got ${postAtCapacity.status}`);
+	// Under a limit the path's GETs are the adapter's, so a spelling SvelteKit
+	// would route onto it is refused rather than handed to the app's router.
+	for (const target of ['/ws/__data.json', '/%77s']) {
+		const answer = await fetch(`${BASE}${target}`);
+		check(`under a limit, ${target} is refused 400`, answer.status === 400, `got ${answer.status}`);
+	}
 
 	// THE PART THAT MATTERS. A permit is held for the socket's whole life, so
 	// the ceiling only recovers if `close` actually gives one back. If the
@@ -224,16 +284,14 @@ try {
 
 	// And the ceiling is still a ceiling afterwards, rather than having been
 	// released into a permanently open gate by the round trip above.
-	const shedAgain = await fetch(`${BASE}/ws`, {
-		headers: { upgrade: 'websocket', connection: 'Upgrade' }
-	});
+	const shedAgain = await handshake();
 	check('the ceiling still holds after a release', shedAgain.status === 503, `got ${shedAgain.status}`);
 
 	// A refused upgrade must not consume a permit of its own. Several refusals
 	// in a row would otherwise walk the ceiling down, so the gate that sheds a
 	// storm would be the thing that made it permanent.
 	for (let i = 0; i < 5; i++) {
-		await fetch(`${BASE}/ws`, { headers: { upgrade: 'websocket', connection: 'Upgrade' } });
+		await handshake();
 	}
 	await closeAndSettle(open.pop());
 	await Bun.sleep(150);

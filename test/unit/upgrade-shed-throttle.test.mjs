@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { HANDSHAKE } from '../helpers/handshake.mjs';
+
 // THE SHED LINE'S THROTTLE, which is the difference between a diagnostic and an
 // amplifier. A refusal costs an attacker one packet, so a line per refusal is
 // stderr the gate itself pays for - synchronous writes to a container's log
@@ -33,7 +35,7 @@ const srv = { taken: 0, upgrade() { srv.taken++; return true; } };
 
 /** @param {{ cursor?: boolean }} [opts] */
 function upgradeRequest(opts = {}) {
-	const headers = { upgrade: 'websocket', connection: 'Upgrade' };
+	const headers = { ...HANDSHAKE };
 	if (opts.cursor) headers['sec-websocket-protocol'] = CURSOR_LANE_SUBPROTOCOL;
 	return new Request('http://127.0.0.1/ws', { headers });
 }

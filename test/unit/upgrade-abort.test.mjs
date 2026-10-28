@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { HANDSHAKE } from '../helpers/handshake.mjs';
+
 // THE ABORT PATH, driven through `tryUpgrade` rather than through the counters.
 //
 // A client that opens a handshake and hangs up while the app's `upgrade` hook is
@@ -59,7 +61,7 @@ __setHooks({ upgrade: () => new Promise((resolve) => parked.push(resolve)) });
  */
 function upgradeRequest(signal) {
 	return new Request('http://127.0.0.1/ws', {
-		headers: { upgrade: 'websocket', connection: 'Upgrade' },
+		headers: { ...HANDSHAKE },
 		signal
 	});
 }
@@ -154,8 +156,9 @@ test('a handshake that is never abandoned still upgrades, and returns only its i
 test('a handshake the RUNTIME refuses gives its permit straight back', async () => {
 	// The other refusal in this lane, and the one no simulated run can produce:
 	// the in-memory double takes every socket it is offered, so the branch where
-	// `server.upgrade` answers false - a malformed handshake, or a request the
-	// runtime has already seen end - is reachable only from a server double that
+	// `server.upgrade` answers false - a request the runtime has already seen
+	// end, since a malformed handshake is refused before it gets that far - is
+	// reachable only from a server double that
 	// says no. Nothing has been written at that point, so the client gets a plain
 	// 400; the permit was handed over on the way in, and if it is not taken back
 	// the ceiling shrinks by one for every such handshake, permanently.

@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { HANDSHAKE } from '../helpers/handshake.mjs';
+
 // A CLIENT THAT LEAVES WHILE ITS HANDSHAKE IS PARKED IN THE PACING QUEUE.
 //
 // Its own file because the shape needs a budget of one AND a queue with room in
@@ -41,7 +43,7 @@ function fakeServer() {
 
 function upgradeRequest(signal) {
 	return new Request('http://127.0.0.1/ws', {
-		headers: { upgrade: 'websocket', connection: 'Upgrade' },
+		headers: { ...HANDSHAKE },
 		signal
 	});
 }

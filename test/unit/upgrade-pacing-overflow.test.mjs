@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { HANDSHAKE } from '../helpers/handshake.mjs';
+
 // THE FOURTH WAY AN UPGRADE IS SHED: the pacing queue is full.
 //
 // Its own file because the fixture is the opposite of the other shed cases - no
@@ -38,14 +40,14 @@ function fakeServer() {
 
 function upgradeRequest() {
 	return new Request('http://127.0.0.1/ws', {
-		headers: { upgrade: 'websocket', connection: 'Upgrade' }
+		headers: { ...HANDSHAKE }
 	});
 }
 
 /** The same handshake, with a client that can hang up on it. */
 function upgradeRequestWith(signal) {
 	return new Request('http://127.0.0.1/ws', {
-		headers: { upgrade: 'websocket', connection: 'Upgrade' },
+		headers: { ...HANDSHAKE },
 		signal
 	});
 }

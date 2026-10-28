@@ -1,3 +1,6 @@
+const sensitiveKeyPatterns = ['token', 'secret', 'password', 'key', 'session', 'credential', 'email', 'phone', 'ssn', 'dob', 'iban', 'creditcard', 'cc', 'pin'];
+const warnedUserDataKeys = new Set();
+import { copyUpgradeUserData } from '../utils/upgrade-user-data.js';
 /**
  * The WebSocket upgrade path.
  *
@@ -10,105 +13,57 @@
  * is called afterwards - a 25ms await before the call still upgrades cleanly
  * (probed). The aborted-tracking and the async-upgrade trap are both gone.
  *
- * Rejection is likewise native: returning a `Response` from `fetch` instead of
- * calling `server.upgrade` rejects the handshake with that exact response,
- * which is the shape the family's `upgradeResponse` API already models. Here
- * the hook just returns a Response and it goes on the wire.
+ * Returning false from the application's hook refuses with 401. A successful
+ * hook returns userData, optionally wrapped by upgradeResponse to attach
+ * headers to the 101 response.
  */
 
-import { platform } from './platform.js';
+import { snapshotUpgradeHeaders, warnSetCookieOnUpgradeOnce } from '../utils/upgrade-headers.js';
+import { parseCookies } from '../utils/cookies.js';
 import { wsModule } from '../ws-handler-bridge.js';
 import { isUpgradeOriginAllowed } from '../utils/ws-origin.js';
 import { resolveRequestId } from '../utils/request-id.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
 import { clearTimer, processMonotonicNow, randomUuid, setTimer } from '../runtime.js';
-import { WS_REQUEST_ID_KEY, isDraining, recordUpgradeRejection, wsCounters } from './ws-state.js';
+import { CARRY_REQUEST_ID, isConnectionSlot, isDraining, recordUpgradeRejection, wsCounters } from './ws-state.js';
 import { get_origin, origin, upgrade_timeout_ms, ws_options, ws_path } from './config.js';
 import { WS_CONNECTION_PERMIT, awaitAdmissionSlot, upgradeAdmission } from './admission.js';
 import {
 	resolveRateLimitAddress,
 	upgradeRateLimitExceeded,
 	upgradeRateLimiter,
-	upgradeRateLimitWindowSeconds,
+	rateLimitAddress,
 	warnRateLimitProxyCollapse,
 	UPGRADE_DOOR
 } from './rate-limit.js';
 import {
 	REFUSAL_RETRY_AFTER_SECONDS,
+	buildAccessibleCapacityRefusalPage,
 	isCursorLaneUpgrade,
 	jitterRetryAfter,
+	negotiateRejection,
 	POSTURE_RETRY_SPREAD
 } from '../utils/upgrade-admission.js';
+import {
+	WEBSOCKET_VERSION,
+	isWebSocketUpgradeAttempt,
+	readHandshake,
+	webSocketHandshakeRefusal
+} from '../utils/ws-handshake.js';
+import { targetStart } from '../utils/request-target.js';
+import { response400 } from './http-helpers.js';
+
+/**
+ * Bun writes Headers values as Latin-1 bytes. Encode the accepted high-range
+ * code points as UTF-8 first, then carry those octets through its byte string.
+ * @param {string} value
+ */
+function upgradeHeaderBytes(value) {
+	return /[\x80-\xff]/.test(value) ? Buffer.from(value, 'utf8').toString('latin1') : value;
+}
 
 /** Upgrade-hook throws, throttled with decay. */
 const upgradeThrewThrottle = createLogThrottle(() => processMonotonicNow());
-
-/** Refused handshake headers, throttled with decay. */
-const badHeaderThrottle = createLogThrottle(() => processMonotonicNow());
-
-/**
- * RFC 7230 token characters, which is what a header NAME may contain.
- * @type {RegExp}
- */
-const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
-
-/**
- * First unusable handshake header, or null when they are all fine.
- *
- * @param {Record<string, string>} headers
- * @returns {string | null} a description of the offending entry
- */
-function invalidHeaderEntry(headers) {
-	for (const name of Object.keys(headers)) {
-		if (!HEADER_NAME.test(name)) return `invalid header name ${JSON.stringify(name)}`;
-		// Headers that define the RESPONSE FRAMING or the handshake result are
-		// never the app's to set. `Content-Length` or `Transfer-Encoding` on a
-		// 101 is a request-smuggling primitive through any intermediary that
-		// parses framing, and a duplicate `Sec-WebSocket-Accept` lands BEFORE
-		// Bun's own - a handshake-validation bypass for a first-occurrence-wins
-		// parser. Verified over raw TCP that Bun writes all of these verbatim.
-		if (RESERVED_HEADERS.has(name.toLowerCase())) {
-			return `reserved header ${JSON.stringify(name)}`;
-		}
-		const value = headers[name];
-		if (typeof value !== 'string') return `non-string value for ${JSON.stringify(name)}`;
-		// Anything outside printable ASCII. CR/LF/NUL are the response-splitting
-		// set and the runtime refuses those itself, by throwing out of
-		// srv.upgrade - which is why the guard around that call exists, and why
-		// this check runs first rather than relying on it.
-		//
-		// The range matters beyond them. Where the runtime draws its own line
-		// has MOVED: a value above Latin-1 (an emoji) still throws, but an
-		// accented name does not - it upgrades, and the byte goes on the 101
-		// verbatim (measured, probe/bun-api-facts.report.md, header-values). So
-		// the refusal here is this adapter's own: a header value is bytes on a
-		// wire read by intermediaries that are entitled to assume ASCII, and a
-		// name that survives one hop as UTF-8 and arrives as mojibake at the
-		// next is a worse answer than a refusal the app can see and encode
-		// around.
-		for (let i = 0; i < value.length; i++) {
-			const c = value.charCodeAt(i);
-			if (c < 0x20 || c > 0x7e) {
-				return `non-printable-ASCII character in the value of ${JSON.stringify(name)}`;
-			}
-		}
-	}
-	return null;
-}
-
-/**
- * Headers the app may not set on the 101. Lowercase; names are compared
- * case-insensitively because HTTP header names are.
- */
-const RESERVED_HEADERS = new Set([
-	'content-length',
-	'transfer-encoding',
-	'connection',
-	'upgrade',
-	'sec-websocket-accept',
-	'sec-websocket-version',
-	'sec-websocket-extensions'
-]);
 
 /** Origin refusals, throttled with decay. */
 const originRefusedThrottle = createLogThrottle(() => processMonotonicNow());
@@ -172,23 +127,6 @@ function warnOriginRefused(received, self) {
 		`${JSON.stringify(ws_options && ws_options.allowedOrigins)}.\n` +
 		'  Behind a proxy that terminates TLS, set ORIGIN to the public origin (or PROTOCOL_HEADER/\n' +
 		'  HOST_HEADER) so the comparison uses it rather than a scheme derived from this process.'
-	);
-}
-
-let warnedReturnedHeaders = false;
-/** One-shot: it fires per upgrade and describes a static code shape. */
-function warnReturnedHeaders() {
-	if (warnedReturnedHeaders) return;
-	warnedReturnedHeaders = true;
-	console.warn(
-		'[ws] the upgrade hook returned a `headers` key. Handshake headers belong on the\n' +
-		'  context, and the returned key is treated as ordinary userData:\n' +
-		'    export function upgrade(request, { headers }) {\n' +
-		'      headers[\'sec-websocket-protocol\'] = \'v1\';\n' +
-		'      return { user };\n' +
-		'    }\n' +
-		'  The returned object is frequently built by spreading parsed client input, which makes\n' +
-		'  an in-band `headers` key attacker-settable; the context channel cannot be.'
 	);
 }
 
@@ -262,16 +200,63 @@ function shedResponse() {
 }
 
 /**
- * What a client over its per-address limit gets. `429`, and a `retry-after`
- * naming the window it has to wait out - which is the honest number here,
- * unlike a shed upgrade's, because the limiter knows exactly when the
- * allowance comes back rather than guessing at when capacity will.
+ * The answer to a GET on the WebSocket path that is not a handshake, under an
+ * admission ceiling. Without one the request is the app's, as uws's GET route
+ * on the path yields it, so this is reached only where that route answers.
+ *
+ * With room it is Upgrade Required. At capacity, or under siege, it is the
+ * refusal a shed upgrade gets: a browser navigation gets the accessible 503
+ * page uws serves with its waiting room off, anything else the bare 503.
+ * Nothing is counted, because no handshake was attempted.
+ *
+ * @param {Request} req
+ * @param {NonNullable<typeof upgradeAdmission>} gate
+ * @returns {Response}
  */
+function navigationResponse(req, gate) {
+	const level = wsCounters.activePosture !== null ? wsCounters.activePosture.level : 'normal';
+	if (level !== 'siege' && gate.hasCapacity()) {
+		return new Response('WebSocket upgrade required', {
+			status: 426,
+			headers: { 'content-type': 'text/plain', upgrade: 'websocket' }
+		});
+	}
+	if (negotiateRejection(req.headers.get('accept'), req.headers.get('upgrade')) === 'html') {
+		return new Response(buildAccessibleCapacityRefusalPage(), {
+			status: 503,
+			headers: {
+				'content-type': 'text/html; charset=utf-8',
+				'cache-control': 'no-store',
+				'content-language': 'en',
+				'retry-after': String(
+					jitterRetryAfter(REFUSAL_RETRY_AFTER_SECONDS, POSTURE_RETRY_SPREAD[level])
+				)
+			}
+		});
+	}
+	return shedResponse();
+}
+
+/**
+ * A handshake refused by `webSocketHandshakeRefusal`: 400, or 426 naming the
+ * version the client should retry with (RFC 6455 4.4).
+ *
+ * @param {400 | 426} status
+ * @returns {Response}
+ */
+function handshakeRefusalResponse(status) {
+	if (status === 400) return response400();
+	return new Response('Upgrade Required', {
+		status: 426,
+		headers: { 'sec-websocket-version': WEBSOCKET_VERSION, 'content-type': 'text/plain' }
+	});
+}
+
+/** @returns {Response} */
 function rateLimitedResponse() {
 	return new Response('Too many upgrade requests', {
 		status: 429,
 		headers: {
-			'retry-after': String(Math.max(1, Math.ceil(upgradeRateLimitWindowSeconds))),
 			'content-type': 'text/plain'
 		}
 	});
@@ -281,8 +266,8 @@ function rateLimitedResponse() {
  * What a hook that ran out of time resolves to.
  *
  * A Symbol rather than a value, because every ordinary shape the hook can
- * return is already meaningful here: an object is userData, `false` and a
- * `Response` are rejections, and `undefined` is "no userData". There is no
+ * return is already meaningful here: an object is userData, `false` is a
+ * rejection, and `undefined` is "no userData". There is no
  * spare value left to mean "this never answered", and a hook cannot fabricate
  * this one.
  */
@@ -351,7 +336,7 @@ function awaitUpgradeHook(pending) {
 function timedOutResponse() {
 	return new Response('Upgrade timed out', {
 		status: 504,
-		headers: { 'content-type': 'text/plain' }
+		headers: { 'content-type': 'text/plain', upgrade: 'websocket' }
 	});
 }
 
@@ -469,29 +454,72 @@ function shed(reason) {
 }
 
 /**
+ * Count a request refused for its target (utils/request-target.js) as a
+ * malformed handshake, where uws counts one: where its WebSocket route took the
+ * request. That route matches a GET on the WebSocket path as sent, so a
+ * fragment in the path misses it, and it takes a request on the length of its
+ * key alone, 24 characters. Every other refusal of a target is uncounted, as
+ * there. Bun has resolved dot segments and backslashes in `req.url` before
+ * this reads it, so a spelling that resolves onto the path is counted here
+ * where uws's route would have missed it.
+ *
+ * @param {Request} req
+ */
+export function countRefusedHandshakeTarget(req) {
+	if (ws_options === null || req.method !== 'GET') return;
+	// The target read off `req.url` by position rather than parsed: a Host the
+	// URL parser cannot read lands in `req.url` too, and a throw here would
+	// turn this request's 400 into the error handler's 500.
+	const url = req.url;
+	const start = targetStart(url, req.headers.get('host'));
+	const query = url.indexOf('?', start);
+	const fragment = url.indexOf('#', start);
+	// No `#` in the target means the one refused came with the Host.
+	if (fragment === -1 || query === -1 || query > fragment) return;
+	if (url.slice(start, query) !== ws_path) return;
+	const key = req.headers.get('sec-websocket-key');
+	if (key === null) return;
+	// The first line's value, as uWS reads the header: what is in front of the
+	// first comma Bun joined a repeated line with.
+	const comma = key.indexOf(',');
+	if ((comma === -1 ? key : key.slice(0, comma)).length !== 24) return;
+	recordRefusal(req, 'malformed_handshake');
+}
+
+/**
  * Handle a request that targets the WebSocket endpoint.
  *
  * @param {Request} req
  * @param {import('bun').Server} srv
  * @param {string} pathname
  * @returns {Promise<Response | undefined> | null} `null` when the request is
- *   not for this endpoint (the caller continues its normal routing);
+ *   not this endpoint's to answer (the caller continues its normal routing);
  *   `undefined` when the upgrade succeeded and Bun owns the socket; a Response
  *   when the handshake was refused.
  */
 export function tryUpgrade(req, srv, pathname) {
 	if (ws_options === null || pathname !== ws_path) return null;
-	// Only a real upgrade request belongs here. A plain GET to the WS path is
-	// answered with 426 rather than falling through to SSR, which would render
-	// the app shell at a URL that is not a page.
-	const upgradeHeader = req.headers.get('upgrade');
-	if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
-		return Promise.resolve(
-			new Response('Expected a WebSocket upgrade', {
-				status: 426,
-				headers: { upgrade: 'websocket', connection: 'Upgrade' }
-			})
-		);
+	// GET only, as uws routes the path: its WebSocket route and the GET route
+	// beside it are both GET routes, so HEAD, POST and every other method here,
+	// a handshake sent as one included, go on to the app.
+	if (req.method !== 'GET') return null;
+	const handshake = readHandshake(req.headers);
+	// A GET that is not trying to open a WebSocket: a browser navigation, or an
+	// upgrade to another protocol. Without a ceiling the path's pages are the
+	// app's, which is where uws yields them; with one, the answer is about
+	// capacity.
+	if (!isWebSocketUpgradeAttempt(handshake)) {
+		return upgradeAdmission === null ? null : Promise.resolve(navigationResponse(req, upgradeAdmission));
+	}
+	// The handshake itself, ahead of every capacity, origin and application
+	// answer, as uws judges it: one no one could complete is refused as what it
+	// is rather than answered, or counted, as load. Bun would take most of these
+	// on its own (probe/bun-api-facts.report.md, handshake-cases), so this rule
+	// is what refuses them.
+	const refusal = webSocketHandshakeRefusal(handshake);
+	if (refusal !== null) {
+		recordRefusal(req, 'malformed_handshake');
+		return Promise.resolve(handshakeRefusalResponse(refusal));
 	}
 	// BEFORE any per-request work, which is the whole point of the ceilings: a
 	// connection storm is shed without spending CPU on header parsing, the
@@ -709,6 +737,8 @@ function abandonedResponse() {
  * @returns {Promise<Response | undefined>}
  */
 async function runUpgrade(req, srv, held) {
+	const finishMetric = wsCounters.transportMetricHooks?.upgradeStart?.(req);
+	try {
 	// METERED FIRST, ahead of the origin comparison below. That comparison
 	// normalizes two origins and may reconstruct one from request headers; this
 	// folds a key and reads a map. A flood should be turned away by the cheaper
@@ -779,30 +809,70 @@ async function runUpgrade(req, srv, held) {
 	if (isDraining()) return drainingResponse(req);
 
 	/** @type {Record<string, any>} */
-	const data = {};
+	let data = {};
+	const peer = srv.requestIP?.(req);
+	const address = rateLimitAddress(req, peer ? peer.address : '');
 	const requestId = resolveRequestId(req.headers.get('x-request-id')) ?? randomUuid();
 
-	/** @type {Record<string, string> | undefined} */
+	/** @type {Headers | undefined} */
 	let responseHeaders;
 
 	if (typeof wsModule.upgrade === 'function') {
-		// Handshake headers (a chosen subprotocol, a session cookie) are set
-		// through the CONTEXT, and must never be an in-band key on the returned
-		// object. That object carries userData and is routinely built by
-		// spreading parsed client input - the `__proto__` filter below exists
-		// because this code already anticipates exactly that. An in-band
-		// `headers` key in the same position is attacker-settable: an app doing
-		// `return { ...JSON.parse(atob(jwt)), user }` with an attacker-chosen
-		// `headers` claim would put arbitrary headers, `set-cookie` included, on
-		// the 101 response. A context channel cannot be named by attacker JSON.
-		// Custom headers on the 101 were verified over raw TCP by the probe.
-		/** @type {Record<string, string>} */
-		const ctxHeaders = {};
 		let result;
 		try {
 			// The hook is CALLED inside the try, so a synchronous throw still takes
 			// the hook-error path below rather than escaping the handshake.
-			result = await awaitUpgradeHook(wsModule.upgrade(req, { platform, headers: ctxHeaders }));
+			const target = req.url.slice(targetStart(req.url, req.headers.get('host')));
+			const query = target.indexOf('?');
+			result = await awaitUpgradeHook(wsModule.upgrade({
+				headers: Object.fromEntries(req.headers),
+				cookies: parseCookies(req.headers.get('cookie')),
+				url: query !== -1 && query === target.length - 1 ? target.slice(0, query) : target,
+				remoteAddress: address,
+				requestId,
+				traceContext: null
+			}));
+
+			// Checked BEFORE every shape the hook could have returned. A hook that
+			// eventually produces userData has still not produced it
+			// in time, and reading a late answer here would answer the client twice.
+			if (result === HOOK_TIMED_OUT) {
+				recordRefusal(req, 'auth_timeout');
+				warnUpgradeTimedOut();
+				return timedOutResponse();
+			}
+			// `false` REJECTS, matching the family ("Return `false` to reject with
+			// 401"). Tested explicitly because it is not an object: falling through
+			// to the generic userData path would complete the handshake with empty
+			// userData, so a hook whose auth check reads `if (!session) return false`
+			// would admit exactly the connections it means to refuse.
+			if (result === false) {
+				recordRefusal(req, 'auth_rejected');
+				return new Response('Unauthorized', { status: 401 });
+			}
+			const wrapped = result && result.__upgradeResponse === true;
+			const ctxHeaders = snapshotUpgradeHeaders(wrapped ? result.headers : null);
+			if (wrapped) result = result.userData || {};
+			warnSetCookieOnUpgradeOnce(ctxHeaders);
+			if (ctxHeaders && Object.keys(ctxHeaders).length > 0) {
+				responseHeaders = new Headers();
+				for (const name of Object.keys(ctxHeaders)) {
+					const value = ctxHeaders[name];
+					if (Array.isArray(value)) {
+						for (let i = 0; i < value.length; i++) responseHeaders.append(name, upgradeHeaderBytes(value[i]));
+					} else responseHeaders.append(name, upgradeHeaderBytes(value));
+				}
+			}
+			data = copyUpgradeUserData(result || {}, { has: isConnectionSlot });
+			for (const key of Object.keys(data)) {
+				if (!warnedUserDataKeys.has(key) && sensitiveKeyPatterns.some(pattern => key.toLowerCase().includes(pattern))) {
+					warnedUserDataKeys.add(key);
+					console.warn('[ws] userData key "' + key + '" may contain sensitive data. ' +
+						'userData is accessible to all server-side handlers via ws.getUserData(). ' +
+						'Store sensitive data outside userData and reference it by a non-sensitive ID.\n' +
+						'  See: https://svti.me/userdata-sensitive');
+				}
+			}
 		} catch (err) {
 			// Throttled like every other hook-error site. This one is the
 			// CHEAPEST to drive - plain HTTP, no socket, no Origin needed - so a
@@ -815,100 +885,22 @@ async function runUpgrade(req, srv, held) {
 				const suffix = n > 1 ? ` (occurrence ${n})` : '';
 				console.error(`WebSocket upgrade error${suffix}:`, err);
 			}
-			return new Response('Internal Server Error', { status: 500 });
-		}
-		// Checked BEFORE every shape the hook could have returned. A hook that
-		// eventually produces a Response, or userData, has still not produced it
-		// in time, and reading a late answer here would answer the client twice.
-		if (result === HOOK_TIMED_OUT) {
-			recordRefusal(req, 'auth_timeout');
-			warnUpgradeTimedOut();
-			return timedOutResponse();
-		}
-		// A Response from the hook IS the rejection, verbatim - status, body,
-		// headers. This is why there is no separate upgradeResponse type here.
-		//
-		// Counted as an auth rejection, which is what it is: the app looked at
-		// this client and said no. It is also the spelling the README leads
-		// with, so leaving it out would have meant the counter read zero on
-		// exactly the servers that reject the most - uws has no equivalent
-		// (its hook cannot return a Response at all), so the label is chosen by
-		// what the refusal MEANS rather than by copying a call site.
-		if (result instanceof Response) {
-			recordRefusal(req, 'auth_rejected');
-			return result;
-		}
-		// `false` REJECTS, matching the family ("Return `false` to reject with
-		// 401"). Tested explicitly because it is not an object: falling through
-		// to the generic userData path would complete the handshake with empty
-		// userData, so a hook whose auth check reads `if (!session) return false`
-		// would admit exactly the connections it means to refuse.
-		if (result === false) {
-			recordRefusal(req, 'auth_rejected');
-			return new Response('Unauthorized', { status: 401 });
-		}
-		if (Object.keys(ctxHeaders).length > 0) {
-			// VALIDATED before it reaches the 101. Moving the channel out of
-			// band stopped an attacker NAMING a header; it did nothing about an
-			// attacker supplying a value, and a hook that writes
-			// `headers['x-user'] = name` from client data can still smuggle
-			// CR/LF. The family's equivalent (upgradeResponse) throws on exactly
-			// this, so refusing loudly is the family-consistent answer.
-			const bad = invalidHeaderEntry(ctxHeaders);
-			if (bad !== null) {
-				// Throttled: reachable per request whenever the app echoes a
-				// client-controlled value into a header, which is the exact
-				// shape this check exists for.
-				// Counted as a hook error, which is where uws counts its own
-				// equivalent: there the same unusable value throws out of the
-				// response builder the app called, inside the hook. Same cause,
-				// same answer, so the same label.
-				recordRefusal(req, 'hook_error');
-				const { log: logIt, count: n } = badHeaderThrottle();
-				if (logIt) {
-					const suffix = n > 1 ? ` (occurrence ${n})` : '';
-					console.error(
-						`[ws] the upgrade hook set an unusable handshake header (${bad})${suffix}; ` +
-						'refusing the upgrade rather than writing it to the 101 response.'
-					);
-				}
-				return new Response('Internal Server Error', { status: 500 });
-			}
-			responseHeaders = ctxHeaders;
-		}
-		if (result && typeof result === 'object') {
-			// Copied key by key rather than Object.assign so a `__proto__` own
-			// key (possible whenever a hook spreads parsed client JSON into its
-			// userData) lands nowhere instead of re-pointing this object's
-			// prototype through the inherited setter. userData stays an
-			// ordinary object, so hook code can still call hasOwnProperty on it.
-			const source = /** @type {any} */ (result);
-			for (const key of Object.keys(source)) {
-				if (key === '__proto__') continue;
-				data[key] = source[key];
-			}
-			// A returned `headers` key is ordinary userData. That silently ignores
-			// the handshake intent of a hook that returns one, so say
-			// so once rather than dropping its cookie on the floor unexplained.
-			if (Object.prototype.hasOwnProperty.call(source, 'headers')) {
-				warnReturnedHeaders();
-			}
+			return new Response('Internal Server Error', { status: 500, headers: { 'content-type': 'text/plain', 'x-request-id': requestId } });
 		}
 	}
 
-	// Stamped AFTER the hook's data is merged, never before: the slot is a
-	// STRING key (Symbols do not survive the upgrade boundary), so a hook that
-	// spreads a parsed query or body into its userData could otherwise
-	// overwrite the sanitized value with attacker text - and requestId flows
-	// into structured logs, which is exactly what resolveRequestId's printable-
-	// ASCII whitelist exists to protect.
-	data[WS_REQUEST_ID_KEY] = requestId;
+	// On a key no hook can name (see CARRY_REQUEST_ID), so nothing the hook
+	// returned - a parsed query or body spread into its userData included - can
+	// replace the sanitized value; requestId flows into structured logs, which
+	// is what resolveRequestId's printable-ASCII whitelist protects.
+	if (!data.remoteAddress) data.remoteAddress = address;
+	data[CARRY_REQUEST_ID] = requestId;
 
 	// RE-CHECKED after the app hook. The hook is awaited freely, so a drain can
 	// begin and FINISH inside it - the drain advises and closes what it can see,
 	// and this connection is not visible yet. Without this the handshake
 	// completes onto a process that is already past its drain, so the client
-	// gets no advisory, no 1012, and a 1006 when stop(true) lands.
+	// gets no advisory, no 1001, and a 1006 when stop(true) lands.
 	if (isDraining()) return drainingResponse(req);
 
 	// Paced LAST, immediately before the socket is taken, so a handshake only
@@ -931,7 +923,7 @@ async function runUpgrade(req, srv, held) {
 		// queue parks a handshake across however many turns the budget needs,
 		// and the drain latch is taken synchronously on SIGTERM - so a socket
 		// admitted from the queue lands on a process that has already walked its
-		// live connections and finished draining. It gets no advisory, no 1012,
+		// live connections and finished draining. It gets no advisory, no 1001,
 		// and a 1006 when stop(true) arrives, which is precisely what the
 		// earlier re-check was added to prevent.
 		if (isDraining()) return drainingResponse(req);
@@ -1002,8 +994,14 @@ async function runUpgrade(req, srv, held) {
 		return undefined;
 	}
 
-	// Bun refused the handshake (a malformed request that carried the upgrade
-	// header). Nothing has been written yet, so a plain 400 is safe.
+	// Bun refused the handshake. Every malformed one it was measured refusing is
+	// refused by the rule in tryUpgrade first, so what reaches here is a client
+	// that left while the app's hook was awaited (probe/bun-api-facts.report.md,
+	// upgrade-abort), or one the runtime refuses that the rule passes. Nothing
+	// has been written yet, so a plain 400 is safe.
 	reclaimPermit(data, held);
 	return new Response('WebSocket upgrade failed', { status: 400 });
+	} finally {
+		finishMetric?.();
+	}
 }

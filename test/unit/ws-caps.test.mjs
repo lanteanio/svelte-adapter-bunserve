@@ -14,11 +14,12 @@ globalThis.WS_PATH = '/ws';
 const { websocketHandlers } = await import('../../src/runtime/handler/ws.js');
 const { WS_CAPS, capCounts } = await import('../../src/runtime/handler/ws-state.js');
 const { __setHooks } = await import('../helpers/ws-handler-stub.mjs');
+const { upgradeData } = await import('../helpers/upgrade-data.mjs');
 
 function rawSocket() {
 	const sent = [];
 	return {
-		data: {},
+		data: upgradeData(),
 		sent,
 		readyState: 1,
 		send(payload) {
