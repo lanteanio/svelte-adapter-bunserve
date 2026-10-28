@@ -2,190 +2,120 @@
 //
 // It boots the REAL built fixture server and drives it with real clients -
 // there is no synthetic estimate here, because a leak is a property of the
-// production path and a model of that path cannot have one. The shape is
-// warmup, GC-forced baseline, a fixed-rate measured window sampling memory,
-// cooldown, GC-forced final reading.
+// production path and a model of that path cannot have one. The shape is the
+// svelte-adapter-uws lane's, phase for phase: warmup, a forced-collection
+// baseline, a worked-but-unsampled resettle, a settle loop that opens the
+// window only once the reading has held still, the window itself sampled on a
+// fixed cadence, and a cooled-down final reading. The verdict is `rules.mjs`,
+// which follows that lane's growth, retention and connection gates; see the
+// header there for what each measures and why.
 //
-// TWO KINDS OF MEMORY QUESTION, and they need different instruments.
+// WHAT IT REFUSES TO DO, and why each rule is here:
 //
-// RETENTION is asked with a difference: force the collector until it settles,
-// at both ends, and compare. What survives a settled collection is held on
-// purpose by something. That is the sensitive gate here - the figure is
-// single-digit MB - and it is reproducible to a tenth of a percent. It counts
-// heap PLUS external, because a typed array lives outside the JS heap and most
-// of what a server retains is buffers.
+//   A SLOPE THROUGH A CLOUD IS NOT A TREND. Least squares fits a line through
+//   anything, including noise, and the line it finds through a flat cloud tilts
+//   with wherever the window happens to start and stop. The verdict therefore
+//   needs the fit to EXPLAIN the samples: r-squared at or above 0.5. Without
+//   it, a lane that runs long enough eventually reports a leak on a healthy
+//   server.
 //
-// FOOTPRINT is asked with a slope, because a difference cannot tell a leak
-// from an allocator that had not finished growing into its working set. A
-// least-squares fit over many samples asks whether it is STILL climbing, and
-// the r-squared floor is what stops noise answering: a runner whose RSS
-// wanders has no linear fit, produces r-squared near zero, and cannot fail the
-// build. Only growth that is both large and consistent does.
+//   A FORCED COLLECTION MANUFACTURES THE SIGNATURE IT LOOKS FOR. Sampling right
+//   after one catches the process climbing back to its working set: steep,
+//   near-perfectly linear, r-squared close to 1 - a textbook leak, drawn by the
+//   measurement. So the baseline is collected, then the workload keeps running
+//   through a resettle window that is deliberately NOT sampled, and only then
+//   does the settle loop begin.
 //
-// FIVE INDEPENDENT GATES, because a leak surfaces in whichever one the
-// workload exposes: retained heap, footprint slope, error rate, p95 latency
-// creep, and connections still registered after every client has gone. A
-// server quietly falling over often holds its memory flat while its tail
-// latency doubles.
+//   A GATE THAT CANNOT FAIL IS NOT A GATE. The self-check scenario settles a
+//   clean server, then arms a real leak for the window and requires the
+//   GROWTH GATE ITSELF to have detected it - a verdict failing on error rate
+//   or latency creep is a failing verdict, not a detected leak. A lane that has
+//   quietly lost the ability to detect one then says so, instead of reporting
+//   a pass.
+//
+// EXIT CODES. 0 clean; 1 a scenario's verdict failed (a leak, an error rate, a
+// latency creep, a server that died during the run, or a self-check that did
+// not detect its own planted leak); 2 the lane could not reach a verdict it
+// trusts (the server never became ready, a window never settled, the warmup
+// itself was unhealthy, a probe failed against a live server). The
+// distinction matters in CI: 1 is the server's problem, 2 is the lane's.
 //
 // Run with: npm run test:leak
 
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { assertPortFree, buildPath, serverEnv, waitForServer } from '../live/harness.mjs';
-import { COOLDOWN_MS, MIN_SAMPLES, PORT, RESETTLE_MS, RPS, SAMPLE_MS, SELECTED, WARMUP_MS } from './plan.mjs';
+import {
+	COOLDOWN_MS, GC_PROBE_TIMEOUT_MS, HTTP_CLIENTS, MINUTES, PORT, PROBE_TIMEOUT_MS, RESETTLE_MS, RPS, CHURN_RPS, WS_RPS, WS_CLIENTS,
+	SAMPLE_MS, SELECTED, SETTLE_BAND_BYTES, SETTLE_BAND_RATIO, SETTLE_MAX_ROUNDS, SETTLE_ROUND_MS,
+	SETTLE_STABLE_ROUNDS, SETTLED_PROBE_ROUNDS, WARMUP_MS, WINDOW_MS, OUT_DIR
+} from './plan.mjs';
+import { judge, MAX_ERROR_RATE, quantile, retainedBytes, selfCheckVerdict } from './rules.mjs';
+
+import { churnConnection, topicWorkload } from './workloads.mjs';
 
 const BASE = `http://127.0.0.1:${PORT}`;
 
 /**
- * VERDICT THRESHOLDS, every one calibrated from real runs of this harness
- * rather than guessed. Raising one is a decision: it says this lane now
- * tolerates growth it used to fail. Record why in the same change.
+ * One probe read. Bounded like the workload units are, and for a sharper
+ * reason: the phases AWAIT their probes, so an unbounded probe against a server
+ * that accepted and never answered would hang the whole lane until the
+ * runner's step timeout killed it, reporting nothing about why.
  *
- * WHAT A HEALTHY RUN MEASURES on this fixture, so the headroom is legible and
- * a future reader can tell drift from a threshold that was always loose
- * (default window, three consecutive runs each):
- *
- *   retained growth   http +14.0%, +14.1%      ws +7.0%, +6.9%
- *   rss slope         http ~130 KB/s (r2 ~0.5) ws ~322 KB/s (r2 ~0.996)
- *   rss window growth http ~8%                 ws ~22%
- *   p95 creep         http negative            ws +/-5%
- *
- * And what the self-check's injected leak measures, for the other end of the
- * scale: retained +498%, slope ~3200 KB/s, window growth ~62%.
- *
- * THE RETENTION GATE IS THE SENSITIVE ONE, and the RSS gates are a backstop:
- *
- *   - Settled retention is reproducible to a TENTH OF A PERCENT across runs
- *     and is single-digit MB, so a retained megabyte is a large fraction of
- *     it. It is post-collection at both ends, so what it measures is retention
- *     rather than timing.
- *   - RSS under Bun's allocator climbs steeply and then decelerates toward a
- *     working-set plateau. The ws slope is ~312 KB/s over a 60s window with an
- *     almost perfect fit, which reads exactly like a leak - but the same
- *     workload over 240s measures 107 KB/s with r2 0.667, and the settled heap
- *     under both is flat. A curve that flattens is a plateau; a leak holds its
- *     slope. So an absolute RSS slope means little without knowing where in
- *     that curve the window sat, and these bounds are set to catch runaway
- *     rather than to be precise.
+ * @param {'mem' | 'gc'} op
  */
-const THRESHOLDS = {
-	// A trend is only believed when it fits. Below this the samples are a cloud,
-	// and a slope through a cloud is an artifact of where it starts and stops.
-	minRSquared: 0.5,
-	// Roughly 2.2x the healthy ws figure.
-	maxWindowGrowthRatio: 0.5,
-	// Roughly 3.3x the healthy ws slope. Runaway, not precision.
-	maxSlopeBytesPerSec: 1024 * 1024,
-	// Roughly 2.1x the healthy http figure. Both ends read after the collector
-	// has SETTLED - see settledProbe, where a single forced GC is shown not to
-	// be settled - and both count heap PLUS external, since a retained buffer
-	// barely moves the heap.
-	maxHeapGrowthRatio: 0.3,
-	maxErrorRate: 0.005,
-	maxP95CreepRatio: 0.5
-};
-
-/** @param {number[]} xs @param {number[]} ys */
-function leastSquares(xs, ys) {
-	const n = xs.length;
-	const meanX = xs.reduce((a, b) => a + b, 0) / n;
-	const meanY = ys.reduce((a, b) => a + b, 0) / n;
-	let sxy = 0;
-	let sxx = 0;
-	for (let i = 0; i < n; i++) {
-		sxy += (xs[i] - meanX) * (ys[i] - meanY);
-		sxx += (xs[i] - meanX) ** 2;
-	}
-	// A vertical or single-point fit has no slope to speak of, and reporting one
-	// would be reporting a division by zero.
-	if (sxx === 0) return { slope: 0, rSquared: 0 };
-	const slope = sxy / sxx;
-	const intercept = meanY - slope * meanX;
-	let ssRes = 0;
-	let ssTot = 0;
-	for (let i = 0; i < n; i++) {
-		ssRes += (ys[i] - (slope * xs[i] + intercept)) ** 2;
-		ssTot += (ys[i] - meanY) ** 2;
-	}
-	// Perfectly flat samples fit perfectly, and a flat line is the ANSWER here,
-	// not a degenerate case - but 0/0 would report it as the worst possible fit.
-	if (ssTot === 0) return { slope, rSquared: 1 };
-	return { slope, rSquared: 1 - ssRes / ssTot };
-}
-
-/** @param {number[]} values @param {number} q */
-function quantile(values, q) {
-	if (values.length === 0) return 0;
-	const sorted = [...values].sort((a, b) => a - b);
-	const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil(q * sorted.length) - 1));
-	return sorted[idx];
-}
-
-/**
- * What the verdict calls "retained": heap PLUS external. A typed array lives
- * outside the JS heap, so a retained buffer - the shape of most real leaks in
- * a server, since that is what sockets and bodies are made of - moves
- * `external` and leaves `heapUsed` almost untouched. Measured: 64KB retained
- * per connection over 1000 connections moves heapUsed by 3.8% and this by 498%.
- *
- * @param {{ heapUsed: number, external?: number }} p
- */
-const retained = (p) => p.heapUsed + (p.external || 0);
-
-/**
- * Bounded like the workload units are, and for a sharper reason since the drive
- * loop AWAITS its outstanding sampler probes: an unbounded probe against a
- * server that accepted and never answered would hang the whole lane until the
- * runner's step timeout killed it, reporting nothing about why. The forced
- * collection gets the longer bound because it is a synchronous full GC and is
- * genuinely slower than a read.
- *
- * @param {boolean} [gc] force a full collection before reading
- */
-async function probe(gc = false) {
-	const res = await fetch(`${BASE}/_leak${gc ? '?gc=1' : ''}`, {
-		signal: AbortSignal.timeout(gc ? 30_000 : 5_000)
+async function probe(op) {
+	const res = await fetch(`${BASE}/__leak?op=${op}`, {
+		signal: AbortSignal.timeout(op === 'gc' ? GC_PROBE_TIMEOUT_MS : PROBE_TIMEOUT_MS)
 	});
-	if (!res.ok) throw new Error(`memory probe answered ${res.status}; is LEAK_PROBE armed on the server?`);
-	return res.json();
+	if (!res.ok) throw new Error(`leak probe "${op}" answered ${res.status} - is LEAK_PROBE armed in the child?`);
+	const body = await res.json();
+	// A collection that did not happen is not a settled reading, and a lane
+	// that went on measuring would be comparing unforced numbers under the
+	// name of forced ones. The probe reports rather than throws; the decision
+	// is made here, and it is to refuse.
+	if (op === 'gc' && body.collected !== true) {
+		throw new Error(`the server could not force a collection (${body.reason || 'no reason given'}); nothing measured here would be settled`);
+	}
+	return body;
 }
 
 /**
- * A heap reading that has stopped moving.
+ * A heap reading that has stopped moving, for the retention gate.
  *
  * ONE forced collection is not enough, and the difference is not small.
  * Measured on this fixture after 600 WebSocket connections had churned and the
  * clients had all closed: 5.76MB after the first forced GC, 3.71MB after the
  * second, then 3.68MB three times running. The first reading was 56% above the
- * settled one.
+ * settled one. Comparing single readings makes a HEALTHY run's growth swing
+ * between +7.5% and +67.6% across three runs of the same workload, and no
+ * threshold can sit inside that. Taking readings until two agree removes the
+ * swing, and the settled value is the one that means "still retained".
  *
- * Comparing single readings makes a HEALTHY run's growth swing between +7.5%
- * and +67.6% across three runs of the same workload, and no threshold can sit
- * inside that. Taking readings until two agree removes the swing, and the
- * settled value is the one that means "still retained".
+ * Settles on the quantity the VERDICT compares, heap plus external. Testing
+ * heapUsed alone leaves the larger and more volatile half unchecked: on a
+ * quiescent server, five consecutive settled-by-heapUsed readings spanned
+ * 32.7% of retained, driven entirely by external moving while the heap held
+ * still.
  */
-async function settledProbe(maxRounds = 8, tolerance = 0.02) {
-	let last = await probe(true);
+async function settledProbe(maxRounds = SETTLED_PROBE_ROUNDS, tolerance = 0.02) {
+	await probe('gc');
+	let last = await probe('mem');
 	for (let round = 2; round <= maxRounds; round++) {
 		await Bun.sleep(200);
-		const next = await probe(true);
-		// Settles on the quantity the VERDICT compares, which is heap plus
-		// external. Testing heapUsed alone leaves the larger and more volatile
-		// half unchecked: measured on a quiescent server, five consecutive
-		// settled-by-heapUsed readings spanned 32.7% of retained, driven
-		// entirely by external moving while the heap held still.
-		const settled = Math.abs(retained(next) - retained(last)) <= retained(last) * tolerance;
+		await probe('gc');
+		const next = await probe('mem');
+		const settled = Math.abs(retainedBytes(next) - retainedBytes(last)) <= retainedBytes(last) * tolerance;
 		last = next;
-		if (settled) return { ...last, rounds: round };
+		if (settled) return { ...last, rounds: round, unsettled: false };
 	}
 	return { ...last, rounds: maxRounds, unsettled: true };
 }
 
-const bytes = (n) => `${(n / 1024 / 1024).toFixed(1)}MB`;
-
 /**
- * One unit of work. Returns how long it took, or null if it failed - a leak
- * harness that counts a failed request as a fast one reports a server that has
- * fallen over as a server that got quicker.
+ * One unit of work. Returns how long it took and whether it succeeded - a
+ * leak harness that counts a failed request as a fast one reports a server
+ * that has fallen over as a server that got quicker.
  *
  * @param {() => Promise<void>} fn
  */
@@ -193,27 +123,58 @@ async function timed(fn) {
 	const t0 = performance.now();
 	try {
 		await fn();
-		return performance.now() - t0;
+		return { ms: performance.now() - t0, ok: true };
 	} catch {
-		return null;
+		return { ms: performance.now() - t0, ok: false };
 	}
 }
 
 /**
- * An SSR render plus a body read: the whole HTTP path, not just the router.
- *
- * Bounded like the ws unit is. A server that accepts and never answers would
- * otherwise leave the drive loop awaiting its in-flight set forever, and the
- * lane would hang rather than reporting the error rate that describes it.
+ * A semaphore of HTTP_CLIENTS permits: at most that many requests are on the
+ * wire at once, so Bun's keepalive pool holds that many sockets and no more.
+ * Without it the pool follows concurrency, and a server that slowed would
+ * grow sockets and buffers in step with the backlog - which reads as a leak
+ * and is not one. A unit that waits for a permit pays the wait in its
+ * latency, which is what a request queued on a capped agent pays too.
  */
-async function httpUnit() {
-	const res = await fetch(`${BASE}/`, {
-		headers: { connection: 'keep-alive' },
-		signal: AbortSignal.timeout(5_000)
-	});
-	if (!res.ok) throw new Error(`GET / answered ${res.status}`);
-	await res.text();
+let permits = HTTP_CLIENTS;
+/** @type {(() => void)[]} */
+const waiting = [];
+async function withClient(fn) {
+	if (permits === 0) await new Promise((resolve) => waiting.push(resolve));
+	else permits--;
+	try {
+		return await fn();
+	} finally {
+		const next = waiting.shift();
+		if (next) next();
+		else permits++;
+	}
 }
+
+/**
+ * A bounded GET with the body read: the whole HTTP path, not just the router,
+ * over one of the held keepalive connections.
+ *
+ * @param {string} pathname
+ */
+function get(pathname) {
+	return withClient(async () => {
+		const res = await fetch(`${BASE}${pathname}`, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+		if (!res.ok) throw new Error(`GET ${pathname} answered ${res.status}`);
+		await res.text();
+	});
+}
+
+/** An SSR render plus a body read. */
+const httpUnit = () => get('/');
+
+/**
+ * The planted leak: each call retains a filled 64 KB buffer inside the SERVER
+ * and never releases it. If the verdict comes back clean on a window of these,
+ * the lane has lost the ability to detect a leak and says so.
+ */
+const retainUnit = () => get('/__leak?op=retain&kb=64');
 
 /**
  * Topics are drawn from a SMALL FIXED SET, and that is a correctness property
@@ -221,327 +182,244 @@ async function httpUnit() {
  *
  * A unique topic per connection - the obvious way to write this - grows the
  * adapter's bounded per-topic maps by one entry per connection until they hit
- * their 10,000-topic cap. That is designed behaviour, and it is indistinguishable
- * from a leak over any window shorter than the time it takes to fill: measured
- * here, a random-topic version climbed steadily and would have been reported as
- * a defect in the server by a harness that had not noticed its own workload was
- * the cause. High-cardinality topic churn deserves its own scenario with the
- * cap as the assertion; it is not what a leak gate should be measuring.
+ * their 10,000-topic cap. That is designed behaviour, and it is
+ * indistinguishable from a leak over any window shorter than the time it takes
+ * to fill: measured here, a random-topic version climbed steadily and would
+ * have been reported as a defect in the server by a harness that had not
+ * noticed its own workload was the cause.
  */
 const TOPICS = Array.from({ length: 32 }, (_, i) => `leak:${i}`);
 let topicCursor = 0;
 
-/**
- * Connect, subscribe, publish, close. Per-connection state - subscriptions,
- * wire ids, cohort refs, seq counters - is exactly what a churn workload
- * strands if a release path is wrong, and none of it is reachable from HTTP.
- */
-async function wsUnit() {
-	await new Promise((resolve, reject) => {
-		const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
-		const done = (err) => {
-			try { ws.close(); } catch {}
-			err ? reject(err) : resolve();
-		};
-		const timer = setTimeout(() => done(new Error('ws unit timed out')), 5_000);
-		ws.onerror = () => { clearTimeout(timer); done(new Error('ws errored')); };
-		ws.onopen = () => {
-			ws.send(JSON.stringify({ type: 'subscribe', topic: TOPICS[topicCursor++ % TOPICS.length], ref: 1 }));
-		};
-		ws.onmessage = (ev) => {
-			const msg = typeof ev.data === 'string' ? JSON.parse(ev.data) : null;
-			if (msg && (msg.type === 'subscribed' || msg.type === 'subscribe-denied')) {
-				clearTimeout(timer);
-				done(null);
-			}
-		};
-	});
-}
+const churnUnit = () => churnConnection(`ws://127.0.0.1:${PORT}/ws`, TOPICS[topicCursor++ % TOPICS.length]);
 
 /**
- * Drive `unit` at a fixed rate for `ms`, sampling memory on its own cadence.
+ * Drive `unit` at a fixed rate for `ms`, recording every request's outcome.
  *
- * The pacing is deliberately open-loop: it dispatches on a schedule and does
- * not wait for the previous request. A closed loop would silently reduce the
- * offered load as the server slowed, which hides the very degradation the
- * latency gate exists to catch.
+ * The pacing is deliberately open-loop against an ABSOLUTE schedule: it
+ * dispatches on a timetable computed from the start and does not wait for the
+ * previous request. A closed loop would silently reduce the offered load as
+ * the server slowed, which hides the very degradation the latency gate exists
+ * to catch; a schedule computed from the last dispatch would let the timer's
+ * granularity accumulate into a lower rate than the one printed.
  *
  * @param {() => Promise<void>} unit
  * @param {number} ms
- * @param {{ sample: boolean }} opts
  */
-async function drive(unit, ms, { sample }) {
+async function drive(unit, ms, rate = RPS) {
 	/** @type {number[]} */
 	const latencies = [];
-	let sent = 0;
-	let failed = 0;
-	/** @type {{ tMs: number, rss: number, heapUsed: number, connections: number }[]} */
-	const samples = [];
-
+	let requests = 0;
+	let errors = 0;
 	const started = performance.now();
 	const inflight = new Set();
-	const gap = 1000 / RPS;
-
-	/** Every probe this sampler started, so none can outlive `drive()`. */
-	const sampling = [];
-	const sampler = sample
-		? setInterval(() => {
-			// Stamped at FIRE time rather than at push time. The probe is awaited
-			// before its sample is recorded, so a push-time stamp folds the
-			// probe's own round trip into the x axis - and that round trip is
-			// longest exactly when the server is stressed, which is when the
-			// slope is being relied on.
-			const tMs = performance.now() - started;
-			sampling.push(probe(false).then(
-				(m) => samples.push({ tMs, rss: m.rss, heapUsed: m.heapUsed, connections: m.connections }),
-				// A probe that fails is not a sample; the error gate owns liveness.
-				() => {}
-			));
-		}, SAMPLE_MS)
-		: null;
+	const gap = 1000 / rate;
 
 	let next = started;
 	while (performance.now() - started < ms) {
 		const now = performance.now();
 		if (now >= next) {
 			next += gap;
-			sent++;
-			const p = timed(unit).then((took) => {
-				if (took === null) failed++;
-				else latencies.push(took);
+			requests++;
+			// Every outcome's duration counts toward the tail, the failed ones
+			// included: a request that timed out is the slowest thing the window
+			// saw, and a p95 that dropped it would describe a server quicker
+			// than the one measured.
+			const p = timed(unit).then((r) => {
+				latencies.push(r.ms);
+				if (!r.ok) errors++;
 				inflight.delete(p);
 			});
 			inflight.add(p);
 			// A server that stops answering must not let this loop queue an
-			// unbounded backlog and OOM the harness instead of the subject.
-			if (inflight.size > RPS * 4) await Promise.race(inflight);
+			// unbounded backlog and OOM the harness instead of the subject. Only
+			// past four seconds of backlog does this turn the loop closed; up to
+			// there it is open, and the creep gate sees the server slow down.
+			if (inflight.size > rate * 4) await Promise.race(inflight);
 		} else {
 			await Bun.sleep(Math.min(gap, next - now));
 		}
 	}
-	// `clearInterval` stops FUTURE firings; it cannot cancel a callback already
-	// awaiting its probe. Awaiting those is what makes `samples` complete and
-	// final when this returns, rather than an array the caller reads while a
-	// push is still pending. It does NOT keep a straggler's reading out of the
-	// fit - that reading is memory taken a little after its firing, which is
-	// inherent to sampling through an async probe - and the fire-time stamp is
-	// what keeps its x honest about when it was asked for.
-	if (sampler) clearInterval(sampler);
-	await Promise.all(sampling);
 	await Promise.all(inflight);
-	// Restored to firing order, which the pushes no longer preserve: a probe
-	// slower than the cadence completes behind one fired after it. Least squares
-	// does not care, but `samples[0]` and `samples.at(-1)` are read as the ends
-	// of a trend, and under load - the case worth reading them in - they would
-	// otherwise be the wrong pair.
-	samples.sort((a, b) => a.tMs - b.tMs);
-	return { latencies, sent, failed, samples };
+	const elapsedMs = performance.now() - started;
+	return {
+		requests,
+		errors,
+		latencies,
+		// Reported rather than assumed: a lane that prints the rate it ASKED for
+		// describes a workload it may not have applied.
+		achievedRatePerSecond: elapsedMs > 0 ? (requests * 1000) / elapsedMs : 0
+	};
 }
 
 /**
+ * Run one scenario against the server on PORT.
+ *
  * @param {string} name
- * @param {() => Promise<void>} unit
- * @param {{ expectFailure?: boolean, durationMs: number }} opts
+ * @param {{ warm: () => Promise<void>, window: () => Promise<void> }} work
+ *   the unit driven through warmup and settle, and the one driven through
+ *   the measured window. The same for an ordinary scenario; the self-check
+ *   warms and settles CLEAN and plants its leak only once the window opens,
+ *   because a server retaining three megabytes a second never settles, and a
+ *   self-check that could not settle would be refused as unmeasured rather
+ *   than counted as detected.
+ * @param {Record<string, unknown>} partial
+ *   filled in as the phases complete, so that a scenario which throws still
+ *   leaves what it measured in the record.
  */
-async function scenario(name, unit, opts) {
-	// Supplied by the plan for every scenario, so there is no default to drift.
-	const { durationMs } = opts;
-	console.log(`\n== ${name}`);
-	console.log(`   warmup ${WARMUP_MS / 1000}s, measure ${durationMs / 1000}s at ${RPS} rps, sample every ${SAMPLE_MS / 1000}s`);
+async function runScenario(name, work, partial) {
+	const rate = work.rate ?? RPS;
+	console.log(`\n[leak-lane] ${name}: warmup ${WARMUP_MS / 1000}s, collect, resettle ${RESETTLE_MS / 1000}s unsampled, ` +
+		`settle until steady, then a ${MINUTES} minute window at ${rate}/s`);
 
-	const warm = await drive(unit, WARMUP_MS, { sample: false });
+	// WARMUP. Fills the working set, JITs the hot paths and gives the creep
+	// gate a baseline taken under the same load as the window.
+	const warm = await drive(work.warm, WARMUP_MS, rate);
+	const warmErrorRate = warm.requests > 0 ? warm.errors / warm.requests : 1;
 	const baselineP95 = quantile(warm.latencies, 0.95);
-	// No cooldown before this one, and the asymmetry with the final reading is
-	// deliberate. The cooldown below exists for the CONNECTIONS gate - a count
-	// only means "the close path leaked" once every client has had time to
-	// finish closing - and only the final reading is compared on that. Settling
-	// itself needs no fixed wait, because settledProbe is adaptive: it keeps
-	// reading until two agree, so a warmup still shedding connections simply
-	// costs it another round. Measured on the ws and self-check scenarios, the
-	// baseline settles in three of its eight rounds.
+	Object.assign(partial, { warmRequests: warm.requests, warmErrors: warm.errors, baselineP95 });
+
+	// BASELINE. Forced collections until two agree - the retention gate's
+	// reference reading. No cooldown before it, and the asymmetry with the
+	// final reading is deliberate: the cooldown exists for the connections
+	// gate, and only the final reading is compared on that.
 	const baseline = await settledProbe();
 
-	// Unsampled: see RESETTLE_MS. Sampling through the post-collection climb
-	// measures the climb.
-	await drive(unit, RESETTLE_MS, { sample: false });
+	// RESETTLE. Worked, unsampled; see the header and RESETTLE_MS.
+	await drive(work.warm, RESETTLE_MS, rate);
 
-	const run = await drive(unit, durationMs, { sample: true });
+	// SETTLE. Keep working and reading until the resident set has stopped
+	// MOVING - in either direction - for SETTLE_STABLE_ROUNDS rounds in a row.
+	// After a forced collection it does not drift down to a resting point; it
+	// CLIMBS back to the working set, so a rule that waits only for the reading
+	// to stop falling opens the window on the most leak-shaped stretch a
+	// healthy process ever produces.
+	let settled = false;
+	let previous = null;
+	let stableRounds = 0;
+	/** Every settle reading, kept in the record: a false alarm is unarguable with them and guesswork without. */
+	const settleReadings = [];
+	partial.settleReadings = settleReadings;
+	for (let round = 0; round < SETTLE_MAX_ROUNDS; round++) {
+		await drive(work.warm, SETTLE_ROUND_MS, rate);
+		const { rss } = await probe('mem');
+		settleReadings.push(rss);
+		if (previous !== null) {
+			const band = Math.max(SETTLE_BAND_BYTES, previous * SETTLE_BAND_RATIO);
+			stableRounds = Math.abs(rss - previous) <= band ? stableRounds + 1 : 0;
+			if (stableRounds >= SETTLE_STABLE_ROUNDS) { settled = true; break; }
+		}
+		previous = rss;
+	}
 
+	// WINDOW. One reading per slice while the workload continues.
+	/** @type {number[]} */
+	const rss = [];
+	Object.assign(partial, { settled, rss });
+	/** @type {number[]} */
+	const latencies = [];
+	/** Per-slice achieved rate, so the record states the workload applied rather than the one requested. */
+	const achieved = [];
+	let requests = 0;
+	let errors = 0;
+	for (let elapsed = 0; elapsed < WINDOW_MS; elapsed += SAMPLE_MS) {
+		const slice = await drive(work.window, SAMPLE_MS, rate);
+		achieved.push(slice.achievedRatePerSecond);
+		requests += slice.requests;
+		errors += slice.errors;
+		latencies.push(...slice.latencies);
+		rss.push((await probe('mem')).rss);
+	}
+
+	// FINAL. After the cooldown every client has had time to finish closing,
+	// which is what makes the connections count mean "still registered".
+	work.close?.();
 	await Bun.sleep(COOLDOWN_MS);
 	const final = await settledProbe();
 
-	const xs = run.samples.map((s) => s.tMs / 1000);
-	const ys = run.samples.map((s) => s.rss);
-	const { slope, rSquared } = leastSquares(xs, ys);
-	const windowGrowth = slope * (durationMs / 1000);
-	const growthRatio = baseline.rss > 0 ? windowGrowth / baseline.rss : 0;
-	const errorRate = run.sent > 0 ? run.failed / run.sent : 0;
-	const p95 = quantile(run.latencies, 0.95);
-	const p95Creep = baselineP95 > 0 ? (p95 - baselineP95) / baselineP95 : 0;
+	const windowP95 = quantile(latencies, 0.95);
+	const verdict = judge({
+		rss, errors, requests, baselineP95, windowP95, settled,
+		retained: {
+			baseline: retainedBytes(baseline),
+			final: retainedBytes(final),
+			settled: !baseline.unsettled && !final.unsettled
+		},
+		connectionsAfter: final.connections
+	});
 
-	console.log(`   samples ${run.samples.length}, requests ${run.sent} (${run.failed} failed)`);
-	const heapGrowth = retained(final) - retained(baseline);
-	const heapRatio = retained(baseline) > 0 ? heapGrowth / retained(baseline) : 0;
-	console.log(`   rss baseline ${bytes(baseline.rss)} -> final ${bytes(final.rss)} (both after forced GC)`);
-	// The rounds are printed with whether each end actually CONVERGED, because
-	// "settled over 8/8" for two loops that gave up reads exactly like success.
-	const settleNote = (p) => `${p.rounds}${p.unsettled ? ' GAVE UP' : ''}`;
-	console.log(`   retained (heap+external) baseline ${bytes(retained(baseline))} -> final ${bytes(retained(final))} (${(heapRatio * 100).toFixed(1)}%, over ${settleNote(baseline)}/${settleNote(final)} forced collections)`);
-	console.log(`   slope ${(slope / 1024).toFixed(1)} KB/s, r2 ${rSquared.toFixed(3)}, projected over window ${bytes(windowGrowth)} (${(growthRatio * 100).toFixed(1)}% of baseline)`);
-	console.log(`   ws connections during run ${run.samples[0]?.connections ?? -1} -> ${run.samples.at(-1)?.connections ?? -1}, after cooldown ${final.connections}`);
-	console.log(`   p95 ${baselineP95.toFixed(1)}ms -> ${p95.toFixed(1)}ms (${(p95Creep * 100).toFixed(1)}%), errors ${(errorRate * 100).toFixed(2)}%`);
-
-	// THREE KINDS, and the distinction is load-bearing rather than tidy.
-	//
-	// `memory` is a leak signal. `service` is a server misbehaving in a way
-	// that is not a leak. `health` means this run did not MEASURE anything -
-	// the instrument failed, so its silence proves nothing.
-	//
-	// All three fail an ordinary scenario. Only `memory` can satisfy the
-	// self-check, and any `health` entry disqualifies it outright: a
-	// self-check that collected one sample, or whose workload could not run,
-	// would otherwise report "the gates are live" while detecting nothing, and
-	// that is precisely the vacuous pass this scenario exists to rule out.
-	/** @type {{ kind: 'memory' | 'service' | 'health', message: string }[]} */
-	const failures = [];
-	const fail = (kind, message) => failures.push({ kind, message });
-
-	// The slope gates are ANDed with the fit on purpose: an unfitted slope is
-	// not a trend, and failing on one is how a leak gate earns a reputation for
-	// crying wolf and gets switched off.
-	if (rSquared >= THRESHOLDS.minRSquared) {
-		if (growthRatio > THRESHOLDS.maxWindowGrowthRatio) {
-			fail('memory', `rss grew ${(growthRatio * 100).toFixed(1)}% of baseline over the window (limit ${(THRESHOLDS.maxWindowGrowthRatio * 100).toFixed(0)}%), fitted r2 ${rSquared.toFixed(3)}`);
-		}
-		if (slope > THRESHOLDS.maxSlopeBytesPerSec) {
-			fail('memory', `rss climbing ${(slope / 1024).toFixed(1)} KB/s (limit ${THRESHOLDS.maxSlopeBytesPerSec / 1024} KB/s), fitted r2 ${rSquared.toFixed(3)}`);
-		}
-	}
-	// The one comparison a first-and-last reading CAN make honestly, because
-	// both ends are taken after the collector has settled: what is still held
-	// is retained, not merely uncollected. RSS cannot be read this way - the
-	// allocator keeps arenas it will never return - which is why the slope
-	// above is the RSS signal and this is the retention one.
-	if (heapRatio > THRESHOLDS.maxHeapGrowthRatio) {
-		fail('memory', `retained grew ${(heapRatio * 100).toFixed(1)}% across the run (limit ${(THRESHOLDS.maxHeapGrowthRatio * 100).toFixed(0)}%)`);
-	}
-	if (errorRate > THRESHOLDS.maxErrorRate) {
-		fail('service', `error rate ${(errorRate * 100).toFixed(2)}% (limit ${(THRESHOLDS.maxErrorRate * 100).toFixed(1)}%)`);
-	}
-	if (p95Creep > THRESHOLDS.maxP95CreepRatio) {
-		fail('service', `p95 crept ${(p95Creep * 100).toFixed(1)}% above warmup (limit ${(THRESHOLDS.maxP95CreepRatio * 100).toFixed(0)}%)`);
-	}
-	// After the cooldown every client this scenario opened has closed, so a
-	// connection still registered is one the close path did not release. This
-	// is checked after the cooldown rather than during the run, where in-flight
-	// connections are the workload rather than a leak.
-	if (final.connections > 0) {
-		fail('memory', `${final.connections} WebSocket connection(s) still registered after cooldown; every client had closed`);
-	}
-	// Too few samples cannot fail, but must not silently PASS either: a run
-	// that collected three points proves nothing about a trend.
-	if (run.samples.length < MIN_SAMPLES) {
-		fail('health', `only ${run.samples.length} memory samples; a slope needs more than that to mean anything`);
-	}
-	// A settle loop that exhausted its rounds returned whichever reading it
-	// happened to stop on, so the retention comparison - the sensitive gate -
-	// was made against a number that does not mean "still retained". The same
-	// class as too few samples: the instrument failed, so its silence proves
-	// nothing, and believing it either masks a real leak inside the noise band
-	// or invents one out of it.
-	if (baseline.unsettled || final.unsettled) {
-		const ends = [
-			baseline.unsettled && `the baseline gave up after ${baseline.rounds} forced collections`,
-			final.unsettled && `the final reading gave up after ${final.rounds} forced collections`
-		].filter(Boolean).join(', and ');
-		fail('health', `retention never settled: ${ends}; the retained comparison is noise`);
-	}
-	// A warmup that could not run leaves baselineP95 at zero, which silently
-	// disables the p95 gate - so the run reports a clean tail latency it never
-	// measured.
-	//
-	// The error side is held to the SAME rate as the measured window rather than
-	// to zero. The warmup dispatches RPS * WARMUP_MS / 1000 units - 250 at the
-	// defaults - so demanding that none of them fail makes the phase this file
-	// exists to DISCARD the strictest gate in it: one transient socket in 250
-	// would fail a lane whose measured window tolerates fifteen in three
-	// thousand. That is the shape of gate people switch off.
-	//
-	// It is still the tighter of the two in practice, because the same rate over
-	// 12x fewer units leaves a budget of exactly one failure before it trips.
-	const warmErrorRate = warm.sent > 0 ? warm.failed / warm.sent : 1;
-	if (baselineP95 <= 0 || warmErrorRate > THRESHOLDS.maxErrorRate) {
-		fail('health', `warmup did not produce a clean baseline (${warm.failed} of ${warm.sent} failed, p95 ${baselineP95.toFixed(1)}ms)`);
+	// The warmup is held to the SAME error rate as the window, not to zero.
+	// A stricter gate on the baseline than on the measurement is how a lane
+	// starts failing for reasons nobody acts on.
+	if (warmErrorRate > MAX_ERROR_RATE) {
+		verdict.health.push(`the warmup itself lost ${(warmErrorRate * 100).toFixed(2)}% of ${warm.requests} requests`);
 	}
 
-	const memory = failures.filter((f) => f.kind === 'memory');
-	const health = failures.filter((f) => f.kind === 'health');
-	// What a kind MEANS depends on the scenario, so the label does too. Under
-	// expectFailure a memory gate is the result being looked for and a service
-	// failure decides nothing at all - printing FAIL for that one puts the word
-	// above a lane that then goes green, which is how grepping a CI log for
-	// FAIL starts lying. A health failure still decides, so it keeps the word.
-	for (const f of failures) {
-		const label = opts.expectFailure
-			? (f.kind === 'memory' ? 'detected' : f.kind === 'health' ? 'FAIL' : 'noted')
-			: 'FAIL';
-		console.log(`   ${label} ${f.message}`);
-	}
-
-	// A scenario can be here to prove the gates FIRE. Its pass condition is the
-	// inverse, and the distinction is what keeps this lane from being vacuous:
-	// gates never observed to fail are indistinguishable from gates that cannot.
-	if (opts.expectFailure) {
-		if (health.length) {
-			// Said WITHOUT denying the gates that did fire: claiming nothing was
-			// detected when three memory gates just printed `detected` sends the
-			// reader hunting a phantom. What is wrong is the run, not the gates.
-			const fired = memory.length
-				? `; ${memory.length} memory gate(s) did fire, but a run that measured nothing cannot vouch for them`
-				: '';
-			console.log(`   FAIL the self-check did not measure what it claims to${fired}`);
-			return false;
-		}
-		if (!memory.length) {
-			console.log('   FAIL the injected leak was not caught by a MEMORY gate; this lane cannot detect a leak');
-			return false;
-		}
-		console.log(`   ok (${memory.length} memory gate(s) caught the injected leak, so they are live)`);
-		return true;
-	}
-	if (!failures.length) console.log('   ok');
-	return failures.length === 0;
+	return {
+		scenario: name, port: PORT, ratePerSecond: rate, minutes: MINUTES,
+		requests, errors, baselineP95, windowP95,
+		rss, settled, settleReadings, warmRequests: warm.requests, warmErrors: warm.errors,
+		achievedRatePerSecond: achieved.length > 0 ? achieved.reduce((a, b) => a + b, 0) / achieved.length : 0,
+		settledRounds: { baseline: baseline.rounds, final: final.rounds },
+		connectionsAfter: final.connections,
+		...verdict
+	};
 }
 
 /**
  * Run one scenario against a server of its OWN.
  *
- * Each scenario gets a fresh process rather than sharing one, for two reasons.
- * The measurable one: a second scenario inherits the first's warmed allocator,
- * so it starts from a working set it did not build and its baseline means
- * something different from the first's. The necessary one: the self-check has
- * to arm a leak in the SERVER's environment, which cannot be done to a process
- * that is already running.
+ * Each scenario gets a fresh process rather than sharing one: a second
+ * scenario would inherit the first's warmed allocator, so it would start from
+ * a working set it did not build and its baseline would mean something
+ * different from the first's. The probe route answers only while `LEAK_PROBE`
+ * is set in the child, so it never reaches a build anyone deploys.
  *
- * @param {string} label
- * @param {() => Promise<void>} unit
- * @param {{ env?: Record<string, string>, expectFailure?: boolean, durationMs: number }} opts
+ * @param {string} name
+ * @param {{ warm: () => Promise<void>, window: () => Promise<void> }} work
+ * @param {Record<string, unknown>} partial
  */
-async function withServer(label, unit, opts) {
+async function withServer(name, work, partial) {
 	await assertPortFree(PORT);
 	const proc = Bun.spawn([process.execPath, buildPath()], {
-		env: serverEnv({ PORT: String(PORT), LEAK_PROBE: '1', ...(opts.env || {}) }),
+		env: serverEnv({ HOST: '127.0.0.1', PORT: String(PORT), LEAK_PROBE: '1' }),
 		stdout: 'inherit',
 		stderr: 'inherit'
 	});
+	let running = false;
 	try {
 		await waitForServer(proc, PORT);
-		// Arming is asserted rather than assumed: an unarmed probe 404s, every
-		// sample is then silently dropped, and a run that collected nothing looks
-		// like a run that found nothing.
-		await settledProbe();
-		return await scenario(label, unit, opts);
+		// Arming is asserted rather than assumed: an unarmed probe 404s, and a
+		// run that could not read anything must fail here, as a health
+		// problem, rather than after minutes of warmup.
+		await probe('mem');
+		if (name === 'ws') {
+			const topics = await topicWorkload(`ws://127.0.0.1:${PORT}/ws`, WS_CLIENTS);
+			work = { warm: topics.unit, window: topics.unit, close: topics.close, rate: WS_RPS };
+		}
+		running = true;
+		return await runScenario(name, work, partial);
+	} catch (err) {
+		// A server that is GONE mid-run is the most server-caused outcome this
+		// lane can find - a leak that ran the process out of memory ends
+		// exactly this way - and must not be filed under "the lane could not
+		// measure". The child's exit is what tells the two apart: a probe that
+		// failed against a live server is the lane's problem, and so is a
+		// server that never came up at all, since nothing was measured.
+		//
+		// Asked of the exit promise rather than of `exitCode`, and for two
+		// reasons: a process killed by a signal - the out-of-memory killer's
+		// SIGKILL, JavaScriptCore's abort on heap exhaustion - has NO exit
+		// code, only a signal, and the child is reaped on the event loop a
+		// tick or two after the connection it closed refused this probe.
+		const gone = running && (await Promise.race([proc.exited.then(() => true), Bun.sleep(500).then(() => false)]));
+		if (gone) {
+			const how = proc.signalCode ? `by ${proc.signalCode}` : `with code ${proc.exitCode}`;
+			throw new ServerDied(`the server exited ${how} during the run: ${err.message}`);
+		}
+		throw err;
 	} finally {
+		work.close?.();
 		try { proc.kill(); } catch {}
 		await proc.exited;
 		// The next scenario asserts the port is free, and a killed Bun server
@@ -550,48 +428,103 @@ async function withServer(label, unit, opts) {
 	}
 }
 
-// What each planned scenario DOES, attached by key. The plan owns which
-// scenarios exist and how long each measures, because the runner reads it to
-// bound the lane; this owns the workload. Splitting it that way is what stops
-// the two files disagreeing about how many scenarios there are.
-const workloads = {
-	http: { label: 'http: SSR render at a fixed rate', unit: httpUnit },
-	ws: { label: 'ws: connect / subscribe / close churn', unit: wsUnit },
-	selfcheck: {
-		label: 'SELF-CHECK: a deliberate leak must fail this lane',
-		unit: wsUnit,
-		opts: {
-			// 64 KB retained per connection and never released. At this rate the
-			// gates see it within seconds, which is the point: the check has to be
-			// quick enough that nobody is tempted to skip it.
-			//
-			// Its window is nonetheless well clear of the eight-sample floor - 30s
-			// at the 2s cadence is fourteen, see samplesFor - because a self-check
-			// that trips the floor is REFUSED rather than believed, so one sitting
-			// near it would fail intermittently and teach people to ignore this
-			// lane.
-			env: { LEAK_INJECT: String(64 * 1024) },
-			expectFailure: true
-		}
+class ServerDied extends Error {}
+
+// One record per process, so parallel runs on the same machine do not
+// overwrite each other. Rewritten after EVERY scenario rather than once at
+// the end, so a run the runner has to kill still leaves the scenarios that
+// finished - the evidence is wanted most on exactly the run that did not.
+const RECORD_PATH = join(OUT_DIR, `leak-lane-${process.pid}.json`);
+function writeRecord(records) {
+	try {
+		mkdirSync(OUT_DIR, { recursive: true });
+		writeFileSync(RECORD_PATH, JSON.stringify({ bun: Bun.version, platform: process.platform, records }, null, '\t'));
+		return true;
+	} catch (err) {
+		console.error(`[leak-lane] could not write the record: ${err.message}`);
+		return false;
 	}
+}
+
+// What each planned scenario DOES, attached by key. The plan owns which
+// scenarios exist; this owns the workload. Splitting it that way is what
+// stops the two files disagreeing about how many scenarios there are.
+const workloads = {
+	http: { warm: httpUnit, window: httpUnit },
+	ws: {},
+	churn: { warm: churnUnit, window: churnUnit, rate: CHURN_RPS },
+	selfcheck: { warm: httpUnit, window: retainUnit }
 };
 
-// Which scenarios run - and whether LEAK_SCENARIO named a real one - is the
-// plan's decision, not a second copy of the same filter here. One scenario at a
-// time is how a suspicious slope gets investigated: re-running the whole lane
-// to look at one workload wastes minutes.
-const results = [];
-for (const { key, durationMs } of SELECTED) {
-	const work = workloads[key];
+/** @type {any[]} */
+const records = [];
+let exit = 0;
+for (const name of SELECTED) {
+	const work = workloads[name];
 	// A planned scenario with nothing attached is refused, not skipped. The
 	// runner has already budgeted time for it, and quietly running one fewer
 	// scenario than the plan describes is how a lane measures less than it says.
-	if (!work) throw new Error(`the plan lists a "${key}" scenario but no workload is attached to it`);
-	results.push(await withServer(work.label, work.unit, { ...work.opts, durationMs }));
+	if (!work) throw new Error(`the plan lists a "${name}" scenario but no workload is attached to it`);
+
+	let record;
+	/** @type {Record<string, unknown>} */
+	const partial = {};
+	try {
+		record = await withServer(name, work, partial);
+	} catch (err) {
+		if (err instanceof ServerDied) {
+			console.error(`[leak-lane] ${name}: FAIL - ${err.message}`);
+			records.push({ scenario: name, ...partial, failures: [err.message], health: [], failing: true });
+			exit = Math.max(exit, 1);
+		} else {
+			console.error(`[leak-lane] ${name}: HEALTH - ${err.message}`);
+			records.push({ scenario: name, ...partial, health: [err.message], failing: false });
+			exit = Math.max(exit, 2);
+		}
+		writeRecord(records);
+		continue;
+	}
+	records.push(record);
+	writeRecord(records);
+
+	const mib = (b) => (b / 1048576).toFixed(0);
+	console.log(`[leak-lane] ${name}: ${record.requests} requests at ${record.achievedRatePerSecond.toFixed(0)}/s ` +
+		`(asked ${record.ratePerSecond}/s), ${record.errors} failed, ` +
+		`p95 ${record.baselineP95.toFixed(1)}ms warmed -> ${record.windowP95.toFixed(1)}ms`);
+	console.log(`[leak-lane] ${name}: rss MiB over the window: ${record.rss.map(mib).join(' ')}`);
+	console.log(`[leak-lane] ${name}: fit r-squared ${record.growth.rSquared.toFixed(2)}, verdict ${record.growth.reason}`);
+	console.log(`[leak-lane] ${name}: settle MiB before the window opened: ${record.settleReadings.map(mib).join(' ')}` +
+		(record.settled ? '' : ' (NEVER STEADY)'));
+	console.log(`[leak-lane] ${name}: retained (heap+external) ${(record.retained.baseline / 1048576).toFixed(1)} MiB -> ` +
+		`${(record.retained.final / 1048576).toFixed(1)} MiB (${(record.retained.ratio * 100).toFixed(1)}%, settled over ` +
+		`${record.settledRounds.baseline}/${record.settledRounds.final} forced collections), ` +
+		`connections after cooldown ${record.connectionsAfter}`);
+
+	if (name === 'selfcheck') {
+		// Inverted on purpose - this scenario is leaking by construction - and
+		// typed on purpose: only the growth gate's own detection counts.
+		const check = selfCheckVerdict(record);
+		if (check.pass) {
+			console.log(`[leak-lane] selfcheck: PASS - ${check.reason}`);
+		} else {
+			console.error(`[leak-lane] selfcheck: FAIL - ${check.reason}`);
+			exit = Math.max(exit, 1);
+		}
+	} else if (record.failing) {
+		for (const line of record.failures) console.error(`[leak-lane] ${name}: FAIL - ${line}`);
+		exit = Math.max(exit, 1);
+	} else {
+		console.log(`[leak-lane] ${name}: PASS`);
+	}
+	for (const line of record.health) {
+		console.error(`[leak-lane] ${name}: HEALTH - ${line}`);
+		exit = Math.max(exit, 2);
+	}
 }
-const ok = results.every(Boolean);
+
+if (writeRecord(records)) console.log(`\n[leak-lane] record written to ${RECORD_PATH}`);
 
 // Named for the GATE rather than the lane, because run.mjs prints the lane's
 // verdict too and two identical lines read as the thing having run twice.
-console.log(ok ? '\nleak-check passed' : '\nleak-check FAILED');
-process.exit(ok ? 0 : 1);
+console.log(exit === 0 ? '\nleak-check passed' : exit === 1 ? '\nleak-check FAILED' : '\nleak-check could not reach a verdict');
+process.exit(exit);
