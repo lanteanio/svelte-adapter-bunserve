@@ -2,11 +2,9 @@
  * Topic and event name rules, shared by the envelope writer and the wire
  * accept path. Pure and dependency-free.
  *
- * The two functions here are deliberately kept in lockstep: `esc` defines what
- * can be embedded in a JSON envelope, and `isValidWireTopic` rejects exactly
- * the same character set at the wire boundary. Any topic that survives the
- * accept check is therefore safe to embed later, so the envelope writer can
- * never be handed something that would corrupt the frame.
+ * `esc` rejects characters that would corrupt a JSON envelope.
+ * `isValidWireTopic` also enforces the configured alphabet, length limit and
+ * paired UTF-16 surrogates, so accepted names survive UTF-8 transport intact.
  */
 
 /**
@@ -34,8 +32,9 @@ export function esc(s) {
 }
 
 /**
- * Validate a topic name arriving from a client subscribe / unsubscribe control
- * frame. Non-empty, at most 256 characters, no control bytes, no `"` or `\`.
+ * Validate a topic name arriving from a client subscription control
+ * frame. Non-empty, at most 256 UTF-16 code units, no control bytes, no `"` or `\`.
+ * Non-ASCII names must contain paired surrogates; an astral symbol uses two units.
  *
  * Without `allowNonAscii`, anything above printable ASCII is rejected too. That
  * closes the Unicode line separators (U+2028 / U+2029), the right-to-left
@@ -55,6 +54,12 @@ export function isValidWireTopic(topic, allowNonAscii) {
 		const c = topic.charCodeAt(i);
 		if (c < 32 || c === 34 || c === 92) return false;
 		if (!allowNonAscii && c > 126) return false;
+		if (allowNonAscii && (c & 0xf800) === 0xd800) {
+			if (c > 0xdbff || i + 1 >= topic.length) return false;
+			const low = topic.charCodeAt(i + 1);
+			if (low < 0xdc00 || low > 0xdfff) return false;
+			i++;
+		}
 	}
 	return true;
 }
@@ -84,18 +89,18 @@ export function isSystemTopic(topic) {
  * Build the `platform.topic(name)` scoped publisher: one small object whose
  * named actions forward to `publish` with the topic bound.
  *
- * @param {(topic: string, event: string, data: unknown) => unknown} publish
+ * @param {(topic: string, event: string, data: unknown, options?: object) => unknown} publish
  * @param {string} name
  */
 export function createScopedTopic(publish, name) {
 	return {
-		publish: (event, data) => publish(name, event, data),
-		created: (data) => publish(name, 'created', data),
-		updated: (data) => publish(name, 'updated', data),
-		deleted: (data) => publish(name, 'deleted', data),
-		set: (value) => publish(name, 'set', value),
-		increment: (amount = 1) => publish(name, 'increment', amount),
-		decrement: (amount = 1) => publish(name, 'decrement', amount)
+		publish: (event, data, options) => publish(name, event, data, options),
+		created: (data, options) => publish(name, 'created', data, options),
+		updated: (data, options) => publish(name, 'updated', data, options),
+		deleted: (data, options) => publish(name, 'deleted', data, options),
+		set: (value, options) => publish(name, 'set', value, options),
+		increment: (amount = 1, options) => publish(name, 'increment', amount, options),
+		decrement: (amount = 1, options) => publish(name, 'decrement', amount, options)
 	};
 }
 
@@ -109,7 +114,7 @@ export function createScopedTopic(publish, name) {
  * server) and never module-global keyed on name alone - two servers would
  * otherwise hand out helpers bound to the wrong `publish`.
  *
- * @param {(topic: string, event: string, data: unknown) => unknown} publish
+ * @param {(topic: string, event: string, data: unknown, options?: object) => unknown} publish
  * @param {number} [cap]
  * @returns {(name: string) => ReturnType<typeof createScopedTopic>}
  */

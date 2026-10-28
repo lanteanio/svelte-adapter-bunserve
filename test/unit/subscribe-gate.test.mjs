@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 
 // Same bootstrap as ws-state.test.mjs: the handler modules read values the build
 // freezes into the bundle, so setting them here is what lets the gate be tested
@@ -14,7 +15,7 @@ globalThis.WS_PATH = '/ws';
 const { platform, subscribeWithVerdict } = await import(
 	'../../src/runtime/handler/platform.js'
 );
-const { WS_SUBSCRIPTIONS } = await import('../../src/runtime/handler/ws-state.js');
+const { MAX_SUBSCRIPTIONS_PER_CONNECTION, WS_SUBSCRIPTIONS } = await import('../../src/runtime/handler/ws-state.js');
 const { __setHooks } = await import('../helpers/ws-handler-stub.mjs');
 
 /** A stand-in for the socket facade, recording what it was asked to install. */
@@ -38,8 +39,8 @@ async function withGate(hooks, fn) {
 	}
 }
 
-test('a recover offset the wire would refuse does not reach the hook here either', async () => {
-	// platform.subscribe reaches the same recover branch a `subscribe` frame
+test('a private recover offset the wire would refuse does not reach the hook', async () => {
+	// The private entry reaches the same recover branch a `subscribe` frame
 	// does, so the offset rule cannot live only in the demux - an app calling the
 	// API directly would otherwise hand the hook a value the wire refuses. The
 	// last case is the one that matters in the other direction: refusing does not
@@ -47,13 +48,13 @@ test('a recover offset the wire would refuse does not reach the hook here either
 	let ran = 0;
 	await withGate({ subscribe: () => null, resume: () => { ran++; } }, async () => {
 		const ws = fakeWs();
-		await platform.subscribe(ws, 'room:1', { recover: { offset: '5' } });
+		await subscribeWithVerdict(ws, 'room:1', { recover: { offset: '5' } });
 		assert.equal(ran, 0, 'a string offset is not a recover');
-		await platform.subscribe(ws, 'room:2', { recover: { offset: -1 } });
+		await subscribeWithVerdict(ws, 'room:2', { recover: { offset: -1 } });
 		assert.equal(ran, 0, 'nor a negative one');
-		await platform.subscribe(ws, 'room:3', { recover: { offset: 1e999 } });
+		await subscribeWithVerdict(ws, 'room:3', { recover: { offset: 1e999 } });
 		assert.equal(ran, 0, 'nor a non-finite one');
-		await platform.subscribe(ws, 'room:4', { recover: { offset: 1e308 } });
+		await subscribeWithVerdict(ws, 'room:4', { recover: { offset: 1e308 } });
 		assert.equal(ran, 1, 'an app cursor past 2^53 still gap-fills');
 	});
 });
@@ -64,7 +65,7 @@ test('extra arguments to platform.subscribe cannot bypass the gate', async () =>
 	// public method makes the everyday
 	// `topics.map(platform.subscribe.bind(platform, ws))` - which supplies
 	// (topic, index, array) - install every topic with no gate run at all. The
-	// verdict channel is module-private and this method takes three parameters.
+	// verdict channel is module-private and this method takes two parameters.
 	await withGate(
 		{ subscribe: () => 'FORBIDDEN' },
 		async () => {
@@ -90,10 +91,10 @@ test('extra arguments to platform.subscribe cannot bypass the gate', async () =>
 	);
 });
 
-test('platform.subscribe declares exactly three parameters', () => {
+test('platform.subscribe declares exactly two parameters', () => {
 	// Arity IS the defense: a fourth parameter turns every extra argument a
 	// caller passes into a verdict. Asserted directly so adding one fails here.
-	assert.equal(platform.subscribe.length, 3);
+	assert.equal(platform.subscribe.length, 2);
 });
 
 test('checkSubscribe answers a non-string topic instead of throwing', async () => {
@@ -138,8 +139,7 @@ test('a __proto__ topic fails closed on the per-topic gate too', async () => {
 				'INTERNAL_ERROR'
 			);
 			assert.deepEqual(ws.installed, []);
-			// Without the escape it never reaches the gate at all.
-			assert.equal(await platform.subscribe(ws, '__proto__'), 'INVALID_TOPIC');
+			assert.equal(await platform.subscribe(ws, '__proto__'), 'INTERNAL_ERROR');
 			// An ordinary topic is unaffected.
 			assert.equal(await platform.subscribe(ws, 'room:1'), null);
 			assert.deepEqual(ws.installed, ['room:1']);
@@ -158,7 +158,7 @@ test('an empty-string denial reason still denies', async () => {
 });
 
 test('the private verdict channel still carries the batch verdict', async () => {
-	// The half that fails SILENTLY: because the public method takes three
+	// The half that fails SILENTLY: because the public method takes two
 	// parameters, the wire batch path must call subscribeWithVerdict directly.
 	// Passing a verdict to `platform.subscribe` drops it, and every entry in the
 	// batch re-runs the app gate - one hook call per topic, the exact cost
@@ -193,7 +193,7 @@ test('a verdict cannot override wire validation or the system-namespace guard', 
 		const ws = fakeWs();
 		assert.equal(await subscribeWithVerdict(ws, '', undefined, undefined), 'INVALID_TOPIC');
 		assert.equal(
-			await subscribeWithVerdict(ws, '__internal', undefined, undefined),
+			await subscribeWithVerdict(ws, '__internal', undefined, undefined, { fromWire: true }),
 			'INVALID_TOPIC'
 		);
 		assert.equal(
@@ -252,5 +252,113 @@ test('the readable no-opinion shapes still allow', async () => {
 			);
 			assert.deepEqual(ws.installed, ['room:1']);
 		});
+	}
+});
+
+test('the subscription cap is re-checked AFTER the gate, not only before it', () => {
+	// The bound that a pipelined blast defeats if it is read once. An async gate
+	// lets many frames pass the pre-await size check and all install, so the
+	// landing has to ask again against the set as it stands then. Driven here
+	// directly rather than by pipelining, because the live lane can no longer
+	// reach this ceiling: it is a constant of 65,536 now, not a settable option.
+	const ws = fakeWs();
+	const subs = ws.getUserData()[WS_SUBSCRIPTIONS];
+	for (let i = 0; i < MAX_SUBSCRIPTIONS_PER_CONNECTION - 1; i++) subs.add(`filler:${i}`);
+	let landed = null;
+	return withGate({
+		subscribe: async () => {
+			// Another subscribe lands while this one is parked in the hook. The
+			// pre-await check already passed for both.
+			subs.add('raced');
+			return null;
+		}
+	}, async () => {
+		landed = await platform.subscribe(ws, 'late');
+		assert.equal(landed, 'RATE_LIMITED', 'refused at the landing, not installed past the cap');
+		assert.equal(subs.has('late'), false, 'and nothing was added');
+		assert.equal(subs.size, MAX_SUBSCRIPTIONS_PER_CONNECTION, 'the cap holds exactly');
+		assert.deepEqual(ws.installed, [], 'the socket was never asked to subscribe');
+	});
+});
+
+
+test('platform subscribe silently allows missing hooks and closed sockets', async () => {
+	await withGate({}, async () => {
+		assert.equal(await platform.subscribe(fakeWs(), 'public'), null);
+		assert.equal(await platform.subscribe({ getUserData() { throw new Error('closed'); } }, 'room'), null);
+	});
+	await withGate({ subscribe: () => null }, async () => {
+		const ws = fakeWs();
+		ws.subscribe = () => { throw new Error('closed'); };
+		assert.equal(await platform.subscribe(ws, 'closed-during-gate'), null);
+	});
+});
+
+
+test('pending subscribes count attempts even when all target one topic', async () => {
+	let release;
+	const parked = new Promise(resolve => { release = resolve; });
+	let calls = 0;
+	await withGate({ subscribe: () => { calls++; return parked; } }, async () => {
+		const ws = fakeWs();
+		const pending = Array.from({ length: 4096 }, () => platform.subscribe(ws, 'same'));
+		assert.equal(calls, 4096);
+		assert.equal(await platform.subscribe(ws, 'same'), 'RATE_LIMITED');
+		assert.equal(await subscribeWithVerdict(ws, 'other', undefined, undefined, { fromWire: true }), 'RATE_LIMITED');
+		release(null);
+		assert.ok((await Promise.all(pending)).every(result => result === null));
+		assert.equal(await platform.subscribe(ws, 'other'), null);
+	});
+});
+
+
+test('server system topics reach the application gate without an escape option', async () => {
+	const topics = [];
+	await withGate({ subscribe: (_ws, topic) => { topics.push(topic); return topic === '__denied' ? 'FORBIDDEN' : null; } }, async () => {
+		const ws = fakeWs();
+		assert.equal(await platform.subscribe(ws, '__realtime'), null);
+		assert.equal(await platform.checkSubscribe(ws, '__observer'), null);
+		assert.equal(await platform.subscribe(ws, '__denied'), 'FORBIDDEN');
+		assert.equal(await platform.checkSubscribe(ws, '__denied'), 'FORBIDDEN');
+		assert.deepEqual(topics, ['__realtime', '__observer', '__denied', '__denied']);
+		assert.deepEqual(ws.installed, ['__realtime']);
+	});
+});
+
+test('platform.subscribe ignores extra recovery and system-topic options', async () => {
+	let resumed = 0;
+	await withGate({ subscribe: () => null, resume: () => { resumed++; } }, async () => {
+		const ws = fakeWs();
+		const options = new Proxy({}, { get() { assert.fail('extra arguments are not inspected'); } });
+		assert.equal(await platform.subscribe(ws, '__realtime', options), null);
+		assert.equal(resumed, 0);
+	});
+});
+
+
+test('observer checks share the configured wire alphabet while server checks remain trusted', () => {
+	for (const allowNonAsciiTopics of [false, true]) {
+		const script = `
+			import assert from 'node:assert/strict';
+			globalThis.ENV_PREFIX = '';
+			globalThis.WS_OPTIONS = { allowNonAsciiTopics: ${allowNonAsciiTopics} };
+			globalThis.WS_PATH = '/ws';
+			const { platform } = await import('./src/runtime/handler/platform.js');
+			const { WS_SUBSCRIPTIONS } = await import('./src/runtime/handler/ws-state.js');
+			const { __setHooks } = await import('./test/helpers/ws-handler-stub.mjs');
+			let calls = 0;
+			__setHooks({ subscribe: () => { calls++; return null; } });
+			const topic = 'room:' + String.fromCharCode(0x00fc);
+			const data = { [WS_SUBSCRIPTIONS]: new Set([topic]) };
+			const ws = { getUserData: () => data };
+			platform.authorizeWireSubscribe('strict');
+			assert.equal(await platform.checkSubscribe(ws, topic), null);
+			assert.equal(await platform.checkSubscribe(ws, topic, { requireGrant: true }), ${allowNonAsciiTopics ? 'null' : "'INVALID_TOPIC'"});
+			assert.equal(calls, ${allowNonAsciiTopics ? 2 : 1});
+		`;
+		const result = spawnSync(process.execPath, ['--conditions=bunserve-test', '--input-type=module', '-e', script], {
+			cwd: new URL('../../', import.meta.url), encoding: 'utf8'
+		});
+		assert.equal(result.status, 0, result.stderr || result.stdout);
 	}
 });
