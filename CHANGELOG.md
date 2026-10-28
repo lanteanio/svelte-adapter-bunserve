@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Plugin topic names are validated before state is retained, and default presence projections omit sensitive fields.
+
 - Added the typed bundled client with bounded connection attempts, offline admission, replay recovery and stores that follow explicit connection replacements.
 
 - Added structured operational events, bounded diagnostic formatting and a versioned legacy-prefix table.
