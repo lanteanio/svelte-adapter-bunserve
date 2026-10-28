@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Native probes record Bun 1.4.4 transport, upload, identity and close behavior used by the production HTTP and WebSocket bridges.
+
 - CI and generated fixtures exercise the supported Bun version, explicit environment prefixes, shared handler modules, subscription cleanup and live HTTP and WebSocket contracts.
 
 - Delivery authorization checks recipients before application writes, preserves queued operation order and bounded shutdown, and exposes the same policy in native testing and Vite.
