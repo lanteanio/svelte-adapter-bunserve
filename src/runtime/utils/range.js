@@ -3,7 +3,7 @@
  *
  * Returns:
  *   { start, end } - valid range (both inclusive), serve 206
- *   null           - syntactically valid but unsatisfiable (start >= fileSize), send 416
+ *   null           - syntactically valid but unsatisfiable (start >= fileSize or zero suffix), send 416
  *   false          - syntactically invalid, ignore the header and serve full 200
  *
  * Kept dependency-free so it is unit-testable without the runtime init chain.
@@ -33,7 +33,8 @@ export function parseRange(header, fileSize) {
 	if (rawStart === '') {
 		// Suffix range: bytes=-N (last N bytes)
 		const suffix = parseInt(rawEnd, 10);
-		if (!Number.isFinite(suffix) || suffix <= 0) return false;
+		if (!Number.isFinite(suffix)) return false;
+		if (suffix === 0) return null;
 		start = Math.max(0, fileSize - suffix);
 		end = fileSize - 1;
 	} else {

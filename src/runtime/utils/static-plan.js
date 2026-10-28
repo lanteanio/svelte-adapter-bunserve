@@ -1,6 +1,6 @@
 import { parseRange } from './range.js';
+import { parseHttpDate } from './http-date.js';
 import { negotiateEncoding } from './static-negotiate.js';
-import { httpDateSeconds } from './http-date.js';
 
 /**
  * Decide what a static asset request gets: status, content-coding, and byte
@@ -20,6 +20,9 @@ import { httpDateSeconds } from './http-date.js';
  *   brEtag?: string,
  *   gzEtag?: string,
  *   mtimeSec?: number,
+ *   lastModified?: string,
+ *   brSize?: number,
+ *   gzSize?: number,
  *   hasBr?: boolean,
  *   hasGz?: boolean
  * }} PlanEntry
@@ -29,7 +32,7 @@ import { httpDateSeconds } from './http-date.js';
  * the identity one it would otherwise default to.
  *
  * @typedef {{ status: 200 | 304 | 412 | 416, encoding: '' | 'br' | 'gzip' }
- *   | { status: 206, encoding: '', start: number, end: number }} StaticPlan
+ *   | { status: 206, encoding: '' | 'br' | 'gzip', start: number, end: number }} StaticPlan
  *
  * @param {PlanEntry} entry - the asset's precomputed identity facts
  * @param {number} size - identity byte length
@@ -53,34 +56,8 @@ export function planStaticResponse(
 	ifUnmodifiedSince = '',
 	ifModifiedSince = ''
 ) {
-	// Which representation this request would GET is decided FIRST, because
-	// every precondition below is defined against the SELECTED representation
-	// (RFC 9110 s13.1). Deciding it after the fact is how If-Match came to
-	// accept the gzip validator for a request that was about to be answered
-	// with identity bytes.
-	//
-	//   1. resolve the range, because whether one will be SERVED decides the
-	//      representation - a range is identity-only, and a Range header that
-	//      cannot be honoured (malformed, multi-range, stale If-Range) must
-	//      fall through to a normal negotiated response rather than silently
-	//      pinning identity;
-	//   2. negotiate the coding;
-	//   3. take that representation's validator, and answer every precondition
-	//      against it.
-	/** @type {{ start: number, end: number } | null | false} */
-	let range = false;
-	if (rangeHeader && entry.etag) {
-		if ((!ifRange || ifRange === entry.etag) && !rangeHeader.includes(',')) {
-			range = parseRange(rangeHeader, size);
-		}
-	}
-
-	const encoding = range !== false
-		? ''
-		: negotiateEncoding(acceptEncoding, {
-			hasBr: entry.hasBr === true,
-			hasGz: entry.hasGz === true
-		});
+	const encoding = negotiateEncoding(acceptEncoding, entry.hasBr === true, entry.hasGz === true);
+	const repSize = encoding === 'br' ? entry.brSize : encoding === 'gzip' ? entry.gzSize : size;
 
 	// The validator of the representation the client would actually receive.
 	// Precomputed per coding at index time - deriving it here would allocate a
@@ -91,89 +68,81 @@ export function planStaticResponse(
 			? /** @type {string} */ (entry.gzEtag)
 			: entry.etag;
 
-	// The 412 preconditions come next - RFC 9110's evaluation order, and the
-	// only order that cannot lie: a failed If-Match must not be converted into
-	// a 304 by an If-None-Match that happens to match, because the client that
-	// sent both is asking "is my version still the current one" and the answer
-	// is no.
-	//
-	// If-Match is compared as OPAQUE EQUALITY rather than with the strong
-	// comparison RFC 9110 prescribes. Every validator this lane issues is weak
-	// by construction (mtime + size), and a weak validator never strong-matches
-	// ANYTHING - so the strict reading answers 412 to every client that echoes
-	// the exact validator this server handed it, for a byte-identical resource.
-	// Matching what we issued is what the precondition is for. That is the only
-	// deviation: the tag still has to be THIS representation's, so a client
-	// holding the gzip copy and asking for identity is told its copy is not the
-	// one being served, which is the question it asked.
+	// If-Match accepts any representation validator previously issued for this
+	// asset. If-None-Match validates the representation selected by this request.
+	// If-Match requires an issued tag; If-None-Match uses weak comparison.
 	if (ifMatch) {
-		if (!listNames(ifMatch, repEtag)) return { status: 412, encoding: '' };
-	} else if (ifUnmodifiedSince && entry.mtimeSec !== undefined) {
-		// Evaluated only when If-Match is absent (RFC 9110 s13.2.2), at the
-		// whole-second precision HTTP dates carry. An unintelligible date is an
-		// ignored header, not a refusal - the client said nothing about time,
-		// and 412 on garbage would refuse requests a proxy mangled.
-		const t = httpDateSeconds(ifUnmodifiedSince);
-		if (!Number.isNaN(t) && entry.mtimeSec > t) {
+		if (!listNames(ifMatch, entry.etag) &&
+			!(entry.brEtag !== undefined && listNames(ifMatch, entry.brEtag)) &&
+			!(entry.gzEtag !== undefined && listNames(ifMatch, entry.gzEtag))) {
 			return { status: 412, encoding: '' };
 		}
+	} else if (ifUnmodifiedSince && entry.mtimeSec !== undefined) {
+		const t = ifUnmodifiedSince === entry.lastModified ? entry.mtimeSec * 1000 : parseHttpDate(ifUnmodifiedSince);
+		if (!Number.isNaN(t) && entry.mtimeSec * 1000 > t) return { status: 412, encoding: '' };
 	}
-
-	// If-None-Match takes `*`, takes a list, and compares weakly - which is
-	// what RFC 9110 s13.1.2 asks for and what a cache revalidating a stored
-	// response actually sends. The encoding travels with the 304 because the
-	// validator it carries has to be the one for the representation that was
-	// selected, not the identity one.
-	if (repEtag && ifNoneMatch && listNames(ifNoneMatch, repEtag)) {
-		return { status: 304, encoding };
+	if (ifNoneMatch) {
+		if (weakEtagListHas(ifNoneMatch, repEtag)) return { status: 304, encoding };
+	} else if (ifModifiedSince && entry.mtimeSec !== undefined) {
+		const t = ifModifiedSince === entry.lastModified ? entry.mtimeSec * 1000 : parseHttpDate(ifModifiedSince);
+		if (!Number.isNaN(t) && entry.mtimeSec * 1000 <= t) return { status: 304, encoding };
 	}
-	// Date revalidation is the fallback for a cache that lost the validator,
-	// and RFC 9110 says to ignore it entirely when If-None-Match was sent -
-	// the client that sent both wants the etag answer, and a date-based 304
-	// after an etag MISmatch would claim freshness the validator just denied.
-	if (!ifNoneMatch && ifModifiedSince && entry.mtimeSec !== undefined) {
-		const t = httpDateSeconds(ifModifiedSince);
-		if (!Number.isNaN(t) && entry.mtimeSec <= t) {
-			return { status: 304, encoding };
-		}
+	let range = false;
+	if (rangeHeader && repEtag && !rangeHeader.includes(',') &&
+		(!ifRange || (!ifRange.startsWith('W/') && !repEtag.startsWith('W/') && ifRange === repEtag))) {
+		range = parseRange(rangeHeader, repSize);
 	}
 	if (range === null) {
 		// Syntactically valid but the start position is beyond EOF
-		return { status: 416, encoding: '' };
+		return { status: 416, encoding };
 	}
 	if (range !== false) {
-		return { status: 206, encoding: '', start: range.start, end: range.end };
+		return { status: 206, encoding, start: range.start, end: range.end };
 	}
 	return { status: 200, encoding };
 }
 
-/**
- * The opaque part of an entity-tag, so a client echoing `"x"` for a validator
- * this server spelled `W/"x"` is recognised. Every tag here is weak, and weak
- * comparison - which is what If-None-Match is defined to use - ignores the
- * prefix.
- *
- * @param {string} tag
- * @returns {string}
- */
-function opaqueTag(tag) {
-	return tag.startsWith('W/') ? tag.slice(2) : tag;
+/** Match a whole validator in the list, or the wildcard for an existing asset. */
+function listNames(header, validator) {
+	if (header === '*') return true;
+	if (!validator) return false;
+	let start = 0;
+	while (start < header.length) {
+		let comma = header.indexOf(',', start);
+		if (comma === -1) comma = header.length;
+		if (header.slice(start, comma).trim() === validator) return true;
+		start = comma + 1;
+	}
+	return false;
 }
 
 /**
- * Does a precondition header name this validator? Handles `*` and the list
- * form both preconditions are defined over.
- *
- * @param {string} header - the raw If-Match / If-None-Match value
- * @param {string | undefined} validator - the selected representation's etag
+ * If-None-Match uses weak comparison: only the quoted opaque tag matters.
+ * The common echoed validator avoids list parsing. Walk quoted members on the
+ * list path because a different valid opaque tag can itself contain commas.
+ * If-Match retains the independent exact-issued-validator policy above.
+ * @param {string} header
+ * @param {string} tag
  * @returns {boolean}
  */
-function listNames(header, validator) {
-	for (const token of header.split(',')) {
-		const t = token.trim();
-		if (t === '') continue;
-		if (t === '*') return true;
-		if (validator && opaqueTag(t) === opaqueTag(validator)) return true;
+function weakEtagListHas(header, tag) {
+	if (header === '*') return true;
+	if (!tag) return false;
+	if (header === tag) return true;
+	const opaque = tag.startsWith('W/') ? tag.slice(2) : tag;
+	if (header === opaque) return true;
+	let start = 0;
+	while (start < header.length) {
+		while (header[start] === ' ' || header[start] === '\t' || header[start] === ',') start++;
+		if (header.startsWith('W/', start)) start += 2;
+		if (header[start] !== '"') return false;
+		const end = header.indexOf('"', start + 1);
+		if (end === -1) return false;
+		let next = end + 1;
+		while (header[next] === ' ' || header[next] === '\t') next++;
+		if (next < header.length && header[next] !== ',') return false;
+		if (header.slice(start, end + 1) === opaque) return true;
+		start = next + 1;
 	}
 	return false;
 }

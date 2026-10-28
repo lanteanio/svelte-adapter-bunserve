@@ -1,12 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { manifest, prerendered } from '../manifest-bridge.js';
+import { appPath, prerendered, base } from '../manifest-bridge.js';
 import { mimeLookup } from '../utils/mime.js';
 import { excludedDotPath } from '../utils/dot-path.js';
-import { mergeStaticHeaders } from '../utils/static-headers.js';
+import { contentDispositionValue, mergeStaticHeaders, resolveStaticCacheControl } from '../utils/static-headers.js';
 import { representationEtag } from '../utils/static-negotiate.js';
 import { planStaticResponse } from '../utils/static-plan.js';
+import { now } from '../runtime.js';
 import { resolvePrerendered } from '../utils/prerendered-path.js';
 import { staticCache, prerenderedDirStyle, decodeCache } from './state.js';
 import { response400 } from './http-helpers.js';
@@ -28,6 +29,8 @@ const DOWNLOAD_EXTENSIONS = new Set([
 // disk through Bun.file (kernel sendfile path). The cache identity - headers,
 // ETag, range, 304 - is identical in both lanes; only the body source differs.
 const CACHE_MAX_FILE_SIZE = STATIC_CACHE_MAX;
+
+const NON_ASCII = /[^\x00-\x7f]/;
 
 // This module sits one level below the runtime payload root (in handler/), but
 // the client/ and prerendered/ asset directories the build emits live at that
@@ -60,6 +63,43 @@ function walk(dir, fn, prefix = '') {
 	}
 }
 
+// Only generated clean-path aliases need ownership metadata. If a real name
+// is indexed later, remove its alias and the alias's redirect style together;
+// otherwise a decomposed directory could make a real composed file redirect.
+/** @type {Map<string, { entry: import('./state.js').StaticEntry, directory: boolean }>} */
+const cleanAliases = new Map();
+
+/** @param {string} name */
+function removeCleanAlias(name) {
+	const previous = cleanAliases.get(name);
+	if (previous !== undefined) {
+		const key = previous.directory ? name + '/' : name;
+		if (staticCache.get(key) === previous.entry) staticCache.delete(key);
+		if (previous.directory) prerenderedDirStyle.delete(name);
+		cleanAliases.delete(name);
+	}
+}
+
+/**
+ * Register a prerendered page's canonical clean path and optional NFC alias.
+ * @param {string} name - bare directory path, or canonical file-style path
+ * @param {import('./state.js').StaticEntry} entry
+ * @param {boolean} directory
+ */
+function cacheCleanPath(name, entry, directory) {
+	removeCleanAlias(name);
+	staticCache.set(directory ? name + '/' : name, entry);
+	if (directory) prerenderedDirStyle.add(name);
+
+	const composed = name.normalize('NFC');
+	if (composed === name || !NON_ASCII.test(composed) ||
+		staticCache.has(composed) || staticCache.has(composed + '/') ||
+		prerenderedDirStyle.has(composed)) return;
+	staticCache.set(directory ? composed + '/' : composed, entry);
+	if (directory) prerenderedDirStyle.add(composed);
+	cleanAliases.set(composed, { entry, directory });
+}
+
 /**
  * Load a directory into the static cache.
  * @param {string} dir
@@ -69,8 +109,11 @@ function walk(dir, fn, prefix = '') {
  *   headers merged into every static (and prerendered) response. See
  *   `mergeStaticHeaders`; reserved transfer/caching headers are never
  *   overridden.
+ * @param {{ pattern: string, cacheControl: string }[] | null} [staticCacheControl]
+ *   prevalidated path-specific cache policies, resolved once per file.
  */
-export function cacheDir(dir, urlPrefix, immutable, staticHeaders = null) {
+export function cacheDir(dir, urlPrefix, immutable, staticHeaders = null, staticCacheControl = null) {
+	const immutablePrefix = `${appPath.slice(base.length)}/immutable/`;
 	walk(dir, (relPath, absPath) => {
 		if (relPath.endsWith('.br') || relPath.endsWith('.gz')) return;
 
@@ -87,30 +130,27 @@ export function cacheDir(dir, urlPrefix, immutable, staticHeaders = null) {
 		];
 		let etag = '';
 		let mtimeSec;
-		if (immutable && relPath.startsWith(`${manifest.appPath}/immutable/`)) {
+		let lastModified;
+		if (immutable && relPath.startsWith(immutablePrefix)) {
 			headers.push(['cache-control', 'public, max-age=31536000, immutable']);
 		} else {
 			etag = `W/"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}"`;
-			// Last-Modified rides beside the ETag, at the whole-second
-			// precision HTTP dates carry: a cache that lost the ETag
-			// revalidates by date, and without this header it re-downloads the
-			// full body on every visit. Immutable assets skip it for the same
-			// reason they skip the ETag - the versioned filename IS the
-			// validator.
-			mtimeSec = Math.floor(stat.mtimeMs / 1000);
-			headers.push(
-				['cache-control', 'no-cache'],
-				['etag', etag],
-				['last-modified', new Date(mtimeSec * 1000).toUTCString()] // determinism-allow: renders the file's own mtime, an input read from disk at index time - no clock is consulted
-			);
+			// A future or pre-1900 file time cannot supply an HTTP date. Keep
+			// the ETag, but omit Last-Modified and ignore date preconditions.
+			if (stat.mtimeMs >= Date.UTC(1900, 0, 1) && stat.mtimeMs <= now()) {
+				mtimeSec = Math.floor(stat.mtimeMs / 1000);
+				lastModified = new Date(mtimeSec * 1000).toUTCString(); // determinism-allow: formats a held file time
+			}
+			const policy = resolveStaticCacheControl(relPath, staticCacheControl);
+			// uWS writes header strings as UTF-8; Bun Headers requires byte strings.
+			const cacheControl = policy ? Buffer.from(policy, 'utf8').toString('latin1') : 'no-cache';
+			headers.push(['cache-control', cacheControl], ['etag', etag]);
+			if (lastModified !== undefined) headers.push(['last-modified', lastModified]);
 		}
 
 		const ext = path.extname(relPath).toLowerCase();
 		if (DOWNLOAD_EXTENSIONS.has(ext)) {
-			const basename = path.basename(relPath);
-			// Strip characters that are not allowed in a quoted Content-Disposition filename.
-			const safe = basename.replace(/["\\]/g, '');
-			headers.push(['content-disposition', `attachment; filename="${safe}"`]);
+			headers.push(['content-disposition', contentDispositionValue(path.basename(relPath))]);
 		}
 
 		/** @type {import('./state.js').StaticEntry} */
@@ -121,7 +161,7 @@ export function cacheDir(dir, urlPrefix, immutable, staticHeaders = null) {
 			// steer a disk read. Precompressed variants stay on disk too and are
 			// recorded by path + size so content negotiation works identically
 			// in both lanes.
-			entry = { file: absPath, size: stat.size, etag, mtimeSec, headers: mergeStaticHeaders(headers, staticHeaders) };
+			entry = { file: absPath, size: stat.size, etag, mtimeSec, lastModified, headers: mergeStaticHeaders(headers, staticHeaders) };
 			if (PRECOMPRESS) {
 				const brPath = absPath + '.br';
 				const gzPath = absPath + '.gz';
@@ -136,7 +176,7 @@ export function cacheDir(dir, urlPrefix, immutable, staticHeaders = null) {
 			}
 		} else {
 			const buffer = fs.readFileSync(absPath);
-			entry = { buffer, etag, mtimeSec, headers: mergeStaticHeaders(headers, staticHeaders) };
+			entry = { buffer, etag, mtimeSec, lastModified, headers: mergeStaticHeaders(headers, staticHeaders) };
 
 			if (PRECOMPRESS) {
 				const brPath = absPath + '.br';
@@ -163,16 +203,30 @@ export function cacheDir(dir, urlPrefix, immutable, staticHeaders = null) {
 			entry.brHeaders = variantHeaders(entry.headers, etag, 'br');
 			entry.brNotModified = notModifiedHeaders(entry.brHeaders);
 			entry.brEtag = representationEtag(etag, 'br');
+			entry.brSize ??= entry.brBuffer.byteLength;
 			entry.hasBr = true;
 		}
 		if (entry.gzBuffer || entry.gzFile) {
 			entry.gzHeaders = variantHeaders(entry.headers, etag, 'gzip');
 			entry.gzNotModified = notModifiedHeaders(entry.gzHeaders);
 			entry.gzEtag = representationEtag(etag, 'gzip');
+			entry.gzSize ??= entry.gzBuffer.byteLength;
 			entry.hasGz = true;
 		}
 
+		removeCleanAlias(urlPath);
 		staticCache.set(urlPath, entry);
+		// Also under its composed form, as SvelteKit's Node adapter keys its
+		// files: a name written decomposed, as some macOS tools write it, is found
+		// for the composed spelling a browser sends. Never over a key a file
+		// already holds, and a file's own name replaces such an alias, so a name
+		// that normalizes onto another file's never shadows it. Only a composed
+		// form that is still not ASCII: a target is ASCII, so such an alias is
+		// reached through its encoded spelling alone, and a name that composes
+		// to plain ASCII (a Kelvin sign) is not served for a target that is not
+		// its name.
+		const composed = urlPath.normalize('NFC');
+		if (composed !== urlPath && NON_ASCII.test(composed) && !staticCache.has(composed)) staticCache.set(composed, entry);
 
 		// Prerendered pages: register clean pathname aliases for the static fast
 		// path and tryPrerendered().
@@ -189,20 +243,18 @@ export function cacheDir(dir, urlPrefix, immutable, staticHeaders = null) {
 			if (relPath === 'index.html') {
 				if (urlPrefix) {
 					// Base root with non-empty base: /base/ is canonical
-					staticCache.set(urlPrefix + '/', entry);
-					prerenderedDirStyle.add(urlPrefix);
+					cacheCleanPath(urlPrefix, entry, true);
 				} else {
 					// Site root: / is already canonical
-					staticCache.set('/', entry);
+					cacheCleanPath('/', entry, false);
 				}
 			} else if (relPath.endsWith('/index.html')) {
 				// Directory-style: trailing slash is canonical
 				const cleanPath = `${urlPrefix}/${relPath.slice(0, -'/index.html'.length)}`;
-				staticCache.set(cleanPath + '/', entry);
-				prerenderedDirStyle.add(cleanPath);
+				cacheCleanPath(cleanPath, entry, true);
 			} else if (relPath.endsWith('.html')) {
 				// File-style: bare path is canonical
-				staticCache.set(`${urlPrefix}/${relPath.slice(0, -'.html'.length)}`, entry);
+				cacheCleanPath(`${urlPrefix}/${relPath.slice(0, -'.html'.length)}`, entry, false);
 			}
 		}
 	});
@@ -211,8 +263,7 @@ export function cacheDir(dir, urlPrefix, immutable, staticHeaders = null) {
 /**
  * Derive the response headers for one content-coding of an asset, once at
  * index time. Each coding is a distinct representation: it carries its own
- * validator, and it does not advertise byte ranges (ranges are served from the
- * identity representation only). Precomputing these keeps per-request work to
+ * validator, coding, and byte-range coordinates. Precomputing these keeps per-request work to
  * a single Headers construction - the same cost as serving identity.
  *
  * @param {[string, string][]} base - the identity tuples (already merged with staticHeaders)
@@ -224,7 +275,6 @@ function variantHeaders(base, etag, encoding) {
 	/** @type {[string, string][]} */
 	const out = [];
 	for (const [key, value] of base) {
-		if (key === 'accept-ranges') continue;
 		if (key === 'etag') {
 			out.push(['etag', representationEtag(etag, encoding)]);
 			continue;
@@ -235,25 +285,10 @@ function variantHeaders(base, etag, encoding) {
 	return out;
 }
 
-// What a 304 carries. RFC 9110 s15.4.5 asks for the fields a 200 would have
-// sent that a cache needs to keep its stored response usable: the validator,
-// the freshness directives, and the Vary that says which stored response is
-// even being answered. A bare 304 quietly downgrades every cache that gets one
-// - nothing to confirm the validator against, no freshness to extend, and no
-// sign the answer was negotiated. The representation headers (type, length,
-// coding) stay out: there is no body for them to describe.
-//
-// Baked per coding at index time for the same reason the coding's own headers
-// are: a revalidating cache is the most repetitive request this lane serves,
-// and it must not pay to rebuild a fixed tuple list.
-const NOT_MODIFIED_HEADERS = new Set(['etag', 'cache-control', 'vary', 'last-modified']);
-
-/**
- * @param {[string, string][]} base - one representation's full response headers
- * @returns {[string, string][]}
- */
+// Bake the representation's policy and cache metadata once per coding.
+// Type, encoding and disposition describe a body that a 304 does not carry.
 function notModifiedHeaders(base) {
-	return base.filter(([key]) => NOT_MODIFIED_HEADERS.has(key));
+	return base.filter(([key]) => key !== 'content-type' && key !== 'content-encoding' && key !== 'content-disposition');
 }
 
 export const clientDir = path.join(__dirname, 'client');
@@ -323,24 +358,26 @@ export function serveStatic(entry, requestHeaders, headOnly = false) {
 		return new Response(null, { status: 412 });
 	}
 
+	const repSize = plan.encoding === 'br' ? entry.brSize : plan.encoding === 'gzip' ? entry.gzSize : size;
 	if (plan.status === 416) {
 		return new Response(null, {
 			status: 416,
-			headers: { 'content-range': `bytes */${size}` }
+			headers: { 'content-range': `bytes */${repSize}` }
 		});
 	}
 
 	if (plan.status === 206) {
-		const headers = entryHeaders(entry, '');
-		headers.set('content-range', `bytes ${plan.start}-${plan.end}/${size}`);
+		const headers = entryHeaders(entry, plan.encoding);
+		headers.set('content-range', `bytes ${plan.start}-${plan.end}/${repSize}`);
 		const length = plan.end - plan.start + 1;
 		if (headOnly) {
 			headers.set('content-length', String(length));
 			return new Response(null, { status: 206, headers });
 		}
-		const body = entry.buffer
-			? entry.buffer.subarray(plan.start, plan.end + 1)
-			: Bun.file(/** @type {string} */ (entry.file)).slice(plan.start, plan.end + 1);
+		const buffer = plan.encoding === 'br' ? entry.brBuffer : plan.encoding === 'gzip' ? entry.gzBuffer : entry.buffer;
+		const file = plan.encoding === 'br' ? entry.brFile : plan.encoding === 'gzip' ? entry.gzFile : entry.file;
+		const body = buffer ? buffer.subarray(plan.start, plan.end + 1)
+			: Bun.file(file).slice(plan.start, plan.end + 1);
 		return new Response(body, { status: 206, headers });
 	}
 
@@ -439,4 +476,27 @@ export function tryPrerendered(pathname, search, requestHeaders, headOnly = fals
 		);
 	}
 	return null;
+}
+
+/**
+ * The static file a percent-encoded target names, for a file whose name a
+ * browser encodes - a space, a non-ASCII letter. The fast path matches the
+ * target as sent against the file's own name, and on Bun the target always
+ * arrives encoded: Bun re-escapes raw bytes before the handler sees them.
+ *
+ * Decoded with `decodeURI`, as SvelteKit's Node adapter decodes before its own
+ * file lookup, so an encoded `/` does not reach into a directory the path did
+ * not name.
+ *
+ * @param {string} pathname a target carrying a `%`
+ * @returns {import('./state.js').StaticEntry | undefined}
+ */
+export function encodedStaticEntry(pathname) {
+	let name;
+	try {
+		name = decodeURI(pathname);
+	} catch {
+		return undefined;
+	}
+	return name === pathname ? undefined : staticCache.get(name);
 }

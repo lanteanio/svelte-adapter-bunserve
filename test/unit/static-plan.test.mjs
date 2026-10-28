@@ -7,19 +7,29 @@ const SIZE = 1000;
 
 // A mutable asset with both codings available, shaped as cacheDir bakes it.
 // Frozen on purpose: entries live in the shared static cache, so anything that
-// writes to one while serving a request is a bug. An early draft did exactly
-// that; freezing turns a reintroduction into a failing test rather than a
-// silent per-request write.
+// writes to one while serving a request is a bug. Freezing catches any
+// per-request writes.
 const asset = Object.freeze({
 	etag: ETAG,
 	brEtag: 'W/"abc-123-br"',
 	gzEtag: 'W/"abc-123-gzip"',
 	hasBr: true,
+	brSize: 100,
+	gzSize: 200,
 	hasGz: true
 });
 
-// An immutable versioned asset: no validator, so no conditionals and no ranges.
+// An immutable versioned asset: wildcard conditions still test existence.
 const immutable = Object.freeze({ etag: '', hasBr: true, hasGz: true });
+
+test('immutable entries evaluate preconditions without matching empty validators', () => {
+	assert.equal(plan(immutable, { ifMatch: '"missing"', ifNoneMatch: '*' }).status, 412);
+	assert.equal(plan(immutable, { ifMatch: '*' }).status, 200);
+	assert.equal(plan(immutable, { ifMatch: '*', ifNoneMatch: '*' }).status, 304);
+	assert.equal(plan(immutable, { ifMatch: ', "missing"' }).status, 412);
+	assert.equal(plan(immutable, { ifNoneMatch: ', "missing"' }).status, 200);
+	assert.equal(plan(immutable, { ifModifiedSince: 'Sun, 06 Nov 1994 08:49:37 GMT' }).status, 200);
+});
 
 /** plan(entry, {range, ifRange, ifNoneMatch, accept, ifMatch, ifUnmodifiedSince, ifModifiedSince}) */
 function plan(entry, o = {}) {
@@ -56,15 +66,15 @@ test('a validator from a DIFFERENT representation never yields 304', () => {
 	assert.equal(plan(asset, { ifNoneMatch: asset.gzEtag, accept: 'br' }).status, 200);
 });
 
-test('a served range pins identity and yields 206 with inclusive bounds', () => {
+test('a served range uses the negotiated representation', () => {
 	assert.deepEqual(
 		plan(asset, { range: 'bytes=0-9' }),
 		{ status: 206, encoding: '', start: 0, end: 9 }
 	);
-	// even when the client would happily take brotli
+	// Coded ranges keep the negotiated representation.
 	assert.deepEqual(
 		plan(asset, { range: 'bytes=0-9', accept: 'br' }),
-		{ status: 206, encoding: '', start: 0, end: 9 }
+		{ status: 206, encoding: 'br', start: 0, end: 9 }
 	);
 });
 
@@ -87,8 +97,8 @@ test('a stale If-Range falls through to a negotiated full response', () => {
 	);
 });
 
-test('a matching If-Range honours the range', () => {
-	assert.equal(plan(asset, { range: 'bytes=0-9', ifRange: ETAG }).status, 206);
+test('a weak If-Range never authorizes a range', () => {
+	assert.equal(plan(asset, { range: 'bytes=0-9', ifRange: ETAG }).status, 200);
 });
 
 test('unsatisfiable range yields 416 and stays identity', () => {
@@ -104,12 +114,12 @@ test('If-None-Match takes precedence over a servable range', () => {
 });
 
 test('a honoured range compares If-None-Match against the identity validator', () => {
-	// The range pins identity, so a client holding a coding validator gets no
+	// Without Accept-Encoding this request selects identity, so a coding validator gets no
 	// 304 - it does not hold the representation being served.
 	assert.equal(plan(asset, { range: 'bytes=0-9', ifNoneMatch: asset.brEtag }).status, 206);
 });
 
-test('immutable assets never range and never 304, but still negotiate', () => {
+test('immutable assets never range or match specific tags, but still negotiate', () => {
 	assert.deepEqual(plan(immutable, { range: 'bytes=0-9' }), { status: 200, encoding: '' });
 	assert.deepEqual(plan(immutable, { ifNoneMatch: 'W/"anything"' }), { status: 200, encoding: '' });
 	assert.deepEqual(plan(immutable, { accept: 'br' }), { status: 200, encoding: 'br' });
@@ -142,7 +152,7 @@ test('the plan never selects a coding the entry does not advertise', () => {
 // A fixed mtime keeps every date computable by eye: the file changed at
 // t = 1_700_000_000 (Tue, 14 Nov 2023 22:13:20 GMT).
 const MTIME = 1_700_000_000;
-const dated = Object.freeze({ ...asset, mtimeSec: MTIME });
+const dated = Object.freeze({ ...asset, mtimeSec: MTIME, lastModified: new Date(MTIME * 1000).toUTCString() });
 const BEFORE = new Date((MTIME - 100) * 1000).toUTCString();
 const AT = new Date(MTIME * 1000).toUTCString();
 const AFTER = new Date((MTIME + 100) * 1000).toUTCString();
@@ -151,26 +161,12 @@ test('If-Match with a stale validator answers 412, not a fresh body', () => {
 	assert.deepEqual(plan(dated, { ifMatch: 'W/"old-etag"' }), { status: 412, encoding: '' });
 });
 
-test('If-Match matches the validator of the representation being served', () => {
-	// Opaque equality on purpose: every validator here is weak by
-	// construction, and RFC strong comparison would 412 a client echoing the
-	// exact validator this server handed it. The comment in the planner
-	// carries the reasoning. What it is NOT is coding-blind - the precondition
-	// is defined against the SELECTED representation.
-	assert.equal(plan(dated, { ifMatch: ETAG }).status, 200);
-	assert.equal(plan(dated, { ifMatch: dated.brEtag, accept: 'br' }).status, 200);
-	assert.equal(plan(dated, { ifMatch: '*' }).status, 200);
-	assert.equal(plan(dated, { ifMatch: `W/"other", ${ETAG}` }).status, 200, 'the list form is split');
-});
-
-test('If-Match holding another representation validator is 412, not a fresh body', () => {
-	// The client says "only if my copy is the one you would serve". Its copy is
-	// the gzip representation; identity is what this request selects. Answering
-	// 200 hands it bytes it did not ask about, and the old planner did exactly
-	// that because it compared before negotiating.
-	assert.equal(plan(dated, { ifMatch: dated.gzEtag }).status, 412);
-	assert.equal(plan(dated, { ifMatch: ETAG, accept: 'br' }).status, 412);
-	assert.equal(plan(dated, { ifMatch: dated.brEtag, accept: 'gzip' }).status, 412);
+test('If-Match accepts any validator issued for the asset', () => {
+	for (const accept of ['', 'br', 'gzip']) {
+		for (const ifMatch of [ETAG, dated.brEtag, dated.gzEtag, '*', `W/"other", ${ETAG}`]) {
+			assert.equal(plan(dated, { ifMatch, accept }).status, 200);
+		}
+	}
 });
 
 test('If-None-Match takes the wildcard and the list form', () => {
@@ -182,12 +178,24 @@ test('If-None-Match takes the wildcard and the list form', () => {
 	assert.equal(plan(dated, { ifNoneMatch: `W/"other", ${ETAG}`, accept: 'br' }).status, 200);
 });
 
-test('entity-tags compare weakly, so the W/ prefix is not load-bearing', () => {
-	// RFC 9110 s13.1.2: If-None-Match uses weak comparison. Every validator
-	// this lane issues is weak, and a cache that stored the opaque tag without
-	// the prefix is asking about the same representation.
+test('If-None-Match compares weakly while If-Match requires an issued tag', () => {
 	assert.equal(plan(dated, { ifNoneMatch: '"abc-123"' }).status, 304);
-	assert.equal(plan(dated, { ifMatch: '"abc-123"' }).status, 200);
+	assert.equal(plan(dated, { ifMatch: '"abc-123"' }).status, 412);
+});
+
+test('weak lists walk quoted tags, reject malformed prefixes and preserve representation selection', () => {
+	for (const [accept, tag] of [['', dated.etag], ['br', dated.brEtag], ['gzip', dated.gzEtag]]) {
+		const opaque = tag.slice(2);
+		for (const header of [tag, opaque, `"other", ${opaque}`, `W/"other,tag",\t${opaque}`, `, \t${tag},`, ` ${opaque} `]) {
+			assert.equal(plan(dated, { accept, ifNoneMatch: header }).status, 304, `${accept}: ${header}`);
+		}
+		for (const header of [`other, ${opaque}`, `W/other, ${opaque}`, `w/${opaque}`, `"other" junk, ${opaque}`, `"unterminated, ${opaque}`, '"other,tag"']) {
+			assert.equal(plan(dated, { accept, ifNoneMatch: header }).status, 200, `${accept}: ${header}`);
+		}
+	}
+	assert.equal(plan(dated, { accept: 'br', ifNoneMatch: dated.etag.slice(2) }).status, 200);
+	assert.equal(plan({ ...dated, etag: '"strong"' }, { ifNoneMatch: 'W/"strong"' }).status, 304);
+	assert.equal(plan({ ...dated, etag: 'W/"comma,tag"' }, { ifNoneMatch: '"other", "comma,tag"' }).status, 304);
 });
 
 test('a 304 carries the coding that was negotiated, not identity', () => {
@@ -198,16 +206,13 @@ test('a 304 carries the coding that was negotiated, not identity', () => {
 		{ status: 304, encoding: 'gzip' });
 });
 
-test('only an HTTP-date is a date', () => {
-	// Date.parse would take all of these. RFC 9110 s5.6.7 defines three
-	// formats and an ISO 8601 string is none of them - honouring one lets a
-	// header no HTTP sender may write decide a 304 or a 412.
+test('date preconditions ignore non-HTTP dates', () => {
 	assert.equal(plan(dated, { ifModifiedSince: '2023-11-14T22:13:20Z' }).status, 200);
 	assert.equal(plan(dated, { ifModifiedSince: '14 Nov 2023' }).status, 200);
 	assert.equal(plan(dated, { ifUnmodifiedSince: '2000-01-01' }).status, 200);
-	// The two obsolete formats a recipient MUST still accept.
 	assert.equal(plan(dated, { ifModifiedSince: 'Tuesday, 14-Nov-23 22:13:20 GMT' }).status, 304);
 	assert.equal(plan(dated, { ifModifiedSince: 'Tue Nov 14 22:13:20 2023' }).status, 304);
+	assert.equal(plan(dated, { ifModifiedSince: 'Tue Nov 14 22:13:20 2023 GMT' }).status, 200);
 });
 
 test('a failed If-Match wins over a matching If-None-Match', () => {

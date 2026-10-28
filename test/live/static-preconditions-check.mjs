@@ -12,6 +12,8 @@
 // test while being handed the wrong header name by its caller.
 
 import { assertPortFree, buildPath, serverEnv, waitForServer } from './harness.mjs';
+import assert from 'node:assert/strict';
+import { connect } from 'node:net';
 
 const PORT = 8817;
 const BUILD = buildPath();
@@ -41,6 +43,42 @@ const base = `http://127.0.0.1:${PORT}`;
 const get = (headers = {}) =>
 	fetch(base + ASSET, { headers: { 'accept-encoding': 'identity', ...headers } });
 
+function raw(method, headers) {
+	return new Promise((resolve, reject) => {
+		let data = Buffer.alloc(0);
+		const socket = connect({ port: PORT, host: '127.0.0.1' }, () => {
+			const fields = Object.entries(headers).map(([key, value]) => `${key}: ${value}\r\n`).join('');
+			socket.write(`${method} /test.txt HTTP/1.1\r\nHost: localhost\r\n${fields}Connection: close\r\n\r\n`);
+		});
+		socket.setTimeout(5000, () => socket.destroy(new Error('static response timed out')));
+		socket.on('error', reject);
+		socket.on('data', chunk => {
+			data = Buffer.concat([data, chunk]);
+			const end = data.indexOf('\r\n\r\n');
+			if (end < 0) return;
+			const text = data.subarray(0, end).toString('latin1');
+			const length = /content-length: (\d+)/i.exec(text);
+			if (method === 'HEAD' || (length && data.length - end - 4 >= Number(length[1]))) {
+				socket.destroy();
+				resolve(data);
+			}
+		});
+		socket.on('end', () => resolve(data));
+	});
+}
+
+function response(buffer) {
+	const end = buffer.indexOf('\r\n\r\n');
+	assert.ok(end > 0, 'response headers arrived');
+	const lines = buffer.subarray(0, end).toString('latin1').split('\r\n');
+	const status = Number(lines.shift().split(' ')[1]);
+	const headers = new Headers(lines.map(line => {
+		const colon = line.indexOf(':');
+		return [line.slice(0, colon), line.slice(colon + 1).trim()];
+	}));
+	return { status, headers, bytes: buffer.length - end - 4 };
+}
+
 try {
 	await waitForServer(proc, PORT);
 
@@ -63,7 +101,7 @@ try {
 		check(`the 304 carries ${name}`, notModified.headers.get(name) === full.headers.get(name),
 			`304 ${JSON.stringify(notModified.headers.get(name))} vs 200 ${JSON.stringify(full.headers.get(name))}`);
 	}
-	check('and describes no body', notModified.headers.get('content-type') === null,
+	check('and omits the representation type', notModified.headers.get('content-type') === null,
 		JSON.stringify(notModified.headers.get('content-type')));
 
 	const star = await get({ 'if-none-match': '*' });
@@ -72,10 +110,9 @@ try {
 	const list = await get({ 'if-none-match': `W/"other", ${etag}` });
 	check('a list naming the validator answers 304', list.status === 304, `status ${list.status}`);
 
-	// Weak comparison: the same opaque tag without the prefix is the same
-	// representation, and a cache that stored it that way must be answered.
+	// Cache revalidation uses weak comparison of the selected opaque tag.
 	const strongSpelling = await get({ 'if-none-match': etag.replace(/^W\//, '') });
-	check('the W/ prefix is not load-bearing', strongSpelling.status === 304,
+	check('the validator matches without its W/ prefix', strongSpelling.status === 304,
 		`status ${strongSpelling.status}`);
 
 	const mismatch = await get({ 'if-none-match': 'W/"not-the-one"' });
@@ -103,12 +140,35 @@ try {
 	check('If-Modified-Since after the file changed answers 304', dated.status === 304,
 		`status ${dated.status}`);
 
-	// Date.parse would take this. An HTTP-date parser does not, and an ignored
-	// header means the full response - never a 304 the client did not earn.
+	// Non-HTTP dates must not influence precondition outcomes.
 	const iso = await get({ 'if-modified-since': new Date(servedAt + 60_000).toISOString() });
 	await iso.text();
-	check('an ISO 8601 string is not an HTTP-date and is ignored', iso.status === 200,
+	check('an ISO date is ignored', iso.status === 200,
 		`status ${iso.status}`);
+
+	for (const coding of ['identity', 'br', 'gzip']) {
+		const selected = response(await raw('GET', { 'accept-encoding': coding }));
+		assert.equal(selected.status, 200);
+		assert.equal(selected.headers.get('content-encoding'), coding === 'identity' ? null : coding);
+		const opaque = selected.headers.get('etag').replace(/^W\//, '');
+		for (const method of ['GET', 'HEAD']) {
+			for (const validator of [opaque, `"other,tag", ${opaque}`]) {
+				const unchanged = response(await raw(method, { 'accept-encoding': coding, 'if-none-match': validator }));
+				assert.equal(unchanged.status, 304, `${method} ${coding} ${validator}`);
+				assert.equal(unchanged.bytes, 0);
+				assert.equal(unchanged.headers.get('content-length'), null, '304 without a declared representation length');
+				for (const name of ['content-type', 'content-encoding', 'content-disposition']) assert.equal(unchanged.headers.get(name), null, name);
+				for (const name of ['etag', 'cache-control', 'vary', 'last-modified', 'accept-ranges', 'x-content-type-options', 'strict-transport-security', 'content-security-policy', 'x-frame-options', 'referrer-policy']) {
+					assert.ok(selected.headers.has(name), `configured ${name} reaches the static 200`);
+					assert.equal(unchanged.headers.get(name), selected.headers.get(name), name);
+				}
+				check(`${method} ${coding} weak validator preserves 304 policy metadata`, true);
+			}
+			const malformed = response(await raw(method, { 'accept-encoding': coding, 'if-none-match': `invalid, ${opaque}` }));
+			assert.equal(malformed.status, 200, 'a malformed member before the matching tag rejects the list');
+			check(`${method} ${coding} malformed validator list serves normally`, true);
+		}
+	}
 } catch (err) {
 	failed++;
 	failures.push('THREW: ' + (err?.message ?? String(err)));

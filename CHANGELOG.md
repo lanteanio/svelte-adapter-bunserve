@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Static responses preserve representation validators, cache rules, encoded paths and configured base-path immutability.
+
 - Coalesced drains contain serialization failures, retain the latest value during reentrancy and yield bounded work.
 
 - Framework assertions retain category counters and metric metadata without inventing violation samples.

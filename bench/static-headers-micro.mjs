@@ -6,8 +6,8 @@
 // construction - not just the cheap half, so the number describes production
 // rather than flattering it.
 //
-// The correctness work (a distinct validator per content coding, no
-// accept-ranges on an encoded response) must not be paid for per request: it
+// The correctness work (a distinct validator per content coding, byte ranges
+// available for every representation) must not be paid for per request: it
 // is resolved at index time, so serving any representation costs one Headers
 // construction.
 //
@@ -60,7 +60,6 @@ const identityTuples = [
 function variantTuples(base, encoding) {
 	const out = [];
 	for (const [key, value] of base) {
-		if (key === 'accept-ranges') continue;
 		if (key === 'etag') { out.push(['etag', representationEtag(ETAG, encoding)]); continue; }
 		out.push([key, value]);
 	}

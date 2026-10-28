@@ -47,10 +47,14 @@ test('non-digit tokens are ignored (RFC 7233 1*DIGIT)', () => {
 
 test('negative and inverted forms are ignored', () => {
 	assert.equal(parseRange('bytes=5-2', 1000), false);
-	assert.equal(parseRange('bytes=-0', 1000), false);
 	assert.equal(parseRange('bytes=-', 1000), false);
 });
 
 test('zero-length file: any start is unsatisfiable', () => {
 	assert.equal(parseRange('bytes=0-', 0), null);
+});
+
+test('zero suffix is unsatisfiable', () => {
+	assert.equal(parseRange('bytes=-0', 1000), null);
+	assert.equal(parseRange('bytes=-0', 0), null);
 });
