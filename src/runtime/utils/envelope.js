@@ -39,7 +39,27 @@ export function buildEnvelopePrefix(topic, event) {
  * @returns {string}
  */
 export function completeEnvelope(prefix, data, seq, jitterMs) {
-	const body = prefix + JSON.stringify(data ?? null);
+	return completeSerializedEnvelope(prefix + envelopeData(data), seq, jitterMs);
+}
+
+/** Finish a serialized envelope after sequence assignment. */
+export function completeSerializedEnvelope(body, seq, jitterMs) {
 	const tail = jitterMs == null ? '}' : ',"j":' + jitterMs + '}';
 	return seq == null ? body + tail : body + ',"seq":' + seq + tail;
+}
+
+/**
+ * The `data` field of an envelope as JSON. `JSON.stringify` throws for a BigInt
+ * or a cycle, but for a function or a symbol it returns undefined rather than
+ * a string, which concatenated into a frame would put `"data":undefined` on the
+ * wire - a frame no client can parse. That case throws here instead, to the
+ * caller, like the others.
+ *
+ * @param {unknown} data
+ * @returns {string}
+ */
+export function envelopeData(data) {
+	const json = JSON.stringify(data ?? null);
+	if (typeof json !== 'string') throw new TypeError('message data has no JSON form (a function or a symbol cannot be sent)');
+	return json;
 }

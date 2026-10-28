@@ -1,34 +1,10 @@
-/**
- * The `platform` object handed to every WebSocket hook and to server-side app
- * code. This is the JSON realtime surface: topic fan-out, per-connection send,
- * brokered subscribe/unsubscribe, and the observability getters.
- *
- * What is deliberately NOT here yet: the deferred JSON-tier members
- * sendCoalesced, topicEpoch, batch, publishBatched, request, and
- * requestTopic. Those are their own slices. They are omitted
- * rather than stubbed - a zero stub reports
- * "supported" to a caller and then silently does nothing, which is worse than
- * an undefined member a caller CAN feature-detect.
- *
- * "Can" is doing real work in that sentence, and it is not the same as "does".
- * svelte-adapter-uws-extensions guards some of these (requestTopic,
- * authorizeWireSubscribe, the wire members) and binds four of them
- * unconditionally: sendCoalesced and request (src/redis/pubsub.js:285-286),
- * onPressure and onPublishRate (:362-363). The latter two exist here now
- * (real sampling, not stubs), so `bus.wrap(platform)` - the first line of
- * that package's documented usage - still throws a TypeError against this
- * platform, on sendCoalesced/request. Omission is still the right choice; the
- * consumer's missing guards are the bug, and they are tracked on that repo.
- * But nothing here should claim multi-node fan-out works until they land.
- *
- * Every method that touches a socket goes through the facade
- * (handler/ws-facade.js), so a closed socket throws here rather than silently
- * succeeding. The catch sites below turn that throw into the closedWsAborts
- * lane, which is NOT the backpressure-drop lane - see utils/send-result.js for
- * why conflating them corrupts wire state.
- */
+/** Realtime topic delivery, connection state, and request observability. */
 
-import { completeEnvelope } from '../utils/envelope.js';
+import { isUint8Array } from 'node:util/types';
+import { completeGameEnvelope, assertStampableSeq, wrapBatchEnvelope } from '../utils/epoch.js';
+import { registerGameIngress, assertGameLaneClusterSafe, GAME_FANOUT_CAP, GAME_FANOUT_SCHEMA_VERSION, encodeGameFanoutPayload } from './game-ingress.js';
+import { completeEnvelope, completeSerializedEnvelope, envelopeData } from '../utils/envelope.js';
+import { assert, fatal, readAssertionCounts } from '../utils/assertions.js';
 import { isSystemTopic, isValidWireTopic, createTopicHelperCache } from '../utils/topic.js';
 import { SEND_DROPPED, publishReached } from '../utils/send-result.js';
 import { isValidResumeEpoch, isValidResumeSeq } from '../utils/resume-input.js';
@@ -73,33 +49,75 @@ import {
 } from './resume-buffer.js';
 import {
 	MAX_SUBSCRIPTIONS_PER_CONNECTION,
+	MAX_PENDING_SUBSCRIBES_PER_CONNECTION,
 	WS_CAPS,
 	WS_PLATFORM,
 	WS_SESSION_ID,
 	WS_SUBSCRIPTIONS,
 	beginPendingSubscribe,
+	isPendingSubscribeCancelled,
+	subscribeAuth,
 	capCounts,
 	captureResumeFrame,
 	notePublishedSeq,
 	resumeBuffers,
 	sharedTopics,
 	getServer,
-	hasGateHeadroom,
-	pendingSubscribeTopics,
+	heldSubscriptions,
+	mintTopicEpoch,
+	topicEpochValue,
 	pressureListeners,
 	pressureSnapshot,
 	publishRateListeners,
 	settlePendingSubscribe,
-	withGateCounted,
-	stampExplicitSeq,
 	stampSeq,
 	stampSeqValue,
 	tombstonePendingSubscribe,
 	wsConnections,
-	wsCounters
+	wsCounters,
+	WS_COALESCED,
+	MAX_COALESCED_KEYS_PER_CONNECTION
 } from './ws-state.js';
-import { allow_unauthenticated_subscribe, ws_compression_on, ws_options } from './config.js';
-import { metricsRegistry, metricsSnapshot } from './metrics.js';
+import { flushCoalescedFor } from './coalesced.js';
+import { allow_non_ascii_topics, authorize_wire_subscribe, authorize_wire_subscribe_strict, ws_compression_on, ws_options } from './config.js';
+import { metricsRegistry, metricsSnapshot, projectMetrics } from './metrics.js';
+import { resolveEntrySeq, resolveSendSeq } from '../utils/publish-seq.js';
+import { isWarmupRequest } from './warmup-registry.js';
+import {
+	deniesUngrantedObserve,
+	deniesWireSubscribeLanding,
+	deniesWireSubscribePreHook,
+	exceedsSubscriptionCap,
+	isAuthorizationHook,
+	recoverIsRevoked,
+	isPluginOwnedTopic,
+	wantsRecover
+} from '../utils/subscribe-policy.js';
+import {
+	WS_ATTRIBUTION,
+	WS_PUBLISH_GRANT,
+	WS_COHORT_JOIN,
+	WS_COHORT_LEAVE,
+	WS_RELEASE_MEMBERSHIP,
+	pendingSubscribeTotal,
+	WS_REVOKED_UNSUBSCRIBE,
+	addLogicalSubscription,
+	heldLandingWouldAck,
+	releaseDerivedSubscriptions,
+	removeLogicalSubscription,
+	membershipUnconfirmed,
+	settleDeniedSubscribe,
+	settleHeldSubscribe,
+	unwindRevokedMembership
+} from '../utils/ws-symbols.js';
+import { dispatchServerUnsubscribeHook, dispatchUnsubscribeHook } from './unsubscribe-hook.js';
+
+// Seed the live arming from the build. Raises after this come through
+// `platform.authorizeWireSubscribe()`; nothing ever lowers it.
+if (authorize_wire_subscribe) {
+	subscribeAuth.enabled = true;
+	if (authorize_wire_subscribe_strict) subscribeAuth.strict = true;
+}
 
 // The per-topic window stats the pressure sampler drains are recorded by
 // chargePublishEgress in publish-egress.js - one charge point per logical
@@ -116,29 +134,23 @@ const subscribeThrewThrottle = createLogThrottle(() => processMonotonicNow());
 const recoverThrewThrottle = createLogThrottle(() => processMonotonicNow());
 
 /**
- * A codec that threw, or handed back something that is not bytes. Throttled
- * with decay for the same reason the hook throttles are: safeEncode runs inside
- * the PER-CONNECTION walk, so one broken codec on a busy topic is one stderr
- * write per connection per publish - an event-loop stall and a filled disk from
- * a bug that is already degrading that capability to JSON.
- */
-const encodeFailedThrottle = createLogThrottle(() => processMonotonicNow());
-
-/**
- * The seq-less JSON envelope a wire member falls back to for a caps-less,
- * poisoned, or codec-declined frame: byte-identical to what `send()` produces
- * (`envelopePrefix + JSON.stringify(data ?? null) + '}'`), so a degraded
- * connection is indistinguishable from a caps-less one to the app.
+ * The JSON envelope a wire member falls back to for a caps-less, poisoned, or
+ * codec-declined frame: byte-identical to what `send()` produces
+ * (completeEnvelope over the same prefix and data), so a degraded connection
+ * is indistinguishable from a caps-less one to the app.
  *
  * @param {any} ws - the socket facade
  * @param {string} topic
  * @param {string} event
  * @param {unknown} data
  * @param {boolean} compress
+ * @param {number | null} [seq] - the caller's explicit gap-fill seq, carried
+ *   here so a connection that fell back to JSON keys the same watermark a
+ *   binary one would have read out of the frame's seq slot
  * @returns {0 | 1 | 2}
  */
-function wireJsonSend(ws, topic, event, data, compress) {
-	const json = envelopePrefix(topic, event) + JSON.stringify(data ?? null) + '}';
+function wireJsonSend(ws, topic, event, data, compress, seq) {
+	const json = completeEnvelope(envelopePrefix(topic, event), data, seq);
 	let result;
 	try {
 		result = ws.send(json, false, compress);
@@ -185,112 +197,33 @@ function assertSeqOption(seqOption, topic) {
 }
 
 /**
- * The seq an entry carries in its own right: a validated number, or undefined
- * when the entry defers to the batch. Absent and null defer - a per-row
- * authority column that is null means this row has no cluster seq, not that the
- * batch was called wrong. Anything else is refused by position, because an
- * entry that says `seq: true` or `seq: '42'` was trying to say something about
- * this entry and the counter would answer with a value from another space.
+ * Resolve an entry's override: a validated number is its authority, true
+ * draws the counter, false and null omit the seq, and undefined inherits the
+ * batch options. Invalid values are refused by entry position.
  *
  * @param {unknown} seq
  * @param {string} topic
  * @param {number} index
- * @returns {number | undefined}
+ * @returns {number | boolean | undefined}
  */
 function entrySeq(seq, topic, index) {
-	if (seq === undefined || seq === null) return undefined;
-	if (typeof seq === 'number') return stampExplicitSeq(seq, topic);
-	throw new TypeError(
-		`publishWireBatch entry ${index} carries a seq that is not a number ` +
-		`(${typeof seq === 'string' ? JSON.stringify(seq) : String(seq)}, topic "${topic}"). An ` +
-		'entry seq is the cluster-authoritative value for that entry and must be an integer ' +
-		'>= 1; leave it out (or pass null) to take the seq the batch options ask for.'
-	);
+	return resolveEntrySeq(seq, topic, index);
 }
 
 function throwBatchExplicitSeq(topic, seq) {
 	throw new TypeError(
 		`publishWireBatch was given a batch-level { seq: ${String(seq)} } (topic "${topic}"): one ` +
 		'number cannot be the one-seq-per-entry this method publishes. Put the cluster seq on ' +
-		'each entry instead - { data, seq }, each an integer >= 1 - or use { seq: true } for the ' +
+		'each entry instead - { data, seq }, each a positive integer number or bigint inside the ' +
+		'wire\'s safe-integer range - or use { seq: true } for the ' +
 		'local counter, which already increments per entry.'
 	);
 }
 
 /**
- * Whether the most recent safeEncode call returned null because the codec
- * FAILED (threw, or returned a wrong-type value) rather than declined. A
- * decline is a codec's deliberate answer and leaves its per-connection state
- * coherent by contract; a failure escaped partway, so a stateful codec's
- * dictionaries may have advanced for a frame the client will never see - the
- * decode desync poisoning exists for. Callers that passed a non-null state
- * read this immediately after the call and poison on it. A module flag rather
- * than a sentinel return or a callback: every existing `payload == null`
- * check stays exhaustive, and the fan-out walk allocates nothing for it.
- * EVERY path writes the flag after wire.encode has returned or thrown -
- * including the success and clean-decline paths - so the last write always
- * describes the call that just finished, and a codec that publishes
- * re-entrantly (an inner failure setting the flag mid-call) cannot leave the
- * inner verdict behind for the outer read.
- */
-let encodeFailed = false;
-
-/**
- * Encode one wire frame, treating a throwing codec as a decline rather than
- * letting it abort a fan-out walk partway - some subscribers already have the
- * frame, and the seq is stamped and resume-captured, so a mid-walk escape
- * leaves the topic inconsistent. A failure is logged - throttled with decay,
- * because this runs inside the per-connection walk - and the connection takes
- * the JSON envelope like any other decline; `encodeFailed` records that it
- * was a failure, so stateful callers can poison the capability rather than
- * keep referencing state the client never learned.
- *
- * @param {{ encode: Function }} wire
- * @param {string} event
- * @param {unknown} data
- * @param {unknown} [state]
- * @returns {Uint8Array | null}
- */
-function safeEncode(wire, event, data, state) {
-	let payload;
-	try {
-		payload = wire.encode(event, data, state);
-		// Written AFTER encode returned, never before it runs: encode is app
-		// code and may publish re-entrantly, and an entry-time reset would
-		// let an inner call's failure survive an outer call's clean decline.
-		encodeFailed = false;
-	} catch (err) {
-		encodeFailed = true;
-		const { log, count } = encodeFailedThrottle();
-		if (log) console.error(`[ws] wire.encode threw for ${wire.capability} ${event} (x${count})`, err);
-		return null;
-	}
-	// A wrong-TYPE return is the same class of codec bug as a throw and takes
-	// the same answer. Unchecked it reaches buildBinaryFrame, which sizes the
-	// frame writer as `8 + payload.length`: for anything without a numeric
-	// length that is NaN, the writer gets a zero-capacity buffer, and the
-	// growth loop cannot grow it - the codec's bug becomes a hung event loop
-	// instead of one degraded connection. An accidentally-async `encode` is the
-	// likely route, since a Promise is truthy and has no length. Buffer passes,
-	// being a Uint8Array subclass.
-	if (payload != null && !(payload instanceof Uint8Array)) {
-		encodeFailed = true;
-		const { log, count } = encodeFailedThrottle();
-		if (log) {
-			console.error(
-				`[ws] wire.encode returned a ${typeof payload} for ${wire.capability} ${event} (x${count})` +
-				' - serving the JSON envelope instead. Return a Uint8Array, or null to decline.'
-			);
-		}
-		return null;
-	}
-	return payload;
-}
-
-/**
  * Deliver one prebuilt envelope to one connection inside a fan-out walk:
- * closed sockets land in the closed lane and only delivered bytes are
- * charged. The walk continues either way.
+ * closed sockets land in the closed lane. A broadcast charges no
+ * per-connection traffic counter (see bumpOut). The walk continues either way.
  *
  * @param {any} ws - the socket facade
  * @param {string} envelope
@@ -299,10 +232,7 @@ function safeEncode(wire, event, data, state) {
  */
 function wireEnvelopeSend(ws, envelope, compress) {
 	try {
-		if (ws.send(envelope, false, compress) !== SEND_DROPPED) {
-			bumpOut(ws, envelope);
-			return true;
-		}
+		if (ws.send(envelope, false, compress) !== SEND_DROPPED) return true;
 	} catch {
 		wsCounters.closedWsAborts++;
 	}
@@ -332,7 +262,7 @@ function wireEnvelopeSend(ws, envelope, compress) {
  * @param {string} hookName - the gate that produced the verdict
  * @returns {string | null} a denial reason, or null to allow
  */
-function normalizeSubscribeVerdict(verdict, topic, hookName) {
+export function normalizeSubscribeVerdict(verdict, topic, hookName) {
 	if (verdict === false) return 'FORBIDDEN';
 	if (typeof verdict === 'string') return verdict;
 	if (!isReadableVerdict(verdict)) {
@@ -381,24 +311,103 @@ export async function runBatchGate(ws, topics) {
 	}
 }
 
-let warnedNoSubscribeHook = false;
-/** One-shot, because it fires per denied subscribe and would otherwise flood. */
-function warnNoSubscribeHook() {
-	if (warnedNoSubscribeHook) return;
-	warnedNoSubscribeHook = true;
-	console.error(
-		'[ws] A client tried to subscribe, but this app exports no subscribe gate, so every\n' +
-		'  subscription is being DENIED with SUBSCRIBE_NOT_CONFIGURED. Without a gate the server\n' +
-		'  cannot tell an app-private topic from a public one, and allowing by default would let\n' +
-		'  any client that can name a topic read it. Pick one:\n' +
-		'    1. Export `subscribe(ws, topic, { platform })` from your ws handler and return a\n' +
-		'       reason string to deny, or null to allow.\n' +
-		'    2. Export `subscribeBatch(ws, topics, { platform })` to gate a whole batch in one\n' +
-		'       call, returning a map of topic -> denial reason.\n' +
-		'    3. Set `websocket: { allowUnauthenticatedSubscribe: true }` in the adapter options\n' +
-		'       to state that every topic in this app is public.'
+/** Resolve every batch authorization before recovery and ordered landing. */
+export async function runWireBatchGates(ws, topics, tokens, preDenied = []) {
+	if (typeof wsModule.subscribeBatch === 'function') {
+		const hookTopics = topics.filter((_topic, index) => !preDenied[index]);
+		const verdicts = hookTopics.length ? await runBatchGate(ws, hookTopics) : new Map();
+		return topics.map((topic, index) => preDenied[index] ? 'FORBIDDEN' : verdicts.get(topic));
+	}
+	let userData;
+	try { userData = ws.getUserData(); }
+	catch { return topics.map(() => 'CLOSED'); }
+	return Promise.all(topics.map((topic, index) =>
+		preDenied[index] ? 'FORBIDDEN' : isPendingSubscribeCancelled(userData, topic, tokens[index])
+			? null : runSubscribeGate(ws, topic, undefined, { fromWire: true })));
+}
+
+/**
+ * Whether the server-grant gate, not an app hook, decides a wire subscribe
+ * right now.
+ *
+ * The wire batch lane asks this before it runs the app's `subscribeBatch`
+ * hook. An ungranted topic is refused before application work; held topics
+ * still reach the hook so a current application denial remains authoritative.
+ *
+ * Exported rather than re-derived in the demux: the arming and the
+ * side-effect-only hook rule live here, and a second spelling of them is how
+ * the two lanes would come to disagree.
+ *
+ * @returns {boolean}
+ */
+export function wireGrantGateDecides() {
+	if (!subscribeAuth.enabled) return false;
+	// Strict is conjunctive, so a hook does not take the decision away from the
+	// grant; it only narrows what the grant already allowed.
+	return !(hasUserSubscribeHook() && !subscribeAuth.strict);
+}
+
+/**
+ * Whether the app exported a subscribe hook that DECIDES, which is what stands
+ * the grant gate aside.
+ *
+ * One definition, read by every lane. The question is not `typeof
+ * wsModule.subscribe === 'function'`: a plugin's hook observes the subscribe
+ * without ever denying, and counting it would disarm the gate for an app that
+ * merely imported the plugin. See {@link isAuthorizationHook}.
+ *
+ * @returns {boolean}
+ */
+export function hasUserSubscribeHook() {
+	return isAuthorizationHook(wsModule.subscribe) || isAuthorizationHook(wsModule.subscribeBatch);
+}
+
+/**
+ * Whether the OBSERVER lane's grant has gone since the gate let it in.
+ *
+ * The app's hook is awaited, and `platform.unsubscribe` is synchronous, so a
+ * revocation can begin and finish inside that window. A grant that existed
+ * before the await is not authority to reveal a topic's roster or history
+ * after it was taken away - and the posture itself can tighten in the same
+ * window, because `'strict'` latches at runtime and has to judge the decisions
+ * already in flight. Both are why this reads the arming and the grant set
+ * fresh rather than reusing what the pre-hook check saw.
+ *
+ * A legitimate revoke-then-re-grant is invisible here, as it should be: the
+ * topic is back in the set, so the connection holds it again.
+ *
+ * @param {any} ws
+ * @param {string} topic
+ * @param {{ requireGrant?: boolean } | undefined} lane
+ * @param {boolean} hasUserHook - the reading taken before the hook ran
+ * @returns {boolean}
+ */
+function observerGrantLost(ws, topic, lane, hasUserHook) {
+	if (!lane || !lane.requireGrant || !subscribeAuth.enabled) return false;
+	return deniesUngrantedObserve(
+		true,
+		hasUserHook && !subscribeAuth.strict,
+		confirmedGrants(ws, topic),
+		topic
 	);
 }
+
+/** Read as a grant set by an observer lane whose grant is unconfirmed. */
+const NO_GRANTS = new Set();
+
+/**
+ * The connection's grants as a grant read may use them for `topic`: its
+ * subscriptions, unless the membership for `topic` is still waiting to be
+ * judged, in which case none.
+ *
+ * @param {any} ws
+ * @param {string} topic
+ * @returns {Set<string>}
+ */
+function confirmedGrants(ws, topic) {
+	return grantUnconfirmed(ws, topic) ? NO_GRANTS : heldSubscriptions(ws);
+}
+
 
 /**
  * Lazily built LRU of scoped topic helpers, bound to this platform's publish.
@@ -408,7 +417,22 @@ function warnNoSubscribeHook() {
  */
 let topicHelperCache = null;
 
-/** @type {any} */
+/**
+ * Whether the membership a connection holds for `topic` is still waiting on
+ * an attempt in flight. See membershipUnconfirmed in utils/ws-symbols.js.
+ *
+ * @param {any} ws
+ * @param {string} topic
+ * @returns {boolean}
+ */
+function grantUnconfirmed(ws, topic) {
+	try {
+		return membershipUnconfirmed(ws.getUserData(), topic);
+	} catch {
+		return false;
+	}
+}
+
 /**
  * The one place the subscribe gate runs.
  *
@@ -430,7 +454,7 @@ let topicHelperCache = null;
  * @param {unknown} [verdict] - already obtained from subscribeBatch for this topic
  * @returns {Promise<string | null>}
  */
-async function runSubscribeGate(ws, topic, verdict) {
+async function runSubscribeGate(ws, topic, verdict, lane) {
 	// Validated HERE and not only in platform.subscribe, because
 	// platform.checkSubscribe is a public entry point too and the documented
 	// pattern is `if (await platform.checkSubscribe(...)) return; ws.subscribe(t)`
@@ -447,26 +471,55 @@ async function runSubscribeGate(ws, topic, verdict) {
 	// through, so they cannot disagree about one topic name. Only reachable with
 	// `allowSystemTopicSubscribe: true` - the `__` guard refuses it otherwise.
 	if (topic === '__proto__') return 'INTERNAL_ERROR';
+	// The server-grant gate, decided BEFORE the verdict short-circuit below so
+	// the wire batch lane is judged by it too. A verdict is the app hook's
+	// answer, and under `'strict'` the grant is a second authority no hook can
+	// speak for - reading the verdict first would let the batch spelling of a
+	// request succeed where the single spelling of it is refused.
+	//
+	// Read fresh, never snapshotted: `subscribeAuth.enabled` latches false ->
+	// true at runtime, so a gate armed while a frame was parked in its hook
+	// must judge that frame armed.
+	// ONE reading of the app's hook set for this whole decision. The arming and
+	// the strict latch are read fresh at every check below, because both only
+	// ever tighten and a frame parked in a hook must be judged by the posture in
+	// force when it lands. The hook set is different: it is a module binding
+	// that can change in either direction, and a decision that starts under the
+	// gate's authority and finishes under the app's - or the reverse - is one
+	// request judged by two models.
+	const userHook = hasUserSubscribeHook();
+	if (subscribeAuth.enabled) {
+		// Strict is conjunctive: the grant is required even when a hook exists,
+		// so the hook stops standing the gate aside.
+		const hookDecides = userHook && !subscribeAuth.strict;
+		const grants = heldSubscriptions(ws);
+		if (lane && lane.fromWire) {
+			if (deniesWireSubscribePreHook({
+				armed: true,
+				hasUserHook: hookDecides,
+				// A grant, which a membership installed inside an attempt's await
+				// window is not until an attempt confirms it: read as one, a
+				// client re-sending its subscribe would mint authority from an
+				// install nobody authorized - a revoked attempt's own, say.
+				held: grants.has(topic) && !grantUnconfirmed(ws, topic),
+				topic
+			})) {
+				return 'FORBIDDEN';
+			}
+		} else if (lane && lane.requireGrant) {
+			// The OBSERVER lane: "may this connection see what it already
+			// holds?" It has no landing re-check behind it, so it carries no
+			// carve-out - the gate here IS the whole gate.
+			// A membership still waiting to be judged is not a grant here either.
+			if (deniesUngrantedObserve(true, hookDecides, grantUnconfirmed(ws, topic) ? NO_GRANTS : grants, topic)) {
+				return 'FORBIDDEN';
+			}
+		}
+	}
 	// A verdict the wire batch path already obtained from `subscribeBatch` for
 	// THIS topic, so one `subscribe-batch` frame costs one hook call rather
 	// than one per entry.
 	if (verdict !== undefined) return normalizeSubscribeVerdict(verdict, topic, 'subscribeBatch');
-	// `requireGrant` is the OBSERVER-LANE mode: "may this connection see what
-	// it already holds?" It falls through to the ordinary app gate below.
-	//
-	// It does NOT deny on its own. The grant test it asks for only bites in
-	// the donor when wire-subscribe authorization has been ARMED and the app
-	// exports no subscribe hook (deniesUngrantedObserve, uws
-	// src/runtime/utils/ws-symbols.js:187-204: `if (!armed || hasUserHook)
-	// return false`). This port has no authorizeWireSubscribe at all, so
-	// armed can never be true and the donor would fall through in every
-	// reachable configuration. Denying here unconditionally would be stricter
-	// than the family in every configuration rather than only in the
-	// unimplemented one, and would break the extensions' observer lanes, which
-	// pass `{ requireGrant: true }` on every cursor/presence snapshot
-	// (shared/ws-subscriptions.js OBSERVER_LANE): a reconnecting tab would never
-	// re-sync its cursors, with no error on either side. When
-	// authorizeWireSubscribe lands, the grant test belongs here.
 	// `subscribeBatch` takes precedence over `subscribe` when both exist,
 	// matching the family, and it is consulted HERE rather than only on the
 	// wire batch path. Skipping it for single subscribes left
@@ -474,21 +527,12 @@ async function runSubscribeGate(ws, topic, verdict) {
 	// running no gate at all for an app that gates with the batch hook.
 	if (typeof wsModule.subscribeBatch === 'function') {
 		const verdicts = await runBatchGate(ws, [topic]);
-		return normalizeSubscribeVerdict(verdicts.get(topic), topic, 'subscribeBatch');
+		const decided = normalizeSubscribeVerdict(verdicts.get(topic), topic, 'subscribeBatch');
+		if (decided === null && observerGrantLost(ws, topic, lane, userHook)) return 'FORBIDDEN';
+		return decided;
 	}
 	const hook = wsModule.subscribe;
-	if (typeof hook !== 'function') {
-		// No gate exported at all. Refusing is the safe reading of an
-		// ambiguous configuration: the adapter cannot tell whether these
-		// topics are public, and silently allowing means a client that can
-		// name `user:<id>` receives it. warnNoSubscribeHook() prints the
-		// ways to resolve it, once.
-		if (!allow_unauthenticated_subscribe) {
-			warnNoSubscribeHook();
-			return 'SUBSCRIBE_NOT_CONFIGURED';
-		}
-		return null;
-	}
+	if (typeof hook !== 'function') return null;
 	try {
 		// Argument shape matches the rest of the family: (ws, topic, ctx).
 		// Folding the topic into the context object would silently break
@@ -507,11 +551,13 @@ async function runSubscribeGate(ws, topic, verdict) {
 		} catch {
 			/* closed socket: the shared platform is the honest answer */
 		}
-		return normalizeSubscribeVerdict(
+		const decided = normalizeSubscribeVerdict(
 			await hook(ws, topic, { platform: hookPlatform }),
 			topic,
 			'subscribe'
 		);
+		if (decided === null && observerGrantLost(ws, topic, lane, userHook)) return 'FORBIDDEN';
+		return decided;
 	} catch (err) {
 		// A THROWING hook is different from one returning no opinion: the
 		// gate reached no decision, so this fails closed. The reason is
@@ -534,11 +580,12 @@ async function runSubscribeGate(ws, topic, verdict) {
  * The platform members EVERY build has, WebSocket handler or not.
  *
  * A build with no realtime tier has no realtime platform for a route to reach
- * through, and these two are documented as being on every instance - which is
- * the whole point of them: an app can serve a scrape route without configuring a
- * realtime tier at all. So a request on such a build is prototype-linked to THIS
- * object (see `requestPlatform`), and the realtime platform takes the same
- * members from it rather than declaring copies that could drift apart.
+ * through, and these are documented as being on every instance - which is the
+ * whole point of them: an app can serve a scrape or health route without
+ * configuring a realtime tier at all. So a request on such a build is
+ * prototype-linked to THIS object (see `requestPlatform`), and the realtime
+ * platform takes the same members from it rather than declaring copies that
+ * could drift apart.
  */
 export const httpPlatform = {
 	/**
@@ -547,14 +594,9 @@ export const httpPlatform = {
 	 * 'orders placed').inc({ tier })`. They land in the same document
 	 * `metricsSnapshot()` renders, after the adapter's own.
 	 *
-	 * NEVER NULL here, where svelte-adapter-uws returns null until a `metrics`
-	 * module is configured. The adapter owns the registry rather than taking one
-	 * from a module the app also imports - measured, a module imported by both a
-	 * route and the WebSocket handler is TWO instances in a build, so an app
-	 * scraping its own copy would render a registry the adapter never wrote to.
-	 * Reaching it through the platform is what makes there be exactly one.
 	 */
 	get metrics() {
+		projectMetrics();
 		return metricsRegistry;
 	},
 
@@ -577,10 +619,101 @@ export const httpPlatform = {
 	 */
 	metricsSnapshot() {
 		return metricsSnapshot();
+	},
+
+	/**
+	 * Per-category count of framework invariant violations in this process,
+	 * keyed by category string. Empty on a healthy server; a non-zero entry is
+	 * a defect in the adapter or a plugin, and the
+	 * `[lantean/diagnostic source=svelte-adapter-bunserve component=runtime.assertion event=invariant.violated ...]`
+	 * line logged with each violation carries the context needed to reproduce
+	 * it. The Map is live and owned by the runtime - read it, do not modify it.
+	 *
+	 * @returns {Map<string, number>}
+	 */
+	get assertions() {
+		return readAssertionCounts();
 	}
 };
 
+function admitBatchEgress(messages, sharedRecipients) {
+	/** @type {Map<string, number>} */
+	const perTopic = new Map();
+	for (let i = 0; i < messages.length; i++) {
+		perTopic.set(messages[i].topic, (perTopic.get(messages[i].topic) || 0) + 1);
+	}
+	/** @type {Map<string, { m: number, d: number, topic: string }> | null} */
+	const perTenant = egressGate.tenantArmed ? new Map() : null;
+	for (const [t, c] of perTopic) {
+		const recipients = sharedRecipients === null ? (getServer().subscriberCount(t)) : sharedRecipients;
+		const deliveries = c * recipients;
+		if (!egressGate.account.admitTopic(t, c, deliveries)) return false;
+		if (perTenant === null) continue;
+		const ten = resolvePublishTenant(t);
+		if (ten === null) continue;
+		const agg = perTenant.get(ten);
+		if (agg === undefined) perTenant.set(ten, { m: c, d: deliveries, topic: t });
+		else { agg.m += c; agg.d += deliveries; }
+	}
+	if (perTenant !== null) {
+		for (const [ten, agg] of perTenant) {
+			if (!egressGate.account.admitTenant(ten, agg.topic, agg.m, agg.d)) return false;
+		}
+	}
+	return true;
+}
+
+function collapseByCoalesceKey(messages) {
+	let hasCoalesce = false;
+	for (let i = 0; i < messages.length; i++) {
+		if (messages[i].coalesceKey !== undefined) { hasCoalesce = true; break; }
+	}
+	if (!hasCoalesce) return messages;
+	/** @type {Map<string, number>} */
+	const lastByKey = new Map();
+	for (let i = 0; i < messages.length; i++) {
+		const key = messages[i].coalesceKey;
+		if (key !== undefined) lastByKey.set(key, i);
+	}
+	const out = [];
+	for (let i = 0; i < messages.length; i++) {
+		const key = messages[i].coalesceKey;
+		if (key === undefined || lastByKey.get(key) === i) {
+			out.push(messages[i]);
+		}
+	}
+	return out;
+}
+
+
+registerGameIngress();
+
 export const platform = {
+	[WS_RELEASE_MEMBERSHIP](ws, ud, topic) {
+		try { ws.unsubscribe(topic); } catch { return null; }
+		return removeLogicalSubscription(ud[WS_SUBSCRIPTIONS], topic);
+	},
+	// trackedSubscribe / trackedUnsubscribe join and leave this server's shared
+	// cohorts through these slots, so a plugin's server-side membership on a
+	// shared topic is served the cohort-split publish. Symbol-keyed: invisible
+	// to Object.keys and JSON, unreachable from wire input. One server
+	// per runtime instance, so the base platform is the server's own. See
+	// WS_COHORT_JOIN in utils/ws-symbols.js.
+	[WS_COHORT_JOIN](/** @type {any} */ ws, /** @type {any} */ ud, /** @type {string} */ topic) {
+		const capability = sharedTopics.get(topic);
+		if (capability !== undefined) joinSharedCohort(ws, ud, topic, capability);
+	},
+	[WS_COHORT_LEAVE](/** @type {any} */ ws, /** @type {any} */ ud, /** @type {string} */ topic) {
+		if (sharedTopics.has(topic)) leaveSharedCohort(ws, ud, topic);
+	},
+	// A deny-unwind outside the runtime - the observer lane of
+	// svelte-adapter-uws's copy of the subscription helpers - runs the app's
+	// unsubscribe hook through this server-owned slot.
+	// See WS_REVOKED_UNSUBSCRIBE in utils/ws-symbols.js.
+	[WS_REVOKED_UNSUBSCRIBE](/** @type {any} */ ws, /** @type {string} */ topic, /** @type {any} */ ud) {
+		dispatchServerUnsubscribeHook(ws, topic, true, ud);
+	},
+
 	/**
 	 * Publish to every client subscribed to `topic`, wrapped in the
 	 * `{ topic, event, data }` envelope the client store understands. A no-op
@@ -618,7 +751,8 @@ export const platform = {
 		const server = getServer();
 		const recipients = server.subscriberCount(topic);
 		const egressTenant = resolvePublishTenant(topic);
-		if (egressGate.armed && !admitPublishEgress(topic, egressTenant, 1, recipients)) return false;
+		if (egressGate.armed && !options?.[EGRESS_ADMITTED] && !admitPublishEgress(topic, egressTenant, 1, recipients)) return false;
+		const body = envelopePrefix(topic, event) + envelopeData(data);
 		const seq = stampSeqValue(seqOpt, topic);
 		// Authority is decided from the same single read the stamp consumed.
 		const authoritative = typeof seqOpt === 'number';
@@ -627,7 +761,10 @@ export const platform = {
 		// subscriber of this frame by the SAME amount, which is the stampede
 		// the option exists to prevent.
 		const jitterMs = typeof jitterOpt === 'number' && jitterOpt > 0 ? jitterOpt : null;
-		const envelope = completeEnvelope(envelopePrefix(topic, event), data, seq, jitterMs);
+		const envelope = completeSerializedEnvelope(body, seq, jitterMs);
+		// A zero-length frame at a send site would broadcast garbage to every
+		// subscriber - unrecoverable framing corruption. One length guard.
+		fatal(envelope.length > 0, 'envelope.empty', null);
 		// Everything that can still refuse this publish is resolved above this
 		// line: the egress ceilings and getServer above, stampSeq on a seq the
 		// wire cannot carry, completeEnvelope on a payload JSON cannot
@@ -655,21 +792,39 @@ export const platform = {
 			captureResumeFrame(topic, seq, envelope, compress, null, authoritative);
 		}
 		const result = server.publish(topic, envelope, compress);
-		return publishReached(result);
+		const reached = publishReached(result);
+		wsCounters.transportMetricHooks?.publishOutcome(reached);
+		return reached;
 	},
 
 	/**
 	 * Send to one connection, in the same envelope shape as publish().
 	 *
+	 * `options.seq` stamps an EXPLICIT sequence number onto the envelope - the
+	 * gap-fill channel a resume hook replays history through, so the frames it
+	 * sends carry the per-frame seqs the client keys its watermark off instead
+	 * of an unmarked body. Number and bigint only, the same validation and
+	 * safe-integer range the publish lanes' explicit authority takes; `false`,
+	 * `null` and absent mean no seq - today's frame, byte-identical. `true`
+	 * throws: this lane has no counter to draw, and gap-fill replays history
+	 * that is ALREADY accounted, which is why an explicitly-seq'd send stays
+	 * side-effect-free - no counter advance, no max-seen record, no resume
+	 * capture. The send lanes touch no shared state, and that is load-bearing.
+	 *
 	 * @param {any} ws
 	 * @param {string} topic
 	 * @param {string} event
 	 * @param {unknown} data
-	 * @param {{ compress?: boolean }} [options]
+	 * @param {{ compress?: boolean, seq?: number | bigint | false | null }} [options]
 	 * @returns {0 | 1 | 2} 0 enqueued behind backpressure, 1 sent, 2 dropped
 	 */
 	send(ws, topic, event, data, options) {
-		const payload = completeEnvelope(envelopePrefix(topic, event), data);
+		// The explicit gap-fill seq, resolved BEFORE the socket is touched so an
+		// invalid spelling throws whatever the connection's state - the refusal
+		// is about the call, not the connection.
+		const seq = resolveSendSeq(options != null ? options.seq : undefined);
+		const payload = completeEnvelope(envelopePrefix(topic, event), data, seq);
+		assert(payload.length > 0, 'envelope.send-empty', null);
 		const compress = ws_compression_on && (!options || options.compress !== false);
 		// Callers routinely reach here after an await that outlasted the
 		// socket. The facade throws; report DROPPED so callers can pattern-match
@@ -678,11 +833,7 @@ export const platform = {
 		// remain separable in telemetry.
 		try {
 			const result = ws.send(payload, false, compress);
-			// Only bytes that actually reached the wire. A SEND_DROPPED frame was
-			// refused past the backpressure limit and never went out, so charging
-			// it overstates egress for exactly the connections that are already
-			// in trouble - and the doc on these counters says apps meter and bill
-			// per byte off them.
+			// Queued and written frames count; dropped or throwing sends do not.
 			if (result !== SEND_DROPPED) bumpOut(ws, payload);
 			return result;
 		} catch {
@@ -692,8 +843,54 @@ export const platform = {
 	},
 
 	/**
+	 * Send to one connection with coalesce-by-key semantics: each (ws, key)
+	 * holds at most one pending message, and a newer one for the same key
+	 * replaces it in place before it reaches the wire - latest value wins,
+	 * first insertion order kept. For latest-value streams where the values in
+	 * between are noise (cursor positions, presence, price ticks); use `send`
+	 * or `publish` for delivery of every value.
+	 *
+	 * Serialization waits for the flush, so a key overwritten a thousand times
+	 * before one drain pays for one JSON.stringify. The flush runs now and
+	 * again on every drain; backpressure stops it until the next one. A value
+	 * JSON cannot carry throws from this call when it flushes at once, as
+	 * `send` would; one flushed later from a drain is dropped and reported. A
+	 * topic or event name the envelope cannot carry always throws here, before
+	 * anything is queued.
+	 *
+	 * @param {any} ws
+	 * @param {{ key: unknown, topic: string, event: string, data?: unknown }} message
+	 */
+	sendCoalesced(ws, { key, topic, event, data }) {
+		let userData;
+		try {
+			userData = ws.getUserData();
+		} catch {
+			wsCounters.closedWsAborts++;
+			return;
+		}
+		// Validate before touching the queue, after the closed-socket guard.
+		const prefix = envelopePrefix(topic, event);
+		let pending = userData[WS_COALESCED];
+		if (!pending) {
+			pending = new Map();
+			userData[WS_COALESCED] = pending;
+		}
+		assert(pending instanceof Map, 'coalesce.userdata-pending-type', null);
+		// At the cap with a new key: the oldest pending value goes. Latest
+		// value wins by contract, so it is the most stale one to lose.
+		if (pending.size >= MAX_COALESCED_KEYS_PER_CONNECTION && !pending.has(key)) {
+			const oldest = pending.keys().next().value;
+			pending.delete(oldest);
+		}
+		const entry = { topic, event, data, prefix };
+		pending.set(key, entry);
+		flushCoalescedFor(ws, entry);
+	},
+
+	/**
 	 * Send to every connection whose userData the filter accepts. Returns the
-	 * number of connections written to.
+	 * number of non-throwing sends, including frames the socket drops.
 	 *
 	 * The filter MUST be synchronous: this walks every live connection, and an
 	 * async filter would either serialize the walk behind N awaits or (worse)
@@ -743,6 +940,7 @@ export const platform = {
 			if (!decision) continue;
 			targets.push(ws);
 		}
+		if (targets.length === 0) return 0;
 		const egressTenant = resolvePublishTenant(topic);
 		if (
 			egressGate.armed &&
@@ -750,13 +948,6 @@ export const platform = {
 		) {
 			return 0;
 		}
-		// A direct fan-out's frames are egress like any other, but the
-		// runaway-publisher rates keep meaning publish-family calls, so the
-		// charge skips topicPublishStats.
-		chargeDirectEgress(
-			topic, egressTenant, targets.length,
-			envelopeWireBytes(envelope, targets.length, egressGate.bytesArmed)
-		);
 		let count = 0;
 		for (const ws of targets) {
 			let result;
@@ -766,11 +957,16 @@ export const platform = {
 				wsCounters.closedWsAborts++;
 				continue;
 			}
-			// Dropped past the backpressure limit: not written, so not counted
-			// as a connection this reached.
-			if (result === SEND_DROPPED) continue;
-			bumpOut(ws, envelope);
+			if (result !== SEND_DROPPED) bumpOut(ws, envelope);
 			count++;
+		}
+		// Charge every non-throwing send, including a dropped status, once.
+		// Direct fan-out does not feed the publish-family runaway stats.
+		if (count > 0) {
+			chargeDirectEgress(
+				topic, egressTenant, count,
+				envelopeWireBytes(envelope, count, egressGate.bytesArmed)
+			);
 		}
 		return count;
 	},
@@ -846,6 +1042,7 @@ export const platform = {
 		// Authority is decided from the same single read the stamp consumed.
 		const authoritative = typeof seqOpt === 'number';
 		const envelope = completeEnvelope(envelopePrefix(topic, event), data, seq);
+		fatal(envelope.length > 0, 'envelope.empty', null);
 		// Past every refusal point before the mark or the count moves, as in
 		// publish() above and for the same reasons.
 		if (seq !== null) notePublishedSeq(topic, seq, authoritative);
@@ -937,7 +1134,10 @@ export const platform = {
 					}
 					// Shared encode-once at the codec's baseline schema version.
 					if (!sharedEncoded) {
-						sharedPayload = safeEncode(wire, event, data, null);
+						sharedPayload = wire.encode(event, data, null);
+						if (sharedPayload != null && !isUint8Array(sharedPayload)) {
+							throw new TypeError('wire.encode must return Uint8Array or null');
+						}
 						sharedEncoded = true;
 					}
 					if (sharedPayload == null) {
@@ -963,21 +1163,18 @@ export const platform = {
 					// encoded against no per-connection state, so the client's
 					// decoder stays in sync and the next frame is independent.
 					try {
-						if (ws.send(frame, true, compress) !== SEND_DROPPED) { bumpOut(ws, frame); delivered = true; }
+						if (ws.send(frame, true, compress) !== SEND_DROPPED) delivered = true;
 					} catch {
 						wsCounters.closedWsAborts++;
 					}
 				} else {
 					// Per-connection encode against this connection's state,
 					// stamped with the schema version that state negotiated.
-					const payload = safeEncode(wire, event, data, state);
+					const payload = wire.encode(event, data, state);
+					if (payload != null && !isUint8Array(payload)) {
+						throw new TypeError('wire.encode must return Uint8Array or null');
+					}
 					if (payload == null) {
-						// A FAILED encode (throw or wrong-type return) may have
-						// advanced this connection's dictionaries for a frame
-						// the client will never see - the same desync a dropped
-						// stateful frame leaves, and the same answer: JSON from
-						// here on. A clean decline poisons nothing.
-						if (encodeFailed) poisonWireState(ws, ud, wire.capability);
 						delivered = wireEnvelopeSend(ws, envelope, compress) || delivered;
 						continue;
 					}
@@ -1001,7 +1198,7 @@ export const platform = {
 						wsCounters.closedWsAborts++;
 						continue;
 					}
-					if (result !== SEND_DROPPED) { bumpOut(ws, frame); delivered = true; }
+					if (result !== SEND_DROPPED) delivered = true;
 					// The encode above already mutated this connection's
 					// dictionary for the dropped frame, so the client decoder
 					// can never catch up - degrade to JSON until reconnect.
@@ -1018,7 +1215,10 @@ export const platform = {
 		// (topic-id + seq) differs, memoized per distinct id so the common
 		// all-same-id case builds one frame and reuses it for every binary
 		// send.
-		const payload = safeEncode(wire, event, data);
+		const payload = wire.encode(event, data);
+		if (payload != null && !isUint8Array(payload)) {
+			throw new TypeError('wire.encode must return Uint8Array or null');
+		}
 		if (payload == null) {
 			// A declined frame serves everyone the envelope, whichever
 			// sub-branch delivers it.
@@ -1048,10 +1248,7 @@ export const platform = {
 				try {
 					// Inside the guard: a frame refused past the backpressure
 					// limit never went out, so it is not delivery.
-					if (ws.send(envelope, false, compress) !== SEND_DROPPED) {
-						bumpOut(ws, envelope);
-						delivered = true;
-					}
+					if (ws.send(envelope, false, compress) !== SEND_DROPPED) delivered = true;
 				} catch {
 					wsCounters.closedWsAborts++;
 				}
@@ -1094,18 +1291,21 @@ export const platform = {
 			// envelope. The binary-cohort size is the shared wire-id refcount
 			// (one reference per cohorted socket), so the split is exact
 			// without a walk or a native read.
+			// The binary cohort exists only if a capable client joined it (its
+			// announce succeeded); otherwise this shared topic currently has
+			// only JSON subscribers and skips the binary fan-out entirely.
+			// Resolved BEFORE the charge, because the id is part of what the
+			// frame costs: it is a varint, so the 128th shared topic onward
+			// spends a second byte on every frame it sends.
+			const id = getSharedWireId(topic);
 			{
 				const binCount = Math.min(sharedWireIdRefs(topic), recipients);
 				chargePublishEgress(
 					topic, egressTenant, 1, recipients, envelope.length,
-					binaryFrameChargeBytes(payload.length, seqOnWire) * binCount +
+					binaryFrameChargeBytes(payload.length, seqOnWire, id ?? 0) * binCount +
 						envelopeWireBytes(envelope, recipients - binCount, egressGate.bytesArmed)
 				);
 			}
-			// The binary cohort exists only if a capable client joined it (its
-			// announce succeeded); otherwise this shared topic currently has
-			// only JSON subscribers and skips the binary fan-out entirely.
-			const id = getSharedWireId(topic);
 			let binBytes = 0;
 			if (id !== undefined) {
 				binBytes = server.publish(bin, buildBinaryFrame(wire.schemaVersion, id, seqOnWire, payload), compress);
@@ -1127,7 +1327,12 @@ export const platform = {
 		chargePublishEgress(
 			topic, egressTenant, 1, recipients, envelope.length,
 			capCounts.has(wire.capability)
-				? binaryFrameChargeBytes(payload.length, seqOnWire) * recipients
+				// Topic ids are PER CONNECTION here, so there is no one id this
+				// O(1) charge could read - the charge is taken before the walk
+				// that would learn them. Charged at the one-byte id every
+				// connection's first 127 topics use, which is the same
+				// approximation the mixed-room case above already takes.
+				? binaryFrameChargeBytes(payload.length, seqOnWire, 1) * recipients
 				: envelopeWireBytes(envelope, recipients, egressGate.bytesArmed)
 		);
 		let delivered = false;
@@ -1164,10 +1369,7 @@ export const platform = {
 					frameById.set(id, frame);
 				}
 				try {
-					if (ws.send(frame, true, compress) !== SEND_DROPPED) {
-						bumpOut(ws, frame);
-						delivered = true;
-					}
+					if (ws.send(frame, true, compress) !== SEND_DROPPED) delivered = true;
 				} catch {
 					wsCounters.closedWsAborts++;
 				}
@@ -1186,12 +1388,13 @@ export const platform = {
 	 * may carry its own `excludeWs` (per-entry author suppression); an entry
 	 * is withheld from its excluded socket on every delivery path.
 	 *
-	 * A call-level `{ excludeWs }` withholds the WHOLE batch from that socket,
-	 * on this lane and on the stateless reroute alike. An entry that names its
-	 * own overrides it for that entry, `null` included - which is how a single
-	 * entry opts back in to a batch the rest of which the socket is excluded
-	 * from. Unlike a call-level seq, one exclusion IS one-per-entry: it says
-	 * the same thing about every entry, so it is honoured rather than refused.
+	 * A call-level `{ excludeWs }` is the DEFAULT exclusion for every entry -
+	 * the author of a tick's updates is one socket for the whole batch, which
+	 * is the exclusion's whole use - and it applies on this lane and on the
+	 * stateless reroute alike. An entry carrying its own overrides it for that
+	 * entry; a `null` entry exclusion is ABSENT and inherits. Unlike a
+	 * call-level seq, one exclusion IS one-per-entry: it says the same thing
+	 * about every entry, so it is honoured rather than refused.
 	 *
 	 * Sequencing and accounting match N publishWire calls exactly: one seq
 	 * per entry. The binary batch frame's header seq slot carries the
@@ -1260,7 +1463,12 @@ export const platform = {
 		// otherwise the misuse hides on exactly the ticks that publish nothing
 		// and surfaces later under load, which is what fail-fast exists to
 		// prevent.
-		if (options && typeof options.seq === 'number') throwBatchExplicitSeq(topic, options.seq);
+		// Both spellings of the explicit authority, because they are one value:
+		// a bigint batch-level seq is the same "one number for N entries" the
+		// number spelling cannot satisfy.
+		if (options && (typeof options.seq === 'number' || typeof options.seq === 'bigint')) {
+			throwBatchExplicitSeq(topic, options.seq);
+		}
 		// And the same fail-fast for a batch-level seq that is not a seq option
 		// at all. Refused here rather than on the first entry that reaches the
 		// counter lane, so a batch is whole or nothing in this direction too.
@@ -1294,26 +1502,33 @@ export const platform = {
 		{
 			const records = new Array(n);
 			// The call-level exclusion, read once with the other options above.
-			// An entry that names its own overrides it - including with null,
-			// which is how one entry opts back IN to a batch-wide exclusion -
-			// and an entry that says nothing inherits it. The stateful lane used
-			// to read the per-entry field alone, so the same call excluded the
-			// socket through a stateless codec and delivered to it through a
-			// stateful one: the author got its own update back, in a frame it
-			// could not tell apart, on an upgrade that changed no publish code.
+			// It is the DEFAULT for every entry - the author of a tick's updates
+			// is one socket for the whole batch, which is the exclusion's whole
+			// use - and an entry carrying its own overrides it for that entry.
+			//
+			// A null entry exclusion is ABSENT, so it INHERITS. Reading it as
+			// "this entry opts back in" would make `{ data, excludeWs: null }`
+			// mean something here that it means nowhere else in the family, and
+			// an app relying on it could not move to the adapter this one
+			// mirrors.
 			const optionExclude = options ? options.excludeWs : undefined;
 			for (let i = 0; i < n; i++) {
 				const e = entries[i];
-				const ownExclude = e.excludeWs !== undefined;
+				// ONE read of the accessor. Two reads let a getter answer
+				// "defined" to the test and something else to the value, which
+				// is the whole reason this pre-pass exists.
+				const own = e.excludeWs;
+				const ownExclude = own !== undefined && own !== null;
 				records[i] = {
 					data: e.data,
-					excludeWs: ownExclude ? e.excludeWs : optionExclude,
+					excludeWs: ownExclude ? own : optionExclude,
 					ownExclude,
-					// An entry seq is a number or it is not this entry's to decide:
-					// absent and null both defer to the batch's own option, which
-					// is what a nullable authority column reads as per row. A
-					// string or a boolean is refused rather than quietly deferred,
-					// because both were meant to say something about THIS entry.
+					// The entry lane speaks the same table as the options lane:
+					// number and bigint are the explicit authority, `true` the
+					// counter, `false` and `null` no-seq - each an OVERRIDE of
+					// the batch options for this entry - `undefined` inherits,
+					// and anything else refuses the whole batch here, before the
+					// first entry fans out.
 					seq: entrySeq(e.seq, topic, i)
 				};
 			}
@@ -1405,15 +1620,25 @@ export const platform = {
 			// same wire-representability check in the pre-pass, whose record
 			// is stamped verbatim here. Anything else draws from this batch's
 			// shared options (the counter, or no seq at all).
-			const seq = entry.seq !== undefined ? entry.seq : stampSeq(options, topic);
-			// An explicit entry seq is authoritative by construction: the
-			// pre-pass accepted it or threw - there is no refused-but-published
-			// case left to tell apart, and no way for a toJSON run by an
-			// earlier iteration's completeEnvelope to swap in a value the
-			// pre-pass never saw.
-			authoritative[i] = entry.seq !== undefined;
+			// Every form but `undefined` is an OVERRIDE of the batch options for
+			// this entry: a number is its explicit authority, `true` draws the
+			// counter for it alone, `false` publishes it seq-less. The booleans
+			// go back through the shared stamp so the entry lane and the options
+			// lane cannot answer them differently.
+			const own = entry.seq;
+			const seq = own === undefined
+				? stampSeq(options, topic)
+				: (typeof own === 'number' ? own : stampSeqValue(own, topic));
+			// Only a NUMBER is authoritative: a counter draw is a different
+			// sequence space and no-seq has no value to be authoritative about.
+			// The pre-pass accepted it or threw, so there is no
+			// refused-but-published case left to tell apart, and no way for a
+			// toJSON run by an earlier iteration's completeEnvelope to swap in a
+			// value the pre-pass never saw.
+			authoritative[i] = typeof own === 'number';
 			seqs[i] = seq;
 			envs[i] = completeEnvelope(envelopePrefix(topic, event), entry.data, seq);
+			fatal(envs[i].length > 0, 'envelope.empty', null);
 			if (entry.excludeWs !== undefined && entry.excludeWs !== null) anyExclude = true;
 		}
 		// The topic's mark and the publish count both move only once EVERY entry
@@ -1487,10 +1712,7 @@ export const platform = {
 		const sendJson = (ws, list) => {
 			for (let i = 0; i < list.length; i++) {
 				try {
-					if (ws.send(list[i], false, compress) !== SEND_DROPPED) {
-						bumpOut(ws, list[i]);
-						delivered = true;
-					}
+					if (ws.send(list[i], false, compress) !== SEND_DROPPED) delivered = true;
 				} catch {
 					wsCounters.closedWsAborts++;
 					return;
@@ -1557,44 +1779,24 @@ export const platform = {
 			}
 			const updates = new Array(list.length);
 			for (let i = 0; i < list.length; i++) updates[i] = list[i].data;
-			// The schema version is read BEFORE the encode: `state` is the
-			// codec's own onAttach object, so this read can run app code (an
-			// accessor), and app code between safeEncode and the encodeFailed
-			// read below could run another encode and overwrite the flag.
-			// Same order as sendWireBatch.
 			const sv =
 				typeof state.schemaVersion === 'number' ? state.schemaVersion : wire.schemaVersion;
-			const payload = safeEncode(wire, event + '-batch', { updates }, state);
+			const payload = wire.encode(event + '-batch', { updates }, state);
+			if (payload != null && !isUint8Array(payload)) {
+				throw new TypeError('wire.encode must return Uint8Array or null');
+			}
 			if (payload == null) {
-				// A FAILED batch encode may have advanced this connection's
-				// dictionaries partway - running the per-entry encodes below
-				// against that state would reference entries the client never
-				// learned. Poison and serve the JSON envelopes; only a clean
-				// decline earns the per-entry retry.
-				if (encodeFailed) {
-					poisonWireState(ws, ud, wire.capability);
-					sendJson(ws, envList);
-					continue;
-				}
 				// The codec declined the batch (older codec, unrepresentable
 				// entry): per-entry encodes with per-entry JSON fallback - the
 				// N publishWire bodies this call replaces.
 				for (let i = 0; i < list.length; i++) {
-					const p = safeEncode(wire, event, list[i].data, state);
+					const p = wire.encode(event, list[i].data, state);
+					if (p != null && !isUint8Array(p)) {
+						throw new TypeError('wire.encode must return Uint8Array or null');
+					}
 					if (p == null) {
-						// Same rule per entry: a failure poisons and the rest
-						// of the batch goes out as JSON; a decline costs only
-						// this entry's binary form.
-						if (encodeFailed) {
-							poisonWireState(ws, ud, wire.capability);
-							sendJson(ws, envList.slice(i));
-							break;
-						}
 						try {
-							if (ws.send(envList[i], false, compress) !== SEND_DROPPED) {
-								bumpOut(ws, envList[i]);
-								delivered = true;
-							}
+							if (ws.send(envList[i], false, compress) !== SEND_DROPPED) delivered = true;
 						} catch {
 							wsCounters.closedWsAborts++;
 							break;
@@ -1617,7 +1819,7 @@ export const platform = {
 						wsCounters.closedWsAborts++;
 						break;
 					}
-					if (result !== SEND_DROPPED) { bumpOut(ws, frame); delivered = true; }
+					if (result !== SEND_DROPPED) delivered = true;
 					if (result === SEND_DROPPED) {
 						poisonWireState(ws, ud, wire.capability);
 						sendJson(ws, envList.slice(i + 1));
@@ -1643,7 +1845,7 @@ export const platform = {
 				wsCounters.closedWsAborts++;
 				continue;
 			}
-			if (result !== SEND_DROPPED) { bumpOut(ws, frame); delivered = true; }
+			if (result !== SEND_DROPPED) delivered = true;
 			// The encode mutated the dictionaries for a frame the client
 			// never saw - JSON until reconnect.
 			if (result === SEND_DROPPED) poisonWireState(ws, ud, wire.capability);
@@ -1655,20 +1857,26 @@ export const platform = {
 	 * Single-target send via a plugin-declared binary wire codec. The target
 	 * receives a `0x03` frame when it advertised `wire.capability` and the
 	 * codec can encode this frame; otherwise it receives the JSON envelope
-	 * `send()` would have sent. No seq is stamped (matches `send()`); the
-	 * binary frame carries seq 0 ("no seq"). Used for snapshot/catalog frames.
+	 * `send()` would have sent. `options.seq` takes the same explicit gap-fill
+	 * authority `send()` takes, and rides the binary frame's seq slot and the
+	 * JSON fallback identically; absent, the frame carries the 0 sentinel.
 	 *
 	 * @param {any} ws
 	 * @param {string} topic
 	 * @param {string} event
 	 * @param {any} data
 	 * @param {{ capability: string, schemaVersion: number, encode: Function, state?: any }} wire
-	 * @param {{ compress?: boolean }} [options] - `{ compress: true }` opts this
+	 * @param {{ compress?: boolean, seq?: number | bigint | false | null }} [options] - `{ compress: true }` opts this
 	 *   low-frequency binary frame into permessage-deflate when a compressor is
 	 *   configured (binary frames are uncompressed by default).
 	 * @returns {0 | 1 | 2} the send tri-state, or 2 on a closed socket
 	 */
 	sendWire(ws, topic, event, data, wire, options) {
+		// Resolved before the freed-handle guard, for the reason `send` resolves
+		// it first. Rides the binary frame's seq slot and the JSON fallback
+		// envelope identically, so the client keys one watermark whichever form
+		// this connection negotiates.
+		const seq = resolveSendSeq(options != null ? options.seq : undefined);
 		let ud;
 		try {
 			ud = ws.getUserData();
@@ -1692,23 +1900,18 @@ export const platform = {
 				// snapshot CATALOG interns ids the following BULK (and every
 				// later broadcast) references against the same dictionary.
 				const state = ensureWireState(ws, ud, wire);
-				payload = safeEncode(wire, event, data, state);
-				// A failed encode against real per-connection state poisons,
-				// as on every stateful lane; with a null state (older client
-				// on the stateless schema) there is nothing to desync.
-				if (payload == null && state != null && encodeFailed) {
-					poisonWireState(ws, ud, wire.capability);
-				}
+				payload = wire.encode(event, data, state);
 				if (state != null && typeof state.schemaVersion === 'number') {
 					schemaVersion = state.schemaVersion;
 				}
 			} else {
-				payload = safeEncode(wire, event, data);
+				payload = wire.encode(event, data);
 			}
 		}
 		if (payload == null) {
-			return wireJsonSend(ws, topic, event, data, compress);
+			return wireJsonSend(ws, topic, event, data, compress, seq);
 		}
+		if (!isUint8Array(payload)) throw new TypeError('wire.encode must return Uint8Array or null');
 		const id = ensureWireId(ws, ud, topic);
 		if (id === -1) {
 			// Dropped wire-id announce: the client can never resolve this
@@ -1716,9 +1919,10 @@ export const platform = {
 			// undecodable here. JSON for this frame, and poison so every later
 			// frame takes the JSON path too.
 			poisonWireState(ws, ud, wire.capability);
-			return wireJsonSend(ws, topic, event, data, compress);
+			return wireJsonSend(ws, topic, event, data, compress, seq);
 		}
-		const frame = buildBinaryFrame(schemaVersion, id, 0, payload);
+		// 0 is the frame's "no seq" sentinel, which is what an unseq'd send means.
+		const frame = buildBinaryFrame(schemaVersion, id, seq ?? 0, payload);
 		let result;
 		try {
 			result = ws.send(frame, true, compress);
@@ -1740,15 +1944,15 @@ export const platform = {
 	 * same-event updates for ONE subscriber as a single binary frame (the
 	 * codec's `<event>-batch` form), or the per-entry JSON envelopes when the
 	 * connection has no capability / is poisoned. The per-subscriber twin of
-	 * publishWireBatch, for culled per-viewer delivery walks. No seq is
-	 * stamped (matches `send()` / `sendWire()`); the binary frame carries
-	 * seq 0.
+	 * publishWireBatch, for culled per-viewer delivery walks. No seq is stamped -
+	 * one value cannot be the one-per-entry a batch carries, which is the same
+	 * reason publishWireBatch refuses a batch-level one - so the binary frame
+	 * carries the 0 sentinel and the JSON entries omit the field.
 	 *
 	 * Degradation: a declined batch falls back to per-entry encodes, a
 	 * per-entry null to that entry's JSON envelope, and a dropped stateful
 	 * frame poisons the capability to JSON until reconnect. A stateless codec
-	 * has no batch form and is routed per entry through sendWire, so a capable
-	 * connection still receives binary rather than JSON.
+	 * sends per-entry JSON envelopes. Codec errors propagate to the caller.
 	 *
 	 * @param {any} ws
 	 * @param {string} topic
@@ -1770,62 +1974,52 @@ export const platform = {
 		}
 		const caps = ud[WS_CAPS];
 		const compress = ws_compression_on && !!(options && options.compress === true);
-		const sendJsonFrom = (i) => {
-			let result = 1;
-			for (; i < entries.length; i++) {
-				result = wireJsonSend(ws, topic, event, entries[i].data, compress);
+		const count = entries.length;
+		// `prior` is the status of the send this continues from, so a call whose
+		// last frame was dropped, with nothing left to send, still reports it.
+		const sendJsonFrom = (i, source, prior = 1) => {
+			let result = prior;
+			for (; i < count; i++) {
+				const data = source === null ? entries[i].data : source[i];
+				result = wireJsonSend(ws, topic, event, data, compress);
 				if (result === SEND_DROPPED && ws._closed) return SEND_DROPPED;
 			}
 			return result;
 		};
-		if (!caps || !caps.has(wire.capability) || wireStatePoisoned(ud, wire.capability)) {
-			return sendJsonFrom(0);
-		}
-		// A STATELESS codec has no batch form; route each entry through
-		// sendWire so a capable connection still gets binary, exactly as the
-		// fan-out batch routes a stateless codec through publishWire per entry.
-		// Dumping to JSON here would send a capable client JSON from
-		// sendWireBatch while sendWire sent it binary for the same codec.
-		if (!wire.state) {
-			let result = 1;
-			for (let i = 0; i < entries.length; i++) {
-				result = this.sendWire(ws, topic, event, entries[i].data, wire, options);
-				if (result === SEND_DROPPED && ws._closed) return SEND_DROPPED;
-			}
-			return result;
+		if (!caps || !caps.has(wire.capability) || wireStatePoisoned(ud, wire.capability) || !wire.state) {
+			return sendJsonFrom(0, null);
 		}
 		const state = ensureWireState(ws, ud, wire);
-		if (state == null) return sendJsonFrom(0);
-		const updates = new Array(entries.length);
-		for (let i = 0; i < entries.length; i++) updates[i] = entries[i].data;
+		if (state == null) return sendJsonFrom(0, null);
+		// Pin each payload once before calling application code. Every fallback
+		// uses the same references the batch encode saw, even if that encode
+		// replaces entries or their data accessors return another value later.
+		const datas = new Array(count);
+		for (let i = 0; i < count; i++) datas[i] = entries[i].data;
 		const schemaVersion =
 			typeof state.schemaVersion === 'number' ? state.schemaVersion : wire.schemaVersion;
-		const payload = safeEncode(wire, event + '-batch', { updates }, state);
+		const payload = wire.encode(event + '-batch', { updates: datas }, state);
+		if (payload != null && !isUint8Array(payload)) {
+			throw new TypeError('sendWireBatch: wire.encode must return Uint8Array or null');
+		}
 		if (payload == null) {
-			// A FAILED batch encode may have advanced the dictionaries partway;
-			// poison and serve JSON rather than encode per entry against state
-			// the client never learned (see publishWireBatch).
-			if (encodeFailed) {
-				poisonWireState(ws, ud, wire.capability);
-				return sendJsonFrom(0);
-			}
 			// The codec declined the batch (older codec, unrepresentable
 			// entry): the N sendWire bodies this call replaces.
 			let result = 1;
-			for (let i = 0; i < entries.length; i++) {
-				const p = safeEncode(wire, event, entries[i].data, state);
+			for (let i = 0; i < count; i++) {
+				const p = wire.encode(event, datas[i], state);
+				if (p != null && !isUint8Array(p)) {
+					throw new TypeError('sendWireBatch: wire.encode must return Uint8Array or null');
+				}
 				if (p == null) {
-					if (encodeFailed) {
-						poisonWireState(ws, ud, wire.capability);
-						return sendJsonFrom(i);
-					}
-					result = wireJsonSend(ws, topic, event, entries[i].data, compress);
+					result = wireJsonSend(ws, topic, event, datas[i], compress);
+					if (result === SEND_DROPPED && ws._closed) return SEND_DROPPED;
 					continue;
 				}
 				const id = ensureWireId(ws, ud, topic);
 				if (id === -1) {
 					poisonWireState(ws, ud, wire.capability);
-					return sendJsonFrom(i);
+					return sendJsonFrom(i, datas);
 				}
 				const frame = buildBinaryFrame(schemaVersion, id, 0, p);
 				try {
@@ -1837,7 +2031,7 @@ export const platform = {
 				if (result !== SEND_DROPPED) bumpOut(ws, frame);
 				if (result === SEND_DROPPED) {
 					poisonWireState(ws, ud, wire.capability);
-					return sendJsonFrom(i + 1);
+					return sendJsonFrom(i + 1, datas, SEND_DROPPED);
 				}
 			}
 			return result;
@@ -1847,7 +2041,7 @@ export const platform = {
 			// Dropped wire-id announce; the batch encode already advanced this
 			// connection's dictionaries - the desync the poisoning exists for.
 			poisonWireState(ws, ud, wire.capability);
-			return sendJsonFrom(0);
+			return sendJsonFrom(0, datas);
 		}
 		const frame = buildBinaryFrame(schemaVersion, id, 0, payload);
 		let result;
@@ -1878,105 +2072,53 @@ export const platform = {
 	 * backoff tick.
 	 *
 	 * @param {{ windowMs?: number, afterMs?: number, close?: boolean, filter?: (userData: any) => boolean, compress?: boolean }} [options]
-	 * @returns {number} connections the advisory actually REACHED. A client past
-	 *   its backpressure limit is closed but not counted, because it never saw
-	 *   the frame. In the close-only mode (`{ close: true }` with no `windowMs`)
-	 *   there is no advisory to reach anyone, so this counts connections closed.
+	 * @returns {number} completed advisory attempts, including dropped frames. A send
+	 *   or requested close that throws is not counted. A non-positive
+	 *   whole-millisecond window performs no sends or closes.
 	 */
 	adviseReconnect(options) {
 		const windowMs = options && typeof options.windowMs === 'number' && options.windowMs > 0
-			? Math.floor(options.windowMs)
-			: 0;
+			? Math.floor(options.windowMs) : 0;
+		// A non-positive window means suppressed (legacy behavior): nothing to advise.
+		if (windowMs <= 0) return 0;
 		const afterMs = options && typeof options.afterMs === 'number' && options.afterMs > 0
-			? Math.floor(options.afterMs)
-			: 0;
+			? Math.floor(options.afterMs) : 0;
 		const doClose = !options || options.close !== false;
-		// A window is what makes an ADVISORY possible; with none there is nothing
-		// to tell the client. But a caller that EXPLICITLY asked to close still
-		// gets the close: returning early here would make
-		// `adviseReconnect({ close: true })` a silent no-op - zero advised,
-		// zero closed, no warning. A bare `adviseReconnect()` still returns 0
-		// without closing anything, because close-defaults-true must not turn an
-		// argument-less call into a mass disconnect.
-		const advisory = windowMs > 0;
-		if (!advisory && !(options && options.close === true)) return 0;
 		const filter = options && typeof options.filter === 'function' ? options.filter : null;
-		// Additive control frame: an old client that does not know the type
-		// ignores it and falls back to ordinary backoff, so this needs no
-		// capability negotiation.
-		const frame = !advisory
-			? ''
-			: afterMs > 0
-				? '{"type":"reconnect","afterMs":' + afterMs + ',"windowMs":' + windowMs + '}'
-				: '{"type":"reconnect","windowMs":' + windowMs + '}';
+		const frame = afterMs > 0
+			? '{"type":"reconnect","afterMs":' + afterMs + ',"windowMs":' + windowMs + '}'
+			: '{"type":"reconnect","windowMs":' + windowMs + '}';
 		const compress = ws_compression_on && !!(options && options.compress === true);
-		let count = 0;
-		// Snapshot the registry: with close:true the close handler runs and
-		// mutates wsConnections while we iterate.
+		// Snapshot the registry before filtering so side effects and closes cannot
+		// change the candidate set. Settle every filter verdict before the first frame.
+		const targets = [];
 		for (const ws of [...wsConnections]) {
 			let userData;
-			try {
-				userData = ws.getUserData();
-			} catch {
-				wsCounters.closedWsAborts++;
-				continue;
-			}
+			try { userData = ws.getUserData(); }
+			catch { wsCounters.closedWsAborts++; continue; }
 			if (filter) {
 				const decision = filter(userData);
-				// An async filter cannot be evaluated synchronously, and a
-				// Promise is truthy - so treating it as a verdict would advise
-				// and CLOSE every connection on the instance, which is the
-				// opposite of the caller's intent when they filtered. Fail
-				// closed, exactly as sendTo does.
-				if (decision && typeof decision.then === 'function') {
-					if (!wsCounters.adviseAsyncWarned) {
-						wsCounters.adviseAsyncWarned = true;
-						console.error(
-							'[ws] platform.adviseReconnect filter returned a Promise; treating as fail-closed.\n' +
-							'  Async filters cannot be used here because the drain walks every active\n' +
-							'  connection synchronously. Resolve the fields you need into userData from\n' +
-							'  your `upgrade` hook so the filter can read them synchronously.'
-						);
-					}
-					continue;
-				}
+				// An async filter cannot be evaluated synchronously; fail-closed (do not
+				// advise), matching sendTo.
+				if (decision && typeof decision.then === 'function') continue;
 				if (!decision) continue;
 			}
-			if (advisory) {
-				let result;
-				try {
-					result = ws.send(frame, false, compress);
-				} catch {
-					wsCounters.closedWsAborts++;
-					continue;
-				}
-				// SEND_DROPPED means the frame never reached the wire: this client
-				// is past its backpressure limit. Counting it as advised reports a
-				// reconnect window the client never received - and since the
-				// buffer cannot drain, the graceful close below cannot flush
-				// either, so this client sees a 1006 no matter what. Close it
-				// anyway (nothing better is available) but do not claim it was
-				// advised; the drain reports the difference.
-				if (result === SEND_DROPPED) {
-					if (doClose) ws.end(1012, 'server draining');
-					continue;
-				}
-				bumpOut(ws, frame);
-			}
+			targets.push(ws);
+		}
+		let count = 0;
+		for (const ws of targets) {
+			try {
+				// Close after attempting the advisory; only accepted frames count.
+				const result = ws.send(frame, false, compress);
+				if (result !== SEND_DROPPED) bumpOut(ws, frame);
+				if (doClose) ws.end(1001, 'Server draining');
+			} catch { wsCounters.closedWsAborts++; continue; }
 			count++;
-			// 1012 "service restart" is the honest code for a drain, and the
-			// client's reconnect scheduling is already carried by the frame.
-			if (doClose) ws.end(1012, 'server draining');
 		}
-		// The advisory frames are egress: topic-less, so they land in the
-		// window counters and never against a ceiling, and only what was
-		// actually advised is charged - a dropped frame never went out.
-		if (advisory && count > 0) {
-			chargeDirectEgress(
-				null, null, count,
-				envelopeWireBytes(frame, count, egressGate.bytesArmed)
-			);
-		}
+		// The advisory is operator-lane egress: it carries no topic and no
+		// tenant, so it lands in the worker egress window but sits outside
+		// every ceiling - a drain command must not be refusable by a budget.
+		if (count > 0) chargeDirectEgress(null, null, count, envelopeWireBytes(frame, count, egressGate.bytesArmed));
 		return count;
 	},
 
@@ -1990,40 +2132,33 @@ export const platform = {
 	 * and can leak a topic the app would have refused.
 	 *
 	 * Idempotent - subscribing twice returns null both times, charges the
-	 * counter once, and runs the hook once.
+	 * counter once, and runs the hook once. A topic held only through an
+	 * install still waiting on an attempt in flight is judged again rather
+	 * than acked.
 	 *
-	 * Exactly THREE parameters, and deliberately not four: the batch verdict
-	 * travels through `subscribeWithVerdict` below, which is not reachable from
-	 * this object. A fourth positional parameter here made every extra argument a
-	 * caller happened to pass an unconditional gate bypass -
-	 * `topics.map(platform.subscribe.bind(platform, ws))` supplies
-	 * `(topic, index, array)`, and the array read as an allow verdict.
+	 * Two parameters, matching the server subscription contract. Batch verdicts
+	 * and recovery state travel through the private subscribeWithVerdict entry.
 	 *
 	 * @param {any} ws
 	 * @param {string} topic
-	 * @param {{ allowSystemTopic?: boolean }} [options]
 	 * @returns {Promise<string | null>} null on success, else a denial reason
 	 */
-	async subscribe(ws, topic, options) {
-		return subscribeWithVerdict(ws, topic, options, undefined);
+	async subscribe(ws, topic) {
+		const result = await subscribeWithVerdict(ws, topic, undefined, undefined);
+		return result === 'CLOSED' ? null : result;
 	},
 
 	/**
 	 * Run the app's subscribe authorization hook without subscribing.
 	 *
-	 * Applies the SAME system-namespace guard `subscribe` does, with the same
-	 * `{ allowSystemTopic: true }` escape. Without it the two disagreed about
-	 * the same topic, and the documented check-then-subscribe pattern - which
-	 * ends in a bare `ws.subscribe(topic)` the adapter never sees - became the
-	 * way to reach an internal channel with client input. Nothing in the family
-	 * asks this about a `__` topic: the extensions' observer lanes pass the real
-	 * application topic, and the one caller that starts from a `__cursor:` name
-	 * strips the prefix before asking.
+	 * Server callers may authorize system topics through the application hook.
 	 *
-	 * `requireGrant` is the other member the family defines here, and it is
-	 * still not read: the grant test it asks for needs `authorizeWireSubscribe`,
-	 * which this port does not have, so the donor itself falls through to the
-	 * app gate in every reachable configuration. See runSubscribeGate.
+	 * `requireGrant` is the OBSERVER-LANE mode: "may this connection see what
+	 * it already holds?" With the grant gate armed and no app hook deciding,
+	 * the topic must already be in that connection's grant set; under
+	 * `'strict'` the grant is required even when an app hook exists. With the
+	 * gate unarmed it falls through to the ordinary app gate, which is what
+	 * keeps the snapshot lanes working for apps that never armed anything.
 	 *
 	 * @param {any} ws
 	 * @param {string} topic
@@ -2031,59 +2166,482 @@ export const platform = {
 	 * @returns {Promise<string | null>} a denial reason, or null to allow
 	 */
 	async checkSubscribe(ws, topic, options) {
-		// Validated BEFORE the system-namespace guard, because `isSystemTopic`
-		// reads `topic.charCodeAt(0)` and this is the one gate entry point the
-		// adapter cannot see the other half of - the documented pattern is
-		// `if (await platform.checkSubscribe(ws, topic) !== null) return;` over a
-		// topic taken straight from client input. Guard-first turned
-		// `{"room": null}` into a rejected promise where `subscribe` returns
-		// `INVALID_TOPIC`, so the two disagreed at exactly the boundary the
-		// shared gate exists to keep them agreeing on. It fails closed in the
-		// documented spelling, but an app wrapping the call in a try/catch with
-		// a permissive fallback flips that open.
-		if (!isValidWireTopic(topic, true)) return 'INVALID_TOPIC';
-		if (!(options && options.allowSystemTopic) && isSystemTopic(topic)) {
-			return 'INVALID_TOPIC';
-		}
-		return runSubscribeGate(ws, topic);
+		// Observer topics come from client snapshot frames and share the wire alphabet.
+		if (!isValidWireTopic(topic, options && options.requireGrant ? allow_non_ascii_topics : true)) return 'INVALID_TOPIC';
+		return runSubscribeGate(ws, topic, undefined, {
+			requireGrant: !!(options && options.requireGrant)
+		});
 	},
 
 	/**
-	 * Unsubscribe a connection and keep the adapter's bookkeeping in step.
+	 * Arm wire-subscribe authorization for this worker, the programmatic
+	 * spelling of `websocket.authorizeWireSubscribe`.
+	 *
+	 * Once armed, a CLIENT-initiated `subscribe` / `subscribe-batch` frame is
+	 * honoured only for a topic the server already authorized for that
+	 * connection through `platform.subscribe`, unless the app exports its own
+	 * `subscribe` / `subscribeBatch` hook, which then decides. `'strict'`
+	 * requires BOTH the server grant and an application-hook allow.
+	 *
+	 * For a framework whose subscriptions are all server-initiated: call once
+	 * at startup, before connections arrive. Idempotent, and it only ever
+	 * raises - strict is latched and a later no-argument call cannot downgrade
+	 * it, because a gate that can be disarmed at runtime is not a gate.
+	 *
+	 * Worker-wide, not process-wide in any shared sense: call it from each
+	 * worker's startup rather than expecting one worker's call to reach
+	 * another's JavaScript realm.
+	 *
+	 * @param {'legacy' | 'strict'} [mode]
+	 * @returns {'legacy' | 'strict'} the posture in force after the call
+	 */
+	authorizeWireSubscribe(mode) {
+		if (mode !== undefined && mode !== 'legacy' && mode !== 'strict') {
+			throw new TypeError(
+				`platform.authorizeWireSubscribe() takes 'legacy' or 'strict' - got ${
+					typeof mode === 'string' ? `'${mode}'` : String(mode)
+				}. It gates who may subscribe, so a mode it cannot read is refused ` +
+				'rather than treated as the weaker one.'
+			);
+		}
+		subscribeAuth.enabled = true;
+		if (mode === 'strict') subscribeAuth.strict = true;
+		return subscribeAuth.strict ? 'strict' : 'legacy';
+	},
+
+	/** Publish compatible events in a shared frame when all subscribers opt in. */
+	publishBatched(messages, options) {
+		if (!Array.isArray(messages) || messages.length === 0) return;
+
+		// Opt-in compression for the whole batch (default off). A batched frame
+		// mixes event types, so the safe default is uncompressed; pass
+		// { compress: true } to deflate. Applied uniformly to the fast (shared
+		// frame) AND slow (per-event) paths so the two are consistent. No-op
+		// while websocket.compression is off (the default).
+		const compressOptIn = !!(options && options.compress === true);
+
+		// Coalesce-by-key dedup runs first. Events that carry a
+		// `coalesceKey` collapse so only the latest value per key
+		// survives; events without a key pass through unchanged. This
+		// is the same latest-value-wins primitive sendCoalesced offers
+		// for streaming sends, lifted into the batched path so a single
+		// publishBatched call carrying 100 cursor positions for the
+		// same user delivers only the latest.
+		messages = collapseByCoalesceKey(messages);
+		if (messages.length === 0) return;
+		// Validate the WHOLE batch before one event can mutate counters or reach a
+		// subscriber. A mixed safe/unsafe batch must fail atomically rather than
+		// partially publishing its prefix. One read per field, snapshotted: the
+		// value judged here is the value the stamp and the relay decision use
+		// below, so a stateful accessor cannot pass this atomic pre-pass and
+		// then hand the fast path an authoritative number it would relay.
+		const msgSeqs = new Array(messages.length);
+		const msgRelays = new Array(messages.length);
+		const msgJitters = new Array(messages.length);
+		for (let i = 0; i < messages.length; i++) {
+			const o = messages[i].options;
+			const seqOption = o != null ? o.seq : undefined;
+			const relayOption = o != null ? o.relay : undefined;
+			msgJitters[i] = o != null ? o.jitterMs : undefined;
+			// And the value, for the same reason batch() asks it: the topology
+			// check short-circuits on a single worker, so without this the
+			// stamping loop below is where a bad value surfaces - after earlier
+			// entries have advanced the topic counter and written the max-seen
+			// map for a batch that puts nothing on any wire. The counter would
+			// then skip a number no client ever sees, and a republish of it
+			// after the payload is fixed reads as already-seen.
+			assertStampableSeq(seqOption);
+			msgSeqs[i] = seqOption;
+			msgRelays[i] = relayOption;
+		}
+
+		// Batch only when every interested subscriber sees the same event slice.
+		// Mixed membership or missing capabilities fall back to per-event publish.
+		const firstTopic = messages[0].topic;
+		let allSameTopic = true;
+		for (let i = 1; i < messages.length; i++) {
+			if (messages[i].topic !== firstTopic) { allSameTopic = false; break; }
+		}
+
+		// Combined detection pass: walk the subscriber set once to
+		// determine whether the batch qualifies for the fast path
+		// (single-topic or all-see-all) AND whether every interested
+		// connection has advertised the 'batch' capability. We need
+		// both: the shared-frame fast path is only safe when every
+		// recipient can decode the {type:'batch',...} envelope.
+		let allSeeAll = true;
+		let everyoneCapable = true;
+		/** @type {Set<string> | null} */
+		let batchTopics = null;
+		if (!allSameTopic) {
+			batchTopics = new Set();
+			for (let i = 0; i < messages.length; i++) batchTopics.add(messages[i].topic);
+		}
+		for (const ws of wsConnections) {
+			const ud = ws.getUserData();
+			const subs = ud[WS_SUBSCRIPTIONS];
+			if (!subs || subs.size === 0) continue;
+			let touchesAny = false;
+			if (allSameTopic) {
+				touchesAny = subs.has(firstTopic);
+			} else {
+				let touchesAll = true;
+				for (const t of /** @type {Set<string>} */ (batchTopics)) {
+					if (subs.has(t)) touchesAny = true;
+					else touchesAll = false;
+				}
+				if (touchesAny && !touchesAll) { allSeeAll = false; break; }
+			}
+			if (!touchesAny) continue;
+			const caps = ud[WS_CAPS];
+			if (!caps || !caps.has('batch')) { everyoneCapable = false; break; }
+		}
+
+		// Slow-path fallback: per-event publish() so the caller pays
+		// no penalty on small / disjoint shapes. Also the safe
+		// degradation when any interested subscriber is non-cap-able -
+		// they would otherwise receive an unparseable batch frame.
+		if ((!allSameTopic && !allSeeAll) || !everyoneCapable) {
+			// The batch is atomic on this path too: admitting per event would
+			// deliver a prefix and refuse the tail, which is the mid-batch
+			// shedding the budget forbids. Each topic carries its own
+			// recipient count here (the paths differ only in dispatch), and a
+			// tenant decides once on everything it owns in the batch.
+			if (egressGate.armed && !admitBatchEgress(messages, null)) return;
+			for (let i = 0; i < messages.length; i++) {
+				const m = messages[i];
+				// The snapshot, not a spread of the live object: publish() consumes
+				// exactly these fields, and the values it stamps must be the ones
+				// the atomic pre-pass above already judged.
+				platform.publish(m.topic, m.event, m.data, ({ [EGRESS_ADMITTED]: true,
+					seq: msgSeqs[i],
+					relay: msgRelays[i],
+					jitterMs: msgJitters[i],
+					compress: compressOptIn
+				}));
+			}
+			return;
+		}
+
+		// Egress admission for the whole fast-path batch, before anything is
+		// stamped. In all-see-all every interested subscriber holds every batch
+		// topic, so the dispatch topic's tracked count IS the recipient set for
+		// every topic in the batch; a mixed-topic batch admits each distinct
+		// topic's own share and pools each tenant's, and one refusal refuses
+		// the whole batch (its atomicity contract). The slow path above takes
+		// the same decision through the same helper, reading each topic's own
+		// count, and marks its events so they charge without re-deciding.
+		const recipients = getServer().subscriberCount(messages[0].topic);
+		const gateArmed = egressGate.armed;
+		let egressTenant = null;
+		if (gateArmed) {
+			if (allSameTopic) {
+				egressTenant = resolvePublishTenant(firstTopic);
+				if (!admitPublishEgress(firstTopic, egressTenant, messages.length, messages.length * recipients)) return;
+			} else if (!admitBatchEgress(messages, recipients)) return;
+		}
+		// Fast path: build per-event envelopes (also stamps seq + charges the
+		// per-event egress), wrap into a shared batch frame, and hand
+		// fanout through Bun's native topic tree. In all-see-all
+		// every interested subscriber is subscribed to every batch
+		// topic, so dispatching on any one of them reaches them all.
+		/** @type {Array<{ topic: string, env: string, seq: number | null }>} */
+		const events = new Array(messages.length);
+		// A later serialization failure refuses the whole shared frame. Prepare
+		// every body before any entry advances its topic's sequence or seen mark.
+		for (let i = 0; i < messages.length; i++) {
+			const m = messages[i];
+			const topic = m.topic;
+			events[i] = { topic, env: envelopePrefix(topic, m.event) + envelopeData(m.data), seq: null };
+		}
+		for (let i = 0; i < events.length; i++) {
+			const entry = events[i];
+			wsCounters.publishCount++;
+			wsCounters.publishCountWindow++;
+			const seq = stampSeqValue(msgSeqs[i], entry.topic);
+			// Track the highest observed seq per topic (see platform.publish): the
+			// compare-free record for the monotonic in-memory counter, the
+			// monotone-max guard for an explicit numeric seq.
+			if (seq !== null) {
+				if (typeof msgSeqs[i] === 'number' || typeof msgSeqs[i] === 'bigint') notePublishedSeq(entry.topic, seq, true);
+				else notePublishedSeq(entry.topic, seq, false);
+			}
+			const env = completeSerializedEnvelope(entry.env, seq);
+			entry.env = env;
+			entry.seq = seq;
+			// One egress charge per logical publish: each batched event is one,
+			// priced at its own envelope's UTF-8 bytes times the shared
+			// recipient set. The batch frame's wrapper bytes are uncharged
+			// overhead, so a tenant pays the same for N events whether the
+			// runtime batches them or not.
+			chargePublishEgress(entry.topic,
+				gateArmed ? (allSameTopic ? egressTenant : resolvePublishTenant(entry.topic)) : null,
+				1, recipients, env.length, envelopeWireBytes(env, recipients, egressGate.bytesArmed));
+		}
+
+		// Resume cutover in flight: a caps-less resuming connection receives these
+		// events as per-event JSON (the slow path this fast path stands in for), so
+		// hold each per-event envelope for any open buffer - NOT the wrapped batch
+		// frame, which a caps-less connection never decodes and which can span topics.
+		if (resumeBuffers.size > 0) {
+			for (let i = 0; i < events.length; i++) captureResumeFrame(events[i].topic, events[i].seq, events[i].env, compressOptIn);
+		}
+
+		// Build the shared batch frame once.
+		const slice = new Array(events.length);
+		for (let i = 0; i < events.length; i++) slice[i] = events[i].env;
+		const sharedBatchEnv = wrapBatchEnvelope(slice);
+		assert(sharedBatchEnv.length > 0, 'envelope.batch-empty', { events: events.length });
+		// Hand fanout to Bun's native topic tree. Any batch topic works
+		// as the dispatch channel because every interested subscriber
+		// is subscribed to every batch topic in the all-see-all case
+		// (single-topic is the trivial sub-case).
+		const fanoutTopic = allSameTopic ? firstTopic : messages[0].topic;
+		const result = getServer().publish(fanoutTopic, sharedBatchEnv, ws_compression_on && compressOptIn);
+		wsCounters.transportMetricHooks?.publishOutcome(publishReached(result));
+	},
+
+	/**
+	 * Grant a connection the right to publish to `topic` via the client-driven
+	 * relay (`game`) lane - the trusted server-side dual of `platform.subscribe`.
+	 * A client `game` frame carries NO topic; the server derives it from this
+	 * binding, so a client can only publish to a room it was granted (typically
+	 * at join, from the framework's authorization gate). This is the general
+	 * publish-authorization primitive; a game session is its first consumer.
+	 *
+	 * Single-valued per connection (one room per socket, mirroring the native
+	 * daemon's per-socket grant): a second call re-binds to the new topic. Pass a
+	 * different topic to move the binding; call `revokePublish` to clear it.
 	 *
 	 * @param {any} ws
 	 * @param {string} topic
-	 * @returns {boolean} whether the connection had been subscribed
+	 * @returns {boolean} `true` on success, `false` if the socket had already closed
+	 * @throws {Error} when sockets span more than one I/O worker and no single
+	 *   authoritative game-lane home exists
+	 */
+	grantPublish(ws, topic) {
+		// The per-room seq and sender-excluding walk are worker-local. Refuse the
+		// first grant in a multi-I/O-worker topology instead of authorizing a lane
+		// that would silently omit remote participants and fork its sequence.
+		assertGameLaneClusterSafe();
+		let ud;
+		try { ud = ws.getUserData(); } catch { wsCounters.closedWsAborts++; return false; }
+		ud[WS_PUBLISH_GRANT] = topic;
+		return true;
+	},
+
+	/**
+	 * Clear a connection's client-publish binding - the dual of `unsubscribe`.
+	 * After this the connection's `game` frames are denied (`game-denied`
+	 * `FORBIDDEN`) until re-granted. Idempotent.
+	 *
+	 * @param {any} ws
+	 * @returns {boolean} `true` if a binding was cleared, `false` if there was none
+	 */
+	revokePublish(ws) {
+		let ud;
+		try { ud = ws.getUserData(); } catch { return false; }
+		if (ud[WS_PUBLISH_GRANT] === undefined) return false;
+		ud[WS_PUBLISH_GRANT] = undefined;
+		return true;
+	},
+
+	/**
+	 * The topic a connection is currently bound to publish to via the `game`
+	 * lane, or `null` when it holds no grant. Read-only introspection.
+	 *
+	 * @param {any} ws
+	 * @returns {string | null}
+	 */
+	publishGrant(ws) {
+		let ud;
+		try { ud = ws.getUserData(); } catch { return null; }
+		return ud[WS_PUBLISH_GRANT] ?? null;
+	},
+
+	/**
+	 * Relay a client-originated `game` frame to a topic's local subscribers,
+	 * EXCLUDING the sender (echo suppression - the sender already holds its own
+	 * input and predicts locally) and echoing the sender's client `id` for
+	 * input ordering / prediction-reconcile on the other receivers. The server
+	 * stamps a monotonic per-room seq (the session-home sequencer), so a globally
+	 * ordered relay sequence is this home worker's counter.
+	 *
+	 * Trusted server path (explicit topic): the wire-level `game` handler resolves
+	 * the topic from the sender's `WS_PUBLISH_GRANT` and gates on it before calling
+	 * this. Fan-out takes the per-subscriber walk (native topic broadcast cannot skip a
+	 * socket); this is the conformance ORACLE behavior, not the perf path - the
+	 * native daemon does the same fan-out with `publish_wire`/`exclude_ws`. Local
+	 * only: cross-worker / cross-edge home relay is a separate mechanism. Game
+	 * frames are sent uncompressed (the 60 Hz input path, like the cursor lane).
+	 *
+	 * @param {any} senderWs  the publishing socket, excluded from the fan-out
+	 * @param {string} topic
+	 * @param {string} event
+	 * @param {unknown} data
+	 * @param {number | string} [id]  the sender's client input id, echoed to the other receivers
+	 * @returns {{ seq: number | null, delivered: number }}
+	 * @throws {Error} when sockets span more than one I/O worker
+	 */
+	publishGame(senderWs, topic, event, data, id) {
+		// Server-authored frames can bypass grantPublish, so guard this primitive
+		// independently as well. One I/O worker plus any number of compute workers
+		// is safe; more than one socket-owning worker needs an external authority.
+		assertGameLaneClusterSafe();
+		// Egress: the sender is subscribed to its own room in the ordinary case
+		// and is excluded from the walk, so it is not a recipient. The game lane
+		// is the one publish with a socket in hand - its tenant is the SENDER's
+		// frozen attribution, never the topic resolver: the client relaying
+		// through this lane is the party whose budget the fan-out spends.
+		let recipients = getServer().subscriberCount(topic);
+		if (excludedRecipient(senderWs, topic)) recipients--;
+		let egressTenant = null;
+		if (egressGate.armed) {
+			if (egressGate.account !== null && egressGate.account.tenantEnabled) {
+				let att = null;
+				try { att = senderWs.getUserData()[WS_ATTRIBUTION] ?? null; } catch { att = null; }
+				egressTenant = att !== null && typeof att.tenantId === 'string' ? att.tenantId : null;
+			}
+			// A refusal delivers nothing and stamps nothing; { seq: null,
+			// delivered: 0 } is this lane's refusal shape.
+			if (!admitPublishEgress(topic, egressTenant, 1, recipients)) return { seq: null, delivered: 0 };
+		}
+		wsCounters.publishCountWindow++;
+		const seq = stampSeqValue(undefined, topic);
+		if (seq !== null) notePublishedSeq(topic, seq, false);
+		const envelope = completeGameEnvelope(envelopePrefix(topic, event), data, seq, id);
+		fatal(envelope.length > 0, 'envelope.empty', null);
+		// The one egress charge for this logical publish. Compact-binary
+		// recipients are charged the envelope size too: the 0x03 form is
+		// per-capability and encoded lazily inside the walk, and forcing the
+		// encode on every publish just to price it would tax the 60 Hz lane.
+		chargePublishEgress(topic, egressTenant, 1, recipients, envelope.length, envelopeWireBytes(envelope, recipients, egressGate.bytesArmed));
+		// Fan out to the topic's LOCAL subscribers, skipping the sender. The single
+		// native topic fan-out cannot skip a socket, so the exclusion forces the
+		// per-subscriber walk (the same shape publishWire uses for excludeWs).
+		//
+		// Compact fan-out (PROTOCOL.md 6.7): a subscriber that negotiated
+		// `game.fanout:1` receives the value-codec `0x03` frame; everyone else
+		// gets the JSON envelope, byte-identical to before. The compact payload is
+		// stateless (sender-independent), so it is encoded ONCE and framed per
+		// connection by its wire-id - exactly the stateless publishWire path. The
+		// walk is mandatory here regardless of that, because the sender must be
+		// excluded. capCounts short-circuits the whole binary path to zero cost
+		// when no connected client advertised the capability.
+		// Resume cutover in flight: hold the JSON game envelope a caps-less resuming
+		// subscriber would receive (compact-binary subscribers recover via their own
+		// wire-id announce on join, not this buffer). One guarded size check.
+		if (resumeBuffers.size > 0) captureResumeFrame(topic, seq, envelope, false);
+		const wantBinary = capCounts.has(GAME_FANOUT_CAP);
+		const seqOnWire = seq == null ? 0 : seq;
+		/** @type {Uint8Array | null} */
+		let sharedPayload = null;
+		let sharedEncoded = false;
+		/** @type {Map<number, Uint8Array> | null} */
+		let sharedFrameById = null;
+		let delivered = 0;
+		for (const ws of wsConnections) {
+			if (ws === senderWs) continue;
+			let ud;
+			try { ud = ws.getUserData(); } catch { continue; }
+			const subs = ud[WS_SUBSCRIPTIONS];
+			if (!subs || !subs.has(topic)) continue;
+			const caps = wantBinary ? ud[WS_CAPS] : null;
+			if (caps && caps.has(GAME_FANOUT_CAP) && !wireStatePoisoned(ud, GAME_FANOUT_CAP)) {
+				if (!sharedEncoded) {
+					sharedPayload = encodeGameFanoutPayload(event, data, id);
+					sharedEncoded = true;
+					sharedFrameById = new Map();
+				}
+				const wid = ensureWireId(ws, ud, topic);
+				if (wid === -1) {
+					// Dropped wire-id announce: the client can never resolve this
+					// topic's numeric id, so binary is undecodable here from now on.
+					// JSON for this frame + poison to JSON until reconnect.
+					poisonWireState(ws, ud, GAME_FANOUT_CAP);
+					try { const result = ws.send(envelope, false, false); if (result !== 2) bumpOut(ws, envelope); delivered++; }
+					catch { wsCounters.closedWsAborts++; }
+					continue;
+				}
+				let frame = sharedFrameById.get(wid);
+				if (!frame) {
+					frame = buildBinaryFrame(GAME_FANOUT_SCHEMA_VERSION, wid, seqOnWire, /** @type {Uint8Array} */ (sharedPayload));
+					sharedFrameById.set(wid, frame);
+				}
+				// A dropped shared frame needs no poisoning: the payload carries no
+				// per-connection state, so the client decoder stays in sync.
+				try { const result = ws.send(frame, true, false); if (result !== 2) bumpOut(ws, frame); delivered++; }
+				catch { wsCounters.closedWsAborts++; }
+				continue;
+			}
+			try { const result = ws.send(envelope, false, false); if (result !== 2) bumpOut(ws, envelope); delivered++; }
+			catch { wsCounters.closedWsAborts++; }
+		}
+		return { seq, delivered };
+	},
+
+	/**
+	 * The seq-space generation for one topic: its override when something
+	 * minted one, else this process's own. The value that rides the topic's
+	 * `subscribed` ack, so an app comparing a client's `lastSeenEpochs` entry
+	 * against it is asking the same question the client will.
+	 *
+	 * Opaque and equality-only, like every epoch on this wire: a different
+	 * value means the topic's seq space changed and a client's stored offsets
+	 * are no longer meaningful.
+	 *
+	 * @param {string} topic
+	 * @returns {number}
+	 */
+	topicEpoch(topic) {
+		return topicEpochValue(topic);
+	},
+
+	/**
+	 * Mint a fresh generation for one topic, repudiating every offset clients
+	 * recorded under the old one.
+	 *
+	 * The explicit-seq lane is single-authority per topic: the max-seen mark is
+	 * monotone and no seq carries the identity of the counter that issued it,
+	 * so one publish from a different authority pins that mark for the life of
+	 * the process and every later resume dedups against a floor from the wrong
+	 * sequence space. An app that CHANGES a topic's authority - counter to an
+	 * external allocator, a different partition, a reset store - calls this, and
+	 * the old offsets die at their next resume through the ordinary
+	 * epoch-mismatch answer rather than silently deduping against the poison.
+	 *
+	 * @param {string} topic
+	 * @returns {number} the installed epoch
+	 */
+	bumpTopicEpoch(topic) {
+		return mintTopicEpoch(topic);
+	},
+
+	/**
+	 * Whether `request` is a synthetic boot-warmup render rather than a real
+	 * client request.
+	 *
+	 * Tagged by object IDENTITY, never a header, so a real client cannot forge
+	 * one. An app's hooks use it to skip the side effects a real visit would
+	 * incur - analytics, rate counting, an audit log entry - for a render
+	 * nobody asked for.
+	 *
+	 * @param {Request} request
+	 * @returns {boolean}
+	 */
+	isWarmupRequest(request) {
+		return isWarmupRequest(request);
+	},
+
+	/**
+	 * Remove a held membership or cancel an in-flight subscribe.
+	 * Server revocations dispatch every app teardown without a client flood limit.
+	 * @param {any} ws
+	 * @param {string} topic
+	 * @returns {boolean} whether membership was removed or an attempt cancelled
 	 */
 	unsubscribe(ws, topic) {
-		let userData;
-		try {
-			userData = ws.getUserData();
-		} catch {
-			wsCounters.closedWsAborts++;
-			return false;
-		}
-		// Cancel any subscribe for this topic still sitting in the authorization
-		// gate. Done BEFORE the membership check, because the racing case is
-		// exactly the one where the topic is not in `subs` yet - an unsubscribe
-		// that returns early here would let the gate land afterwards and
-		// resurrect a subscription the client just cancelled.
-		tombstonePendingSubscribe(userData, topic);
-		const subs = userData[WS_SUBSCRIPTIONS];
-		if (!subs || !subs.has(topic)) return false;
-		try {
-			ws.unsubscribe(topic);
-		} catch {
-			// The native membership is already gone with the socket; the
-			// bookkeeping below still has to run or the counter leaks.
-			wsCounters.closedWsAborts++;
-		}
-		subs.delete(topic);
-		wsCounters.totalSubscriptions--;
-		// A shared topic's cohort membership travels with the logical
-		// subscription; leaving releases the wire-id ref this connection held.
-		if (sharedTopics.has(topic)) leaveSharedCohort(ws, userData, topic);
-		return true;
+		return unsubscribeMembership(ws, topic, dispatchServerUnsubscribeHook);
 	},
 
 	/** Live connections on THIS instance. */
@@ -2225,7 +2783,7 @@ export const platform = {
 	topic(name) {
 		if (topicHelperCache === null) {
 			topicHelperCache = createTopicHelperCache(
-				(topic, event, data) => platform.publish(topic, event, data)
+				(topic, event, data, options) => platform.publish(topic, event, data, options)
 			);
 		}
 		return topicHelperCache(name);
@@ -2288,6 +2846,29 @@ export function requestPlatform(requestId) {
 
 
 /**
+ * Answer a refusal from the landing, settling the attempt as denied: a
+ * membership standing with no authority behind it, judged by its last attempt,
+ * is unwound before the answer goes out.
+ *
+ * @param {any} ws
+ * @param {any} userData
+ * @param {Set<string>} subs
+ * @param {string} topic
+ * @param {number} token
+ * @param {any} recoverCapture - the recover lane's open live-frame buffer, if any
+ * @param {string} reason
+ * @param {{ fromWire?: boolean }} [lane]
+ * @returns {string}
+ */
+function refuseLanding(ws, userData, subs, topic, token, recoverCapture, reason, lane) {
+	if (recoverCapture) discardResumeCapture(recoverCapture);
+	if (settleDeniedSubscribe(userData, topic, token, subs.has(topic)) === 'deny-unwind') {
+		unwindRevokedSubscribe(ws, topic, userData, lane);
+	}
+	return reason;
+}
+
+/**
  * The implementation behind `platform.subscribe`, plus the PRIVATE verdict
  * channel the wire batch path needs.
  *
@@ -2308,85 +2889,113 @@ export function requestPlatform(requestId) {
  *
  * @param {any} ws
  * @param {string} topic
- * @param {{ allowSystemTopic?: boolean }} [options]
+ * @param {{ allowSystemTopic?: boolean, recover?: { offset: number, epoch?: number } }} [options] -
+ *   `recover` asks for a gap-fill from that offset before the subscription lands
  * @param {unknown} [verdict] - from a batch gate already run for this frame
+ * @param {{ fromWire?: boolean, pendingToken?: number }} [lane] - which
+ *   authority is exercised, and the batch lane's own in-flight stamp for the
+ *   topic when it has one
  * @returns {Promise<string | null>} null on success, else a denial reason
  */
-export async function subscribeWithVerdict(ws, topic, options, verdict) {
+export async function subscribeWithVerdict(ws, topic, options, verdict, lane) {
+	// A stamp the batch lane took before its own gate. Every exit from here on
+	// settles it, and none takes a second one.
+	const carried = lane && typeof lane.pendingToken === 'number' ? lane.pendingToken : undefined;
 	// Server-side callers are trusted past the always-illegal bytes: an app
-	// using non-ASCII topic names must not be blocked at this layer.
-	if (!isValidWireTopic(topic, true)) return 'INVALID_TOPIC';
-	// The `__` namespace is the adapter's and its plugins' own. The guard is
-	// HERE and not only on the wire path because the documented advice is to
-	// route server-initiated subscribes through this method, so an app
-	// implementing its own `join` verb otherwise passes a client-supplied
-	// room straight into an internal channel - refused on the wire
-	// microseconds earlier and granted here. Callers that legitimately need
-	// one pass `{ allowSystemTopic: true }`.
-	//
-	// The guard stays even though it costs the extensions bus its
-	// `degraded`/`recovered` events: that package subscribes its system channel
-	// through this method without the option
-	// (svelte-adapter-uws-extensions/src/redis/pubsub.js:634). Dropping the
-	// guard for every app to unblock one privileged caller would turn the
-	// documented-safe spelling into the bypass; the privileged caller passes the
-	// option instead.
-	const allowSystemTopic = !!(options && options.allowSystemTopic);
-	if (!allowSystemTopic && isSystemTopic(topic)) return 'INVALID_TOPIC';
+	// using non-ASCII topic names must not be blocked at this layer. The batch
+	// lane's topics already passed the stricter wire check, so a carried stamp
+	// never reaches these two refusals; it is settled anyway rather than left
+	// counting against the connection until close.
+	if (!isValidWireTopic(topic, true)) return releaseCarried(ws, topic, carried, 'INVALID_TOPIC', lane);
+	// System-topic restrictions belong to the wire boundary. Server callers
+	// delegate authorization to the app hook, including plugin-owned channels.
+	if (lane?.fromWire && !options?.allowSystemTopic && isSystemTopic(topic) && !isPluginOwnedTopic(topic)) {
+		return releaseCarried(ws, topic, carried, 'INVALID_TOPIC', lane);
+	}
 	let userData;
 	try {
 		userData = ws.getUserData();
 	} catch {
+		if (options?.preparedRecovery?.capture) discardResumeCapture(options.preparedRecovery.capture);
 		wsCounters.closedWsAborts++;
 		return 'CLOSED';
 	}
 	const subs = userData[WS_SUBSCRIPTIONS];
-	if (!subs) return 'CLOSED';
-	if (subs.has(topic)) return null;
-	// Count gates that are open but have not landed. Bun does not await the
-	// message handler, so a client can pipeline subscribe frames faster than
-	// they install: every one of them reads `subs.size` at its pre-await
-	// value, passes, and lands. Measured at 500 installed against a cap of
-	// 20 with a 40ms async hook, and the ceiling is the client's write rate,
-	// not the cap. The in-flight total is what makes this a bound - and it
-	// also bounds the concurrent app-hook invocations, which are their own
-	// stampede against whatever the hook talks to.
-	//
-	// DISTINCT pending topics, not total in-flight gates: N concurrent
-	// subscribes to ONE topic can only ever install one subscription, so
-	// counting them N times refused legitimate subscribes with a
-	// `RATE_LIMITED` that was not true (measured: 25 concurrent subscribes
-	// to a single topic produced 5 false denials against a cap of 20).
-	if (subs.size + pendingSubscribeTopics(userData) >= MAX_SUBSCRIPTIONS_PER_CONNECTION) {
-		return 'RATE_LIMITED';
+	// The subscription slot is assigned a Set once at open and never reassigned;
+	// a non-Set on a live connection is unrecoverable corruption. In production
+	// fatal() has only scheduled the exit, so the same test then answers the
+	// caller rather than letting `subs.has` throw out of a platform method.
+	fatal(subs instanceof Set, 'subs.shape', null);
+	if (!(subs instanceof Set)) return releaseCarried(ws, topic, carried, 'CLOSED', lane);
+	let token = carried;
+	// Admit an attempt that brings no stamp of its own: the held short-circuit,
+	// the independent landed and pending-attempt caps, and the stamp. Written here rather than as a helper:
+	// a function this size is past the bytecode cost JavaScriptCore's optimizing
+	// tier inlines, so as a helper every subscribe paid a real call for it.
+	if (token === undefined) {
+		// NOT when a gap-fill was asked for. Live membership carries no HISTORY, so
+		// acking a held topic here left a caller that asked to recover from an
+		// offset subscribed and believing itself caught up, with the tail between
+		// its last-seen seq and now silently missing - and under an armed gate,
+		// where held is exactly what granted means, that is every legal recover the
+		// wire can ask for. Falls through to the recover lane instead, which acks
+		// through the already-subscribed branch below once the gap is filled.
+		const wantsGapFill = wantsRecover({
+			hasResumeHook: wsModule.resume,
+			recover: options && options.recover
+		});
+		// Nor when the membership is still waiting to be judged - installed inside
+		// an attempt's await window, by that attempt's own hook: acked on sight, it
+		// could be unwound a moment later under an ack that said it stood. That one
+		// enrols and is judged like any attempt, and an allow recorded on its
+		// landing is the authority the other attempts' landings then read.
+		if (!(lane && lane.fromWire) && subs.has(topic) && !wantsGapFill && !membershipUnconfirmed(userData, topic)) return null;
+		// Landed membership and in-flight attempts have independent bounds.
+		if (
+			exceedsSubscriptionCap({
+				held: subs.has(topic),
+				size: subs.size,
+				max: MAX_SUBSCRIPTIONS_PER_CONNECTION
+			})
+		) {
+			return 'RATE_LIMITED';
+		}
+
+		// A permanent authorization refusal wins over a transient retry signal.
+		if (lane?.fromWire && deniesWireSubscribePreHook({
+			armed: subscribeAuth.enabled,
+			hasUserHook: hasUserSubscribeHook() && !subscribeAuth.strict,
+			held: subs.has(topic) && !membershipUnconfirmed(userData, topic),
+			topic
+		})) return 'FORBIDDEN';
+
+		if (pendingSubscribeTotal(userData) >= MAX_PENDING_SUBSCRIBES_PER_CONNECTION) return 'RATE_LIMITED';
+
+		token = beginPendingSubscribe(userData, topic, subs.has(topic));
 	}
+	let recoverCapture = options?.preparedRecovery?.capture ?? null;
+	let denial = null;
+	// A batch entry with no batch verdict runs the per-topic hook here. One a
+	// revocation already cancelled is not run at all: there is nothing its
+	// answer could change, and the hook is app work the client's frame would be
+	// buying for nothing.
+	const skipGate = lane && lane.pendingToken !== undefined && verdict === undefined
+		&& isPendingSubscribeCancelled(userData, topic, token);
+	if (!skipGate) {
 
-	// Stamp the in-flight subscribe BEFORE the gate. An unsubscribe landing
-	// while the hook is awaited bumps the epoch, and the landing below then
-	// refuses to install a subscription the client has already left - which
-	// would otherwise survive as a phantom the client believes it cancelled.
-	// The SECOND limit: concurrent gates. The cap above counts distinct
-	// pending topics, so N concurrent subscribes to ONE topic cost 1 against
-	// it - correct for what can install, useless as a bound on app work:
-	// without this check a socket repeating one topic opens a fresh gate call
-	// per frame with nothing to stop it.
-	if (!hasGateHeadroom(ws)) return 'RATE_LIMITED';
-
-	const token = beginPendingSubscribe(userData, topic);
-	let denial;
-	try {
-		denial = await withGateCounted(ws, () => runSubscribeGate(ws, topic, verdict));
-	} catch (err) {
-		settlePendingSubscribe(userData, topic, token);
-		throw err;
+		try {
+			denial = await runSubscribeGate(ws, topic, verdict, lane);
+		} catch (err) {
+			refuseLanding(ws, userData, subs, topic, token, recoverCapture, 'INTERNAL_ERROR', lane);
+			throw err;
+		}
 	}
 	// Recover gap-fill, only after the gate ALLOWED: a topic's replay history
 	// must never be served ahead of a refusal. The barrier opens BEFORE the
 	// resume await so a publish landing inside the hook's window is held, and
 	// the pending entry stays in flight across the await so an unsubscribe
 	// landing mid-resume still cancels the install below.
-	let recoverCapture = null;
-	let recoverCovered;
+	let recoverCovered = options?.preparedRecovery?.covered;
 	const recover = options && options.recover;
 	if (
 		(denial === null || denial === undefined) &&
@@ -2396,28 +3005,42 @@ export async function subscribeWithVerdict(ws, topic, options, verdict) {
 		// offset the server could not have issued is not a recover, and
 		// subscribing plainly beats gap-filling from a fabricated cursor.
 		isValidResumeSeq(recover.offset) &&
-		typeof wsModule.resume === 'function'
+		typeof wsModule.resume === 'function' &&
+		// Replay history is served BEFORE the subscription lands, so the ways a
+		// grant can be absent have to be asked here rather than at the landing
+		// below - by then the frames are already on the socket. Membership is
+		// read first, so a revoke followed by a legitimate re-grant inside one
+		// await window is served rather than acked with the replay silently
+		// dropped.
+		//
+		// The grant term is scoped to the WIRE lane. Server-initiated recovery
+		// is the server subscribing a topic it is granting in the same call, so
+		// judging it against a grant that by definition has not landed yet
+		// would make an armed worker unable to gap-fill anything at all. The
+		// cancellation term is not scoped: an unsubscribe that landed mid-gate
+		// means the client left, and it left on either lane.
+		!recoverIsRevoked({
+			// Held only as the landing would ack it: a revoked attempt whose own
+			// hook installed the membership reads as held, and would be served
+			// the history before its landing refused it.
+			held: subs.has(topic) && heldLandingWouldAck(userData, topic, token),
+			wireAuthz:
+				Boolean(lane && lane.fromWire) &&
+				subscribeAuth.enabled &&
+				(subscribeAuth.strict || !hasUserSubscribeHook()),
+			cancelled: isPendingSubscribeCancelled(userData, topic, token),
+			topic
+		})
 	) {
-		// The resume hook is app work a client frame triggers, so it runs
-		// under the same per-connection concurrency bound as the gates. The
-		// subscribe gate released its count above; without re-taking one here
-		// a client pipelining recover subscribes to distinct topics would
-		// open one concurrent backend read - and one live-frame buffer - per
-		// frame it can write.
-		if (!hasGateHeadroom(ws)) {
-			settlePendingSubscribe(userData, topic, token);
-			return 'RATE_LIMITED';
-		}
+		// The pending attempt remains counted throughout recovery.
 		recoverCapture = beginResumeCapture([topic], ws);
 		try {
-			recoverCovered = await withGateCounted(ws, () =>
-				wsModule.resume(ws, {
+			recoverCovered = await wsModule.resume(ws, {
 					sessionId: userData[WS_SESSION_ID],
 					lastSeenSeqs: { [topic]: recover.offset },
 					lastSeenEpochs: isValidResumeEpoch(recover.epoch) ? { [topic]: recover.epoch } : undefined,
 					platform: userData[WS_PLATFORM] || platform
-				})
-			);
+			});
 		} catch (err) {
 			// The hook did not finish, so how much of the window it covered is
 			// unknown - and the `subscribed` ack this lane ends with would imply a
@@ -2434,33 +3057,65 @@ export async function subscribeWithVerdict(ws, topic, options, verdict) {
 			if (recoverCapture) markResumeTruncated(recoverCapture, topic);
 		}
 	}
-	const stillWanted = settlePendingSubscribe(userData, topic, token);
 	// Explicit nullish test, NOT truthiness. checkSubscribe classifies any
 	// string the hook returns as a denial reason, including the empty
 	// string - which a hook produces naturally from a lookup miss
 	// (`DENY_REASONS[topic] ?? ''`). Under truthiness that denial fell
 	// through to the install below and the client got a `subscribed` ack for
-	// a topic the app meant to refuse.
-	if (denial !== null && denial !== undefined) return denial;
-	if (!stillWanted) {
-		if (recoverCapture) discardResumeCapture(recoverCapture);
-		return 'CANCELLED';
-	}
+	// a topic the app meant to refuse. The app's answer outranks membership:
+	// a refusal it gave is not overruled by the connection happening to hold
+	// the topic now.
+	if (denial !== null && denial !== undefined) return refuseLanding(ws, userData, subs, topic, token, recoverCapture, denial, lane);
 
-	// Re-check after the await: a duplicate subscribe may have landed and
-	// completed while this one was in the gate. The client is then already
-	// live, so any frames held for it would be duplicates - discard them.
+	// MEMBERSHIP FIRST, asked before the cancellation mark for the reason the
+	// recover lane asks in that order too: the mark only ever rises, so reading
+	// it alone cannot see a revoke followed by a legitimate re-grant inside one
+	// await window - which is the shape of an ordinary permission refresh. But
+	// held is not enough on its own either: a revocation removes the membership
+	// when it cancels, so a topic held at a revoked landing was installed inside
+	// the await window, either by a fresh attempt whose authorization completed
+	// (current authority, ack) or by this attempt's own hook (the install the
+	// cancellation exists to defeat). settleHeldSubscribe reads which. Any
+	// frames held for a recover would be duplicates of what the connection is
+	// already live for - discard them either way.
 	if (subs.has(topic)) {
 		if (recoverCapture) discardResumeCapture(recoverCapture);
-		return null;
+		const held = settleHeldSubscribe(userData, topic, token);
+		if (held === 'ack') return null;
+		if (held === 'deny-unwind') unwindRevokedSubscribe(ws, topic, userData, lane);
+		return 'FORBIDDEN';
 	}
-	// And re-check the cap, for the same reason it counts in-flight above:
-	// this gate entered when there was headroom, and any number of others
-	// may have landed while it was awaiting. The pre-gate check bounds how
-	// many hooks run at once; this one bounds what actually installs.
-	if (subs.size >= MAX_SUBSCRIPTIONS_PER_CONNECTION) {
+	// Recheck landed capacity after authorization because other attempts may land.
+	// The grant gate re-checked where the subscription LANDS. `subscribeAuth`
+	// is runtime-mutable and latches false -> true, so a wire subscribe that
+	// entered unarmed - or before `'strict'` was latched - has to be judged
+	// under the posture in force now rather than the one it started under.
+	// Both ends read it fresh for that reason. Reaching here means the topic is
+	// not held, so an armed worker with no hook deciding has no grant to
+	// honour. Scoped to the wire lane: the server's own `platform.subscribe` IS
+	// the grant, and judging it against a grant that has not landed yet would
+	// leave an armed worker unable to authorize anything.
+	if (
+		lane && lane.fromWire &&
+		deniesWireSubscribeLanding({
+			armed: subscribeAuth.enabled,
+			hasUserHook: hasUserSubscribeHook() && !subscribeAuth.strict,
+			held: false,
+			topic
+		})
+	) {
+		return refuseLanding(ws, userData, subs, topic, token, recoverCapture, 'FORBIDDEN', lane);
+	}
+	if (exceedsSubscriptionCap({ held: false, size: subs.size, max: MAX_SUBSCRIPTIONS_PER_CONNECTION })) {
+		return refuseLanding(ws, userData, subs, topic, token, recoverCapture, 'RATE_LIMITED', lane);
+	}
+	// Settled LAST, after every refusal above, and marked as authority: this
+	// attempt is about to install the membership on the current epoch, so a
+	// revoked sibling landing after it reads the grant as current. Marking it
+	// before a refusal would hand that sibling authority nobody exercised.
+	if (!settlePendingSubscribe(userData, topic, token, true)) {
 		if (recoverCapture) discardResumeCapture(recoverCapture);
-		return 'RATE_LIMITED';
+		return 'FORBIDDEN';
 	}
 	try {
 		ws.subscribe(topic);
@@ -2469,8 +3124,7 @@ export async function subscribeWithVerdict(ws, topic, options, verdict) {
 		wsCounters.closedWsAborts++;
 		return 'CLOSED';
 	}
-	subs.add(topic);
-	wsCounters.totalSubscriptions++;
+	addLogicalSubscription(subs, topic);
 	// Live membership is installed: flush any frames held during the resume
 	// window, in order, skipping what the resume already covered, before the
 	// caller sends the ack.
@@ -2491,4 +3145,142 @@ export async function subscribeWithVerdict(ws, topic, options, verdict) {
 	const sharedCap = sharedTopics.get(topic);
 	if (sharedCap !== undefined) joinSharedCohort(ws, userData, topic, sharedCap);
 	return null;
+}
+
+/**
+ * Settle a carried batch stamp on an exit that refuses before the landing, and
+ * answer with `reason`. A no-op without one.
+ *
+ * @param {any} ws
+ * @param {string} topic
+ * @param {number | undefined} token
+ * @param {string} reason
+ * @param {{ fromWire?: boolean }} [lane]
+ * @returns {string}
+ */
+function releaseCarried(ws, topic, token, reason, lane) {
+	if (token === undefined) return reason;
+	let userData;
+	try {
+		userData = ws.getUserData();
+	} catch {
+		// Closed: the close dropped the whole record.
+		return reason;
+	}
+	if (settleDeniedSubscribe(userData, topic, token, heldSubscriptions(ws).has(topic)) === 'deny-unwind') {
+		unwindRevokedSubscribe(ws, topic, userData, lane);
+	}
+	return reason;
+}
+
+/**
+ * Undo a membership a revoked subscribe attempt installed from its own hook -
+ * the 'deny-unwind' answer of the landing's provenance reads - and run the
+ * app's `unsubscribe` hook for it. Application promises never delay revocation.
+ *
+ * @param {any} ws
+ * @param {string} topic
+ * @param {any} userData
+ * @param {{ fromWire?: boolean }} [lane]
+ */
+function unwindRevokedSubscribe(ws, topic, userData, lane) {
+	unwindRevokedMembership(ws, topic);
+	const dispatchHook = lane?.fromWire ? dispatchUnsubscribeHook : dispatchServerUnsubscribeHook;
+	dispatchHook(ws, topic, true, userData);
+}
+
+/** Authorize all batch entries before serving one combined recovery request. */
+export async function prepareBatchRecovery(ws, topics, tokens, verdicts, recover) {
+	let userData;
+	try { userData = ws.getUserData(); }
+	catch { return topics.map(() => ({ denial: 'CLOSED', capture: null })); }
+	const subs = userData[WS_SUBSCRIPTIONS];
+	const entries = [];
+	for (let i = 0; i < topics.length; i++) {
+		const topic = topics[i];
+		const denial = isPendingSubscribeCancelled(userData, topic, tokens[i])
+			? null : await runSubscribeGate(ws, topic, verdicts[i], { fromWire: true });
+		entries.push({ denial, capture: null, covered: undefined });
+	}
+	const lastSeenSeqs = {};
+	const lastSeenEpochs = {};
+	for (let i = 0; i < topics.length; i++) {
+		const topic = topics[i];
+		const input = recover[topic];
+		if (entries[i].denial !== null || !wantsRecover({ hasResumeHook: wsModule.resume, recover: input })) continue;
+		if (recoverIsRevoked({
+			held: subs.has(topic) && heldLandingWouldAck(userData, topic, tokens[i]),
+			wireAuthz: subscribeAuth.enabled && (subscribeAuth.strict || !hasUserSubscribeHook()),
+			cancelled: isPendingSubscribeCancelled(userData, topic, tokens[i]), topic
+		})) continue;
+		lastSeenSeqs[topic] = input.offset;
+		if (isValidResumeEpoch(input.epoch)) lastSeenEpochs[topic] = input.epoch;
+		entries[i].capture = beginResumeCapture([topic], ws);
+	}
+	if (Object.keys(lastSeenSeqs).length === 0) return entries;
+	try {
+		const covered = await wsModule.resume(ws, {
+			sessionId: userData[WS_SESSION_ID], lastSeenSeqs,
+			lastSeenEpochs: Object.keys(lastSeenEpochs).length ? lastSeenEpochs : undefined,
+			platform: userData[WS_PLATFORM] || platform
+		});
+		if (covered !== null && typeof covered === 'object') {
+			for (const entry of entries) entry.covered = covered;
+		}
+	} catch (err) {
+		const { log } = recoverThrewThrottle();
+		if (log) console.error('[ws] recover-on-subscribe hook threw:', err);
+		for (let i = 0; i < entries.length; i++) {
+			if (entries[i].capture) markResumeTruncated(entries[i].capture, topics[i]);
+		}
+	}
+	return entries;
+}
+
+
+/** Release a client-requested membership and invoke its teardown hook. */
+export function unsubscribeFromWire(ws, topic) {
+	return unsubscribeMembership(ws, topic, dispatchUnsubscribeHook, true);
+}
+
+function unsubscribeMembership(ws, topic, dispatchHook, releaseUntracked = false) {
+	let userData;
+	try {
+		userData = ws.getUserData();
+	} catch {
+		wsCounters.closedWsAborts++;
+		return false;
+	}
+	// Cancel any subscribe for this topic still sitting in the authorization
+	// gate. Done BEFORE the membership check, because the racing case is
+	// exactly the one where the topic is not in `subs` yet - an unsubscribe
+	// that returns early here would let the gate land afterwards and
+	// resurrect a subscription the client just cancelled.
+	const cancelledPending = tombstonePendingSubscribe(userData, topic);
+	// Release the taps a plugin derived from this topic (a roster channel, a
+	// cursor channel) before the membership check: revoking a topic takes
+	// them away whether or not the base membership is still present.
+	releaseDerivedSubscriptions(ws, topic);
+	if (userData[WS_PUBLISH_GRANT] === topic) userData[WS_PUBLISH_GRANT] = undefined;
+	const subs = userData[WS_SUBSCRIPTIONS];
+	assert(subs instanceof Set, 'subs.shape-unsubscribe', null);
+	if (!(subs instanceof Set)) return cancelledPending;
+	const wasHeld = subs.has(topic);
+	if (!wasHeld && !releaseUntracked) return cancelledPending;
+	try {
+		// Bun cannot hold an empty native topic and rejects its removal.
+		// The wire release still clears grants and invokes application teardown.
+		if (topic !== '') ws.unsubscribe(topic);
+	} catch {
+		// The native membership is already gone with the socket; the
+		// bookkeeping below still has to run or the counter leaks.
+		wsCounters.closedWsAborts++;
+	}
+	if (wasHeld) removeLogicalSubscription(subs, topic);
+	// A shared topic's cohort membership travels with the logical
+	// subscription; leaving releases the wire-id ref this connection held.
+	if (sharedTopics.has(topic)) leaveSharedCohort(ws, userData, topic);
+	if (!wasHeld) return cancelledPending;
+	dispatchHook(ws, topic, true, userData);
+	return true;
 }

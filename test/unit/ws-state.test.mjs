@@ -11,15 +11,7 @@ globalThis.WS_PATH = '/ws';
 
 const {
 	MAX_CONTROL_EGRESS_BYTES,
-	beginPendingRelease,
 	chargeControlEgress,
-	clearPendingReleases,
-	clearUnsubscribeHooks,
-	settlePendingRelease,
-	hasGateHeadroom,
-	pendingReleaseTopics,
-	runUnsubscribeHook,
-	withGateCounted,
 	wsCounters
 } =
 	await import('../../src/runtime/handler/ws-state.js');
@@ -69,302 +61,26 @@ test('a closed socket is not charged and is not reported as flooding', () => {
 	assert.equal(chargeControlEgress(closedWs(), 1), true);
 });
 
-test('a connection has gate headroom until exactly 64 gates are in flight', async () => {
-	const ws = fakeWs();
-	const gates = [];
-	let opened = 0;
-	while (hasGateHeadroom(ws)) {
-		const d = deferred();
-		gates.push(d);
-		void withGateCounted(ws, () => d.promise);
-		opened++;
-		assert.ok(opened <= 200, 'headroom never ran out');
+test('production connection slots share the family registry keys', async () => {
+	const slots = await import('../../src/runtime/handler/ws-state.js');
+	for (const [name, key] of Object.entries({ WS_STATS: 'stats', WS_COALESCED: 'coalesced', WS_LEASE: 'lease', WS_TOPIC_IDS: 'topic-ids', WS_WIRE_STATE: 'wire-state', WS_SHARED_COHORTS: 'shared-cohorts', WS_CONNECTION_PERMIT: 'connection-permit' })) {
+		assert.equal(slots[name], Symbol.for('adapter-uws.ws.' + key), name);
 	}
-	assert.equal(opened, 64);
-	// The bound measures CONCURRENT gates, so finishing one restores headroom.
-	gates[0].resolve();
-	await gates[0].promise;
-	assert.equal(hasGateHeadroom(ws), true);
-	for (const d of gates) d.resolve();
-	await Promise.all(gates.map((d) => d.promise));
-	assert.equal(hasGateHeadroom(ws), true);
 });
 
-test('a gate is counted for the whole time it is suspended, not just while it is called', async () => {
-	const ws = fakeWs();
-	const d = deferred();
-	// The distinction that makes the bound mean anything: a hook that awaits a
-	// database round-trip returns to the caller immediately, so counting only
-	// the synchronous call would bound nothing.
-	const running = withGateCounted(ws, () => d.promise);
-	let held = 0;
-	while (hasGateHeadroom(ws)) {
-		held++;
-		void withGateCounted(ws, () => new Promise(() => {}));
-		if (held > 200) break;
-	}
-	// 63 more, because the suspended one still occupies a slot.
-	assert.equal(held, 63);
-	d.resolve();
-	await running;
-});
-
-test('a gate that throws still releases its slot', async () => {
-	const ws = fakeWs();
-	const d = deferred();
-	const running = withGateCounted(ws, () => d.promise);
-	d.reject(new Error('the app hook threw'));
-	await assert.rejects(running, /the app hook threw/);
-	// A leaked slot is permanent: the connection would answer RATE_LIMITED for
-	// the rest of its life after 64 failed gates.
-	assert.equal(hasGateHeadroom(ws), true);
-});
-
-test('a closed socket has no headroom but still runs the call', async () => {
-	const ws = closedWs();
-	// Nothing to charge the gate to, so the answer is the conservative one.
-	assert.equal(hasGateHeadroom(ws), false);
-	// The call still has to happen: the caller needs a verdict, not a crash.
-	assert.equal(await withGateCounted(ws, async () => 'verdict'), 'verdict');
-});
-
-test('unsubscribe hooks are bounded PER CONNECTION and do not touch the gate counter', () => {
-	// The two lanes are separate counters on purpose. Sharing one meant an
-	// ordinary page unmounting a hundred stores drove the shared count past the
-	// gate bound, and the SUBSCRIBE path then answered RATE_LIMITED on a
-	// connection nowhere near any real limit - a SvelteKit route change, which
-	// unmounts the old stores and mounts the new ones in one tick, hit exactly
-	// that.
-	const ws = fakeWs();
-	const held = [];
-	for (let i = 0; i < 200; i++) {
-		held.push(deferred());
-		runUnsubscribeHook(ws, () => held[i].promise, true);
-	}
-	assert.equal(hasGateHeadroom(ws), true, 'teardown must not starve the subscribe lane');
-});
-
-test('a connection cannot burst more concurrent unsubscribe hooks than the bound', () => {
-	// Bun does not await the message handler, so a client holding the permitted
-	// subscriptions can pipeline every release in one read burst and land them
-	// all synchronously. The held lane used to skip the headroom test entirely.
-	const ws = fakeWs();
-	let concurrent = 0;
-	let peak = 0;
-	const gates = [];
-	for (let i = 0; i < 5000; i++) {
-		const d = deferred();
-		gates.push(d);
-		runUnsubscribeHook(
-			ws,
-			() => {
-				concurrent++;
-				if (concurrent > peak) peak = concurrent;
-				return d.promise;
-			},
-			true
-		);
-	}
-	assert.equal(peak, 64, 'the default bound is what actually bounds it');
-});
-
-test('a required hook is deferred, never refused, while there is queue space', () => {
-	const ws = fakeWs();
-	for (let i = 0; i < 64; i++) runUnsubscribeHook(ws, () => deferred().promise, true);
-	// Speculative work yields once the slots are full...
-	assert.equal(runUnsubscribeHook(ws, () => Promise.resolve(), false), 'refused');
-	// ...but a real release waits instead of being dropped: dropping it leaks
-	// the plugin state the app releases in that hook, silently, because the
-	// family client sends unsubscribe with no ref and has no refusal branch.
-	assert.equal(runUnsubscribeHook(ws, () => Promise.resolve(), true), 'queued');
-});
-
-test('a closed socket refuses the hook rather than throwing', () => {
-	assert.equal(runUnsubscribeHook(closedWs(), () => Promise.resolve(), true), 'refused');
-});
-
-test('clearing a connection stops its queued hooks from resuming', async () => {
-	const ws = fakeWs();
-	const first = deferred();
-	let queuedRan = false;
-	for (let i = 0; i < 64; i++) runUnsubscribeHook(ws, () => (i === 0 ? first.promise : deferred().promise), true);
-	runUnsubscribeHook(ws, () => {
-		queuedRan = true;
-		return Promise.resolve();
-	}, true);
-	clearUnsubscribeHooks(ws.getUserData());
-	first.resolve();
-	await first.promise;
-	await new Promise((r) => setTimeout(r, 0));
-	assert.equal(queuedRan, false, 'the close hook does this teardown; the socket is gone');
-});
-
-test('the pending-release record tracks what is owed and what has settled', async () => {
-	// The bookkeeping in isolation. What the demux does WITH it - which
-	// outcomes settle a debt and which leave it owed - is pinned in
-	// ws-demux.test.mjs against the real message handler, because that is where
-	// the resolve-vs-reject decision is actually made.
-	const ws = fakeWs();
-	const ud = ws.getUserData();
-	assert.deepEqual([...pendingReleaseTopics(ud)], []);
-
-	beginPendingRelease(ud, 'room:1');
-	beginPendingRelease(ud, 'room:2');
-	assert.deepEqual([...pendingReleaseTopics(ud)].sort(), ['room:1', 'room:2']);
-
-	// A hook that finishes tears its own topic down, so the close hook must not
-	// be told to do it again.
-	settlePendingRelease(ud, 'room:1', true);
-	assert.deepEqual([...pendingReleaseTopics(ud)], ['room:2']);
-
-	// The record is dropped once the close hook has been handed it.
-	clearPendingReleases(ud);
-	assert.deepEqual([...pendingReleaseTopics(ud)], []);
-});
-
-test('the pending-release record tolerates a connection that never had one', () => {
-	// The close path reads it unconditionally, including for connections that
-	// never sent an unsubscribe frame at all.
-	assert.deepEqual([...pendingReleaseTopics({})], []);
-	assert.deepEqual([...pendingReleaseTopics(undefined)], []);
-	settlePendingRelease(undefined, 'room:1', true);
-	clearPendingReleases(undefined);
-});
-
-test('an overflowing queue leaves every dropped release recorded', async () => {
-	// The scenario the bound exists for: a client pipelines more releases than
-	// the queue holds. Whatever the queue refuses to carry must still reach the
-	// app by the close route, so the count that matters is that NOTHING went
-	// missing between the two.
-	const ws = fakeWs();
-	const ud = ws.getUserData();
-	const gate = deferred();
-	const outcomes = [];
-	for (let i = 0; i < 200; i++) {
-		const topic = `room:${i}`;
-		beginPendingRelease(ud, topic);
-		outcomes.push(
-			runUnsubscribeHook(ws, () => gate.promise.finally(() => settlePendingRelease(ud, topic, true)), true)
-		);
-	}
-	// The bound held: only the concurrency limit ran, the rest are waiting.
-	const ran = outcomes.filter((o) => o === 'ran').length;
-	assert.equal(ran, 64);
-	assert.equal(outcomes.filter((o) => o === 'queued').length, 200 - 64);
-
-	// Nothing has finished, so every topic is still owed a teardown.
-	assert.equal([...pendingReleaseTopics(ud)].length, 200);
-
-	// The connection dies with all of them outstanding.
-	clearUnsubscribeHooks(ud);
-	gate.resolve();
-	await new Promise((r) => setTimeout(r, 0));
-
-	// The ones that were RUNNING completed and cleared themselves; the ones the
-	// clear dropped are still recorded, which is what puts them in the close
-	// hook's snapshot.
-	assert.equal([...pendingReleaseTopics(ud)].length, 200 - 64);
-});
-
-test('two releases of one topic are both owed until both settle', async () => {
-	// A topic can be owed more than one teardown at a time: release it,
-	// subscribe it again, release it again. Recording membership rather than a
-	// COUNT collapses those into one entry, and the first hook to finish then
-	// deletes it - so the second release is dropped at close and the app never
-	// tears down the state it re-created in between. That is the same leak this
-	// record exists to close, reached by a different route.
-	const ud = fakeWs().getUserData();
-	beginPendingRelease(ud, 'room:1');
-	beginPendingRelease(ud, 'room:1');
-	assert.deepEqual([...pendingReleaseTopics(ud)], ['room:1']);
-
-	// The first hook finishes. One teardown is still owed, so the topic must
-	// still reach the close hook.
-	settlePendingRelease(ud, 'room:1', true);
-	assert.deepEqual([...pendingReleaseTopics(ud)], ['room:1']);
-
-	// Only when the second finishes is nothing owed.
-	settlePendingRelease(ud, 'room:1', true);
-	assert.deepEqual([...pendingReleaseTopics(ud)], []);
-
-	// And settling more times than were begun cannot drive the count negative
-	// into a state where a later release is silently discharged.
-	settlePendingRelease(ud, 'room:1', true);
-	beginPendingRelease(ud, 'room:1');
-	assert.deepEqual([...pendingReleaseTopics(ud)], ['room:1']);
-});
-
-test('a hook that failed leaves its topic owed', async () => {
-	// A hook that threw ran the app's code but did not necessarily release
-	// anything - `await redis.srem(...)` against a backend that is down is the
-	// realistic shape. Discharging the debt on failure means the close hook is
-	// not told either, and one backend blip leaks the entry with no attacker
-	// involved.
-	const ud = fakeWs().getUserData();
-	beginPendingRelease(ud, 'room:1');
-	settlePendingRelease(ud, 'room:1', false);
-	assert.deepEqual([...pendingReleaseTopics(ud)], ['room:1']);
-	// A later successful release of the same topic discharges one debt, not
-	// both: the failed one is still owed.
-	beginPendingRelease(ud, 'room:1');
-	settlePendingRelease(ud, 'room:1', true);
-	assert.deepEqual([...pendingReleaseTopics(ud)], ['room:1']);
-});
-
-test('the pending-release record is bounded', () => {
-	// Otherwise a hook that fails every time turns "release, re-subscribe,
-	// release" into unbounded growth on one connection: a failed hook frees its
-	// queue slot but stays owed, so the queue's own bound does not cover this.
-	const ud = fakeWs().getUserData();
-	for (let i = 0; i < 5000; i++) {
-		beginPendingRelease(ud, `room:${i}`);
-		settlePendingRelease(ud, `room:${i}`, false);
-	}
-	const recorded = [...pendingReleaseTopics(ud)].length;
-	assert.equal(recorded, 2 * (64 + 1024));
-	// Everything in flight still fits: the queue admits at most 64 + 1024 at
-	// once, so the ceiling cannot be reached by legitimate concurrency alone.
-	assert.ok(recorded > 64 + 1024);
-});
-
-test('what the ceiling refuses to record is counted', async () => {
-	// Past the ceiling a release's teardown is not guaranteed by anyone, which
-	// is the one hole in the at-least-once contract. The warning fires once per
-	// process, so without a counter the second connection to hit this loses
-	// teardowns with no output at all, and an operator has nothing to read.
-	const ud = fakeWs().getUserData();
-	const before = wsCounters.droppedReleaseRecords;
-	const CEILING = 2 * (64 + 1024);
-	for (let i = 0; i < CEILING; i++) {
-		beginPendingRelease(ud, `room:${i}`);
-		settlePendingRelease(ud, `room:${i}`, false);
-	}
-	assert.equal(wsCounters.droppedReleaseRecords, before, 'nothing dropped while there is room');
-
-	beginPendingRelease(ud, 'one-too-many');
-	assert.equal(wsCounters.droppedReleaseRecords, before + 1);
-	assert.equal([...pendingReleaseTopics(ud)].includes('one-too-many'), false);
-});
-
-test('a topic already recorded still takes on another debt at the ceiling', async () => {
-	// The ceiling refuses NEW keys only. Refusing an increment for a topic that
-	// is already recorded would silently drop the second teardown owed for it,
-	// which is the exact leak the count exists to prevent - and dropping the
-	// `owed === undefined` half of that test reads like a simplification.
-	const ud = fakeWs().getUserData();
-	const CEILING = 2 * (64 + 1024);
-	for (let i = 0; i < CEILING; i++) {
-		beginPendingRelease(ud, `room:${i}`);
-		settlePendingRelease(ud, `room:${i}`, false);
-	}
-	const dropped = wsCounters.droppedReleaseRecords;
-
-	// A second release of a topic that is already owed one, at the ceiling.
-	beginPendingRelease(ud, 'room:0');
-	assert.equal(wsCounters.droppedReleaseRecords, dropped, 'an existing key is not a new record');
-	// Two debts now, so one successful hook must not discharge both.
-	settlePendingRelease(ud, 'room:0', true);
-	assert.equal([...pendingReleaseTopics(ud)].includes('room:0'), true);
-	settlePendingRelease(ud, 'room:0', true);
-	assert.equal([...pendingReleaseTopics(ud)].includes('room:0'), false);
+test('runtime slots shadow inherited setters and preserve an own connection permit', async () => {
+	const { declareRuntimeConnectionSlots, WS_STATS, WS_CONNECTION_PERMIT } = await import('../../src/runtime/handler/ws-state.js');
+	let calls = 0;
+	const prototype = {};
+	Object.defineProperty(prototype, WS_STATS, { set() { calls++; }, get() { throw new Error('inherited stats read'); } });
+	Object.defineProperty(prototype, WS_CONNECTION_PERMIT, { set() { calls++; } });
+	const userData = Object.create(prototype);
+	Object.defineProperty(userData, WS_CONNECTION_PERMIT, { value: true, writable: true, configurable: true });
+	declareRuntimeConnectionSlots(userData);
+	const stats = { bytes: 1 };
+	userData[WS_STATS] = stats;
+	assert.equal(calls, 0);
+	assert.equal(Object.hasOwn(userData, WS_STATS), true);
+	assert.equal(userData[WS_STATS], stats);
+	assert.equal(userData[WS_CONNECTION_PERMIT], true);
 });

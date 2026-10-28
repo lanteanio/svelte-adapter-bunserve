@@ -15,31 +15,9 @@
 export const CONTROL_FRAME_LIMIT = 8192;
 
 /** The control types the demux consumes itself. */
-export const CONSUMED_CONTROL_TYPES = ['subscribe', 'unsubscribe', 'subscribe-batch', 'hello', 'resume', 'request-n'];
+export const CONSUMED_CONTROL_TYPES = ['subscribe', 'unsubscribe', 'subscribe-batch', 'hello', 'resume', 'request-n', 'ingress-bind'];
 
-/**
- * Topics one control frame may name - the entries of a `subscribe-batch`, and
- * the per-topic maps of a `resume`.
- *
- * ONE number for both lanes on purpose. A client that already chunks its
- * subscribe-batch to stay under this needs no second chunking rule for the
- * resume it sends beside it on reconnect, and two limits to remember is how a
- * client ends up respecting neither.
- *
- * A frame beyond this is refused WHOLE (see batchTooLargeFrame and
- * resumeTooLargeFrame) rather than partly applied. Partial application is the worse contract on both sides: the
- * client has to diff what it sent against what it was told about, and the
- * server has to answer every dropped entry to tell it - which is what turned
- * one 8 KB frame into 800 KB of denials, since a frame that size holds four
- * thousand two-byte entries and each one bought a whole refusal frame.
- *
- * Refusing whole costs one frame no matter how many entries arrived, and no
- * client is left guessing: the frame either applied or it did not.
- *
- * Every client in the family chunks well below this - 200 topics and 8000
- * bytes, explicitly to stay under this limit and the parse ceiling - so the
- * refusal is unreachable for them.
- */
+/** Subscribe batches apply this prefix and deny extra string topics. */
 export const MAX_BATCH_TOPICS = 256;
 
 /**
@@ -184,9 +162,10 @@ export function controlFrameTooLargeFrame(size) {
  *
  * 4429, NOT 1008. Both family clients list 1008 in their TERMINAL_CLOSE_CODES
  * and stop reconnecting permanently on it, while 4429 is their THROTTLE code,
- * which reconnects with accelerated backoff. The budget is an operator-tunable
- * limit that a legitimate client can reach by resubscribing a large enough set,
- * so cutting the connection must not permanently kill the page.
+ * which reconnects with accelerated backoff. The budget is a limit a legitimate
+ * client can reach by resubscribing a large enough set, so cutting the
+ * connection must not permanently kill the page. Nothing is written before
+ * the close (see refuseControlFlood).
  */
 export const CONTROL_FLOOD_CLOSE_CODE = 4429;
 
@@ -204,80 +183,6 @@ export const CONTROL_FLOOD_CLOSE_CODE = 4429;
  * selects would be the wrong curve for a socket that needs time to drain.
  */
 export const RESUME_INCOMPLETE_CLOSE_CODE = 1013;
-
-/**
- * The oversized-batch refusal.
- *
- * An `error` frame rather than a `subscribe-denied`, and deliberately: a denial
- * answers for ONE topic, and the family client keys its denial store by topic
- * name. There is no topic this answers for, since the whole batch was refused,
- * and a denial carrying `topic: null` is discarded unseen by every client in
- * the family - their branch is guarded by `typeof msg.topic === 'string'`.
- * `code` is the field they gate on for frames that answer for no topic, which
- * is exactly what this is.
- *
- * @param {number} size - how many entries the batch actually carried
- * @returns {string}
- */
-export function batchTooLargeFrame(size) {
-	return '{"type":"error","code":"BATCH_TOO_LARGE","limit":' + MAX_BATCH_TOPICS +
-		',"size":' + size + '}';
-}
-
-/**
- * The oversized-resume refusal.
- *
- * The same shape and the same reasoning as the batch refusal above: an `error`
- * frame carrying a `code`, because there is no single topic it answers for.
- *
- * A resume is refused whole rather than truncated to the limit, and that matters
- * more here than it does for a batch: a partly-covered gap-fill still ends in
- * `resumed`, and the client has no gap detection, so it would go live believing
- * it had caught up on topics the server never read. One refusal the client can
- * act on beats a silent hole.
- *
- * @param {number} size - how many topics the resume frame actually named
- * @returns {string}
- */
-export function resumeTooLargeFrame(size) {
-	return '{"type":"error","code":"RESUME_TOO_LARGE","limit":' + MAX_BATCH_TOPICS +
-		',"size":' + size + '}';
-}
-
-/**
- * The three resume refusals that carry no payload.
- *
- * Constants rather than builders because there is nothing to interpolate, and
- * they live HERE beside the builders rather than inline at the send site so the
- * shapes the README documents have one source. Each answers for the whole frame,
- * so each is an `error` carrying a `code` - the field a client gates on for
- * frames that answer for no single topic - and none of them echoes anything the
- * client sent.
- *
- * The two RESUME_ ones exist because `resumed` is the only frame a resuming
- * client keys on, and it has no gap detection: an ack that follows no gap-fill
- * tells it that it caught up on history nobody read. They are distinct codes
- * because the client's move differs. RATE_LIMITED is transient and retrying is
- * the right response; FAILED means the app's hook threw, where retrying the same
- * frame does not help and a cold resync does.
- */
-export const INVALID_SESSION_ID_FRAME = '{"type":"error","code":"INVALID_SESSION_ID"}';
-export const RESUME_RATE_LIMITED_FRAME = '{"type":"error","code":"RESUME_RATE_LIMITED"}';
-export const RESUME_FAILED_FRAME = '{"type":"error","code":"RESUME_FAILED"}';
-
-/**
- * The control-budget-exhausted refusal.
- *
- * Same `code` field the oversize refusal uses, and for the same reason: the
- * family client gates on `typeof msg.code === 'string'` and discards anything
- * else, so a differently-shaped frame is a frame the developer never sees.
- *
- * @param {number} limit - the budget in bytes per window
- * @returns {string}
- */
-export function controlFloodFrame(limit) {
-	return '{"type":"error","code":"CONTROL_FLOOD","limit":' + limit + '}';
-}
 
 // - Send-gate control frames -----------------------------------------------
 // JSON control frames carrying no data body, JSON transport only. Routed

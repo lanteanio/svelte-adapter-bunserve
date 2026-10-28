@@ -145,6 +145,13 @@ function createWindowLedger(ceilings, onEvict, maxKeys, evictionSample) {
 		return u;
 	}
 
+	/**
+	 * What a key that has spent nothing this window reads as. Frozen and
+	 * shared: a decision only ever reads it, and a shared mutable zero would
+	 * let one accidental `+=` silently give every key a head start.
+	 */
+	const EMPTY_WINDOW = Object.freeze({ at: 0, pu: 0, m: 0, b: 0, d: 0 });
+
 	/** @type {Map<string, { at: number, pu: number, m: number, b: number, d: number }>} */
 	const map = new Map();
 
@@ -275,6 +282,36 @@ function createWindowLedger(ceilings, onEvict, maxKeys, evictionSample) {
 		 * @param {number} nowMs
 		 * @param {number} windowMs
 		 */
+		/**
+		 * What `key` has spent in the current window, WITHOUT touching the
+		 * ledger. What a decision is allowed to use.
+		 *
+		 * `windowFor` is a decision and a mutation at once: it inserts a key
+		 * (reclaiming and, at the cap, EVICTING another to make room) and it
+		 * rotates a lapsed window, zeroing what that key had spent. Both are
+		 * correct when a publish is going out and wrong when it is only being
+		 * considered - the topic half of a two-part admission runs before the
+		 * tenant half can refuse, so a publish the tenant ceiling stops would
+		 * still have evicted a live topic's accounting, or handed a rotating
+		 * one its ceiling back. A tenant already over its limit could churn the
+		 * topic ledger with fresh topic names and reset other topics' charges
+		 * on the way through.
+		 *
+		 * A key with no window, or one whose window has lapsed, has spent
+		 * nothing - the same answer `windowFor` would give after rotating it,
+		 * without writing the rotation down.
+		 *
+		 * @param {string} key
+		 * @param {number} nowMs
+		 * @param {number} windowMs
+		 * @returns {{ at: number, pu: number, m: number, b: number, d: number }}
+		 */
+		spentIn(key, nowMs, windowMs) {
+			const w = map.get(key);
+			if (w === undefined || nowMs - w.at >= windowMs) return EMPTY_WINDOW;
+			return w;
+		},
+
 		windowFor(key, nowMs, windowMs) {
 			let w = map.get(key);
 			if (w === undefined) {
@@ -371,14 +408,29 @@ export function normalizeEgressOptions(input) {
  * @param {number} seq - the on-wire seq (0 when unstamped)
  * @returns {number}
  */
-export function binaryFrameChargeBytes(payloadLength, seq) {
-	let seqLen = 1;
-	let v = seq;
-	while (v > 0x7f) {
-		v = Math.floor(v / 128);
-		seqLen++;
+export function binaryFrameChargeBytes(payloadLength, seq, topicId) {
+	// tag + schemaVersion are one byte each; the topic id and the seq are both
+	// VARINTS. The id used to be counted as a flat byte, which is right only
+	// while it stays under 128 - a connection past its 127th topic, or a shared
+	// wire id past the 127th shared topic, then paid less than it sent, on
+	// every frame, for the rest of its life.
+	return 2 + varintLength(topicId) + varintLength(seq) + payloadLength;
+}
+
+/**
+ * Bytes the frame's varint encoder spends on `v`.
+ *
+ * @param {number} v
+ * @returns {number}
+ */
+function varintLength(v) {
+	let len = 1;
+	let n = v;
+	while (n > 0x7f) {
+		n = Math.floor(n / 128);
+		len++;
 	}
-	return 3 + seqLen + payloadLength;
+	return len;
 }
 
 /**
@@ -536,7 +588,9 @@ export function createEgressAccount(io) {
 		 */
 		admitTopic(topic, messages, deliveries) {
 			if (!enabled || !config.topicEnabled || topic === null) return true;
-			const w = topicWindows.windowFor(topic, clock(), config.windowMs);
+			// PEEKED, not taken: the topic half runs before the tenant half can
+			// refuse, so deciding here must not insert, evict or rotate anything.
+			const w = topicWindows.spentIn(topic, clock(), config.windowMs);
 			const dim = over(w, config.topic, messages, deliveries);
 			if (dim === null) return true;
 			try { onRefused?.('topic', topic, dim, config.topic[dim]); } catch { /* reporting never breaks a refusal */ }
@@ -556,7 +610,7 @@ export function createEgressAccount(io) {
 		 */
 		admitTenant(tenantId, topic, messages, deliveries) {
 			if (!enabled || !config.tenantEnabled || tenantId === null || tenantId === undefined) return true;
-			const w = tenantWindows.windowFor(tenantId, clock(), config.windowMs);
+			const w = tenantWindows.spentIn(tenantId, clock(), config.windowMs);
 			const dim = over(w, config.tenant, messages, deliveries);
 			if (dim === null) return true;
 			try { onRefused?.('tenant', topic, dim, config.tenant[dim]); } catch { /* reporting never breaks a refusal */ }

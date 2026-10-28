@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { runInNewContext } from 'node:vm';
 
 // The binary fan-out members: capable subscribers get the 0x03 frame, everyone
 // else the exact publish() envelope with the SAME seq, the fast path never
@@ -12,8 +13,9 @@ globalThis.WS_PATH = '/ws';
 
 
 const { platform } = await import('../../src/runtime/handler/platform.js');
-const { WS_CAPS, WS_SUBSCRIPTIONS, capCounts, maxAuthoritativeSeq, sharedTopics, setServer, topicSeqs, wsConnections, wsCounters } =
+const { WS_CAPS, WS_PLATFORM, WS_SHARED_COHORTS, WS_SUBSCRIPTIONS, capCounts, maxAuthoritativeSeq, sharedTopics, setServer, topicSeqs, wsConnections, wsCounters } =
 	await import('../../src/runtime/handler/ws-state.js');
+const { trackedSubscribe, trackedUnsubscribe } = await import('../../src/runtime/utils/ws-symbols.js');
 const { wireStatePoisoned } = await import('../../src/runtime/handler/wire-state.js');
 const { leaveSharedCohort } = await import('../../src/runtime/handler/cohort.js');
 const { parseBinaryFrame } = await import('../../src/runtime/utils/wire.js');
@@ -147,7 +149,7 @@ test('a seq the wire cannot carry throws, and publishes nothing at all', () => {
 		withConnections([capable, jsonOnly], () => {
 			assert.throws(
 				() => platform.publishWire('room', 'moved', { x: 1 }, statelessCodec(), { seq: -1 }),
-				(err) => err instanceof TypeError && /integer >= 1/.test(err.message),
+				(err) => err instanceof TypeError && /positive integer number or bigint/.test(err.message),
 				'a TypeError naming the rule'
 			);
 			assert.equal(capable.sent.length, 0, 'no binary frame went out');
@@ -526,246 +528,78 @@ test('a toJSON swapping a later entry\'s payload reference publishes the referen
 	}
 });
 
-test('a codec returning a non-Uint8Array declines, it does not hang the loop', { timeout: 5000 }, () => {
-	// safeEncode exists to keep a misbehaving codec from taking the fan-out with
-	// it, and it caught a THROW but not a wrong-type return. Untyped, the value
-	// reached buildBinaryFrame, which sizes its writer `8 + payload.length` -
-	// NaN for anything without a numeric length - and the writer's growth loop
-	// could not grow a zero-capacity buffer. The codec's bug became a hung event
-	// loop. An accidentally-async encode is the likely route: a Promise is
-	// truthy and has no length.
-	const errors = [];
-	const realError = console.error;
-	console.error = (...args) => errors.push(args.map(String).join(' '));
-	try {
-		for (const bad of [{}, 'bytes', Promise.resolve(new Uint8Array([1]))]) {
-			const srv = fakeServer();
-			setServer(srv);
-			const capable = fakeWs({ topics: ['room'], caps: [CAP] });
-			withConnections([capable], () => {
-				const ok = platform.publishWire(
-					'room',
-					'moved',
-					{ x: 1 },
-					statelessCodec({ encode: () => bad })
-				);
-				assert.equal(ok, true, 'the publish still reported delivery');
-			});
-			assert.equal(srv.published.length, 1, 'it went out as the plain JSON fan-out instead');
-			// The type IS the assertion: a binary frame would be a Uint8Array
-			// here. Checking the connection's own sends would prove nothing -
-			// the declined path returns before any per-connection walk, so that
-			// list is empty either way.
-			assert.equal(
-				typeof srv.published[0].payload,
-				'string',
-				'the fan-out carried the JSON envelope, not a frame built from the bad value'
-			);
-			assert.ok(srv.published[0].payload.includes('"topic":"room"'), srv.published[0].payload);
+// Every production broadcast encode site must expose codec failures to its
+// caller before announcing a wire id or sending a fallback for that encode.
+for (const lane of ['stateless', 'stateless-batch', 'stateful-shared', 'stateful', 'batch', 'per-entry']) {
+	function setupBroadcast(encode, onDetach = () => {}) {
+		const wire = statelessCodec({ encode });
+		if (!lane.startsWith('stateless')) {
+			wire.state = { onAttach: () => lane === 'stateful-shared' ? null : {}, onDetach };
 		}
-	} finally {
-		console.error = realError;
+		const publish = () => lane.includes('batch') || lane === 'per-entry'
+			? platform.publishWireBatch('room', 'moved', [{ data: 1 }, { data: 2 }], wire)
+			: platform.publishWire('room', 'moved', 1, wire);
+		return publish;
 	}
-	// An EXACT count, which holds only while the shared throttle enters this
-	// test with fewer than seven failures consumed (the schedule logs every
-	// one of the first nine). Earlier tests in this file fail no encodes, so
-	// that holds today; the any-offset contract is the bounded test below.
-	assert.equal(errors.length, 3, 'each bad return was reported');
-	assert.ok(errors[0].includes('Return a Uint8Array'), errors[0]);
-	assert.ok(errors[0].includes('object'), 'and named the type it got: ' + errors[0]);
-	assert.ok(errors[1].includes('string'), 'and named the type it got: ' + errors[1]);
-});
 
-test('a persistently broken codec produces a BOUNDED diagnostic, not one line per publish', () => {
-	// safeEncode runs inside the fan-out, so an unthrottled failure log is one
-	// synchronous stderr write per publish - on a busy topic that trades the
-	// codec's bug for an event-loop stall, which is the same class of failure
-	// the wrong-type guard itself exists to prevent. The log goes through the
-	// decaying throttle: every one of the first nine, then powers of ten, so
-	// ten thousand failures may produce at most fourteen lines from ANY
-	// starting point in the schedule. The exact count depends on what earlier
-	// tests consumed from the shared throttle; the BOUND does not, and the
-	// bound is the contract.
-	const errors = [];
-	const realError = console.error;
-	console.error = (...args) => errors.push(args.map(String).join(' '));
-	const N = 10_000;
-	try {
-		setServer(fakeServer());
+	test(`${lane} broadcast propagates codec exceptions without sending or poisoning`, () => {
+		const server = fakeServer();
+		setServer(server);
 		const capable = fakeWs({ topics: ['room'], caps: [CAP] });
-		withConnections([capable], () => {
-			const wire = statelessCodec({ encode: () => ({}) });
-			for (let i = 0; i < N; i++) {
-				platform.publishWire('room', 'moved', { x: i }, wire);
-			}
-		});
-	} finally {
-		console.error = realError;
-	}
-	assert.ok(errors.length >= 1, 'the failure is still reported at all');
-	assert.ok(
-		errors.length <= 14,
-		`${N} failures produced ${errors.length} log lines - the throttle is not wired`
-	);
-	assert.match(
-		errors[errors.length - 1],
-		/x\d+/,
-		'the last line carries the occurrence count, so an operator sees it is ongoing'
-	);
-});
-
-test('a failing STATEFUL encode poisons the capability to JSON; a decline does not', () => {
-	// A stateful codec mutates its per-connection state during encode -
-	// interned keys, advanced baselines. An encode that threw, or returned a
-	// wrong-type value, escaped partway: that state may now reference entries
-	// the client never received, and the next successful frame would decode
-	// against a dictionary the client does not have, silently. Same evidence
-	// as a dropped stateful frame, same recovery tier: JSON until reconnect.
-	// A null return is the codec's deliberate decline, leaves its state
-	// coherent by contract, and must keep binary available.
-	const realError = console.error;
-	console.error = () => {};
-	try {
-		for (const failure of ['throw', 'wrong-type']) {
-			setServer(fakeServer());
-			const capable = fakeWs({ topics: ['room'], caps: [CAP] });
-			let mode = 'ok';
-			const wire = {
-				capability: CAP,
-				schemaVersion: 2,
-				state: { onAttach: () => ({}) },
-				encode: () => {
-					if (mode === 'throw') throw new Error('codec died mid-encode');
-					if (mode === 'wrong-type') return {};
-					if (mode === 'decline') return null;
-					return new Uint8Array([4, 2]);
-				}
-			};
-			withConnections([capable], () => {
-				platform.publishWire('room', 'moved', { x: 1 }, wire);
-				assert.ok(
-					capable.sent.some((s) => s.payload instanceof Uint8Array),
-					failure + ': binary flowed while the codec behaved'
-				);
-				capable.sent.length = 0;
-				mode = 'decline';
-				platform.publishWire('room', 'moved', { x: 2 }, wire);
-				mode = 'ok';
-				platform.publishWire('room', 'moved', { x: 3 }, wire);
-				assert.equal(wireStatePoisoned(capable.ud, CAP), false, failure + ': a decline poisons nothing');
-				assert.ok(
-					capable.sent.some((s) => s.payload instanceof Uint8Array),
-					failure + ': binary still available after a decline'
-				);
-				capable.sent.length = 0;
-				mode = failure;
-				platform.publishWire('room', 'moved', { x: 4 }, wire);
-				assert.equal(wireStatePoisoned(capable.ud, CAP), true, failure + ': the failure poisoned');
-				mode = 'ok';
-				platform.publishWire('room', 'moved', { x: 5 }, wire);
-				assert.ok(capable.sent.length >= 2, failure + ': both frames were still delivered');
-				assert.ok(
-					capable.sent.every((s) => typeof s.payload === 'string'),
-					failure + ': JSON only, from the failing frame on'
-				);
-			});
-		}
-	} finally {
-		console.error = realError;
-	}
-});
-
-test("an inner re-entrant failure cannot poison an outer codec's clean decline", () => {
-	// encode is app code and may publish re-entrantly. The failure flag is
-	// written after EVERY return path of the encode it describes - an
-	// entry-time reset instead would let an inner call's failure survive an
-	// outer call's clean decline, and one codec's bug would then poison a
-	// DIFFERENT codec's healthy connection.
-	const realError = console.error;
-	console.error = () => {};
-	try {
-		setServer(fakeServer());
-		const innerWire = { capability: 'cap:inner', schemaVersion: 1, encode: () => ({}) };
-		const outer = fakeWs({ topics: ['room'], caps: [CAP, 'cap:inner'] });
-		const outerWire = {
-			capability: CAP,
-			schemaVersion: 2,
-			state: { onAttach: () => ({}) },
-			encode: () => {
-				// The inner publish FAILS (wrong-type return, stateless codec:
-				// poisons nothing itself) and then this codec declines cleanly.
-				platform.publishWire('room', 'inner-moved', { x: 1 }, innerWire);
-				return null;
-			}
-		};
-		withConnections([outer], () => {
-			platform.publishWire('room', 'moved', { x: 1 }, outerWire);
-			assert.equal(
-				wireStatePoisoned(outer.ud, CAP),
-				false,
-				"the outer decline stayed a decline - the inner failure's flag did not leak"
-			);
-			assert.equal(
-				wireStatePoisoned(outer.ud, 'cap:inner'),
-				false,
-				'and the stateless inner codec never poisons anything'
-			);
-		});
-	} finally {
-		console.error = realError;
-	}
-});
-
-test('a failing stateful BATCH encode poisons and serves the JSON envelopes', () => {
-	// The batch form encodes every entry against the connection state in one
-	// call. A failure may have advanced the dictionaries partway, so the
-	// per-entry retry a clean decline earns would encode against state the
-	// client never learned; a failure serves the whole list as JSON and
-	// degrades the capability, exactly like the dropped-frame poisoning
-	// beside it.
-	const realError = console.error;
-	console.error = () => {};
-	try {
-		setServer(fakeServer());
-		const capable = fakeWs({ topics: ['room'], caps: [CAP] });
+		const later = fakeWs({ topics: ['room'], caps: [CAP] });
+		const failure = new Error('codec failure');
 		let fail = true;
-		const wire = {
-			capability: CAP,
-			schemaVersion: 2,
-			state: { onAttach: () => ({}) },
-			encode: (event) => {
-				if (fail && event === 'moved-batch') throw new Error('batch encode died');
-				return new Uint8Array([4, 2]);
-			}
-		};
-		withConnections([capable], () => {
-			const ok = platform.publishWireBatch(
-				'room',
-				'moved',
-				[{ data: { x: 1 } }, { data: { x: 2 } }],
-				wire
-			);
-			assert.equal(ok, true, 'the entries were still delivered');
-			assert.equal(capable.sent.length, 2, 'one JSON envelope per entry');
-			assert.ok(
-				capable.sent.every((s) => typeof s.payload === 'string'),
-				'no per-entry binary was built from the failed state'
-			);
-			assert.equal(wireStatePoisoned(capable.ud, CAP), true, 'the capability is poisoned');
+		let detached = 0;
+		const publish = setupBroadcast((event) => {
+			if (lane === 'per-entry' && event.endsWith('-batch')) return null;
+			if (fail) throw failure;
+			return new Uint8Array([4, 2]);
+		}, () => detached++);
+		withConnections([capable, later], () => {
+			assert.throws(publish, (error) => error === failure);
+			assert.equal(capable.sent.length, 0, 'no announcement or JSON substitution');
+			assert.equal(later.sent.length, 0, 'the failed broadcast stops its walk');
+			assert.equal(server.published.length, 0);
+			assert.equal(wireStatePoisoned(capable.ud, CAP), false);
+			assert.equal(detached, 0);
 			fail = false;
-			capable.sent.length = 0;
-			platform.publishWireBatch('room', 'moved', [{ data: { x: 3 } }], wire);
-			assert.ok(
-				capable.sent.every((s) => typeof s.payload === 'string'),
-				'JSON until reconnect'
-			);
+			assert.equal(publish(), true);
+			assert.ok(capable.sent.some((frame) => frame.payload instanceof Uint8Array));
 		});
-	} finally {
-		console.error = realError;
-	}
-});
+	});
 
-test('a failing stateful encode poisons on the send lanes too', () => {
+	test(`${lane} broadcast rejects invalid payloads before announcing or sending`, () => {
+		for (const value of [{}, 'bytes', Promise.resolve(new Uint8Array([1])), new Uint16Array([1]), new ArrayBuffer(1)]) {
+			const server = fakeServer();
+			setServer(server);
+			const capable = fakeWs({ topics: ['room'], caps: [CAP] });
+			const publish = setupBroadcast((event) => lane === 'per-entry' && event.endsWith('-batch') ? null : value);
+			withConnections([capable], () => {
+				assert.throws(publish, { name: 'TypeError', message: 'wire.encode must return Uint8Array or null' });
+				assert.equal(capable.sent.length, 0);
+				assert.equal(server.published.length, 0);
+				assert.equal(wireStatePoisoned(capable.ud, CAP), false);
+			});
+		}
+	});
+
+	test(`${lane} broadcast accepts Uint8Array payloads from another realm`, () => {
+		setServer(fakeServer());
+		const capable = fakeWs({ topics: ['room'], caps: [CAP] });
+		const payload = runInNewContext('new Uint8Array([4, 2])');
+		assert.equal(payload instanceof Uint8Array, false);
+		const publish = setupBroadcast((event) => lane === 'per-entry' && event.endsWith('-batch') ? null : payload);
+		withConnections([capable], () => {
+			assert.equal(publish(), true);
+			const binary = capable.sent.filter((frame) => frame.isBinary);
+			assert.equal(binary.length, lane === 'per-entry' || lane === 'stateless-batch' ? 2 : 1);
+			for (const frame of binary) assert.deepEqual([...parseBinaryFrame(frame.payload).payload], [4, 2]);
+			assert.equal(wireStatePoisoned(capable.ud, CAP), false);
+		});
+	});
+}
+
+test('directed single and batch sends propagate codec exceptions without poisoning', () => {
 	const realError = console.error;
 	console.error = () => {};
 	try {
@@ -781,35 +615,36 @@ test('a failing stateful encode poisons on the send lanes too', () => {
 				return new Uint8Array([4, 2]);
 			}
 		};
-		platform.sendWire(capable, 'room', 'snapshot', { x: 1 }, wire);
-		assert.equal(wireStatePoisoned(capable.ud, CAP), true, 'sendWire poisoned on the failure');
+		assert.throws(() => platform.sendWire(capable, 'room', 'snapshot', { x: 1 }, wire), /encode died/);
+		assert.equal(wireStatePoisoned(capable.ud, CAP), false, 'sendWire leaves recovery to the caller');
 		fail = false;
 		capable.sent.length = 0;
 		platform.sendWire(capable, 'room', 'snapshot', { x: 2 }, wire);
 		assert.ok(
-			capable.sent.every((s) => typeof s.payload === 'string'),
-			'JSON after the poison'
+			capable.sent.some((s) => s.payload instanceof Uint8Array),
+			'the next successful encode remains binary'
 		);
 
 		const capable2 = fakeWs({ topics: ['room'], caps: [CAP] });
-		let failBatch = true;
 		const wire2 = {
 			capability: CAP,
 			schemaVersion: 2,
 			state: { onAttach: () => ({}) },
 			encode: (event) => {
-				if (failBatch && event === 'snap-batch') throw new Error('batch encode died');
+				if (event === 'snap-batch') throw new Error('batch encode died');
 				return new Uint8Array([4, 2]);
 			}
 		};
-		platform.sendWireBatch(capable2, 'room', 'snap', [{ data: { x: 1 } }, { data: { x: 2 } }], wire2);
+		assert.throws(
+			() => platform.sendWireBatch(capable2, 'room', 'snap', [{ data: { x: 1 } }, { data: { x: 2 } }], wire2),
+			/batch encode died/
+		);
 		assert.equal(
 			wireStatePoisoned(capable2.ud, CAP),
-			true,
-			'sendWireBatch poisoned on the batch failure'
+			false,
+			'sendWireBatch leaves recovery to the caller'
 		);
-		assert.equal(capable2.sent.length, 2, 'both entries arrived as JSON envelopes');
-		assert.ok(capable2.sent.every((s) => typeof s.payload === 'string'));
+		assert.equal(capable2.sent.length, 0, 'a failed batch encode sends no envelopes');
 	} finally {
 		console.error = realError;
 	}
@@ -866,29 +701,29 @@ test('a publish refused on a PAYLOAD leaves no mark, on every atomic lane', () =
 	}
 });
 
-test('a refused publish leaves the { seq: true } counter advanced, on purpose', () => {
-	// The one piece of state a refusal does NOT rewind, pinned as a decision
-	// on the record.
-	//
-	// It cannot be rewound safely: completeEnvelope runs JSON.stringify, so a
-	// toJSON can publish re-entrantly and take the next counter value, and a
-	// rollback would then hand two frames the same seq - which is worse than a
-	// gap by exactly the margin that makes seqs useful. And it costs nothing:
-	// the counter is a separate space, never deduped and never marking the
-	// topic, so the only consequence is a gap in that topic's counter numbering.
-	// Nothing in the README or the wire contract calls that lane contiguous.
-	setServer(fakeServer());
+test('serialization failures leave the counter untouched while reentrant publishes keep their sequence', () => {
+	const server = fakeServer();
+	setServer(server);
 	try {
 		platform.publish('room', 'said', { x: 1 }, { seq: true });
 		assert.equal(topicSeqs.get('room'), 1);
 		assert.throws(() => platform.publish('room', 'said', { n: 1n }, { seq: true }), TypeError);
-		platform.publish('room', 'said', { x: 3 }, { seq: true });
-		assert.equal(topicSeqs.get('room'), 3, 'the refused publish consumed its counter value');
-		assert.equal(
-			maxAuthoritativeSeq.get('room'),
-			undefined,
-			'and marked nothing, which is why the gap is harmless'
-		);
+		assert.equal(topicSeqs.get('room'), 1, 'serialization precedes the counter draw');
+		platform.publish('room', 'said', { toJSON() {
+			platform.publish('room', 'nested', 'inner', { seq: true });
+			return 'outer';
+		} }, { seq: true });
+		assert.equal(topicSeqs.get('room'), 3);
+		assert.throws(() => platform.publish('room', 'said', { toJSON() {
+			platform.publish('room', 'nested', 'before failure', { seq: true });
+			throw new Error('serialization failed');
+		} }, { seq: true }), /serialization failed/);
+		assert.equal(topicSeqs.get('room'), 4, 'a failed outer value does not rewind a delivered nested frame');
+		platform.publish('room', 'said', 'after failure', { seq: true });
+		const delivered = server.published.map(({ payload }) => JSON.parse(payload));
+		assert.deepEqual(delivered.map(({ seq }) => seq), [1, 2, 3, 4, 5]);
+		assert.deepEqual(delivered.map(({ data }) => data), [{ x: 1 }, 'inner', 'outer', 'before failure', 'after failure']);
+		assert.equal(maxAuthoritativeSeq.get('room'), undefined);
 	} finally {
 		topicSeqs.clear();
 		maxAuthoritativeSeq.clear();
@@ -1427,7 +1262,7 @@ test('the stateless lane answers the identical call identically', () => {
 	});
 });
 
-test('an entry excludeWs overrides the call-level one, null included', () => {
+test('an entry excludeWs overrides the call-level one; null inherits it', () => {
 	setServer(fakeServer());
 	const author = fakeWs({ topics: ['room'] });
 	const other = fakeWs({ topics: ['room'] });
@@ -1449,15 +1284,131 @@ test('an entry excludeWs overrides the call-level one, null included', () => {
 			wire,
 			{ excludeWs: author }
 		);
-		// Entry 2 opts the author back in; entry 3 names someone else, which
-		// replaces the call-level exclusion rather than adding to it.
+		// Entry 2's null is ABSENT, so it inherits the call-level exclusion
+		// exactly as entry 1 does - reading it as "opt back in" would give
+		// `excludeWs: null` a meaning it has nowhere else in the family. Entry 3
+		// names someone else, which REPLACES the call-level exclusion for that
+		// entry rather than adding to it, so the author receives it.
 		assert.deepEqual(
 			author.sent.map((s) => JSON.parse(s.payload).data),
-			[{ x: 2 }, { x: 3 }]
+			[{ x: 3 }]
 		);
 		assert.deepEqual(
 			other.sent.map((s) => JSON.parse(s.payload).data),
 			[{ x: 1 }, { x: 2 }]
 		);
+	});
+});
+
+test('the pre-pass reads each entry accessor exactly once', () => {
+	// The records exist so that what the batch publishes is what the call was
+	// handed. A getter read twice defeats that on its own: it can answer
+	// "defined" to the presence test and something else to the value read, so
+	// delivery, the recipient discount and the resume capture end up disagreeing
+	// about who was excluded.
+	setServer(fakeServer());
+	const author = fakeWs({ topics: ['room'] });
+	const other = fakeWs({ topics: ['room'] });
+	const reads = { excludeWs: 0, data: 0, seq: 0 };
+	let flip = 0;
+	const hostile = {
+		get excludeWs() {
+			reads.excludeWs++;
+			// Defined on the first read, a different socket on the next.
+			return flip++ === 0 ? other : author;
+		},
+		get data() { reads.data++; return { x: 1 }; },
+		get seq() { reads.seq++; return undefined; }
+	};
+	withConnections([author, other], () => {
+		platform.publishWireBatch('room', 'moved', [hostile], {
+			capability: CAP,
+			schemaVersion: 3,
+			encode: () => new Uint8Array([1]),
+			state: { onAttach: () => ({}) }
+		}, {});
+	});
+	assert.equal(reads.excludeWs, 1, 'the exclusion accessor ran once');
+	assert.equal(reads.data, 1, 'so did the payload accessor');
+	assert.equal(reads.seq, 1, 'and the seq accessor');
+	// The first read is the one that counts, everywhere: `other` was excluded,
+	// so it received nothing and the author received the entry.
+	assert.equal(other.sent.length, 0, 'the socket named by the first read is the excluded one');
+	assert.equal(author.sent.length, 1);
+});
+
+// - tracked membership on a shared topic --------------------------------------
+// A plugin joins and leaves through trackedSubscribe / trackedUnsubscribe, which
+// find this server's cohort registry through the slots on the connection's own
+// platform clone.
+
+/** A fake facade whose userData carries a platform clone, as open makes it. */
+function trackedWs(opts) {
+	const ws = fakeWs(opts);
+	ws.ud[WS_PLATFORM] = Object.create(platform);
+	return ws;
+}
+
+test('a tracked join of a shared topic enters the binary cohort and is announced once', () => {
+	const server = fakeServer();
+	setServer(server);
+	const capable = trackedWs({ caps: [CAP] });
+	const member = fakeWs({ topics: ['world'], caps: [CAP] });
+	withConnections([capable, member], () => {
+		// Shared before the tracked join: the join must enter the cohort itself.
+		platform.publishWire('world', 'tick', { t: 0 }, statelessCodec({ shared: true }));
+		const id = getSharedWireId('world');
+		assert.ok(id !== undefined && id >= SHARED_WIRE_ID_BASE);
+
+		assert.equal(trackedSubscribe(capable, 'world'), true);
+		assert.ok(capable.nativeSubs.has('world'), 'the logical topic');
+		assert.ok(capable.nativeSubs.has('world\0bin'), 'and the binary cohort');
+		assert.ok(!capable.nativeSubs.has('world\0json'));
+		assert.ok(capable.ud[WS_SHARED_COHORTS].has('world'));
+		assert.deepEqual(JSON.parse(capable.sent[0].payload), { type: 'wire-id', topic: 'world', id });
+
+		assert.equal(trackedSubscribe(capable, 'world'), true);
+		assert.equal(capable.sent.length, 1, 'a second join of the held topic announces nothing');
+
+		server.published.length = 0;
+		platform.publishWire('world', 'tick', { t: 1 }, statelessCodec({ shared: true }));
+		assert.ok(server.published.some((p) => p.topic === 'world\0bin'), 'the binary cohort is published to');
+		assert.ok(!server.published.some((p) => p.topic === 'world'), 'not the logical topic: no per-member walk either');
+		assert.equal(capable.sent.length, 1, 'and nothing per connection');
+
+		// The leave takes it out of both cohorts and gives its reference back.
+		assert.equal(trackedUnsubscribe(capable, 'world'), true);
+		assert.ok(!capable.nativeSubs.has('world'));
+		assert.ok(!capable.nativeSubs.has('world\0bin'));
+		assert.ok(!capable.ud[WS_SHARED_COHORTS].has('world'));
+		assert.equal(getSharedWireId('world'), id, 'the other member still holds the id');
+		leaveSharedCohort(member, member.ud, 'world');
+		assert.equal(getSharedWireId('world'), undefined, 'the last reference retired it');
+	});
+});
+
+test('a tracked join of a shared topic from a JSON-only connection enters the JSON cohort', () => {
+	setServer(fakeServer());
+	const jsonOnly = trackedWs();
+	const member = fakeWs({ topics: ['world'], caps: [CAP] });
+	withConnections([jsonOnly, member], () => {
+		platform.publishWire('world', 'tick', { t: 0 }, statelessCodec({ shared: true }));
+		assert.equal(trackedSubscribe(jsonOnly, 'world'), true);
+		assert.ok(jsonOnly.nativeSubs.has('world\0json'));
+		assert.ok(!jsonOnly.nativeSubs.has('world\0bin'));
+		assert.equal(jsonOnly.sent.length, 0, 'nothing to announce to a JSON-only client');
+		trackedUnsubscribe(jsonOnly, 'world');
+		assert.ok(!jsonOnly.nativeSubs.has('world\0json'));
+	});
+});
+
+test('a tracked join of a topic that is not shared enters no cohort', () => {
+	setServer(fakeServer());
+	const capable = trackedWs({ caps: [CAP] });
+	withConnections([capable], () => {
+		assert.equal(trackedSubscribe(capable, 'plain'), true);
+		assert.deepEqual([...capable.nativeSubs], ['plain']);
+		assert.equal(capable.ud[WS_SHARED_COHORTS], undefined);
+		assert.equal(capable.sent.length, 0);
 	});
 });

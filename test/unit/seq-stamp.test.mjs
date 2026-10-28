@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 // WHAT A PUBLISH STAMPS WHEN NOBODY SAID. The exotic seq VALUES are pinned in
 // publish-seq.test.mjs; this file pins the option being ABSENT, which is the
@@ -35,6 +36,10 @@ const {
 	maxAuthoritativeSeq,
 	notePublishedSeq,
 	noteRecentlyUsed,
+	processEpoch,
+	resetProcessEpoch,
+	resetTopicEpochs,
+	topicEpochValue,
 	resetSeqState,
 	setServer,
 	stampSeq,
@@ -117,7 +122,8 @@ test('only an explicit false opts out, and it does not consume a counter value',
 test('an explicit number is taken as given, and never advances the counter', () => {
 	try {
 		assert.equal(stampSeqValue(5, 'room'), 5);
-		assert.equal(stampSeqValue(2 ** 53, 'room'), 2 ** 53, 'no ceiling: an event-store cursor passes through');
+		assert.equal(stampSeqValue(Number.MAX_SAFE_INTEGER, 'room'), Number.MAX_SAFE_INTEGER, 'the top of the range passes through');
+		assert.throws(() => stampSeqValue(2 ** 53, 'room'), /safe-integer range/, 'and one past it is refused, not rounded');
 		assert.equal(stampSeqValue(undefined, 'room'), 1, 'the counter is untouched by the explicit lane');
 	} finally {
 		reset();
@@ -297,7 +303,7 @@ test('the bound and the sweep window are the numbers the docs state', () => {
 	// that sets one and expects the documented number. Pinned anyway, because
 	// two literals for one documented number drift apart silently and the
 	// survivor of a refactor is whichever copy it keeps.
-	assert.equal(MAX_SUBSCRIPTIONS_PER_CONNECTION, 10_000);
+	assert.equal(MAX_SUBSCRIPTIONS_PER_CONNECTION, 65_536);
 	assert.equal(MAX_CONTROL_EGRESS_BYTES, 4 * 1024 * 1024);
 });
 
@@ -458,10 +464,10 @@ test('platform.publish with an explicit seq marks the topic authoritative', () =
 // costs the client its resume dedup with nothing on the wire to notice it by.
 
 test('a seq that is not a number, a boolean or null is refused by option name', () => {
-	assert.throws(() => stampSeqValue('742', 'room'), /publish seq must be a number/);
-	assert.throws(() => stampSeqValue({}, 'room'), /publish seq must be a number/);
-	assert.throws(() => stampSeqValue([5], 'room'), /publish seq must be a number/);
-	assert.throws(() => stampSeq({ seq: '742' }, 'room'), /publish seq must be a number/);
+	assert.throws(() => stampSeqValue('742', 'room'), /publish seq must be a positive integer number or bigint/);
+	assert.throws(() => stampSeqValue({}, 'room'), /publish seq must be a positive integer number or bigint/);
+	assert.throws(() => stampSeqValue([5], 'room'), /publish seq must be a positive integer number or bigint/);
+	assert.throws(() => stampSeq({ seq: '742' }, 'room'), /publish seq must be a positive integer number or bigint/);
 });
 
 test('the refusal quotes the string it was given, so the log names the value', () => {
@@ -496,7 +502,7 @@ test('platform.publish refuses a string seq instead of publishing a counter', ()
 	try {
 		assert.throws(
 			() => platform.publish('room', 'said', { n: 1 }, { seq: '742' }),
-			/publish seq must be a number/
+			/publish seq must be a positive integer number or bigint/
 		);
 		assert.equal(srv.published.length, 0, 'refused before anything reached the socket');
 	} finally {
@@ -513,5 +519,196 @@ test('platform.publish with { seq: null } sends the envelope without the field',
 		assert.equal('seq' in envelope, false);
 	} finally {
 		reset();
+	}
+});
+
+test('bigint is the second spelling of the explicit authority on every lane', () => {
+	// One value, two spellings, so they cannot disagree about validity. A caller
+	// reading an offset out of a store that hands back BigInt stops converting at
+	// the call site, which is where the silent rounding used to happen.
+	resetSeqState();
+	try {
+		assert.equal(stampSeqValue(7n, 'room'), 7, 'stamped as the number it projects to');
+		assert.equal(stampSeq({ seq: 7n }, 'room'), 7, 'and through the options form');
+		assert.equal(
+			stampSeqValue(BigInt(Number.MAX_SAFE_INTEGER), 'room'),
+			Number.MAX_SAFE_INTEGER,
+			'the top of the range'
+		);
+		assert.throws(() => stampSeqValue(2n ** 53n, 'room'), /safe-integer range/);
+		assert.throws(() => stampSeqValue(0n, 'room'), /positive integer number or bigint/);
+		// The explicit lane, whichever spelling reached it, leaves the counter alone.
+		assert.equal(stampSeqValue(undefined, 'room'), 1, 'the counter never advanced');
+	} finally {
+		resetSeqState();
+	}
+});
+
+test('a batch-level bigint is refused exactly as a batch-level number is', () => {
+	// One number cannot be the one-seq-per-entry publishWireBatch publishes, and
+	// spelling it as a bigint does not make it N of them.
+	resetSeqState();
+	setServer({ publish: () => 0, subscriberCount: () => 0 });
+	try {
+		assert.throws(
+			() => platform.publishWireBatch(
+				'room', 'moved', [{ data: { x: 1 } }], { capability: 'x', schemaVersion: 1, encode: () => null },
+				{ seq: 9n }
+			),
+			/one number cannot be the one-seq-per-entry/,
+			'the bigint spelling reaches the same refusal'
+		);
+	} finally {
+		resetSeqState();
+		maxAuthoritativeSeq.clear();
+	}
+});
+
+test('the send lanes carry an explicit gap-fill seq and draw no counter', () => {
+	// A resume hook's only primitive for delivering replayed frames was
+	// platform.send, and it emitted an envelope with no seq field at all - so a
+	// hook could report "I delivered up to 22" while the client received nothing
+	// it could key its next watermark off. The seq now rides the frame.
+	resetSeqState();
+	const sent = [];
+	const ws = { getUserData: () => ({}), send: (p) => { sent.push(p); return 1; } };
+	try {
+		platform.send(ws, 'room', 'moved', { x: 1 }, { seq: 21 });
+		assert.match(sent[0], /"seq":21/, 'the replayed frame carries its own seq');
+		platform.send(ws, 'room', 'moved', { x: 2 }, { seq: 22n });
+		assert.match(sent[1], /"seq":22/, 'bigint is the same authority');
+
+		// Absent, false and null are the historical shape, byte-identical.
+		platform.send(ws, 'room', 'moved', { x: 3 });
+		platform.send(ws, 'room', 'moved', { x: 3 }, { seq: false });
+		platform.send(ws, 'room', 'moved', { x: 3 }, { seq: null });
+		assert.equal(sent[2].includes('"seq"'), false, 'absent stamps nothing');
+		assert.deepEqual([sent[3], sent[4]], [sent[2], sent[2]], 'false and null match it exactly');
+
+		// `true` has no meaning here: gap-fill replays history that is ALREADY
+		// accounted, so there is no counter for this lane to draw.
+		assert.throws(() => platform.send(ws, 'room', 'moved', {}, { seq: true }),
+			/never draw the in-memory counter/);
+		assert.throws(() => platform.send(ws, 'room', 'moved', {}, { seq: '21' }),
+			/must be an explicit positive integer number or bigint/);
+		assert.throws(() => platform.send(ws, 'room', 'moved', {}, { seq: 2 ** 53 }),
+			/safe-integer range/);
+
+		// The whole point of the lane: it touches no shared state.
+		assert.equal(topicSeqs.get('room'), undefined, 'no counter advanced');
+		assert.equal(maxAuthoritativeSeq.get('room'), undefined, 'and no topic was marked');
+	} finally {
+		resetSeqState();
+		maxAuthoritativeSeq.clear();
+	}
+});
+
+test('an invalid send seq is refused whatever the socket is doing', () => {
+	// The refusal is about the CALL, not the connection, so it resolves before
+	// the freed-handle guard - a closed socket must not turn a caller's bug into
+	// a silent DROPPED.
+	const dead = { getUserData: () => { throw new Error('freed'); }, send: () => { throw new Error('freed'); } };
+	assert.throws(() => platform.send(dead, 'room', 'moved', {}, { seq: '9' }), TypeError);
+	assert.throws(() => platform.sendWire(dead, 'room', 'moved', {}, { capability: 'x', schemaVersion: 1, encode: () => null }, { seq: true }), TypeError);
+});
+
+test('the generation token is one lazily-latched draw in the u32 domain', () => {
+	// The family contract: an OPAQUE per-process generation token, equality-only,
+	// never a timestamp. Both adapters draw a random uint32, so a client written
+	// against one reads the other unchanged - and a boot-time value would have
+	// handed every unauthenticated client the process start time.
+	resetProcessEpoch();
+	const first = processEpoch();
+	assert.ok(Number.isInteger(first) && first >= 0 && first <= 0xffffffff,
+		`inside the u32 domain: ${first}`);
+	assert.equal(processEpoch(), first, 'latched: every read of one process agrees');
+
+	// LAZY, not at module import. A simulation that seeds the RNG has to be able
+	// to latch a reproducible value afterwards, which an import-time draw has
+	// already spent bytes ahead of.
+	resetProcessEpoch();
+	assert.equal(processEpoch(), processEpoch(), 're-latched once on first read');
+
+	// A harness may pin a specific generation, squeezed into the same domain, so
+	// an epoch-ms input cannot smuggle a wider value onto the wire.
+	resetProcessEpoch(7);
+	assert.equal(processEpoch(), 7);
+	resetProcessEpoch(1700000000000);
+	assert.equal(processEpoch(), 1700000000000 >>> 0, 'squeezed into u32, not carried whole');
+	assert.ok(processEpoch() <= 0xffffffff);
+	resetProcessEpoch();
+});
+
+test('the subscribed ack is the single emit site for the generation token', () => {
+	// One latch, one field. A second source would let two acks on one connection
+	// disagree about the seq space, which is the one thing the token is for.
+	const src = readFileSync(new URL('../../src/runtime/handler/ws.js', import.meta.url), 'utf8');
+	const emits = src.match(/topicEpochValue\(|processEpoch\(/g) || [];
+	assert.equal(emits.length, 1, 'exactly one emit site in the demux');
+	assert.match(src, /subscribedFrame\(topic, ref, topicEpochValue\(topic\)\)/,
+		'and it is the subscribed ack, reading the topic-layered authority');
+	// Nothing anywhere interprets the value beyond equality: no date rendering,
+	// no ordering, no arithmetic on it.
+	for (const file of ['../../src/runtime/handler/ws.js', '../../src/runtime/handler/ws-state.js']) {
+		const text = readFileSync(new URL(file, import.meta.url), 'utf8');
+		assert.doesNotMatch(text, /new Date\((?:[A-Za-z_$][\w$]*)?[Ee]poch/,
+			`${file} does not render the token as a date`);
+	}
+});
+
+test('a topic epoch is the process generation until something mints one', () => {
+	resetProcessEpoch();
+	resetTopicEpochs();
+	try {
+		const base = processEpoch();
+		assert.equal(topicEpochValue('room:1'), base, 'no override: the process generation');
+		assert.equal(topicEpochValue('room:2'), base, 'one token describes every counter');
+
+		// The explicit-seq lane is single-authority per topic. An app that
+		// CHANGES a topic's authority has to repudiate the offsets clients
+		// recorded under the old one, because the max-seen mark is monotone and
+		// no seq carries the identity of the counter that issued it.
+		const minted = platform.bumpTopicEpoch('room:1');
+		assert.notEqual(minted, base, 'a mint that equals what it replaces repudiates nothing');
+		assert.equal(topicEpochValue('room:1'), minted, 'the override is what the topic reads');
+		assert.equal(platform.topicEpoch('room:1'), minted, 'and the platform agrees');
+		assert.equal(topicEpochValue('room:2'), base, 'other topics are untouched');
+		assert.ok(minted >= 0 && minted <= 0xffffffff, 'still inside the u32 domain');
+
+		// Bumping again re-rolls off the CURRENT value, not the process one.
+		const second = platform.bumpTopicEpoch('room:1');
+		assert.notEqual(second, minted);
+		assert.equal(topicEpochValue('room:1'), second);
+	} finally {
+		resetTopicEpochs();
+		resetProcessEpoch();
+	}
+});
+
+test('the topic-epoch override map is bounded and evicts the least recently minted', () => {
+	// Authority changes are rare, but nothing grows without a ceiling: a topic
+	// namespace is client-named, so an unbounded map is an unbounded map.
+	resetProcessEpoch();
+	resetTopicEpochs();
+	try {
+		const base = processEpoch();
+		const CAP = 4096;
+		for (let i = 0; i < CAP; i++) platform.bumpTopicEpoch('t' + i);
+		assert.notEqual(topicEpochValue('t0'), base, 'the first override is still held at the cap');
+
+		// Refresh t0's recency, then push one past the cap: the victim must be
+		// the longest-undisturbed entry (t1), never the one just re-minted.
+		platform.bumpTopicEpoch('t0');
+		platform.bumpTopicEpoch('overflow');
+		assert.notEqual(topicEpochValue('t0'), base, 're-minting refreshed its recency');
+		assert.equal(topicEpochValue('t1'), base, 'the longest-undisturbed override was dropped');
+		assert.notEqual(topicEpochValue('overflow'), base);
+
+		// A dropped override degrades to the process generation rather than to
+		// anything invented.
+		assert.equal(topicEpochValue('t1'), processEpoch());
+	} finally {
+		resetTopicEpochs();
+		resetProcessEpoch();
 	}
 });

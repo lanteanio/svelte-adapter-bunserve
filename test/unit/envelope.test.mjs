@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildEnvelopePrefix, completeEnvelope } from '../../src/runtime/utils/envelope.js';
+import { buildEnvelopePrefix, completeEnvelope, envelopeData } from '../../src/runtime/utils/envelope.js';
 import {
 	esc,
 	isValidWireTopic,
@@ -12,6 +12,24 @@ test('an envelope is valid JSON the client can parse', () => {
 	const frame = completeEnvelope(buildEnvelopePrefix('chat', 'created'), { text: 'hi' });
 	assert.equal(frame, '{"topic":"chat","event":"created","data":{"text":"hi"}}');
 	assert.deepEqual(JSON.parse(frame), { topic: 'chat', event: 'created', data: { text: 'hi' } });
+});
+
+test('data JSON has no form for is refused, like a BigInt', () => {
+	// JSON.stringify throws for a BigInt or a cycle, but returns undefined for a
+	// function or a symbol, which concatenated into the frame would put
+	// "data":undefined on the wire - a frame no client can parse.
+	assert.throws(() => envelopeData(() => 1), TypeError);
+	assert.throws(() => envelopeData(Symbol('s')), TypeError);
+	assert.throws(() => envelopeData(1n), TypeError);
+	assert.throws(() => completeEnvelope(buildEnvelopePrefix('t', 'e'), () => 1), TypeError, 'the builder goes through it');
+});
+
+test('every value JSON can carry is left as it was', () => {
+	assert.equal(envelopeData({ a: 1 }), '{"a":1}');
+	assert.equal(envelopeData(undefined), 'null');
+	assert.equal(envelopeData('x'), '"x"');
+	assert.deepEqual(JSON.parse(completeEnvelope(buildEnvelopePrefix('t', 'e'), { a: 1 }, 3)),
+		{ topic: 't', event: 'e', data: { a: 1 }, seq: 3 });
 });
 
 test('seq and jitter are appended in the documented order', () => {

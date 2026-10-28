@@ -2,6 +2,7 @@
 // Bun, drives a real WebSocket client against it, and asserts the wire
 // protocol end to end. Run the whole live lane with: npm run test:live
 
+import { HANDSHAKE } from '../helpers/handshake.mjs';
 import { assertPortFree, buildPath, serverEnv, waitForServer } from './harness.mjs';
 
 const PORT = 8802;
@@ -71,16 +72,26 @@ try {
 	await waitForServer(proc, PORT);
 
 	// --- upgrade lane ------------------------------------------------------
+	// Without an admission ceiling a request on the path that is not a
+	// handshake is the app's, whatever its method: the fixture's /ws route
+	// answers it, and a HEAD shows the route's header.
 	const plainGet = await fetch(`http://127.0.0.1:${PORT}/ws`);
-	check('plain GET on the ws path is 426, not SSR', plainGet.status === 426, `got ${plainGet.status}`);
+	check('plain GET on the ws path reaches the app', plainGet.status === 200 && (await plainGet.text()) === 'app GET', `got ${plainGet.status}`);
+	const plainHead = await fetch(`http://127.0.0.1:${PORT}/ws`, { method: 'HEAD' });
+	check('and so does HEAD', plainHead.status === 200 && plainHead.headers.get('x-app-route') === 'ws', `got ${plainHead.status}`);
+	const otherProtocol = await fetch(`http://127.0.0.1:${PORT}/ws`, { headers: { upgrade: 'h2c', connection: 'Upgrade' } });
+	check('and a GET asking to upgrade to another protocol', (await otherProtocol.text()) === 'app GET', `got ${otherProtocol.status}`);
+	// A complete handshake sent as POST included: only a GET opens a socket.
+	const postHandshake = await fetch(`http://127.0.0.1:${PORT}/ws`, { method: 'POST', headers: { ...HANDSHAKE } });
+	check('POST on the ws path reaches the app, handshake headers and all', (await postHandshake.text()) === 'app POST', `got ${postHandshake.status}`);
 
 	const denied = await fetch(`http://127.0.0.1:${PORT}/ws?deny=1`, {
-		headers: { upgrade: 'websocket', connection: 'Upgrade' }
+		headers: { ...HANDSHAKE }
 	});
-	check('upgrade hook returning a Response rejects with it', denied.status === 401, `got ${denied.status}`);
+	check('upgrade hook returning false rejects with 401', denied.status === 401, `got ${denied.status}`);
 
 	const foreign = await fetch(`http://127.0.0.1:${PORT}/ws`, {
-		headers: { upgrade: 'websocket', connection: 'Upgrade', origin: 'https://evil.example' }
+		headers: { ...HANDSHAKE, origin: 'https://evil.example' }
 	});
 	check('foreign Origin is refused (CSWSH defense)', foreign.status === 403, `got ${foreign.status}`);
 
@@ -94,7 +105,7 @@ try {
 		proto.onerror = () => reject(new Error('subprotocol client failed to connect'));
 	});
 	check(
-		'an awaited upgrade hook sets the subprotocol through the context headers',
+		'the native handshake selects the offered subprotocol after the awaited hook',
 		proto.protocol === 'alpha',
 		`got "${proto.protocol}"`
 	);
@@ -188,9 +199,8 @@ try {
 	a.send(JSON.stringify({ type: 'unsubscribe', topic: 'room', ref: 11 }));
 	const unsubHook = j(await a.next());
 	check('the app unsubscribe hook fires', unsubHook.event === 'unsubscribe-hook' && unsubHook.data.topic === 'room', JSON.stringify(unsubHook));
-	const unsubAck = j(await a.next());
-	check('unsubscribe acks with the ref', unsubAck.type === 'unsubscribed' && unsubAck.ref === 11, JSON.stringify(unsubAck));
-
+	// The next application response is a barrier: an extra unsubscribe ack
+	// would appear before it and fail the membership assertion below.
 	a.send(JSON.stringify({ type: 'fixture-stats', topic: 'room' }));
 	const stats2 = j(await a.next());
 	check('unsubscribe drops native membership', stats2.data.subscribers === 1, JSON.stringify(stats2.data));
@@ -241,27 +251,48 @@ try {
 	check('the per-entry frames are the ones the family client understands',
 		reasons.size === 0 || [...reasons].every((r) => typeof r === 'string'), [...reasons].join(','));
 
-	// One entry past the limit is refused WHOLE, in one frame. The reply must
-	// not scale with the inbound frame: a maximal frame of two-byte entries
-	// answered per entry is 800KB of egress bought with 8KB of input.
-	a.send(JSON.stringify({ type: 'subscribe-batch', topics: Array.from({ length: 257 }, (_, i) => 'x' + i), ref: 13 }));
-	const refused = j(await a.next());
-	check('an oversized batch is refused with a single frame',
-		refused.type === 'error' && refused.code === 'BATCH_TOO_LARGE', JSON.stringify(refused));
-	check('the refusal reports the limit and what arrived',
-		refused.limit === 256 && refused.size === 257, JSON.stringify(refused));
-	// PEEK for silence after giving anything in flight time to land - never
-	// await a timeout, which swallows the next frame and desynchronizes
-	// every assertion after it.
-	await Bun.sleep(200);
-	check('no entry of an oversized batch was applied', a.pending() === 0, `${a.pending()} queued`);
+	// The bounded prefix is processed normally; each extra topic is refused.
+	// Replies may arrive in any order because authorization is asynchronous.
+	for (const [prefix, count, ref] of [['x', 257, 13], ['y', 300, 14]]) {
+		const topics = Array.from({ length: count }, (_, i) => prefix + i);
+		a.send(JSON.stringify({ type: 'subscribe-batch', topics, ref }));
+		const replies = [];
+		for (let i = 0; i < count; i++) replies.push(j(await a.next()));
+		const byTopic = new Map(replies.map(frame => [frame.topic, frame]));
+		check(`oversized ${prefix} batch answers every unique topic`,
+			byTopic.size === count && topics.every(topic => byTopic.has(topic)), `${byTopic.size} topics`);
+		check(`oversized ${prefix} batch subscribes its first 256 entries`,
+			topics.slice(0, 256).every(topic => byTopic.get(topic)?.type === 'subscribed'),
+			JSON.stringify(replies.filter(frame => frame.type !== 'subscribed').slice(0, 3)));
+		check(`oversized ${prefix} batch refuses only the extra entries with BATCH_OVERFLOW`,
+			topics.slice(256).every(topic => {
+				const frame = byTopic.get(topic);
+				return frame?.type === 'subscribe-denied' && frame.reason === 'BATCH_OVERFLOW';
+			}), JSON.stringify(replies.slice(0, 3)));
+		check(`oversized ${prefix} batch preserves ref presence on every reply`,
+			replies.every(frame => ref === undefined ? !Object.hasOwn(frame, 'ref') : frame.ref === ref));
+	}
 
-	// And the refusal does not depend on a ref: it is the client learning its
-	// frame did nothing, not an ack.
-	a.send(JSON.stringify({ type: 'subscribe-batch', topics: Array.from({ length: 300 }, (_, i) => 'y' + i) }));
-	const refusedNoRef = j(await a.next());
-	check('an oversized batch is refused even with no ref',
-		refusedNoRef.code === 'BATCH_TOO_LARGE' && refusedNoRef.size === 300, JSON.stringify(refusedNoRef));
+	// Without a ref, neither successful entries nor overflow entries reply.
+	// Observe the completed prefix through native membership instead.
+	a.send(JSON.stringify({ type: 'subscribe-batch', topics: Array.from({ length: 300 }, (_, i) => 'z' + i) }));
+	const noRefDeadline = Date.now() + 5000;
+	let lastPrefix;
+	do {
+		a.send(JSON.stringify({ type: 'fixture-stats', topic: 'z255' }));
+		lastPrefix = j(await a.next());
+		if (lastPrefix.data?.subscribers === 1) break;
+		if (Date.now() > noRefDeadline) throw new Error('ref-less batch prefix did not finish');
+		await Bun.sleep(10);
+	} while (true);
+	check('a ref-less oversized batch installs the end of its bounded prefix', lastPrefix.data.subscribers === 1);
+	for (const [topic, expected] of [['z0', 1], ['z256', 0], ['z299', 0]]) {
+		a.send(JSON.stringify({ type: 'fixture-stats', topic }));
+		const membership = j(await a.next());
+		check(`ref-less batch membership for ${topic} is ${expected}`,
+			membership.data?.subscribers === expected, JSON.stringify(membership));
+	}
+	check('a ref-less oversized batch emits no unsolicited replies', a.pending() === 0, `${a.pending()} queued`);
 
 	// --- close bookkeeping -------------------------------------------------
 	b.close();
@@ -292,20 +323,21 @@ try {
 		drainClosed,
 		new Promise((r) => setTimeout(() => r({ code: 'timeout' }), 2000))
 	]);
+	// 1001 on the wire (close-frame-check reads it raw); Bun's client reports a
+	// 1001 as 1000, so the reason is what proves the close frame arrived.
 	check('the drained connection is then closed with a real code, not a 1006',
-		closeEvt.code === 1012, JSON.stringify(closeEvt));
+		(closeEvt.code === 1001 || closeEvt.code === 1000) && closeEvt.reason === 'Server draining',
+		JSON.stringify(closeEvt));
 
-	// --- a release still in flight when the connection dies ----------------
-	// The release happens BEFORE the app's unsubscribe hook is dispatched, and
-	// it removes the topic from the subscription set the close hook is handed.
-	// So a hook that has not finished when the socket dies is dropped, and
-	// unless the topic is carried across some other way the app is never told
-	// to release its per-topic state at all. `hang:` never settles, so this is
-	// that case exactly.
+	// The unsubscribe hook starts after membership is removed. Even when that
+	// hook remains pending, close reports only the topics still held.
 	const hangClient = client('?user=hanger');
 	await hangClient.opened;
 	await hangClient.next(); // welcome
 	await hangClient.next(); // opened
+	hangClient.send(JSON.stringify({ type: 'subscribe', topic: 'held-at-close', ref: 89 }));
+	const heldSubbed = j(await hangClient.next());
+	check('the close control topic subscribes', heldSubbed.type === 'subscribed', JSON.stringify(heldSubbed));
 	hangClient.send(JSON.stringify({ type: 'subscribe', topic: 'hang:1', ref: 90 }));
 	const hangSubbed = j(await hangClient.next());
 	check('a hang topic subscribes normally', hangSubbed.type === 'subscribed', JSON.stringify(hangSubbed));
@@ -328,9 +360,10 @@ try {
 	const errText = await new Response(proc.stderr).text();
 	// Asserted from the server's own log because the close hook's view is the
 	// thing under test, and no client can observe it.
-	const hangClose = out.split('\n').find((line) => line.includes('[fixture] close') && line.includes('hang:1'));
-	check('a release whose hook never finished still reaches the close hook',
-		Boolean(hangClose), 'no close line named hang:1');
+	const hangClose = out.split('\n').find((line) => line.includes('[fixture] close') && line.includes('held-at-close'));
+	check('close reports held membership while the released topic hook remains pending',
+		Boolean(hangClose) && hangClose.includes('subs=1 topics=held-at-close ') && !hangClose.includes('hang:1'),
+		hangClose ?? 'no close line named the held control topic');
 	if (failed > 0) {
 		console.log('\n--- server stdout ---\n' + out.slice(-3000));
 		if (errText.trim()) console.log('\n--- server stderr ---\n' + errText.slice(-3000));

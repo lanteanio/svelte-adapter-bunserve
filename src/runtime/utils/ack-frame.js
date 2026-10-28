@@ -73,26 +73,3 @@ export function subscribedFrame(topic, ref, epoch) {
 export function subscribeDeniedFrame(topic, ref, reason) {
 	return JSON.stringify({ type: 'subscribe-denied', topic, ref, reason });
 }
-
-/**
- * @param {unknown} topic
- * @param {number | string} ref
- * @returns {string}
- */
-export function unsubscribedFrame(topic, ref) {
-	return JSON.stringify({ type: 'unsubscribed', topic, ref });
-}
-
-/**
- * Its own frame type rather than a reused `unsubscribed` ack: the ack means
- * "you no longer hold this", which is a claim the adapter cannot make about a
- * topic it refused to look at.
- *
- * @param {unknown} topic
- * @param {number | string} ref
- * @param {string} reason
- * @returns {string}
- */
-export function unsubscribeDeniedFrame(topic, ref, reason) {
-	return JSON.stringify({ type: 'unsubscribe-denied', topic, ref, reason });
-}

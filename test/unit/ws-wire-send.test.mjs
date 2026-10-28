@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { runInNewContext } from 'node:vm';
 
 // The single-target wire senders and the per-connection codec lifecycle:
 // announce-before-first-frame, caps/poison gating, degrade-to-JSON, and the
@@ -247,24 +248,137 @@ test('a declined batch falls back to per-entry encodes with per-entry JSON', () 
 	assert.ok(parseBinaryFrame(ws.sent[3].payload));
 });
 
-test('a STATELESS codec batches as per-entry binary, not JSON', () => {
-	// A stateless codec has no -batch form, so sendWireBatch routes each entry
-	// through sendWire. Dumping to JSON here would hand a capable client JSON
-	// from sendWireBatch while sendWire sent it binary for the same codec.
+test('a closed per-entry JSON fallback stops the batch without encoding or poisoning later entries', () => {
+	const ws = capable(fakeWs());
+	const track = {};
+	const wire = statefulCodec(track);
+	let entryEncodes = 0;
+	wire.encode = (event) => {
+		if (event.endsWith('-batch')) return null;
+		entryEncodes++;
+		if (entryEncodes === 1) {
+			ws.detach();
+			return null;
+		}
+		return new Uint8Array([7]);
+	};
+	ws.send = () => { throw new Error('socket closed'); };
+	const before = wsCounters.closedWsAborts;
+	assert.equal(platform.sendWireBatch(ws, 'room', 'moved', [{ data: 1 }, { data: 2 }], wire), 2);
+	assert.equal(entryEncodes, 1);
+	assert.equal(wsCounters.closedWsAborts, before + 1);
+	assert.equal(wireStatePoisoned(ws.ud, CAP), false);
+	assert.equal(track.detached, 0, 'a closed send does not poison the codec');
+});
+
+/** A stateful codec that declines every batch and encodes each entry alone. */
+function entryOnlyCodec() {
+	const wire = statefulCodec({});
+	wire.encode = (event) => (event.endsWith('-batch') ? null : new Uint8Array([7]));
+	return wire;
+}
+
+test('a declined batch whose LAST entry frame is dropped reports the drop', () => {
+	// Announce sent, entry 0 sent, entry 1 - the last - dropped. Nothing is
+	// left for the JSON fallback to send, and it started its own result at 1,
+	// so the call used to report the dropped frame as sent.
+	const ws = capable(fakeWs([1, 1, 2]));
+	const result = platform.sendWireBatch(ws, 'room', 'update', [{ data: { n: 0 } }, { data: { n: 1 } }], entryOnlyCodec());
+	assert.equal(ws.sent.filter((s) => s.isBinary).length, 2, 'both entries went out as binary frames');
+	assert.equal(result, 2);
+});
+
+test('a declined batch reports the last send when JSON follows a dropped frame', () => {
+	// Announce sent, entry 0 dropped, entry 1 falls back to JSON and is sent.
+	const ws = capable(fakeWs([1, 2, 1]));
+	const result = platform.sendWireBatch(ws, 'room', 'update', [{ data: { n: 0 } }, { data: { n: 1 } }], entryOnlyCodec());
+	assert.ok(ws.sent.some((s) => typeof s.payload === 'string' && s.payload.includes('"n":1')));
+	assert.equal(result, 1);
+});
+
+test('a stateless codec sends per-entry JSON without calling encode', () => {
 	const ws = capable(fakeWs());
 	const result = platform.sendWireBatch(
 		ws,
 		'room',
 		'moved',
 		[{ data: { x: 1 } }, { data: { x: 2 } }],
-		statelessCodec()
+		statelessCodec({ encode() { assert.fail('stateless batches do not encode'); } })
 	);
 	assert.equal(result, 1);
-	// announce + one binary frame per entry.
-	assert.equal(ws.sent.length, 3);
-	assert.equal(typeof ws.sent[0].payload, 'string', 'the announce');
-	assert.ok(parseBinaryFrame(ws.sent[1].payload), 'entry 1 is binary');
-	assert.ok(parseBinaryFrame(ws.sent[2].payload), 'entry 2 is binary');
+	assert.deepEqual(ws.sent.map((s) => JSON.parse(s.payload)), [
+		{ topic: 'room', event: 'moved', data: { x: 1 } },
+		{ topic: 'room', event: 'moved', data: { x: 2 } }
+	]);
+});
+
+test('batch fallbacks reuse payloads read once before encode', () => {
+	for (const mode of ['decline', 'announce-drop', 'entry-announce-drop', 'frame-drop']) {
+		const script = mode === 'announce-drop' || mode === 'entry-announce-drop'
+			? [2] : mode === 'frame-drop' ? [1, 2] : [];
+		const ws = capable(fakeWs(script));
+		const reads = [0, 0];
+		const originals = [{ x: 1 }, { x: 2 }];
+		const entries = originals.map((data, i) => ({ get data() {
+			reads[i]++;
+			return reads[i] === 1 ? data : { x: 99 };
+		} }));
+		const wire = statefulCodec();
+		wire.encode = (event, data) => {
+			if (event.endsWith('-batch')) {
+				assert.deepEqual(data.updates, originals);
+				entries.splice(0, entries.length, { data: { x: 100 } });
+				return mode === 'announce-drop' ? new Uint8Array([7]) : null;
+			}
+			assert.ok(originals.includes(data), mode);
+			return mode === 'decline' ? null : new Uint8Array([7]);
+		};
+		assert.equal(platform.sendWireBatch(ws, 'room', 'moved', entries, wire), 1, mode);
+		assert.deepEqual(reads, [1, 1], mode);
+		const json = ws.sent.filter((s) => !s.isBinary).map((s) => JSON.parse(s.payload))
+			.filter((m) => m.event === 'moved');
+		assert.deepEqual(json.map((m) => m.data), mode === 'frame-drop' ? [originals[1]] : originals, mode);
+	}
+});
+
+test('batch and per-entry codec exceptions propagate unchanged', () => {
+	for (const failBatch of [true, false]) {
+		const ws = capable(fakeWs());
+		const wire = statefulCodec();
+		const failure = new Error('encode failed');
+		wire.encode = (event) => {
+			if (!failBatch && event.endsWith('-batch')) return null;
+			throw failure;
+		};
+		assert.throws(() => platform.sendWireBatch(ws, 'room', 'moved', [{ data: 1 }], wire),
+			(error) => error === failure);
+		assert.deepEqual(ws.sent, []);
+		assert.equal(wireStatePoisoned(ws.ud, CAP), false);
+	}
+});
+
+test('batch and per-entry codecs cannot hand invalid payloads to the frame writer', () => {
+	for (const failBatch of [true, false]) {
+		for (const payload of [{}, [], 'bytes', 42, true, new ArrayBuffer(2), Promise.resolve(null)]) {
+			const ws = capable(fakeWs());
+			const wire = statefulCodec();
+			wire.encode = (event) => !failBatch && event.endsWith('-batch') ? null : payload;
+			assert.throws(() => platform.sendWireBatch(ws, 'room', 'moved', [{ data: 1 }], wire),
+				/Uint8Array/);
+			assert.deepEqual(ws.sent, [], 'invalid payload is refused before an announce');
+		}
+	}
+});
+
+test('batch and per-entry codecs accept Uint8Array payloads from another realm', () => {
+	for (const declineBatch of [true, false]) {
+		const ws = capable(fakeWs());
+		const wire = statefulCodec();
+		const payload = runInNewContext('new Uint8Array([7, 8])');
+		wire.encode = (event) => declineBatch && event.endsWith('-batch') ? null : payload;
+		assert.equal(platform.sendWireBatch(ws, 'room', 'moved', [{ data: 1 }], wire), 1);
+		assert.deepEqual([...parseBinaryFrame(ws.sent.at(-1).payload).payload], [7, 8]);
+	}
 });
 
 test('a caps-less batch is N JSON envelopes; an empty batch is a 1 no-op', () => {
@@ -371,4 +485,38 @@ test('the codec registry is idempotent, last-wins, and resettable', () => {
 	assert.equal(getWireCodec('undefined'), null);
 	_resetWireCodecRegistry();
 	assert.equal(getWireCodec('x:1'), null);
+});
+
+
+test('single-target codec failures propagate without sending or poisoning', () => {
+	for (const stateful of [false, true]) {
+		const ws = capable(fakeWs());
+		const wire = stateful ? statefulCodec() : statelessCodec();
+		const failure = new Error('encode failed');
+		wire.encode = () => { throw failure; };
+		assert.throws(() => platform.sendWire(ws, 'room', 'moved', 1, wire), (error) => error === failure);
+		assert.deepEqual(ws.sent, []);
+		assert.equal(wireStatePoisoned(ws.ud, CAP), false);
+		wire.encode = () => new Uint8Array([7]);
+		assert.equal(platform.sendWire(ws, 'room', 'moved', 2, wire), 1);
+		assert.ok(parseBinaryFrame(ws.sent.at(-1).payload));
+	}
+});
+
+test('single-target codecs validate payloads and accept another realm', () => {
+	for (const stateful of [false, true]) {
+		for (const payload of [{}, [], 'bytes', 42, true, new ArrayBuffer(2), Promise.resolve(null)]) {
+			const ws = capable(fakeWs());
+			const wire = stateful ? statefulCodec() : statelessCodec();
+			wire.encode = () => payload;
+			assert.throws(() => platform.sendWire(ws, 'room', 'moved', 1, wire), TypeError);
+			assert.deepEqual(ws.sent, []);
+			assert.equal(wireStatePoisoned(ws.ud, CAP), false);
+		}
+		const ws = capable(fakeWs());
+		const wire = stateful ? statefulCodec() : statelessCodec();
+		wire.encode = () => runInNewContext('new Uint8Array([7, 8])');
+		assert.equal(platform.sendWire(ws, 'room', 'moved', 1, wire), 1);
+		assert.deepEqual([...parseBinaryFrame(ws.sent.at(-1).payload).payload], [7, 8]);
+	}
 });

@@ -10,16 +10,34 @@
 import { ws_options } from './config.js';
 import { createByteBudget } from '../utils/egress-budget.js';
 import { processMonotonicNow, randomBytes as randomOctets } from '../runtime.js';
-import { createHookQueue } from '../utils/hook-queue.js';
-import { isValidPublishSeq } from '../utils/publish-seq.js';
+import { explicitSeqValue, throwInvalidSeq } from '../utils/publish-seq.js';
 import { createCapCounts } from '../utils/wire.js';
+import { assert } from '../utils/assertions.js';
+import { formatDiagnostic } from '../diagnostic-format.js';
 import {
-	beginPending,
-	createPending,
-	pendingTopics,
-	settlePending,
-	tombstonePending
-} from '../utils/pending-subscribe.js';
+	WS_ATTRIBUTION,
+	WS_CAPS,
+	WS_INGRESS_BINDINGS,
+	WS_PENDING_SUBSCRIBES,
+	WS_PENDING_SUBSCRIBES_TOTAL,
+	WS_PLATFORM,
+	WS_PUBLISH_GRANT,
+	WS_SESSION_ID,
+	WS_SUBSCRIPTIONS,
+	setSubscriptionAccountingHook
+} from '../utils/ws-symbols.js';
+
+export {
+	WS_PENDING_SUBSCRIBES,
+	WS_PENDING_SUBSCRIBES_TOTAL,
+	WS_PLATFORM,
+	WS_SESSION_ID,
+	WS_SUBSCRIPTIONS,
+	beginPendingSubscribe,
+	isPendingSubscribeCancelled,
+	settlePendingSubscribe,
+	tombstonePendingSubscribe
+} from '../utils/ws-symbols.js';
 
 /**
  * The Bun server, needed for topic fan-out (`server.publish`) and the native
@@ -48,21 +66,32 @@ export function getServer() {
 /**
  * Per-connection userData slots. Symbols so they cannot collide with anything
  * an app puts on its own userData from the upgrade hook, and so they do not
- * show up in Object.keys / JSON.stringify of user data.
+ * show up in Object.keys / JSON.stringify of user data. The subscription,
+ * in-flight subscribe and platform slots live in utils/ws-symbols.js beside the
+ * helpers that move them.
  */
-export const WS_SUBSCRIPTIONS = Symbol('subscriptions');
-export const WS_PENDING_SUBSCRIBES = Symbol('pendingSubscribes');
-export const WS_PENDING_RELEASES = Symbol('pendingReleases');
-export const WS_PLATFORM = Symbol('platform');
-export const WS_SESSION_ID = Symbol('sessionId');
-export const WS_STATS = Symbol('stats');
+export const WS_STATS = Symbol.for('adapter-uws.ws.stats');
+
+/**
+ * The connection's `platform.sendCoalesced` queue: a Map from key to the one
+ * pending { topic, event, data }, created on first use.
+ */
+export const WS_COALESCED = Symbol.for('adapter-uws.ws.coalesced');
+
+/**
+ * Distinct `sendCoalesced` keys one connection may hold pending. A new key at
+ * the cap evicts the oldest pending one - latest value wins is the contract,
+ * so the oldest is the most stale value to lose. The figure svelte-adapter-uws
+ * uses.
+ */
+export const MAX_COALESCED_KEYS_PER_CONNECTION = 1_000_000;
 
 /**
  * The capability tokens this connection declared in its `hello` frame. Absent
  * on connections that never sent one - old clients - which is the safe-default
  * "no opt-in features" signal every capability consumer keys on.
  */
-export const WS_CAPS = Symbol('caps');
+export { WS_CAPS } from '../utils/ws-symbols.js';
 
 /**
  * The connection's send-gate window, present only after a `hello` carrying the
@@ -72,7 +101,7 @@ export const WS_CAPS = Symbol('caps');
  * which today always reads 0, because the observation happens after the
  * re-grant (see the request-n lane in handler/ws.js).
  */
-export const WS_LEASE = Symbol('lease');
+export const WS_LEASE = Symbol.for('adapter-uws.ws.lease');
 
 /**
  * Live per-capability connection counts across the instance, maintained by the
@@ -87,20 +116,20 @@ export const capCounts = createCapCounts();
  * utils/wire.js allocWireId. Reset with the connection: a reconnect is a new
  * connection with a fresh id space and fresh announces.
  */
-export const WS_TOPIC_IDS = Symbol('topicIds');
+export const WS_TOPIC_IDS = Symbol.for('adapter-uws.ws.topic-ids');
 
 /**
  * Per-connection stateful wire-codec entries, keyed by capability:
  * `{ state, detach }`, or the poisoned sentinel `{ state: null, poisoned }`.
  * See handler/wire-state.js for the lifecycle.
  */
-export const WS_WIRE_STATE = Symbol('wireState');
+export const WS_WIRE_STATE = Symbol.for('adapter-uws.ws.wire-state');
 
 /**
  * Topics whose SHARED binary cohort this connection joined, so close releases
  * exactly the shared wire-id refs it acquired and no others.
  */
-export const WS_SHARED_COHORTS = Symbol('sharedCohorts');
+export const WS_SHARED_COHORTS = Symbol.for('adapter-uws.ws.shared-cohorts');
 
 /**
  * Topics running shared binary fan-out, topic -> the capability whose codec
@@ -109,6 +138,23 @@ export const WS_SHARED_COHORTS = Symbol('sharedCohorts');
  * subscriber is cohorted at subscribe time instead.
  * @type {Map<string, string>}
  */
+/**
+ * Wire-subscribe authorization arming, worker-wide.
+ *
+ * `enabled` is set from `websocket.authorizeWireSubscribe` at boot and can be
+ * turned on later through `platform.authorizeWireSubscribe()` - the spelling a
+ * framework whose subscriptions are all server-initiated uses at startup. It
+ * latches false -> true and is never turned back off: a gate that can be
+ * disarmed at runtime is not a gate, and every lane reads this fresh rather
+ * than snapshotting it, so arming mid-flight tightens the in-flight frames
+ * instead of leaving them judged under the old posture.
+ *
+ * `strict` makes the two authorities conjunctive - a server grant AND an app
+ * hook allow - and latches the same way, so a later no-argument call cannot
+ * downgrade a strict worker.
+ */
+export const subscribeAuth = { enabled: false, strict: false };
+
 export const sharedTopics = new Map();
 
 /**
@@ -385,12 +431,24 @@ export function captureResumeFrame(topic, seq, envelope, compress, excludeWs, au
 }
 
 /**
- * The upgrade-time request id travels as a STRING key, not a Symbol: it is set
- * on the object handed to `server.upgrade(req, { data })` before any socket
- * exists, and is promoted to a per-connection platform clone in `open()` and
- * then deleted, so userData stays clean for hook code.
+ * Carries the upgrade-time request id from `server.upgrade(req, { data })` to
+ * `open()`, which promotes it to the per-connection platform clone and deletes
+ * the slot, so userData stays clean for hook code.
+ *
+ * A Symbol no other code can name, never a string: assigning a string key goes
+ * through any setter Object.prototype has for that name, so a preload or
+ * polyfill defining one would take the value, and a hook spreading client JSON
+ * into its userData could name it. Bun hands `open` the very object passed to
+ * `upgrade()`, so a Symbol key arrives intact (probe: upgrade-data).
  */
-export const WS_REQUEST_ID_KEY = '__adapter_request_id';
+export const CARRY_REQUEST_ID = Symbol('adapter.carryRequestId');
+
+/**
+ * Marks a socket whose handshake reserved a connection permit, so `close`
+ * releases exactly the permits that were taken. The shared family symbol
+ * keeps connection accounting consistent across adapter modules.
+ */
+export const WS_CONNECTION_PERMIT = Symbol.for('adapter-uws.ws.connection-permit');
 
 /**
  * Live connections, holding the FACADE (not the raw Bun socket) so identity is
@@ -415,16 +473,17 @@ export const pendingCloseHooks = new Set();
 
 /**
  * Track one in-flight close hook. The promise is already rejection-guarded by
- * callHook, so this only needs to know when it settles.
+ * runCloseHook (utils/hook-boundary.js), so this only needs to know when it
+ * settles.
  *
  * @param {Promise<void>} p
  */
 export function trackCloseHook(p) {
 	pendingCloseHooks.add(p);
-	// Promise.resolve() because callHook accepts any thenable (it only requires
-	// `.catch`), and a custom thenable without `.finally` would throw out of the
-	// close handler AND strand this entry forever - which would then burn the
-	// full settle window on every later drain.
+	// Promise.resolve() because a hook may return any thenable, and a custom
+	// one without `.finally` would throw out of the close handler AND strand
+	// this entry forever - which would then burn the full settle window on
+	// every later drain.
 	Promise.resolve(p).finally(() => pendingCloseHooks.delete(p));
 }
 
@@ -433,7 +492,7 @@ export function trackCloseHook(p) {
  * connections from this point: the drain advises and closes everything it can
  * SEE, and an upgrade whose async app hook was mid-await when the signal landed
  * would otherwise complete afterwards and hand a brand-new client to a process
- * that is about to exit - with no advisory, no 1012, and a 1006 from stop(true)
+ * that is about to exit - with no advisory, no 1001, and a 1006 from stop(true)
  * moments later.
  */
 let draining = false;
@@ -483,19 +542,10 @@ export function resetDraining() {
 	draining = false;
 }
 
-/**
- * Per-connection subscription cap.
- *
- * This is a real bound, not a formality. One connection reaching it pins a Set
- * entry, a JS string, and an entry in Bun's native topic registry per topic, and
- * subscribe-batch lets a client add hundreds per frame - so a cap set high
- * enough to never fire (the family's historical 1,000,000) bounds nothing and
- * leaves single-connection memory exhaustion available to any unauthenticated
- * client. Fixed rather than configurable, because the adapter this one mirrors
- * declares no option for it; a design needing more per-connection fan-in is the
- * thing to revisit.
- */
-export const MAX_SUBSCRIPTIONS_PER_CONNECTION = 10_000;
+export {
+	MAX_PENDING_SUBSCRIBES_PER_CONNECTION,
+	MAX_SUBSCRIPTIONS_PER_CONNECTION
+} from '../utils/caps.js';
 
 /**
  * Topics whose per-topic seq state is retained - the cap on `topicSeqs` and on
@@ -514,12 +564,14 @@ export const MAX_SEQ_TOPICS = 10_000;
  * same word on both and a dashboard built against one is not quietly wrong
  * against the other. What uws has and this list does not:
  *
- * - `siege` belongs to `protection`, a recorded parity gap. Each label arrives
- *   with the feature, which is how `auth_timeout`, `ip_rate_limit` and
- *   `auth_rate_limit` got here.
- * - `duplicate_header` is unreachable on this transport rather than unported:
- *   repeated request headers are merged before the adapter is entered, so there
- *   is no ambiguity here to refuse.
+ * - `siege` belongs to `protection`. Each label arrives with the feature, which
+ *   is how `auth_timeout`, `ip_rate_limit` and `auth_rate_limit` got here.
+ * - `duplicate_header` and `ambiguous_framing` belong to uws's reading of the
+ *   handshake's whole header set: a repeated Host, Origin, Authorization,
+ *   Proxy-Authorization or Content-Type, and a framing header said twice or
+ *   sent empty. Bun joins a repeated one of those five into one value with
+ *   ", ", and refuses the framing conflicts its own parser recognises with a
+ *   400 before the adapter is entered.
  *
  * A refusal the RUNTIME makes (a handshake Bun itself rejects) is counted by
  * neither adapter.
@@ -532,6 +584,8 @@ export const MAX_SEQ_TOPICS = 10_000;
  * it reads means something different.
  */
 export const UPGRADE_REJECTION_REASONS = Object.freeze([
+	// A handshake no one could complete, refused before every other reason.
+	'malformed_handshake',
 	'over_capacity',
 	'cursor_lane',
 	'connection_capacity',
@@ -567,6 +621,7 @@ function seedRejectionCounts() {
 }
 
 export const wsCounters = {
+	transportMetricHooks: null,
 	/**
 	 * Sends and subscribes that were refused because the socket had already
 	 * closed. This is the lane a closed-socket operation lands in; it must
@@ -574,16 +629,6 @@ export const wsCounters = {
 	 * entirely (see utils/send-result.js).
 	 */
 	closedWsAborts: 0,
-
-	/**
-	 * Releases whose teardown could not be recorded for the close hook because
-	 * the connection's pending-release record was full. Non-zero means an
-	 * `unsubscribe` hook has been failing persistently, and those releases lost
-	 * the close-hook fallback: nothing covers them if their own hook does not
-	 * perform the teardown. Internal: the operator signal is the console error
-	 * this raises, and uws exposes no counter for it.
-	 */
-	droppedReleaseRecords: 0,
 
 	/**
 	 * Topic publishes since boot. Monotonic and never reset, so the name says
@@ -641,11 +686,14 @@ export const wsCounters = {
 	/** Connection count at the previous sampler tick. */
 	lastConnections: 0,
 
-	/** heapUsed/heapTotal at the previous sampler tick. */
+	/**
+	 * The memory-wall reading (utils/memory-wall.js) at the previous sampler
+	 * tick: what the send-gate window sizer reads; no known wall contributes zero.
+	 */
 	lastHeapUsedRatio: 0,
 
-	/** process RSS bytes at the previous sampler tick. */
-	lastResidentBytes: 0,
+	/** @type {number | null} No sample or no known memory wall. */
+	lastMeasuredHeapUsedRatio: null,
 
 	/**
 	 * The UNLAYERED pressure reason of the previous sample - what the raw
@@ -663,12 +711,10 @@ export const wsCounters = {
 	lastSampleWallMs: 0,
 
 	/**
-	 * Worst per-connection send-gate saturation observed since the last
-	 * sample; written on `request-n`, folded into the snapshot value by the
-	 * sampler, then decayed by half each tick. The write site reads a freshly
-	 * re-granted window (the sibling's order, kept for parity), which is 0
-	 * for a server that never consumes permits - so the fold is armed but
-	 * cannot lift the value today. See the request-n lane in handler/ws.js.
+	 * Worker peak of the client's advisory backlog ratio (`queued / 256`,
+	 * clamped to 0..1), written on `request-n`. The sampler folds it into
+	 * pressure.value, then halves the retained peak each tick. It does not
+	 * change the pressure reason or the size of a grant.
 	 */
 	leaseSaturationPeak: 0,
 
@@ -719,6 +765,8 @@ export const wsCounters = {
 	 * seeds preceded it.
 	 */
 	upgradeAdmittedTotal: 0,
+	/** Active, connected upgrade attempts measured independently of admission. */
+	upgradeInFlight: 0,
 
 	/**
 	 * Pressure-reason changes, keyed `from>to`. Bounded by the reason
@@ -733,6 +781,53 @@ export const wsCounters = {
 	 */
 	pressureReasonTransitions: new Map()
 };
+
+/**
+ * Move `wsCounters.totalSubscriptions` by one membership change: +1 on an
+ * install, -1 on a release. This is the worker's subscription-accounting sink,
+ * so it is reached only through add/removeLogicalSubscription and the close
+ * settle in utils/ws-symbols.js, never written beside a Set mutation by hand.
+ *
+ * The total can never go negative: a release the counter has no install for is
+ * corruption somewhere upstream, and the clamp keeps it from poisoning the
+ * pressure reading and every later close, while the assertion makes it visible.
+ *
+ * The topic every delta carries is not read. Egress here reads Bun's native
+ * subscriber count, so there is no per-topic tally to keep beside the total.
+ *
+ * @param {number} delta
+ * @param {string} [_topic]
+ */
+export function adjustTotalSubscriptions(delta, _topic) {
+	const next = wsCounters.totalSubscriptions + delta;
+	if (next < 0) {
+		assert(false, 'subs.total-negative', { totalSubscriptions: next });
+		wsCounters.totalSubscriptions = 0;
+	} else {
+		wsCounters.totalSubscriptions = next;
+	}
+}
+
+// One sink per worker, shared by every copy of the subscription helpers. A
+// second runtime in the same worker would take it from this one: each keeps its
+// own counter, so the displaced one freezes while the other is charged releases
+// it never matched - a total stuck under the live memberships on one side and
+// driven negative on the other, with neither saying why. Reported rather than
+// asserted, because the condition is about a deployment carrying two runtimes,
+// and a soft assertion throws in test mode.
+if (setSubscriptionAccountingHook(adjustTotalSubscriptions)) {
+	try {
+		console.warn(formatDiagnostic({
+			source: 'svelte-adapter-bunserve',
+			component: 'runtime.subscription-accounting',
+			event: 'runtime.subscription-accounting.sink-displaced',
+			severity: 'warn',
+			dataClass: 'operational',
+			message: 'A second adapter runtime in this worker took over the subscription accounting sink. One subscription total is now frozen and the other is charged releases it never matched.',
+			attributes: {}
+		}));
+	} catch { /* console gone */ }
+}
 
 /**
  * Per-topic sequence counters. This is the DEFAULT seq space: a publish
@@ -820,11 +915,104 @@ function drawProcessEpoch() {
 	return ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
 }
 
-let PROCESS_EPOCH = drawProcessEpoch();
+/** @type {number | undefined} */
+let PROCESS_EPOCH;
 
-/** @returns {number} */
+/**
+ * The connection's seq-space generation, latched on FIRST READ rather than at
+ * module import - the spelling the sibling adapter uses, and for its reason: a
+ * controlled simulation that has seeded the RNG can then latch a reproducible
+ * value, where an import-time draw has already spent bytes from a stream the
+ * simulation had no chance to seed.
+ *
+ * @returns {number}
+ */
 export function processEpoch() {
+	if (PROCESS_EPOCH === undefined) PROCESS_EPOCH = drawProcessEpoch();
 	return PROCESS_EPOCH;
+}
+
+/**
+ * Per-topic epoch overrides, layered over the process generation.
+ *
+ * A topic's epoch normally IS the process generation: every in-memory seq
+ * counter resets together, so one token describes them all. An override exists
+ * for the case where ONE topic's recorded history can no longer be trusted
+ * while the process lives on.
+ *
+ * The explicit-seq lane is what needs it. `maxAuthoritativeSeq` is monotone by
+ * design - an explicit seq may arrive reordered, so the mark only ever moves up
+ * - and no number carries the identity of the counter that issued it. One
+ * publish stamped from a different authority (a `{ seq: Date.now() }` in a
+ * one-off path, a second partition's offsets, an upstream counter restarted
+ * after a deploy) therefore pins the mark at that value for the life of the
+ * process, and every later resume window on that topic dedups against a floor
+ * from the wrong sequence space. Nothing self-heals it, because healing it
+ * would mean writing a counter value into the explicit space.
+ *
+ * Minting a fresh epoch for the topic is the answer, and it needs no protocol
+ * change: the field already rides the `subscribed` ack. Every offset a client
+ * recorded under the old authority dies at its next resume through the ordinary
+ * epoch-mismatch answer, using machinery every client already implements. So an
+ * app that CHANGES a topic's authority - moves it from the counter to an
+ * external allocator, repoints it at another partition, resets the store behind
+ * it - repudiates the old offsets deliberately instead of leaving them to dedup
+ * against a poisoned floor forever.
+ *
+ * The map is bounded: authority changes are rare, but nothing should grow
+ * without a ceiling. At the cap the longest-undisturbed override is dropped and
+ * reads fall back to the process generation, which for a long-dead change is
+ * the honest degradation - an offset old enough to outlive the cap has usually
+ * cycled through a resume already.
+ */
+const TOPIC_EPOCH_OVERRIDE_MAX = 4096;
+
+/** @type {Map<string, number>} */
+const topicEpochs = new Map();
+
+/**
+ * The epoch for one topic: its override when something minted one, else the
+ * process generation. The SINGLE read authority - the platform member and the
+ * `subscribed` ack both route through it, so they cannot answer differently for
+ * the same topic.
+ *
+ * @param {string} topic
+ * @returns {number}
+ */
+export function topicEpochValue(topic) {
+	const override = topicEpochs.get(topic);
+	return override !== undefined ? override : processEpoch();
+}
+
+/**
+ * Mint and install a fresh generation for ONE topic, returning it.
+ *
+ * The re-roll guard is load-bearing rather than tidy: a mint that equals the
+ * value it replaces is a no-op for exactly the offsets the caller asked to
+ * repudiate, and a deliberate bump has the current value in hand, so it can
+ * simply not collide.
+ *
+ * Re-installing refreshes the entry's recency, so the cap always evicts the
+ * longest-undisturbed override rather than the one most recently asked about.
+ *
+ * @param {string} topic
+ * @returns {number} the installed epoch
+ */
+export function mintTopicEpoch(topic) {
+	const current = topicEpochValue(topic);
+	let minted = drawProcessEpoch();
+	while (minted === current) minted = drawProcessEpoch();
+	if (topicEpochs.delete(topic) === false && topicEpochs.size >= TOPIC_EPOCH_OVERRIDE_MAX) {
+		const oldest = topicEpochs.keys().next().value;
+		if (oldest !== undefined) topicEpochs.delete(oldest);
+	}
+	topicEpochs.set(topic, minted);
+	return minted;
+}
+
+/** Clear every topic override. Simulation and harness use only. */
+export function resetTopicEpochs() {
+	topicEpochs.clear();
 }
 
 /**
@@ -833,14 +1021,16 @@ export function processEpoch() {
  * stops depending on module-load randomness.
  */
 export function resetProcessEpoch(next) {
-	// A harness may LATCH a specific generation; argless, it redraws through
-	// the seam exactly as module load did. A latched value is squeezed into
+	// A harness may LATCH a specific generation; argless, it CLEARS the latch so
+	// the next read draws through the seam - from whatever stream the harness
+	// has seeded by then, which is the whole point of latching lazily. A latched
+	// value is squeezed into
 	// the epoch's u32 domain (`>>> 0`, drawProcessEpoch's range), so an
 	// epoch-ms input like 1700000000000 latches as its low 32 bits and the
 	// `subscribed` ack carries a different value than a sibling that latches
 	// the full ms. What latching preserves is the DRAW ORDER: no bytes leave
 	// the seeded rng stream for this epoch, on either adapter.
-	PROCESS_EPOCH = typeof next === 'number' ? (next >>> 0) : drawProcessEpoch();
+	PROCESS_EPOCH = typeof next === 'number' ? (next >>> 0) : undefined;
 }
 
 /**
@@ -850,28 +1040,17 @@ export function resetProcessEpoch(next) {
 export const envelopePrefixCache = new Map();
 
 /**
- * Per-connection wrappers over the pure epoch helpers (utils/pending-subscribe.js),
- * which hold the reasoning and the tests. These only locate the connection's Map.
- *
- * @param {any} ud
- * @param {string} topic
- * @returns {number} token
- */
-export function beginPendingSubscribe(ud, topic) {
-	let state = ud[WS_PENDING_SUBSCRIBES];
-	if (!state) state = ud[WS_PENDING_SUBSCRIBES] = createPending();
-	return beginPending(state, topic);
-}
-
-/**
- * Distinct topics with a gate in flight on this connection - what the cap
- * counts. See the note in utils/pending-subscribe.js.
+ * DISTINCT topics with a subscribe in flight on this connection - what the
+ * subscription cap and the in-flight bound count, not the attempt total. N
+ * concurrent subscribes to one topic can only ever install one subscription -
+ * the landing short-circuits on `subs.has(topic)` - so charging them N times
+ * refuses subscribes the connection has every right to make. O(1): Map.size.
  *
  * @param {any} ud
  * @returns {number}
  */
 export function pendingSubscribeTopics(ud) {
-	return pendingTopics(ud[WS_PENDING_SUBSCRIBES]);
+	return ud[WS_PENDING_SUBSCRIBES]?.size ?? 0;
 }
 
 /**
@@ -882,235 +1061,18 @@ export function pendingSubscribeTopics(ud) {
  */
 export function heldSubscriptions(ws) {
 	try {
-		return ws.getUserData()[WS_SUBSCRIPTIONS] ?? EMPTY_SUBSCRIPTIONS;
+		const subs = ws.getUserData()[WS_SUBSCRIPTIONS];
+		// A slot that is not a Set is corruption, reported where the slot is
+		// read to change it (`subs.shape`, `subs.shape-unsubscribe`,
+		// `subs.shape-batch`); answering with it here would only move the
+		// failure into the caller's `has`.
+		return subs instanceof Set ? subs : EMPTY_SUBSCRIPTIONS;
 	} catch {
 		return EMPTY_SUBSCRIPTIONS;
 	}
 }
 
 const EMPTY_SUBSCRIPTIONS = new Set();
-
-/**
- * Authorization gates this connection may have running at once.
- *
- * A SECOND limit, deliberately separate from the subscription cap, because one
- * counter cannot do both jobs. The cap bounds what can INSTALL, and it counts
- * distinct pending topics - N concurrent subscribes to one topic can only ever
- * install one subscription, so counting them N times produced denials that were
- * not true. But that same distinctness means N concurrent gates for one topic
- * cost 1 against the cap, which left concurrent APP WORK unbounded: one socket
- * repeating a single topic, or pipelining batch frames, opened as many
- * concurrent gate calls as it sent frames. The gate is where an app does its DB
- * or Redis round-trip, so that is the expensive thing to bound.
- *
- * The bound itself is asserted in test/unit/ws-state.test.mjs, including the
- * part that makes it mean anything: a gate is counted for as long as it is
- * SUSPENDED, not just while it is being called.
- */
-const MAX_CONCURRENT_GATES = 64;
-
-/** Per-connection count of gates currently running. */
-const WS_GATES = Symbol('inflightGates');
-
-/**
- * Unsubscribe hooks this connection may have running at once, and how many may
- * wait behind them.
- *
- * A THIRD limit, and deliberately not the gate counter. Sharing `WS_GATES`
- * breaks both lanes at once. Bun does not await the message handler, so a
- * client holding the permitted 10,000 subscriptions can pipeline 10,000
- * `unsubscribe` frames in one read burst and land that many CONCURRENT app
- * hooks unless the unsubscribe lane has its own CHECKED bound on every path,
- * held and speculative alike. And every increment a shared counter takes from
- * legitimate releases drives the SUBSCRIBE path toward `RATE_LIMITED` on a
- * connection nowhere near any real limit - a SvelteKit route change unmounts
- * the old page's stores in one tick, which is exactly such a burst.
- *
- * Separate counters because the two lanes have different rights: a subscribe
- * gate may be REFUSED (the client is told, and its own frame caused it), while
- * an unsubscribe hook may only be DEFERRED - see utils/hook-queue.js.
- */
-const MAX_CONCURRENT_UNSUBSCRIBE_HOOKS = 64;
-
-/**
- * The queue is what makes deferral safe rather than unbounded. Each waiting
- * entry is a closure over a topic string already capped at 256 characters, so
- * the ceiling here is memory measured in hundreds of kilobytes per connection at
- * worst, against an unbounded number of concurrent database round-trips without
- * it.
- */
-const MAX_QUEUED_UNSUBSCRIBE_HOOKS = 1024;
-
-const WS_UNSUB_QUEUE = Symbol('unsubscribeHookQueue');
-
-/**
- * Run the app's `unsubscribe` hook under this connection's bound.
- *
- * @param {any} ws
- * @param {() => unknown} task
- * @param {boolean} required - false for a topic this connection never held
- * @returns {'ran' | 'queued' | 'refused' | 'overflow'}
- */
-export function runUnsubscribeHook(ws, task, required) {
-	let ud;
-	try {
-		ud = ws.getUserData();
-	} catch {
-		// The socket is gone; its close hook has already had its turn at the
-		// teardown this task duplicates.
-		return 'refused';
-	}
-	let queue = ud[WS_UNSUB_QUEUE];
-	if (queue === undefined) {
-		queue = createHookQueue({
-			concurrency: MAX_CONCURRENT_UNSUBSCRIBE_HOOKS,
-			maxQueued: MAX_QUEUED_UNSUBSCRIBE_HOOKS
-		});
-		ud[WS_UNSUB_QUEUE] = queue;
-	}
-	return queue.enqueue(task, required);
-}
-
-/**
- * Drop this connection's waiting unsubscribe hooks. Their topics stay in the
- * pending-release set, so the close hook is handed them and performs the
- * teardown they did not get to.
- *
- * @param {any} ud
- */
-export function clearUnsubscribeHooks(ud) {
-	ud?.[WS_UNSUB_QUEUE]?.clear();
-}
-
-/**
- * Distinct topics one connection may carry an unowed teardown for.
- *
- * Twice what the queue can hold in flight, so ordinary concurrency never
- * approaches it: at most `concurrency + backlog` releases exist at once, and
- * every one of them is recorded.
- *
- * The slack exists for entries an app hook that keeps FAILING leaves behind.
- * Those free their queue slot but stay owed, so they accumulate ON TOP of
- * whatever is in flight, and without a ceiling a connection that releases and
- * re-subscribes in a loop against a broken hook would grow this without limit.
- *
- * That means the ceiling IS reachable, and reaching it costs teardown coverage
- * for the releases past it - there is no way around that, since every entry at
- * that point is a topic genuinely owed something. Getting there takes roughly
- * two thousand DISTINCT topics on one connection whose hook never resolved -
- * the record is keyed by topic, so releasing the SAME topic over and over
- * against a broken hook does not grow it at all. It is counted in
- * `droppedReleaseRecords`, and it says so once.
- */
-const MAX_PENDING_RELEASE_TOPICS =
-	2 * (MAX_CONCURRENT_UNSUBSCRIBE_HOOKS + MAX_QUEUED_UNSUBSCRIBE_HOOKS);
-
-let warnedPendingReleaseFull = false;
-/**
- * Warned once, COUNTED every time. The warning describes a static fault - an
- * `unsubscribe` hook that keeps failing - so repeating it per release adds
- * nothing, but a connection that hits this an hour after the first one still
- * has to be visible to an operator, which is what the counter is for.
- */
-function warnPendingReleaseFull() {
-	wsCounters.droppedReleaseRecords++;
-	if (warnedPendingReleaseFull) return;
-	warnedPendingReleaseFull = true;
-	console.error(
-		`[ws] a connection is carrying ${MAX_PENDING_RELEASE_TOPICS} distinct topics whose unsubscribe hook has not\n` +
-		'  succeeded yet, so further releases are no longer recorded for the close hook and their teardown\n' +
-		'  is not guaranteed. The usual cause is an `unsubscribe` hook that throws or rejects on every\n' +
-		'  call - fix that, and check the errors logged above it. The running total is\n' +
-		'  is logged once per process, and every further drop is silent.'
-	);
-}
-
-/**
- * Record that a topic is owed a teardown the app has not performed yet.
- *
- * The release itself runs BEFORE the hook is queued, and it deletes the topic
- * from the subscription set. That set is what the close hook is handed, so
- * without this record a hook that is still waiting when the connection closes
- * would be dropped by `clearUnsubscribeHooks` AND be absent from the close
- * hook's snapshot - the app's per-topic state (a presence roster entry, a
- * cursor attachment) would then be released by nobody. A client can drive that
- * on purpose by pipelining more releases than the queue holds.
- *
- * COUNTED, not a plain set membership. One topic can be owed more than one
- * teardown at a time - release it, subscribe it again, release it again - and
- * a set collapses those into one entry that the first hook to finish then
- * deletes, dropping the teardown still owed for the second. The count is what
- * makes "two owed, one settled" expressible.
- *
- * Only topics the connection GENUINELY held are recorded, so a client cannot
- * grow this by naming topics it never had.
- *
- * @param {any} ud
- * @param {string} topic
- */
-export function beginPendingRelease(ud, topic) {
-	let pending = ud[WS_PENDING_RELEASES];
-	if (pending === undefined) {
-		pending = new Map();
-		ud[WS_PENDING_RELEASES] = pending;
-	}
-	const owed = pending.get(topic);
-	if (owed === undefined && pending.size >= MAX_PENDING_RELEASE_TOPICS) {
-		warnPendingReleaseFull();
-		return;
-	}
-	pending.set(topic, (owed ?? 0) + 1);
-}
-
-/**
- * Settle one owed teardown for a topic.
- *
- * Only a hook that RESOLVED discharges what it was owed. A hook that threw or
- * rejected ran the app's code but did not necessarily release anything - the
- * realistic shape is `await redis.srem(...)` against a backend that is down -
- * so its topic stays owed and the close hook is told to tear it down. That
- * makes teardown AT LEAST once rather than exactly once; see the note on
- * `pendingReleaseTopics`.
- *
- * @param {any} ud
- * @param {string} topic
- * @param {boolean} released - did the hook resolve?
- */
-export function settlePendingRelease(ud, topic, released) {
-	if (!released) return;
-	const pending = ud?.[WS_PENDING_RELEASES];
-	if (pending === undefined) return;
-	const owed = pending.get(topic);
-	if (owed === undefined) return;
-	if (owed <= 1) pending.delete(topic);
-	else pending.set(topic, owed - 1);
-}
-
-/**
- * The topics still owed a teardown, for the close hook's snapshot.
- *
- * These are handed to the `close` hook IN ADDITION to what the connection still
- * held, so teardown is at-least-once: a hook that was mid-await when the socket
- * died can complete AND have its topic named to the close hook. An app's
- * teardown therefore has to be idempotent, which is documented - the
- * alternative is dropping the release whenever the two race, which is the leak
- * this record exists to close.
- *
- * @param {any} ud
- * @returns {Iterable<string>}
- */
-export function pendingReleaseTopics(ud) {
-	return ud?.[WS_PENDING_RELEASES]?.keys() ?? EMPTY_SUBSCRIPTIONS;
-}
-
-/**
- * Drop the pending-release record once the close hook has been handed it.
- *
- * @param {any} ud
- */
-export function clearPendingReleases(ud) {
-	if (ud) ud[WS_PENDING_RELEASES] = undefined;
-}
 
 /**
  * Control-frame bytes a connection may be sent per window.
@@ -1125,9 +1087,9 @@ export function clearPendingReleases(ud) {
 export const MAX_CONTROL_EGRESS_BYTES = 4 * 1024 * 1024;
 
 /** Window over which the budget above is measured. */
-const CONTROL_EGRESS_WINDOW_MS = 10_000;
+export const CONTROL_EGRESS_WINDOW_MS = 10_000;
 
-const WS_CONTROL_BUDGET = Symbol('controlBudget');
+const WS_CONTROL_BUDGET = Symbol.for('adapter-uws.ws.control-budget');
 
 /**
  * Charge control-frame bytes to a connection's budget.
@@ -1160,64 +1122,6 @@ export function chargeControlEgress(ws, bytes) {
 	return budget(bytes);
 }
 
-/**
- * @param {any} ws
- * @returns {boolean} false when this connection already has too many gates open
- */
-export function hasGateHeadroom(ws) {
-	let ud;
-	try {
-		ud = ws.getUserData();
-	} catch {
-		return false;
-	}
-	return (ud[WS_GATES] ?? 0) < MAX_CONCURRENT_GATES;
-}
-
-/**
- * Run `fn` counted as one in-flight gate on this connection.
- *
- * @template T
- * @param {any} ws
- * @param {() => Promise<T>} fn
- * @returns {Promise<T>}
- */
-export async function withGateCounted(ws, fn) {
-	let ud;
-	try {
-		ud = ws.getUserData();
-	} catch {
-		// No connection to charge it to; the call still has to happen so the
-		// caller gets a verdict rather than a crash.
-		return fn();
-	}
-	ud[WS_GATES] = (ud[WS_GATES] ?? 0) + 1;
-	try {
-		return await fn();
-	} finally {
-		ud[WS_GATES]--;
-		if (ud[WS_GATES] < 0) ud[WS_GATES] = 0;
-	}
-}
-
-/**
- * @param {any} ud
- * @param {string} topic
- * @param {number} token
- * @returns {boolean} whether the subscription may still be installed
- */
-export function settlePendingSubscribe(ud, topic, token) {
-	return settlePending(ud[WS_PENDING_SUBSCRIBES], topic, token);
-}
-
-/**
- * @param {any} ud
- * @param {string} topic
- * @returns {boolean}
- */
-export function tombstonePendingSubscribe(ud, topic) {
-	return tombstonePending(ud[WS_PENDING_SUBSCRIBES], topic);
-}
 
 /**
  * Take an explicit (cluster-authoritative) seq for a publish, or throw when the
@@ -1237,38 +1141,8 @@ export function tombstonePendingSubscribe(ud, topic) {
  * @returns {number}
  * @throws {TypeError} when the seq cannot be represented on both wires
  */
-/**
- * Refuse a `seq` option that is none of the four spellings the lanes accept.
- * Named separately from stampExplicitSeq because the two say different things:
- * that one is about a number the wire cannot carry, this one about a value that
- * was never a seq option at all.
- *
- * @param {unknown} seqOption
- * @param {string} topic
- * @returns {never}
- * @throws {TypeError} always
- */
-function throwSeqOption(seqOption, topic) {
-	throw new TypeError(
-		`publish seq must be a number, true, false or null, received ${typeof seqOption === 'string' ? JSON.stringify(seqOption) : String(seqOption)} ` +
-		`(topic "${topic}"). A number is a cluster-authoritative seq, true draws the local ` +
-		'counter (as an absent option does), and false or null publish without a seq. A seq that ' +
-		'arrives as a string - from JSON, a Redis reply, a header, a form field - is the case this ' +
-		'refuses: drawing the counter for it would publish a value from a different sequence ' +
-		'space and leave the topic unmarked, so convert it with Number() at the boundary.'
-	);
-}
-
 export function stampExplicitSeq(seq, topic) {
-	if (isValidPublishSeq(seq)) return seq;
-	throw new TypeError(
-		`publish seq must be an integer >= 1, received ${String(seq)} (topic "${topic}"). ` +
-		'There is no upper bound - the frame varint carries any magnitude exactly - but 0 is ' +
-		'the binary frame\'s "no seq" sentinel so a stamped 0 vanishes for binary subscribers, ' +
-		'a negative seq parses back off the wire as a different number, and a fractional one is ' +
-		'truncated on the frame but not in the JSON envelope. The counter lane and every shipped ' +
-		'authority are 1-based; offset a 0-based source by 1.'
-	);
+	return explicitSeqValue(seq, topic);
 }
 
 /**
@@ -1304,7 +1178,19 @@ export function stampSeqValue(seqOption, topic) {
 	// two adapters, silently, on the call every app makes. `false` keeps
 	// meaning "no seq": that is the spelling an app uses to say so.
 	if (seqOption === false || seqOption === null) return null;
-	if (typeof seqOption === 'number') return stampExplicitSeq(seqOption, topic);
+	if (typeof seqOption === 'number') {
+		// Inlined from explicitSeqValue so the overwhelmingly common number
+		// spelling keeps its single call frame on the hot path. SAFE integer,
+		// because the wire carries a value faithfully only inside that range.
+		if (Number.isSafeInteger(seqOption) && seqOption >= 1) return seqOption;
+		// Cold: let the shared validator pick between the magnitude refusal and
+		// the spelling one, so the two lanes cannot word it differently.
+		return explicitSeqValue(seqOption, topic);
+	}
+	// The second spelling of the same authority, held to the same range, so a
+	// caller reading an offset out of a store that hands back BigInt does not
+	// convert at the call site - which is where the silent rounding happened.
+	if (typeof seqOption === 'bigint') return explicitSeqValue(seqOption, topic);
 	// Everything that is not one of the four legal spellings is a bug in the
 	// calling app, and the counter is the worst possible place to put it: a
 	// `{ seq: '742' }` read off a JSON column or a Redis reply was MEANT as the
@@ -1312,7 +1198,7 @@ export function stampSeqValue(seqOption, topic) {
 	// different sequence space, leaves the topic unmarked, and degrades resume
 	// dedup to nothing with no signal at all. The same misuse already throws
 	// when the number is one the wire cannot carry.
-	if (seqOption !== undefined && seqOption !== true) throwSeqOption(seqOption, topic);
+	if (seqOption !== undefined && seqOption !== true) throwInvalidSeq(seqOption, topic);
 	const current = topicSeqs.get(topic);
 	if (current !== undefined) {
 		// The stamp of an existing topic is the hottest primitive in the
@@ -1347,3 +1233,53 @@ export function stampSeqValue(seqOption, topic) {
 }
 
 let seqEvictionWarned = false;
+
+/**
+ * Every Symbol this adapter keeps on a connection's userData.
+ *
+ * The object an upgrade hook returns is copied into the connection's userData
+ * key by key, enumerable Symbol keys included - but never these. A hook that
+ * returns, or spreads, the userData of another connection
+ * (`{ ...other.getUserData(), tab }` copies own Symbols too) would otherwise
+ * hand the new connection that one's wire-id table, cohort set, capabilities,
+ * budgets and permit, and nothing would say so: frames under ids the client
+ * never learned, cohort references released twice, a permit given back that
+ * was never taken. `open` and the upgrade build these themselves.
+ */
+const CONNECTION_SLOTS = new Set([
+	WS_ATTRIBUTION,
+	WS_SUBSCRIPTIONS,
+	WS_PENDING_SUBSCRIBES,
+	WS_PENDING_SUBSCRIBES_TOTAL,
+	WS_PLATFORM,
+	WS_PUBLISH_GRANT,
+	WS_SESSION_ID,
+	WS_STATS,
+	WS_COALESCED,
+	WS_CAPS,
+	WS_INGRESS_BINDINGS,
+	WS_LEASE,
+	WS_TOPIC_IDS,
+	WS_WIRE_STATE,
+	WS_SHARED_COHORTS,
+	CARRY_REQUEST_ID,
+	WS_CONNECTION_PERMIT,
+	WS_CONTROL_BUDGET
+]);
+
+/**
+ * @param {symbol} key
+ * @returns {boolean} whether `key` is one of the adapter's own userData slots
+ */
+export function isConnectionSlot(key) {
+	return CONNECTION_SLOTS.has(key);
+}
+
+
+/** Declare transport-owned slots without invoking inherited application setters. */
+export function declareRuntimeConnectionSlots(userData) {
+	for (const key of CONNECTION_SLOTS) {
+		if (key === CARRY_REQUEST_ID) continue;
+		if (!Object.hasOwn(userData, key)) Object.defineProperty(userData, key, { value: undefined, writable: true, enumerable: true, configurable: true });
+	}
+}

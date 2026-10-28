@@ -39,6 +39,7 @@
  */
 
 import { mapSendResult, SEND_DROPPED, SEND_SUCCESS } from '../utils/send-result.js';
+import { NO_STATUS_CLOSE_CODE, closeFrameReason } from '../utils/close-frame.js';
 
 /**
  * @param {string | Uint8Array | ArrayBuffer} payload
@@ -70,88 +71,16 @@ export class WsClosedError extends Error {
 /** raw ServerWebSocket -> its one facade. Weak so a closed socket is collectable. */
 const facades = new WeakMap();
 
-let warnedCloseArgs = false;
-/** One-shot: it describes a static call shape, not a per-frame condition. */
-function warnCloseArgs() {
-	if (warnedCloseArgs) return;
-	warnedCloseArgs = true;
-	console.warn(
-		'[ws] ws.close(code, reason) was called. This socket is uWS-shaped, where close() is the\n' +
-		'  HARD cut (client sees 1006) and end(code, reason) is the graceful close. The arguments\n' +
-		'  have been honoured as a graceful close, which is what they mean; use end(code, reason)\n' +
-		'  to say so directly, or close() with no arguments for the hard cut.'
-	);
-}
-
-/** The close codes the runtime will put on the wire: 1000-1003, 1007-1014, 3000-4999. */
-const sendableCloseCode = (code) =>
-	Number.isInteger(code) &&
-	((code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) || (code >= 3000 && code <= 4999));
-
-const utf8 = new TextEncoder();
-const utf8back = new TextDecoder();
-
-let warnedUnsendableClose = false;
-
-/**
- * A (code, reason) pair the runtime will accept, from whatever the caller
- * passed. uWS puts any code and any reason on the wire, so hook code written
- * against it has never had these arguments checked. What an unchecked pair
- * does downstream depends on the runtime generation - measured: on Bun 1.3.14
- * a close(5000) reaches the client verbatim while a close(999) surfaces
- * client-side as a 1002 protocol error; on 1.4.0 both surface as 1002, the
- * runtime refusing to put them on the wire; and the documented direction of
- * travel is a spec-shaped close that THROWS on a code outside 1000-1003 /
- * 1007-1014 / 3000-4999 or a reason over 123 UTF-8 bytes - a throw that would
- * land in cleanup paths, the code least likely to be wrapped in a try. Every
- * one of those outcomes is worse than closing, so the pair is made sendable
- * here: a close must close, with the same clean result on every generation.
- *
- * An unsendable code becomes 1000, because the reason string is where an app
- * puts the part a human reads and 1000 is the only spelling that keeps it - a
- * no-code close cannot carry a reason. Said once out loud, so the app learns
- * its code never reaches clients. An oversize reason is cut at the last whole
- * code point that fits, since a split one would re-refuse the frame.
- *
- * @param {number | undefined} code
- * @param {string | undefined} reason
- * @returns {[] | [number] | [number, string]}
- */
-function sendableClose(code, reason) {
-	if (typeof reason === 'string' && reason.length * 4 > 123) {
-		const bytes = utf8.encode(reason);
-		if (bytes.length > 123) {
-			let cut = 123;
-			while (cut > 0 && (bytes[cut] & 0xc0) === 0x80) cut--;
-			reason = utf8back.decode(bytes.subarray(0, cut));
-		}
-	}
-	if (code === undefined) {
-		return typeof reason === 'string' && reason.length > 0 ? [1000, reason] : [];
-	}
-	if (!sendableCloseCode(code)) {
-		if (!warnedUnsendableClose) {
-			warnedUnsendableClose = true;
-			console.warn(
-				`[ws] a close was requested with code ${String(code)}, which the runtime refuses to put ` +
-				'on the wire (sendable: 1000-1003, 1007-1014, 3000-4999). The socket was closed with ' +
-				'1000 and the reason kept, so the close still happens - but clients never see this code.'
-			);
-		}
-		code = 1000;
-	}
-	return typeof reason === 'string' ? [code, reason] : [code];
-}
-
 /**
  * Wrap one raw Bun socket. Idempotent: calling this twice for the same socket
  * returns the same facade, which is what keeps identity stable across the
  * open/message/drain/close handlers.
  *
  * @param {any} raw - Bun ServerWebSocket
+ * @param {() => any} [getServer] - lazy native server access for publish
  * @returns {any} the facade
  */
-export function wsFacade(raw) {
+export function wsFacade(raw, getServer, getMetricHooks) {
 	const existing = facades.get(raw);
 	if (existing !== undefined) return existing;
 
@@ -169,6 +98,10 @@ export function wsFacade(raw) {
 	 * to identify the connection it is tearing down.
 	 */
 	let detached = false;
+
+	/** Set when end() closed with no code: the close handler reports 0 for it. */
+	let noStatusSent = false;
+	let hadMembership = (raw.subscriptions?.length ?? 0) > 0;
 
 	/**
 	 * @param {string} operation
@@ -248,9 +181,13 @@ export function wsFacade(raw) {
 			// truth, and in the unprobed backpressured-but-under-limit state a
 			// false drop self-heals where a false delivery would not.
 			if (result === 0 && isEmptyPayload(payload)) {
-				return raw.getBufferedAmount() === 0 ? SEND_SUCCESS : SEND_DROPPED;
+				const mapped = raw.getBufferedAmount() === 0 ? SEND_SUCCESS : SEND_DROPPED;
+				if (mapped === SEND_DROPPED) getMetricHooks?.()?.dropped(0);
+				return mapped;
 			}
-			return mapSendResult(result);
+			const mapped = mapSendResult(result);
+			if (mapped === SEND_DROPPED) getMetricHooks?.()?.dropped(typeof payload === 'string' ? Buffer.byteLength(payload) : payload.byteLength);
+			return mapped;
 		},
 
 		/**
@@ -261,17 +198,26 @@ export function wsFacade(raw) {
 		 * @param {string | Uint8Array | ArrayBuffer} payload
 		 * @param {boolean} [isBinary]
 		 * @param {boolean} [compress]
-		 * @returns {0 | 1 | 2}
+		 * @returns {boolean} whether the publication has an eligible recipient
 		 */
 		publish(topic, payload, isBinary, compress) {
 			assertOpen('publish');
-			// The zero-length discrimination send() applies has no analogue
-			// here: publish fans out to many sockets, so there is no single
-			// backlog to consult, and Bun's 0 already conflates "no
-			// subscribers" with "zero bytes". An empty publish therefore
-			// reports DROPPED - the conservative reading - rather than
-			// guessing at delivery.
-			return mapSendResult(raw.publish(topic, payload, compress));
+			if (!hadMembership) return false;
+			const result = raw.publish(topic, payload, compress);
+			if (result !== 0) return true;
+			if (getServer === undefined) return false;
+			const server = getServer();
+			const peers = server.subscriberCount(topic) - Number(raw.isSubscribed(topic));
+			if (peers <= 0) return false;
+			// Bun requires the publisher to hold a native membership. A socket
+			// that released every membership cannot receive a server broadcast; this fallback
+			// preserves exclusion without changing any subscriptions.
+			if (raw.subscriptions.length === 0) {
+				return server.publish(topic, payload, compress) !== 0 || isEmptyPayload(payload);
+			}
+			// Zero bytes can still be a published empty frame. As with uWS,
+			// true describes a publication, not delivery past backpressure.
+			return isEmptyPayload(payload);
 		},
 
 		/**
@@ -284,7 +230,9 @@ export function wsFacade(raw) {
 			// throw. The whole reason this facade exists; the closed check makes
 			// the runtime's choice of boolean unobservable.
 			assertOpen('subscribe');
-			return raw.subscribe(topic);
+			const subscribed = raw.subscribe(topic);
+			if (subscribed) hadMembership = true;
+			return subscribed;
 		},
 
 		/**
@@ -316,49 +264,50 @@ export function wsFacade(raw) {
 		},
 
 		/**
-		 * Graceful close with a code and reason, both of which reach the client
-		 * (probed: 4001/"probe-close" observed client-side). uWS spells this
-		 * `end`; Bun spells it `close`.
+		 * Close with a close frame the client reads. uWS spells this `end`;
+		 * Bun spells it `close`.
 		 *
-		 * Safe to call on an already-closed socket: closing twice is a no-op,
-		 * not an error, so cleanup paths do not need their own guard.
-		 *
-		 * The pair goes through {@link sendableClose} first: uWS puts any code
-		 * and any reason on the wire, so callers have never had these checked,
-		 * and a runtime that throws on an unsendable pair would turn an app's
-		 * cleanup call into a crash.
+		 * The pair goes through the close rule (utils/close-frame.js) FIRST,
+		 * whatever the socket's state: a code outside 1000-1003, 1007-1014 and
+		 * 3000-4999 throws a TypeError, as does a reason with no code or one
+		 * that is neither text nor UTF-8 bytes, and the connection stays open.
+		 * A reason over 123 UTF-8 bytes is cut at a character boundary. No code
+		 * at all sends a close frame with no status, which the peer reads as
+		 * 1005 (and the server's own close hook reads 0, as on uWS). Then, like
+		 * send and subscribe, it throws WsClosedError on a closed socket.
 		 *
 		 * @param {number} [code]
-		 * @param {string} [reason]
+		 * @param {string | ArrayBufferView | ArrayBuffer} [reason]
 		 */
 		end(code, reason) {
-			if (closed || raw.readyState !== OPEN) return;
-			raw.close(...sendableClose(code, reason));
+			const sent = closeFrameReason(code, reason);
+			assertOpen('end');
+			if (code === undefined) {
+				// The close handler runs inside raw.close, so the mark goes first.
+				noStatusSent = true;
+				try {
+					raw.close(NO_STATUS_CLOSE_CODE);
+				} catch {
+					// A runtime that refuses the reserved code still closes, with
+					// 1000 instead of an empty status; close-frame-check notices.
+					raw.close();
+				}
+			} else if (sent === undefined) raw.close(code);
+			else raw.close(code, sent);
 		},
 
 		/**
-		 * Hard cut with no close handshake - the client sees 1006. uWS spells
-		 * this `close`; Bun spells it `terminate`.
+		 * Drop the connection with no close frame - the client reads 1006 and
+		 * reconnects. uWS spells this `close`; Bun spells it `terminate`. Any
+		 * arguments are ignored, as on uWS: the graceful close with a code is
+		 * `end(code, reason)`.
 		 *
 		 * THE NAME CROSSES OVER, which is the trap: `end()` above is the
 		 * graceful close and this is the hard cut, the opposite way round from
-		 * Bun. So code written against Bun's own API - `ws.close(1000, 'bye')` -
-		 * arrives here meaning a graceful close with a code, and silently
-		 * dropping the arguments would turn every such call into a 1006 with no
-		 * diagnostic. They are therefore honoured as the graceful close the
-		 * caller plainly meant, with a one-shot note about the spelling; calling
-		 * it with NO arguments keeps the uWS meaning.
-		 *
-		 * @param {number} [code]
-		 * @param {string} [reason]
+		 * Bun's own API.
 		 */
-		close(code, reason) {
-			if (closed || raw.readyState !== OPEN) return;
-			if (code !== undefined) {
-				warnCloseArgs();
-				raw.close(...sendableClose(code, reason));
-				return;
-			}
+		close() {
+			assertOpen('close');
 			raw.terminate();
 		},
 
@@ -389,6 +338,16 @@ export function wsFacade(raw) {
 		 */
 		_markDetached() {
 			detached = true;
+		},
+
+		/**
+		 * Whether this side closed with end() and no code. uWS reports such a
+		 * close to the server's own close handler as 0 (the peer reads 1005),
+		 * and the close handler gives the hook the same.
+		 * @internal
+		 */
+		get _noStatusSent() {
+			return noStatusSent;
 		},
 
 		/** @returns {boolean} @internal test seam */

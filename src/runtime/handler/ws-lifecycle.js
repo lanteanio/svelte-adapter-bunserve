@@ -37,15 +37,15 @@ import { wsModule } from '../ws-handler-bridge.js';
  * @param {'init' | 'shutdown'} name
  * @returns {Promise<void>}
  */
-export async function runWsLifecycleHook(name) {
+export async function runWsLifecycleHook(name, context = {}) {
 	const hook = /** @type {any} */ (wsModule)[name];
 	if (typeof hook !== 'function') return;
 	if (name === 'init') {
-		await hook({ platform, workerData: null });
+		await hook.call(wsModule, { platform, workerData: null });
 		return;
 	}
 	try {
-		await hook({ platform });
+		await hook.call(wsModule, { platform, ...context });
 	} catch (err) {
 		console.error(`[ws] the ${name} hook threw; the shutdown continued:`, err);
 	}

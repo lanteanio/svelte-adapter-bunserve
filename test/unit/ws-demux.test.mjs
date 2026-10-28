@@ -13,10 +13,12 @@ globalThis.WS_PATH = '/ws';
 
 
 const { websocketHandlers } = await import('../../src/runtime/handler/ws.js');
-const { WS_SUBSCRIPTIONS, pendingReleaseTopics } = await import(
+const { WS_SUBSCRIPTIONS, WS_LEASE, wsCounters } = await import(
 	'../../src/runtime/handler/ws-state.js'
 );
 const { __setHooks } = await import('../helpers/ws-handler-stub.mjs');
+const { upgradeData } = await import('../helpers/upgrade-data.mjs');
+const { MAX_QUEUED_REQUESTS } = await import('../../src/runtime/utils/lease.js');
 
 /**
  * A stand-in for Bun's raw socket. `websocketHandlers` wraps it in the facade,
@@ -26,7 +28,7 @@ function rawSocket() {
 	const sent = [];
 	const subscribed = new Set();
 	return {
-		data: {},
+		data: upgradeData(),
 		sent,
 		subscribed,
 		ended: null,
@@ -85,20 +87,42 @@ function closeAndCapture(raw) {
 }
 const closeCapture = { hooks: {} };
 
+test('request-n reports a clamped backlog without changing grant eligibility', async () => {
+	const raw = openSocket({});
+	const previousPeak = wsCounters.leaseSaturationPeak;
+	try {
+		await send(raw, { type: 'request-n', queued: MAX_QUEUED_REQUESTS });
+		assert.equal(raw.data[WS_LEASE], undefined, 'no lease before capability negotiation');
+		await send(raw, { type: 'hello', caps: ['lease'] });
+		const grant = JSON.parse(raw.sent.at(-1));
+		for (const [queued, expected] of [
+			[MAX_QUEUED_REQUESTS / 2, 0.5], [MAX_QUEUED_REQUESTS * 100, 1],
+			[undefined, 0], [null, 0], [-1, 0], [1.5, 0], ['256', 0], [true, 0], [{}, 0]
+		]) {
+			wsCounters.leaseSaturationPeak = 0;
+			const before = raw.sent.length;
+			await send(raw, { type: 'request-n', n: 999999, queued });
+			assert.equal(raw.data[WS_LEASE].saturation, expected);
+			assert.equal(wsCounters.leaseSaturationPeak, expected);
+			assert.equal(raw.sent.length, before + 1, 'every negotiated request receives a grant');
+			assert.deepEqual(JSON.parse(raw.sent.at(-1)), grant, 'backlog and n cannot enlarge or deny the grant');
+		}
+		wsCounters.leaseSaturationPeak = 1;
+		await send(raw, { type: 'request-n', queued: 0 });
+		assert.equal(wsCounters.leaseSaturationPeak, 1, 'an empty report does not erase another peak');
+	} finally {
+		websocketHandlers.close(raw, 1000, '');
+		wsCounters.leaseSaturationPeak = previousPeak;
+	}
+});
+
 /** Install hooks and remember them so the close capture can keep them. */
 function withHooks(hooks) {
 	closeCapture.hooks = hooks;
 	__setHooks(hooks);
 }
 
-test('a release whose hook REJECTS is still owed, and the close hook is told', async () => {
-	// The distinction the dispatch exists to make. A hook that rejects ran the
-	// app's code but released nothing - an awaited roster delete against a
-	// backend that is down - so discharging its debt means the close hook is
-	// not told either and the entry leaks with no client involved. Settling on
-	// rejection as well as resolution is exactly the behaviour that reverting
-	// to a `finally` (or to callHook, which turns a rejection into a
-	// resolution) would restore, and this is what fails when it does.
+test('a rejecting release hook leaves membership removed at close', async () => {
 	const hooks = {
 		subscribe: () => null,
 		unsubscribe: () => Promise.reject(new Error('redis is down')),
@@ -110,26 +134,17 @@ test('a release whose hook REJECTS is still owed, and the close hook is told', a
 	await send(raw, { type: 'subscribe', topic: 'room:1' });
 	await settle();
 	assert.deepEqual([...raw.data[WS_SUBSCRIPTIONS]], ['room:1']);
-	// NATIVE membership too, not only the adapter's bookkeeping. Installing one
-	// without the other is invisible to every other assertion here: the acks,
-	// the batch answers, the release accounting and the close snapshot all stay
-	// correct while the client receives publishes for nothing.
 	assert.deepEqual([...raw.subscribed], ['room:1']);
 
 	await send(raw, { type: 'unsubscribe', topic: 'room:1' });
 	await settle();
 	assert.deepEqual([...raw.subscribed], [], 'the release reaches the socket, not just the set');
-	// The release itself happened, so the topic is out of the live set...
 	assert.deepEqual([...raw.data[WS_SUBSCRIPTIONS]], []);
-	// ...but the teardown was never performed, so it is still owed.
-	assert.deepEqual([...pendingReleaseTopics(raw.data)], ['room:1']);
 
-	assert.deepEqual(closeAndCapture(raw), ['room:1']);
+	assert.deepEqual(closeAndCapture(raw), []);
 });
 
-test('a release whose hook throws synchronously is still owed', async () => {
-	// Same requirement on the other throw path: a hook that throws before its
-	// first await released nothing either.
+test('a throwing release hook leaves membership removed at close', async () => {
 	const hooks = {
 		subscribe: () => null,
 		unsubscribe: () => { throw new Error('the hook threw'); },
@@ -143,13 +158,10 @@ test('a release whose hook throws synchronously is still owed', async () => {
 	await send(raw, { type: 'unsubscribe', topic: 'room:1' });
 	await settle();
 
-	assert.deepEqual([...pendingReleaseTopics(raw.data)], ['room:1']);
-	assert.deepEqual(closeAndCapture(raw), ['room:1']);
+	assert.deepEqual(closeAndCapture(raw), []);
 });
 
 test('a release whose hook RESOLVES is discharged and not repeated at close', async () => {
-	// The other half: teardown the app already performed must not be handed to
-	// the close hook, or every ordinary release would be torn down twice.
 	const hooks = {
 		subscribe: () => null,
 		unsubscribe: () => Promise.resolve(),
@@ -163,15 +175,10 @@ test('a release whose hook RESOLVES is discharged and not repeated at close', as
 	await send(raw, { type: 'unsubscribe', topic: 'room:1' });
 	await settle();
 
-	assert.deepEqual([...pendingReleaseTopics(raw.data)], []);
 	assert.deepEqual(closeAndCapture(raw), []);
 });
 
 test('a speculative release is never recorded', async () => {
-	// A topic this connection never held costs a client nothing to invent, so
-	// recording those is how the record becomes a memory amplifier: a client
-	// that never subscribes to anything could fill it to the ceiling and push
-	// every genuine release out.
 	const hooks = {
 		subscribe: () => null,
 		unsubscribe: () => Promise.reject(new Error('would be owed if recorded')),
@@ -185,21 +192,14 @@ test('a speculative release is never recorded', async () => {
 	}
 	await settle();
 
-	assert.deepEqual([...pendingReleaseTopics(raw.data)], []);
 	assert.deepEqual(closeAndCapture(raw), []);
 });
 
 test('an app with no unsubscribe hook cannot be flooded off its own releases', async () => {
-	// With no hook exported there is no app teardown to run, so a release must
-	// not occupy the deferral queue. Enqueuing a no-op per release let a client
-	// pipeline past the backlog and be closed 4429 over hooks that do not
-	// exist.
 	const hooks = { subscribe: () => null, close: () => {} };
 	withHooks(hooks);
 	const raw = openSocket(hooks);
 
-	// The topics have to be genuinely HELD, or the releases take the
-	// speculative lane, which yields with `refused` and never overflows.
 	const TOPICS = 1200;
 	for (let i = 0; i < TOPICS; i++) {
 		await send(raw, { type: 'subscribe', topic: `room:${i}` });
@@ -207,11 +207,6 @@ test('an app with no unsubscribe hook cannot be flooded off its own releases', a
 	await settle();
 	assert.equal(raw.data[WS_SUBSCRIPTIONS].size, TOPICS, 'the fixture must actually hold them');
 
-	// NOT awaited between frames: Bun does not await the message handler, so a
-	// client pipelines the whole burst into one read and every frame runs to
-	// its first suspension before any of them resume. Awaiting each frame here
-	// drains the microtask queue in between, the backlog never builds, and the
-	// bound is never reached - which is the shape that hid this.
 	const inflight = [];
 	for (let i = 0; i < TOPICS; i++) {
 		inflight.push(websocketHandlers.message(raw, JSON.stringify({
@@ -223,7 +218,6 @@ test('an app with no unsubscribe hook cannot be flooded off its own releases', a
 	await settle();
 
 	assert.equal(raw.ended, null, 'no hook to defer means nothing to overflow');
-	assert.deepEqual([...pendingReleaseTopics(raw.data)], []);
 });
 
 test('the demux answers a subscribe-batch per entry', async () => {
@@ -278,4 +272,97 @@ test('the demux answers a subscribe-batch per entry', async () => {
 
 	const held = answers.find((f) => f.topic === 'held:1');
 	assert.equal(held.type, 'subscribed', JSON.stringify(held));
+});
+
+
+test('oversized subscribe batch applies its prefix and denies only the overflow', async () => {
+ const raw = openSocket({ subscribe: () => null });
+ const topics = Array.from({ length: 257 }, (_, i) => `b:${i}`);
+ raw.sent.length = 0;
+ await send(raw, { type: 'subscribe-batch', topics, ref: 7 });
+ assert.equal(raw.subscribed.size, 256);
+ assert.equal(raw.subscribed.has('b:256'), false);
+ const frames = raw.sent.map(JSON.parse);
+ assert.equal(frames.filter(f => f.type === 'subscribed').length, 256);
+ assert.deepEqual(frames.find(f => f.reason === 'BATCH_OVERFLOW'), { type: 'subscribe-denied', topic: 'b:256', ref: 7, reason: 'BATCH_OVERFLOW' });
+ raw.readyState = 3;
+ websocketHandlers.close(raw, 1000, '');
+});
+
+
+test('held wire subscriptions consult changed application verdicts on both spellings', async () => {
+ let denial = null;
+ const seen = [];
+ const raw = openSocket({ subscribeBatch: (_ws, topics) => {
+  seen.push([...topics]);
+  return Object.fromEntries(topics.map(topic => [topic, denial]));
+ } });
+ await send(raw, { type: 'subscribe', topic: 'held', ref: 1 });
+ denial = 'FORBIDDEN';
+ await send(raw, { type: 'subscribe', topic: 'held', ref: 2 });
+ await send(raw, { type: 'subscribe-batch', topics: ['held'], ref: 3 });
+ const denied = raw.sent.map(JSON.parse).filter(f => f.type === 'subscribe-denied');
+ assert.deepEqual(denied.map(f => [f.ref, f.reason]), [[2, 'FORBIDDEN'], [3, 'FORBIDDEN']]);
+ assert.deepEqual(seen, [['held'], ['held'], ['held']]);
+ assert.equal(raw.subscribed.has('held'), true);
+ raw.readyState = 3;
+ websocketHandlers.close(raw, 1000, '');
+});
+
+test('batch fallback hooks start together and land in request order', async () => {
+	const release = new Map();
+	const entered = [];
+	const raw = openSocket({ subscribe: (_ws, topic) => {
+		entered.push(topic);
+		return new Promise((resolve) => release.set(topic, resolve));
+	} });
+	try {
+		const pending = send(raw, { type: 'subscribe-batch', topics: ['a', 'b', 'c'], ref: 1 });
+		assert.deepEqual(entered, ['a', 'b', 'c']);
+		release.get('c')(null);
+		release.get('b')('FORBIDDEN');
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(raw.subscribed.size, 0);
+		release.get('a')(null);
+		await pending;
+		assert.deepEqual([...raw.subscribed], ['a', 'c']);
+		const answers = raw.sent.map((frame) => JSON.parse(frame)).filter((frame) => frame.ref === 1);
+		assert.deepEqual(answers.map((frame) => [frame.topic, frame.type]), [['a', 'subscribed'], ['b', 'subscribe-denied'], ['c', 'subscribed']]);
+	} finally { websocketHandlers.close(raw, 1000, ''); }
+});
+
+test('batch fallback preserves per-attempt verdicts for duplicate topics', async () => {
+	let calls = 0;
+	const raw = openSocket({ subscribe: () => ++calls === 1 ? 'FIRST_DENIED' : null });
+	try {
+		await send(raw, { type: 'subscribe-batch', topics: ['room', 'room'], ref: 4 });
+		assert.equal(calls, 2);
+		const answers = raw.sent.map((frame) => JSON.parse(frame)).filter((frame) => frame.ref === 4);
+		assert.deepEqual(answers.map((frame) => frame.reason ?? frame.type), ['FIRST_DENIED', 'subscribed']);
+	} finally { websocketHandlers.close(raw, 1000, ''); }
+});
+
+
+test('transport metrics finish after async message failures and report one lifecycle', async () => {
+ const previous = wsCounters.transportMetricHooks;
+ const events = [];
+ let release;
+ const parked = new Promise(resolve => { release = resolve; });
+ wsCounters.transportMetricHooks = {
+  connectionOpen() { events.push('open'); },
+  connectionClose(ws, code) { events.push(['close', code]); },
+  messageStart(ws, message) { events.push(['start', message]); return failed => events.push(['done', failed]); }
+ };
+ const raw = openSocket({ message: async () => { await parked; throw new Error('contained'); } });
+ const original = console.error; console.error = () => {};
+ try {
+  const pending = websocketHandlers.message(raw, 'application');
+  await Promise.resolve();
+  assert.deepEqual(events, ['open', ['start', 'application']]);
+  release(); await pending;
+  assert.deepEqual(events.at(-1), ['done', true]);
+  assert.equal(raw.ended.code, 1011);
+  websocketHandlers.close(raw, 1011, '');
+  assert.deepEqual(events.at(-1), ['close', 1011]);
+ } finally { console.error = original; wsCounters.transportMetricHooks = previous; __setHooks({}); }
 });

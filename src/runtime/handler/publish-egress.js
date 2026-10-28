@@ -12,6 +12,7 @@
 // nothing reaches the native layer for a refused publish.
 
 import { processMonotonicNow } from '../runtime.js';
+import { assert } from '../utils/assertions.js';
 import { normalizeEgressOptions, createEgressAccount } from '../utils/egress-account.js';
 import { wsModule } from '../ws-handler-bridge.js';
 import { ws_options } from './config.js';
@@ -225,6 +226,15 @@ export function chargePublishEgress(topic, tenantId, messages, deliveries, envel
 	if (s === undefined) {
 		s = { m: 0, b: 0, d: 0 };
 		topicPublishStats.set(topic, s);
+	} else if (typeof s.m !== 'number' || typeof s.b !== 'number' || typeof s.d !== 'number') {
+		// The context is built on the failing branch only. Passed as an argument
+		// it is an object per publish to a known topic, which only the optimizing
+		// tiers can sink, for a check that passes.
+		assert(false, 'topic.stats-shape', {
+			messagesType: typeof s.m,
+			bytesType: typeof s.b,
+			deliveriesType: typeof s.d
+		});
 	}
 	s.m += messages;
 	s.b += envelopeLen;

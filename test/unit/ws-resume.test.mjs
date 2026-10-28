@@ -16,9 +16,7 @@ const { platform } = await import('../../src/runtime/handler/platform.js');
 const {
 	CONTROL_FLOOD_CLOSE_CODE,
 	MAX_BATCH_TOPICS,
-	RESUME_FAILED_FRAME,
-	RESUME_INCOMPLETE_CLOSE_CODE,
-	RESUME_RATE_LIMITED_FRAME
+	RESUME_INCOMPLETE_CLOSE_CODE
 } = await import('../../src/runtime/utils/control-frame.js');
 const {
 	MAX_CONTROL_EGRESS_BYTES,
@@ -42,6 +40,7 @@ const { captureResumeFrame, MAX_RESUME_BUFFERED_FRAMES } = await import(
 	'../../src/runtime/handler/ws-state.js'
 );
 const { __setHooks } = await import('../helpers/ws-handler-stub.mjs');
+const { upgradeData } = await import('../helpers/upgrade-data.mjs');
 const { SEND_DROPPED } = await import('../../src/runtime/utils/send-result.js');
 
 /**
@@ -110,7 +109,7 @@ function rawSocket() {
 	const closes = [];
 	const subscribed = new Set();
 	return {
-		data: {},
+		data: upgradeData(),
 		sent,
 		closes,
 		subscribed,
@@ -842,237 +841,54 @@ test('a denied gate never runs the resume hook', async () => {
 	cleanup(raw);
 });
 
-test('the standalone resume frame filters topics and acks', async () => {
-	let ctx = null;
-	const hooks = { resume: (ws, c) => { ctx = c; } };
-	const raw = openSocket(hooks);
-	await send(raw, {
-		type: 'resume',
-		sessionId: 'prev-session',
-		lastSeenSeqs: { room: 7, [BAD_TOPIC]: 1, __system: 2, other: 3 },
-		lastSeenEpochs: { room: 123 }
-	});
-	assert.ok(ctx, 'hook ran');
-	assert.deepEqual({ ...ctx.lastSeenSeqs }, { room: 7, other: 3 }, 'invalid and system topics filtered');
-	assert.equal(ctx.sessionId, 'prev-session');
-	assert.deepEqual({ ...ctx.lastSeenEpochs }, { room: 123 });
-	assert.ok(raw.sent.some((f) => f === '{"type":"resumed"}'), 'acked');
-	cleanup(raw);
-});
-
-test('a resume naming more topics than one frame may carry is refused whole', async () => {
-	// The gate beside this lane counts FRAMES, not topics, so one legal frame
-	// could open a backend read per topic it named. Refused WHOLE rather than
-	// truncated: a partial gap-fill still ends in `resumed`, and the client has
-	// no gap detection, so it would go live believing it had caught up.
-	let ran = false;
-	const raw = openSocket({ resume: () => { ran = true; } });
-	await send(raw, {
-		type: 'resume',
-		sessionId: 's',
-		lastSeenSeqs: manyTopics(MAX_BATCH_TOPICS + 1)
-	});
-	assert.equal(ran, false, 'the hook never ran');
-	const err = frames(raw).find((f) => f.type === 'error');
-	assert.ok(err, 'the client is told its frame did nothing');
-	assert.equal(err.code, 'RESUME_TOO_LARGE');
-	assert.equal(err.limit, MAX_BATCH_TOPICS);
-	assert.equal(err.size, MAX_BATCH_TOPICS + 1);
-	assert.ok(!raw.sent.some((f) => f === '{"type":"resumed"}'), 'and NOT told it resumed');
-	cleanup(raw);
-});
-
-test('a resume naming exactly the cap is accepted', async () => {
-	// The boundary in the safe direction: an off-by-one here refuses a frame a
-	// conforming client is entitled to send.
-	let ctx = null;
-	const raw = openSocket({ resume: (ws, c) => { ctx = c; } });
-	await send(raw, {
-		type: 'resume',
-		sessionId: 's',
-		lastSeenSeqs: manyTopics(MAX_BATCH_TOPICS)
-	});
-	assert.ok(ctx, 'hook ran');
-	assert.equal(Object.keys(ctx.lastSeenSeqs).length, MAX_BATCH_TOPICS);
-	assert.ok(raw.sent.some((f) => f === '{"type":"resumed"}'), 'acked');
-	cleanup(raw);
-});
-
-test('the epoch map is counted against the same cap', async () => {
-	// Both maps ride into the same hook, so bounding only the watermarks would
-	// leave the amplifier open through the map beside them.
-	let ran = false;
-	const raw = openSocket({ resume: () => { ran = true; } });
-	await send(raw, {
-		type: 'resume',
-		sessionId: 's',
-		lastSeenSeqs: { room: 1 },
-		lastSeenEpochs: manyTopics(MAX_BATCH_TOPICS + 1)
-	});
-	assert.equal(ran, false, 'the hook never ran');
-	const err = frames(raw).find((f) => f.type === 'error');
-	assert.ok(err && err.code === 'RESUME_TOO_LARGE', 'refused on the epoch map alone');
-	assert.equal(err.size, MAX_BATCH_TOPICS + 2, 'the union of 257 epochs and 1 disjoint watermark');
-	cleanup(raw);
-});
-
-test('a resume with an unusable session id is refused, not forwarded', async () => {
-	// The id is handed straight to the app's hook, which queries a backend with
-	// it. Refused rather than filtered: there is no resume to perform without
-	// one, so forwarding a value this lane could not vouch for is the whole risk.
-	for (const bad of ['x'.repeat(129), 'a' + String.fromCharCode(7) + 'b', '']) {
-		let ran = false;
-		const raw = openSocket({ resume: () => { ran = true; } });
-		await send(raw, { type: 'resume', sessionId: bad, lastSeenSeqs: { room: 1 } });
-		assert.equal(ran, false, `the hook never ran for a ${bad.length}-char id`);
-		const err = frames(raw).find((f) => f.type === 'error');
-		assert.ok(err && err.code === 'INVALID_SESSION_ID', 'refused with a code the client can gate on');
-		assert.ok(!raw.sent.some((f) => f === '{"type":"resumed"}'), 'and NOT told it resumed');
-		// Exact shape, which pins the non-echo property completely rather than
-		// searching for the value: this frame has no room to carry anything the
-		// client sent, so a refusal can never become a reflector.
-		assert.ok(
-			raw.sent.includes('{"type":"error","code":"INVALID_SESSION_ID"}'),
-			'the exact documented frame'
-		);
+test('standalone resume forwards every string session id and both complete maps', async () => {
+	const maps = {
+		lastSeenSeqs: { room: 1, '__realtime': 2, ['__proto__']: 3, [BAD_TOPIC]: 4 },
+		lastSeenEpochs: { room: 7, missing: 9, ['__proto__']: 4 }
+	};
+	for (const sessionId of ['', 's'.repeat(300), 'bad' + String.fromCharCode(0)]) {
+		let ctx;
+		const raw = openSocket({ resume: (_ws, value) => { ctx = value; } });
+		await send(raw, { type: 'resume', sessionId, ...maps });
+		assert.equal(ctx.sessionId, sessionId);
+		assert.deepEqual(ctx.lastSeenSeqs, maps.lastSeenSeqs);
+		assert.deepEqual(ctx.lastSeenEpochs, maps.lastSeenEpochs);
+		assert.deepEqual(raw.sent.filter((frame) => !frame.includes('welcome')), ['{"type":"resumed"}']);
 		cleanup(raw);
 	}
 });
 
-test('a session id at the cap still resumes', async () => {
-	let ctx = null;
-	const raw = openSocket({ resume: (ws, c) => { ctx = c; } });
-	const id = 'x'.repeat(128);
-	await send(raw, { type: 'resume', sessionId: id, lastSeenSeqs: { room: 1 } });
-	assert.ok(ctx && ctx.sessionId === id, 'the boundary value reaches the hook');
+test('standalone resume forwards maps larger than a subscribe batch without truncation', async () => {
+	let ctx;
+	const raw = openSocket({ resume: (_ws, value) => { ctx = value; } });
+	const lastSeenSeqs = Object.fromEntries(Array.from({ length: MAX_BATCH_TOPICS + 1 }, (_, i) => ['t' + i, i]));
+	const lastSeenEpochs = Object.fromEntries(Array.from({ length: MAX_BATCH_TOPICS + 1 }, (_, i) => ['e' + i, i]));
+	await send(raw, { type: 'resume', sessionId: 's', lastSeenSeqs, lastSeenEpochs });
+	assert.deepEqual(ctx.lastSeenSeqs, lastSeenSeqs);
+	assert.deepEqual(ctx.lastSeenEpochs, lastSeenEpochs);
+	assert.ok(raw.sent.includes('{"type":"resumed"}'));
 	cleanup(raw);
 });
 
-test('the resume lane keeps a non-ASCII topic the app can grant server-side', async () => {
-	// The wire SUBSCRIBE lane refuses these by default, but the wire is not the
-	// only way a connection acquires a topic: `platform.subscribe` is the
-	// documented server-side spelling and it trusts non-ASCII names past that
-	// bound on purpose. So holding resume to the wire lane's charset would drop
-	// a topic the app legitimately granted - and this lane's refusal is SILENT,
-	// because the topic just vanishes from the map the hook gap-fills from while
-	// `resumed` still tells the client to go live. Being stricter here
-	// manufactures the hole the resume machinery exists to prevent.
-	let ctx = null;
-	const raw = openSocket({ resume: (ws, c) => { ctx = c; } });
-	await send(raw, {
-		type: 'resume',
-		sessionId: 's',
-		lastSeenSeqs: { room: 1, [RTL_TOPIC]: 2 },
-		lastSeenEpochs: { [RTL_TOPIC]: 9 }
-	});
-	assert.ok(ctx, 'hook ran');
-	assert.deepEqual(
-		Object.keys(ctx.lastSeenSeqs).sort(),
-		['room', RTL_TOPIC].sort(),
-		'the server-grantable topic reached the hook'
-	);
-	assert.deepEqual(Object.keys(ctx.lastSeenEpochs), [RTL_TOPIC], 'through the epoch map too');
-	cleanup(raw);
-});
-
-test('the resume lane still drops what is always illegal', async () => {
-	// What the charset rule does NOT excuse. `__proto__` is a computed key here
-	// on purpose: written as a plain literal it sets the prototype instead of
-	// creating an own property, and the test would assert nothing.
-	let ctx = null;
-	const raw = openSocket({ resume: (ws, c) => { ctx = c; } });
-	await send(raw, {
-		type: 'resume',
-		sessionId: 's',
-		lastSeenSeqs: { room: 1, [BAD_TOPIC]: 2, __presence: 3, ['__proto__']: 4 }
-	});
-	assert.ok(ctx, 'hook ran');
-	assert.deepEqual(Object.keys(ctx.lastSeenSeqs), ['room'], 'quote, system and __proto__ all dropped');
-	assert.equal(Object.getPrototypeOf(ctx.lastSeenSeqs), null, 'and the map has no prototype to poison');
-	cleanup(raw);
-});
-
-test('the cap counts the union of both maps, not the larger of them', async () => {
-	// Two DISJOINT maps of the cap each look compliant one at a time while
-	// naming twice the cap between them, and both ride into the same hook.
-	let ran = false;
-	const raw = openSocket({ resume: () => { ran = true; } });
-	const seqs = {};
-	const epochs = {};
-	for (let i = 0; i < MAX_BATCH_TOPICS; i++) seqs['a:' + i] = i;
-	for (let i = 0; i < MAX_BATCH_TOPICS; i++) epochs['b:' + i] = i;
-	await send(raw, { type: 'resume', sessionId: 's', lastSeenSeqs: seqs, lastSeenEpochs: epochs });
-	assert.equal(ran, false, 'the hook never ran');
-	const err = frames(raw).find((f) => f.type === 'error');
-	assert.ok(err && err.code === 'RESUME_TOO_LARGE', 'refused on the union');
-	assert.equal(err.size, MAX_BATCH_TOPICS * 2, 'and the union is what is reported');
-	cleanup(raw);
-});
-
-test('a topic named in both maps is counted once', async () => {
-	// The union, not the sum. A client that holds the cap and sends a watermark
-	// AND an epoch for each of its topics is naming the cap, not twice it, and
-	// must not be refused for being thorough.
-	let ctx = null;
-	const raw = openSocket({ resume: (ws, c) => { ctx = c; } });
-	const seqs = manyTopics(MAX_BATCH_TOPICS);
-	await send(raw, {
-		type: 'resume',
-		sessionId: 's',
-		lastSeenSeqs: seqs,
-		lastSeenEpochs: { ...seqs }
-	});
-	assert.ok(ctx, 'accepted');
-	assert.equal(Object.keys(ctx.lastSeenSeqs).length, MAX_BATCH_TOPICS);
-	cleanup(raw);
-});
-
-test('an over-cap watermark map is refused even beside a small epoch map', async () => {
-	// Every other cap test loads exactly ONE map, which leaves "read only the
-	// epoch map when one is present" green. This is the case that kills it.
-	let ran = false;
-	const raw = openSocket({ resume: () => { ran = true; } });
-	await send(raw, {
-		type: 'resume',
-		sessionId: 's',
-		lastSeenSeqs: manyTopics(MAX_BATCH_TOPICS + 1),
-		lastSeenEpochs: { room: 1 }
-	});
-	assert.equal(ran, false, 'the hook never ran');
-	const err = frames(raw).find((f) => f.type === 'error');
-	assert.ok(err && err.code === 'RESUME_TOO_LARGE');
-	assert.equal(err.size, MAX_BATCH_TOPICS + 2, 'the union of 257 watermarks and 1 disjoint epoch');
-	cleanup(raw);
-});
-
-test('a lastSeenEpochs that is not an object reads as absent, not as empty', async () => {
-	// The hook distinguishes "no epoch known" (undefined) from "an epoch map
-	// that named nothing" ({}), so a shape that is not a plain object has to
-	// land on the former. An array is the one that would otherwise slip through
-	// as index keys.
-	for (const bad of [['a', 'b'], 'nope', 5, null]) {
-		let ctx = null;
-		const raw = openSocket({ resume: (ws, c) => { ctx = c; } });
-		await send(raw, {
-			type: 'resume',
-			sessionId: 's',
-			lastSeenSeqs: { room: 1 },
-			lastSeenEpochs: bad
-		});
-		assert.ok(ctx, 'hook ran');
-		assert.equal(ctx.lastSeenEpochs, undefined, `read as absent: ${JSON.stringify(bad)}`);
+test('standalone resume preserves array maps and treats non-object epochs as absent', async () => {
+	for (const epochs of [[1, 2], null, 'invalid', 3]) {
+		let ctx;
+		const raw = openSocket({ resume: (_ws, value) => { ctx = value; } });
+		await send(raw, { type: 'resume', sessionId: 's', lastSeenSeqs: [1, 2], lastSeenEpochs: epochs });
+		assert.deepEqual(ctx.lastSeenSeqs, [1, 2]);
+		assert.deepEqual(ctx.lastSeenEpochs, Array.isArray(epochs) ? epochs : undefined);
 		cleanup(raw);
 	}
 });
 
 test('a hookless resume still acks so the client can go live', async () => {
 	const raw = openSocket({});
-	await send(raw, { type: 'resume', sessionId: 's', lastSeenSeqs: { room: 1 } });
-	assert.ok(raw.sent.some((f) => f === '{"type":"resumed"}'));
+	await send(raw, { type: 'resume', sessionId: '', lastSeenSeqs: {} });
+	assert.ok(raw.sent.includes('{"type":"resumed"}'));
 	cleanup(raw);
 });
 
-test('the resume frame refuses only watermarks the wire cannot mean', async () => {
+test('standalone resume leaves watermark validation to the application', async () => {
 	let ctx = null;
 	const raw = openSocket({ resume: (ws, c) => { ctx = c; } });
 	await send(raw, {
@@ -1097,8 +913,8 @@ test('the resume frame refuses only watermarks the wire cannot mean', async () =
 	assert.ok(ctx, 'hook ran');
 	assert.deepEqual(
 		{ ...ctx.lastSeenSeqs },
-		{ good: 5, zero: 0, frac: 2.5, big: 1e308 },
-		'0 is "seen nothing yet"; only what the wire cannot mean is refused'
+		{ good: 5, zero: 0, bad: 'x', huge: null, obj: { n: 1 }, neg: -1, negFrac: -0.5, frac: 2.5, big: 1e308 },
+		'every JSON value reaches the application unchanged'
 	);
 	cleanup(raw);
 });
@@ -1115,44 +931,15 @@ test('an omitted epoch map reaches the hook as undefined, not an empty object', 
 	cleanup(raw);
 });
 
-test('both resume entry points hold the epoch to the same rule', async () => {
-	// A `resume` frame and a `subscribe` carrying `recover` feed the SAME hook
-	// argument. When the two lanes disagreed, identical client state produced
-	// two different gap-fill decisions depending on which frame carried it:
-	// recover took Number.isInteger (so -5 passed) and resume took
-	// Number.isFinite (so 2.5 passed).
+test('subscribe recovery validates epochs while standalone resume forwards them', async () => {
 	setServer({ publish: () => 0, subscriberCount: () => 0 });
 	const seen = [];
-	const raw = openSocket({
-		subscribe: () => null,
-		resume: (ws, c) => { seen.push(c.lastSeenEpochs); }
-	});
-	const epochs = [-5, 2.5];
-	for (let i = 0; i < epochs.length; i++) {
-		const epoch = epochs[i];
-		await send(raw, {
-			type: 'subscribe',
-			topic: 'room' + i,
-			ref: i + 1,
-			recover: { offset: 0, epoch }
-		});
-		await send(raw, {
-			type: 'resume',
-			sessionId: 's',
-			lastSeenSeqs: { room: 0 },
-			lastSeenEpochs: { room: epoch }
-		});
+	const raw = openSocket({ subscribe: () => null, resume: (_ws, ctx) => { seen.push(ctx.lastSeenEpochs); } });
+	for (const epoch of [-5, 2.5]) {
+		await send(raw, { type: 'subscribe', topic: 'room' + epoch, ref: 1, recover: { offset: 0, epoch } });
+		await send(raw, { type: 'resume', sessionId: 's', lastSeenSeqs: { room: 0 }, lastSeenEpochs: { room: epoch } });
 	}
-	assert.equal(seen.length, 4, 'both lanes ran the hook for both values');
-	// Asserted on the values themselves, not on a spread of them: `{ ...x }` is
-	// `{}` for undefined AND for an empty map, so spreading here would hide the
-	// very difference the test above declares hooks key on.
-	assert.equal(seen[0], undefined, 'recover refuses a negative epoch, reporting absence');
-	assert.notEqual(seen[1], undefined, 'resume sends a map, so the hook sees one');
-	assert.equal(Object.keys(seen[1]).length, 0, 'with the refused entry removed');
-	assert.equal(seen[2], undefined, 'recover refuses a fractional epoch');
-	assert.notEqual(seen[3], undefined);
-	assert.equal(Object.keys(seen[3]).length, 0, 'and so does resume');
+	assert.deepEqual(seen, [undefined, { room: -5 }, undefined, { room: 2.5 }]);
 	cleanup(raw);
 });
 
@@ -1178,89 +965,37 @@ test('a recover offset the wire cannot mean subscribes plainly', async () => {
 	cleanup(raw);
 });
 
-test('the epoch map is filtered exactly like the watermark map', async () => {
-	// It rides into the same hook, so it takes the same topic validation,
-	// system-topic guard, value check, and null prototype.
-	let ctx = null;
-	const raw = openSocket({ resume: (ws, c) => { ctx = c; } });
-	await send(raw, {
-		type: 'resume',
-		sessionId: 's',
-		lastSeenSeqs: { room: 1 },
-		lastSeenEpochs: { room: 7, __system: 9, [BAD_TOPIC]: 3, neg: -5, frac: 2.5, str: 'x' }
-	});
-	assert.ok(ctx, 'hook ran');
-	assert.deepEqual({ ...ctx.lastSeenEpochs }, { room: 7 }, 'only the valid topic and value survive');
-	assert.equal(
-		Object.getPrototypeOf(ctx.lastSeenEpochs),
-		null,
-		'null prototype, so a __proto__ key cannot reach the hook as inherited state'
-	);
+test('every pipelined standalone resume reaches the hook and is acknowledged', async () => {
+	let release;
+	const barrier = new Promise((resolve) => { release = resolve; });
+	let entered = 0;
+	const raw = openSocket({ resume: async () => { entered++; await barrier; } });
+	const pending = Array.from({ length: 80 }, (_, i) => send(raw, {
+		type: 'resume', sessionId: 's' + i, lastSeenSeqs: { room: i }
+	}));
+	assert.equal(entered, 80);
+	assert.equal(raw.sent.filter((f) => f === '{"type":"resumed"}').length, 0);
+	release();
+	await Promise.all(pending);
+	assert.equal(raw.sent.filter((f) => f === '{"type":"resumed"}').length, 80);
+	assert.equal(raw.sent.filter((f) => f.includes('RESUME_RATE_LIMITED')).length, 0);
 	cleanup(raw);
 });
 
-test('pipelined resume frames are bounded by the gate counter', async () => {
-	let inFlight = 0;
-	let peak = 0;
-	const raw = openSocket({
-		resume: async () => {
-			inFlight++;
-			if (inFlight > peak) peak = inFlight;
-			await tick();
-			inFlight--;
-		}
-	});
-	const sends = [];
-	for (let i = 0; i < 80; i++) {
-		sends.push(send(raw, { type: 'resume', sessionId: 's' + i, lastSeenSeqs: { room: i } }));
-	}
-	await Promise.all(sends);
-	// Deterministic, not scheduler-dependent: the fan-out loop below is
-	// synchronous and there is no await between entering the resume branch and
-	// the headroom test, so the counter is incremented by exactly the first 64
-	// frames. Asserting the exact split rather than "at least one" is what makes
-	// an off-by-one in the headroom check visible.
-	assert.equal(peak, 64, `concurrent resume hooks bounded, saw ${peak}`);
-	// The overflow is REFUSED, not acked. `resumed` is the only frame a resuming
-	// client keys on, and it has no gap detection, so acking a frame whose hook
-	// never ran would tell it that it caught up on history nobody read.
-	const acks = raw.sent.filter((f) => f === '{"type":"resumed"}');
-	const refused = raw.sent.filter((f) => f === RESUME_RATE_LIMITED_FRAME);
-	assert.equal(acks.length, 64, 'exactly the frames that got a gate slot were acked');
-	assert.equal(refused.length, 16, 'and every frame past it was refused');
-	assert.equal(acks.length + refused.length, 80, 'every frame answered exactly once');
-	cleanup(raw);
-});
-
-test('a resume hook that throws is answered RESUME_FAILED, never resumed', async () => {
-	// The hook did not finish, so how much of the window it covered is unknown,
-	// and `resumed` would claim coverage the app never delivered. A different
-	// code from saturation on purpose: retrying a hook that threw does not help,
-	// a cold resync does.
-	const realError = console.error;
+test('a failed standalone resume hook is contained and still acknowledged', async () => {
+	const saved = console.error;
 	console.error = () => {};
 	try {
-		for (const [label, resume] of [
-			['a synchronous throw', () => { throw new Error('backend down'); }],
-			['a rejected promise', async () => { throw new Error('backend down'); }]
-		]) {
+		for (const resume of [() => { throw new Error('backend down'); }, async () => { throw new Error('backend down'); }]) {
 			const raw = openSocket({ resume });
 			await send(raw, { type: 'resume', sessionId: 's', lastSeenSeqs: { room: 1 } });
-			assert.ok(!raw.sent.includes('{"type":"resumed"}'), `${label}: not acked`);
-			assert.ok(raw.sent.includes(RESUME_FAILED_FRAME), `${label}: refused instead`);
+			assert.deepEqual(raw.sent.filter((frame) => !frame.includes('welcome')), ['{"type":"resumed"}']);
 			cleanup(raw);
 		}
-	} finally {
-		console.error = realError;
-	}
+	} finally { console.error = saved; }
 });
 
-test('a hook that threw does not leak its gate slot', async () => {
-	// The counter is released in a `finally`, so a throwing hook returns its
-	// slot. This drives MORE throws than the gate is wide on purpose: leaking one
-	// slot per throw is invisible to a two-frame test, because 1 is still under
-	// the bound of 64. Sixty-five throws followed by a good one is what makes a
-	// one-slot leak fail.
+test('a resume hook can succeed after repeated failures', async () => {
 	const realError = console.error;
 	console.error = () => {};
 	try {
@@ -1277,9 +1012,9 @@ test('a hook that threw does not leak its gate slot', async () => {
 		}
 		assert.equal(ran, 65, 'every throwing resume still reached the hook');
 		assert.equal(
-			raw.sent.filter((f) => f === RESUME_RATE_LIMITED_FRAME).length,
+			raw.sent.filter((f) => f.includes('RESUME_RATE_LIMITED')).length,
 			0,
-			'no frame was refused, so not one slot stayed held'
+			'no follower-only resume refusal was sent'
 		);
 		boom = false;
 		await send(raw, { type: 'resume', sessionId: 's', lastSeenSeqs: { room: 99 } });
@@ -1364,7 +1099,7 @@ test('a recover hook that succeeds signals no truncation', async () => {
 	cleanup(raw);
 });
 
-test('pipelined recover subscribes are bounded by the gate counter', async () => {
+test('pipelined recover subscribes are bounded by pending attempts', async () => {
 	setServer({ publish: () => 0, subscriberCount: () => 0 });
 	let inFlight = 0;
 	let peak = 0;
@@ -1378,15 +1113,13 @@ test('pipelined recover subscribes are bounded by the gate counter', async () =>
 		}
 	};
 	const raw = openSocket(hooks);
-	// Far more pipelined recover frames than the per-connection gate bound
-	// (64). Without the bound each one opens a concurrent backend read plus a
-	// live-frame buffer.
+	// Recovery holds its pending attempt until the hook and landing settle.
 	const sends = [];
-	for (let i = 0; i < 80; i++) {
+	for (let i = 0; i < 4097; i++) {
 		sends.push(send(raw, { type: 'subscribe', topic: 'r:' + i, ref: i, recover: { offset: 0 } }));
 	}
 	await Promise.all(sends);
-	assert.ok(peak <= 64, `concurrent resume hooks bounded, saw ${peak}`);
+	assert.equal(peak, 4096);
 	const frames = raw.sent.filter((f) => typeof f === 'string').map((f) => JSON.parse(f));
 	const denied = frames.filter((f) => f.type === 'subscribe-denied' && f.reason === 'RATE_LIMITED');
 	assert.ok(denied.length >= 1, 'the overflow is refused, not silently serialized');
@@ -1443,7 +1176,7 @@ test('a batch-level seq that is not a seq option is refused before any entry', (
 	const entries = [{ data: { x: 1 } }, { data: { x: 2 } }];
 	assert.throws(
 		() => platform.publishWireBatch('room', 'moved', entries, statefulCodec(), { seq: '1234' }),
-		(err) => err instanceof TypeError && err.message.includes('publish seq must be a number'),
+		(err) => err instanceof TypeError && err.message.includes('publish seq must be a positive integer number or bigint'),
 		'threw naming the legal spellings'
 	);
 	flushResumeTopic(cap, 'room', 0);
@@ -1462,26 +1195,110 @@ test('an entry seq that is not a number is refused by position', () => {
 	maxAuthoritativeSeq.clear();
 });
 
-test('an entry seq of null defers to the batch, the way an absent one does', () => {
+test('an entry seq of null publishes that entry seq-less, overriding the batch', () => {
 	// What a nullable authority column reads as, per row: this row has no
-	// cluster seq of its own, not that the call was written wrong.
+	// cluster seq. Inheriting the batch's counter for it would mark the row
+	// with a value from another sequence space rather than leaving it unmarked
+	// as the column said. Every entry form but `undefined` is an OVERRIDE.
 	setServer({ publish: () => 0, subscriberCount: () => 0 });
 	const ws = collectingWs();
 	const cap = beginResumeCapture(['room'], ws);
 	platform.publishWireBatch(
 		'room',
 		'moved',
-		[{ data: { x: 1 }, seq: null }, { data: { x: 2 } }],
+		[{ data: { x: 1 }, seq: null }, { data: { x: 2 } }, { data: { x: 3 }, seq: false }],
 		statefulCodec()
 	);
 	flushResumeTopic(cap, 'room', 0);
-	assert.equal(ws.sent.length, 2, 'both entries went out');
-	assert.ok(ws.sent[0].includes('"seq":1'), 'drawing the counter, as the batch asked');
-	assert.ok(ws.sent[1].includes('"seq":2'));
+	assert.equal(ws.sent.length, 3, 'every entry went out');
+	assert.equal(ws.sent[0].includes('"seq"'), false, 'null is no-seq for that entry');
+	assert.ok(ws.sent[1].includes('"seq":1'), 'absent still inherits, and the counter starts at 1');
+	assert.equal(ws.sent[2].includes('"seq"'), false, 'false says the same thing as null');
 	assert.equal(
 		maxAuthoritativeSeq.get('room'),
 		undefined,
 		'and a counter seq marks nothing'
 	);
 	maxAuthoritativeSeq.clear();
+});
+
+test('an entry seq of true draws the counter for that entry alone', () => {
+	// The mirror override: a batch publishing seq-less can still give one entry
+	// the counter, which is the shape a mixed tick takes.
+	setServer({ publish: () => 0, subscriberCount: () => 0 });
+	const ws = collectingWs();
+	const cap = beginResumeCapture(['room'], ws);
+	platform.publishWireBatch(
+		'room',
+		'moved',
+		[{ data: { x: 1 } }, { data: { x: 2 }, seq: true }],
+		statefulCodec(),
+		{ seq: false }
+	);
+	flushResumeTopic(cap, 'room', 0);
+	assert.equal(ws.sent[0].includes('"seq"'), false, 'the batch asked for no seq');
+	assert.ok(ws.sent[1].includes('"seq":1'), 'and this entry overrode it with the counter');
+	assert.equal(maxAuthoritativeSeq.get('room'), undefined, 'a counter draw marks nothing');
+	maxAuthoritativeSeq.clear();
+});
+
+
+test('subscribe batch recovers all allowed topics in one call before their acks', async () => {
+	setServer({ publish: () => 0, subscriberCount: () => 0 });
+	const calls = [];
+	const raw = openSocket({
+		subscribeBatch: () => ({ denied: 'FORBIDDEN' }),
+		resume: async (_ws, ctx) => {
+			calls.push(ctx);
+			platform.publish('a', 'live', 1, { seq: 2 });
+			platform.publish('b', 'live', 2, { seq: 3 });
+			await new Promise(resolve => setImmediate(resolve));
+			return { a: 1, b: 2 };
+		}
+	});
+	await send(raw, { type: 'subscribe-batch', topics: ['a', 'b', 'denied'], ref: 41,
+		recover: { a: { offset: 1, epoch: 7 }, b: { offset: 2, epoch: 'bad' }, denied: { offset: 0 } } });
+	assert.equal(calls.length, 1);
+	assert.deepEqual({ ...calls[0].lastSeenSeqs }, { a: 1, b: 2 });
+	assert.deepEqual({ ...calls[0].lastSeenEpochs }, { a: 7 });
+	assert.equal(Object.getPrototypeOf(calls[0].lastSeenSeqs), Object.prototype);
+	assert.equal(Object.getPrototypeOf(calls[0].lastSeenEpochs), Object.prototype);
+	assert.equal(calls[0].lastSeenSeqs.hasOwnProperty('a'), true);
+	assert.equal(calls[0].lastSeenEpochs.hasOwnProperty('a'), true);
+	const out = frames(raw);
+	for (const topic of ['a', 'b']) {
+		assert.ok(out.findIndex(f => f.topic === topic && f.event === 'live') < out.findIndex(f => f.topic === topic && f.type === 'subscribed'));
+	}
+	assert.equal(out.find(f => f.topic === 'denied').reason, 'FORBIDDEN');
+	assert.equal(resumeBuffers.size, 0);
+	cleanup(raw);
+});
+
+test('batch recover without a ref refuses history named outside its topics before any hook', async () => {
+	let called = 0;
+	const raw = openSocket({ subscribe: () => { called++; }, resume: () => { called++; } });
+	await send(raw, { type: 'subscribe-batch', topics: ['a'], recover: { outside: { offset: 0 } } });
+	assert.equal(called, 0);
+	assert.deepEqual(frames(raw).at(-1), { type: 'error', code: 'RECOVER_REQUIRES_REF', topic: null });
+	await send(raw, { type: 'subscribe-batch', topics: ['a'], recover: { a: { offset: 'bad' } } });
+	assert.equal(called, 1);
+	cleanup(raw);
+});
+
+test('batch recovery rechecks revocation after authorization and never serves denied history', async () => {
+	let resumed = false;
+	const raw = openSocket({ subscribeBatch: (ws) => { platform.unsubscribe(ws, 'revoked'); return {}; },
+		resume: () => { resumed = true; } });
+	await send(raw, { type: 'subscribe-batch', topics: ['revoked'], ref: 3, recover: { revoked: { offset: 0 } } });
+	assert.equal(resumed, false);
+	assert.equal(frames(raw).at(-1).reason, 'FORBIDDEN');
+	assert.equal(resumeBuffers.size, 0);
+	cleanup(raw);
+});
+
+test('batch recovery discards every capture if the socket closes inside resume', async () => {
+	const raw = openSocket({ subscribe: () => null, resume: () => { raw.readyState = 3; } });
+	await send(raw, { type: 'subscribe-batch', topics: ['a', 'b'], ref: 4, recover: { a: { offset: 0 }, b: { offset: 0 } } });
+	assert.equal(resumeBuffers.size, 0);
+	cleanup(raw);
 });

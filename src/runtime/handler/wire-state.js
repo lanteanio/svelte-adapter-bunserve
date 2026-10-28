@@ -11,9 +11,8 @@
  */
 
 import { allocWireId, retireWireId, wireIdAnnounce } from '../utils/wire.js';
-import { SEND_DROPPED } from '../utils/send-result.js';
-import { WS_TOPIC_IDS, WS_WIRE_STATE, wsCounters } from './ws-state.js';
-import { bumpOut } from './ws-stats.js';
+import { WS_TOPIC_IDS, WS_WIRE_STATE } from './ws-state.js';
+import { sendControl, CONTROL_DELIVERED } from './control-egress.js';
 
 /**
  * Resolve (allocating on first use) the per-connection binary topic-id for a
@@ -25,38 +24,29 @@ import { bumpOut } from './ws-stats.js';
  * Per-connection and reset on reconnect (a reconnect is a new connection with
  * fresh userData).
  *
- * Returns -1 when the announce frame itself was dropped by backpressure: the
- * client never learns the mapping, and the mapping is never re-announced, so
- * every later binary frame for this topic would be undecodable on this
- * connection. Callers must send the JSON envelope for the current frame and
- * poison the capability (see poisonWireState). A send result of 0 (enqueued
- * behind backpressure) still delivers in order and is success here; only a
- * drop is a drop.
+ * The announce is a control frame the client's subscribe bought, so it goes
+ * out through the budgeted control sender like every other one.
+ *
+ * Returns -1 when the announce did not reach the socket - refused past the
+ * backpressure limit, or the connection gone or just cut: the client never
+ * learns the mapping, so every later binary frame under it would be
+ * undecodable on this connection. Callers must send the JSON envelope for the
+ * current frame and poison the capability (see poisonWireState). A frame
+ * queued behind backpressure still delivers in order and is success here.
  *
  * @param {any} ws - the socket facade
  * @param {any} ud - the connection's userData
  * @param {string} topic
- * @returns {number} the topic id, or -1 when the announce was dropped
+ * @returns {number} the topic id, or -1 when the announce was not delivered
  */
 export function ensureWireId(ws, ud, topic) {
 	const { id, isNew } = allocWireId(ud, WS_TOPIC_IDS, topic);
-	if (isNew) {
-		const announce = wireIdAnnounce(topic, id);
-		let result;
-		try {
-			result = ws.send(announce, false, false);
-		} catch {
-			wsCounters.closedWsAborts++;
-			return id;
-		}
-		if (result === SEND_DROPPED) {
-			// The client never learned this id. Retire it so the next attempt
-			// - from ANY codec on this shared-per-topic id table - re-announces
-			// a fresh one rather than shipping a frame under an id nobody has.
-			retireWireId(ud, WS_TOPIC_IDS, topic);
-			return -1;
-		}
-		bumpOut(ws, announce);
+	if (isNew && sendControl(ws, wireIdAnnounce(topic, id)) !== CONTROL_DELIVERED) {
+		// The client never learned this id. Retire it so the next attempt
+		// - from ANY codec on this shared-per-topic id table - re-announces
+		// a fresh one rather than shipping a frame under an id nobody has.
+		retireWireId(ud, WS_TOPIC_IDS, topic);
+		return -1;
 	}
 	return id;
 }

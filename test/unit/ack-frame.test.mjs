@@ -3,18 +3,14 @@ import assert from 'node:assert/strict';
 import {
 	isEchoableRef,
 	subscribeDeniedFrame,
-	subscribedFrame,
-	unsubscribeDeniedFrame,
-	unsubscribedFrame
+	subscribedFrame
 } from '../../src/runtime/utils/ack-frame.js';
 
 /** Every ack the demux can emit, built with the same topic and ref. */
 function everyAck(topic, ref) {
 	return [
 		['subscribed', subscribedFrame(topic, ref, 7)],
-		['subscribe-denied', subscribeDeniedFrame(topic, ref, 'FORBIDDEN')],
-		['unsubscribed', unsubscribedFrame(topic, ref)],
-		['unsubscribe-denied', unsubscribeDeniedFrame(topic, ref, 'INVALID_TOPIC')]
+		['subscribe-denied', subscribeDeniedFrame(topic, ref, 'FORBIDDEN')]
 	];
 }
 

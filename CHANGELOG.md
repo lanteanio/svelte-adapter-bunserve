@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Realtime delivery preserves wire codecs, sequence and replay boundaries, hook containment and native send accounting across socket lifecycle transitions.
+
 - WebSocket upgrades validate request identity and handshake fields, preserve authorized response headers and enforce bounded admission before opening.
 
 - Connection slots share tracked membership across bundles; unsubscribe cleanup settles safely after membership removal and closing connections cannot regain subscriptions.

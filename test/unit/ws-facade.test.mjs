@@ -14,6 +14,7 @@ function fakeSocket(overrides = {}) {
 		data: { user: 'u1' },
 		readyState: 1,
 		calls,
+		get subscriptions() { return [...topics]; },
 		send(payload, compress) {
 			calls.push(['send', payload, compress]);
 			return this.readyState === 1 ? String(payload).length : 0;
@@ -164,22 +165,77 @@ test('end() closes gracefully with code and reason; close() cuts hard', () => {
 	assert.deepEqual(hard.calls, [['terminate']]);
 });
 
-test('closing twice is a no-op rather than an error', () => {
-	// Cleanup paths call end() without knowing whether close already fired.
+test('end() and close() on a closed socket throw, as every closed-socket call does', () => {
+	// uWS throws from any method on a closed socket, end and close included.
 	const raw = fakeSocket();
 	const ws = wsFacade(raw);
 	ws.end(1000, 'first');
-	assert.doesNotThrow(() => ws.end(1000, 'second'));
-	assert.doesNotThrow(() => ws.close());
+	assert.throws(() => ws.end(1000, 'second'), WsClosedError);
+	assert.throws(() => ws.close(), WsClosedError);
 	assert.deepEqual(raw.calls, [['close', 1000, 'first']]);
 });
 
-test('publish from a socket maps its result and refuses when closed', () => {
+test('the close rule runs before the closed check', () => {
+	// An unsendable pair is the caller's error whatever the socket's state.
 	const raw = fakeSocket();
 	const ws = wsFacade(raw);
-	assert.equal(ws.publish('room', 'hello'), 1);
+	ws.close();
+	assert.throws(() => ws.end(999), TypeError);
+	assert.throws(() => ws.end(1000), WsClosedError);
+});
+
+test('publish returns boolean admission and refuses when closed', () => {
+	const raw = fakeSocket();
+	const ws = wsFacade(raw);
+	ws.subscribe('other');
+	assert.equal(ws.publish('room', 'hello'), true);
+	raw.publish = () => -1;
+	assert.equal(ws.publish('room', 'hello'), true, 'buffered publication is accepted');
+	raw.publish = () => 0;
+	assert.equal(ws.publish('room', 'hello'), false, 'refused publication is false');
 	raw.readyState = 3;
 	assert.throws(() => ws.publish('room', 'hello'), WsClosedError);
+});
+
+test('empty publication excludes the sender when resolving zero-byte success', () => {
+	const raw = fakeSocket({ publish: () => 0 });
+	let count = 1;
+	const ws = wsFacade(raw, () => ({
+		subscriberCount: () => count,
+		publish() { assert.fail('an existing member uses the native socket publication'); }
+	}));
+	ws.subscribe('room');
+	for (const payload of ['', new Uint8Array(0), new ArrayBuffer(0)]) {
+		assert.equal(ws.publish('room', payload), false, 'sender alone is not a recipient');
+		count = 2;
+		assert.equal(ws.publish('room', payload), true, 'a peer can receive an empty frame');
+		count = 1;
+	}
+});
+
+test('a publisher that released its memberships broadcasts without changing subscriptions', () => {
+	const raw = fakeSocket({ publish: () => 0 });
+	const broadcasts = [];
+	let accepted = 5;
+	const ws = wsFacade(raw, () => ({
+		subscriberCount: () => 1,
+		publish(...args) { broadcasts.push(args); return accepted; }
+	}));
+	for (const payload of ['hello', '', new Uint8Array(0)]) assert.equal(ws.publish('room', payload), false);
+	assert.deepEqual(broadcasts, []);
+	ws.subscribe('other');
+	ws.unsubscribe('other');
+	raw.calls.length = 0;
+	assert.equal(ws.publish('room', 'hello', false, true), true);
+	assert.deepEqual(broadcasts, [['room', 'hello', true]]);
+	assert.deepEqual(raw.subscriptions, []);
+	assert.deepEqual(raw.calls, [], 'no temporary subscribe or unsubscribe');
+	accepted = 0;
+	assert.equal(ws.publish('room', 'hello'), false);
+	assert.equal(ws.publish('room', ''), true, 'empty broadcast remains a publication');
+	raw.readyState = 3;
+	assert.throws(() => ws.publish('room', 'hello'), WsClosedError);
+	assert.equal(broadcasts.length, 3, 'closed publication never reaches the server');
 });
 
 test('readyState and raw are exposed for code that needs the real socket', () => {
@@ -253,29 +309,15 @@ test('getUserData throws once the connection is detached', () => {
 	assert.deepEqual(ws._rawUserData(), { user: 'u1' });
 });
 
-test('an unsendable close code becomes 1000 with the reason kept, said once out loud', () => {
-	// uWS puts any code on the wire, so hook code has never had this argument
-	// checked; a runtime that refuses the code would turn an app's cleanup
-	// call into a crash in the one path least likely to be wrapped in a try.
-	// The reason is where the app put the part a human reads, and 1000 is the
-	// only spelling that keeps it - a no-code close cannot carry one.
-	const warned = [];
-	const realWarn = console.warn;
-	console.warn = (...args) => { warned.push(args.join(' ')); };
-	try {
-		for (const code of [999, 1006, 2999, 5000, 1000.5]) {
-			const raw = fakeSocket();
-			wsFacade(raw).end(code, 'maintenance');
-			assert.deepEqual(
-				raw.calls.at(-1),
-				['close', 1000, 'maintenance'],
-				`code ${code} is clamped and the reason survives`
-			);
-		}
-	} finally {
-		console.warn = realWarn;
+test('an unsendable close code throws a TypeError and leaves the connection open', () => {
+	// Bun would put 999 on the wire as it is, which a conforming peer answers
+	// by failing the connection; the rule refuses it before anything is sent.
+	for (const code of [999, 1004, 1005, 1006, 1015, 2999, 5000, 1000.5, '1000', null]) {
+		const raw = fakeSocket();
+		assert.throws(() => wsFacade(raw).end(code, 'maintenance'), TypeError, `code ${String(code)}`);
+		assert.deepEqual(raw.calls, [], `code ${String(code)}: nothing sent, the socket still open`);
+		assert.equal(raw.readyState, 1);
 	}
-	assert.equal(warned.filter((w) => /refuses to put/.test(w)).length, 1, 'one warning, not one per close');
 });
 
 test('every sendable close code passes through untouched', () => {
@@ -295,35 +337,88 @@ test('an oversize reason is cut at the last whole code point that fits', () => {
 	assert.equal(code, 4000);
 	assert.equal(new TextEncoder().encode(reason).length, 121, 'cut before the split code point, not through it');
 	assert.equal(reason, 'x' + '€'.repeat(40), 'what survives is a clean prefix');
-	assert.doesNotMatch(reason, /�/, 'and no replacement character was minted');
+	assert.doesNotMatch(reason, /\uFFFD/, 'and no replacement character was minted');
 
 	const ascii = fakeSocket();
 	wsFacade(ascii).end(4000, 'r'.repeat(200));
 	assert.equal(ascii.calls.at(-1)[2], 'r'.repeat(123), 'an ASCII reason cuts at exactly the byte limit');
 });
 
-test('a reason with no code is carried on 1000 rather than dropped', () => {
-	// A close frame cannot carry a reason without a code, and the reason is
-	// the half the caller plainly cared about.
+test('a reason with no code throws; no code at all closes with no status', () => {
+	// A close payload starts with its code, so a reason has nowhere to go
+	// without one.
 	const raw = fakeSocket();
-	wsFacade(raw).end(undefined, 'session rotated');
-	assert.deepEqual(raw.calls.at(-1), ['close', 1000, 'session rotated']);
+	assert.throws(() => wsFacade(raw).end(undefined, 'session rotated'), TypeError);
+	assert.deepEqual(raw.calls, []);
 
+	// Bun's close(1005) writes a close frame with an empty payload, which the
+	// peer reads as 1005; a bare close() would send 1000 instead.
 	const bare = fakeSocket();
 	wsFacade(bare).end();
-	assert.deepEqual(bare.calls.at(-1), ['close', undefined, undefined], 'no arguments stay no arguments');
+	assert.deepEqual(bare.calls.at(-1), ['close', 1005, undefined]);
+
+	const codeOnly = fakeSocket();
+	wsFacade(codeOnly).end(4001);
+	assert.deepEqual(codeOnly.calls.at(-1), ['close', 4001, undefined]);
 });
 
-test('the close(code, reason) spelling is sanitized the same way', () => {
+test('a reason in bytes goes out as the text it encodes, not as Bun would stringify it', () => {
+	// Bun stringifies a Uint8Array reason ("111,107"); the facade decodes it.
+	const raw = fakeSocket();
+	wsFacade(raw).end(4000, new TextEncoder().encode('räume'));
+	assert.deepEqual(raw.calls.at(-1), ['close', 4000, 'räume']);
+
+	const buffer = fakeSocket();
+	wsFacade(buffer).end(4000, new TextEncoder().encode('ok').buffer);
+	assert.deepEqual(buffer.calls.at(-1), ['close', 4000, 'ok']);
+
+	const invalid = fakeSocket();
+	assert.throws(() => wsFacade(invalid).end(4000, new Uint8Array([0xff, 0xfe])), TypeError);
+	assert.throws(() => wsFacade(invalid).end(4000, { text: 'no' }), TypeError);
+	assert.deepEqual(invalid.calls, []);
+});
+
+test('a lone surrogate in a reason goes out as U+FFFD', () => {
+	const raw = fakeSocket();
+	wsFacade(raw).end(1000, 'a' + String.fromCharCode(0xd800) + 'b');
+	assert.deepEqual(raw.calls.at(-1), ['close', 1000, 'a' + String.fromCharCode(0xfffd) + 'b']);
+});
+
+test('close() cuts hard and ignores any arguments, as on uWS', () => {
+	const warned = [];
 	const realWarn = console.warn;
-	console.warn = () => {};
+	console.warn = (...args) => warned.push(args.join(' '));
 	try {
 		const raw = fakeSocket();
-		wsFacade(raw).close(2999, 'y'.repeat(200));
-		const [, code, reason] = raw.calls.at(-1);
-		assert.equal(code, 1000);
-		assert.equal(reason, 'y'.repeat(123));
+		wsFacade(raw).close(1000, 'bye');
+		assert.deepEqual(raw.calls, [['terminate']]);
 	} finally {
 		console.warn = realWarn;
 	}
+	assert.deepEqual(warned, []);
+});
+
+test('a runtime that refuses close(1005) still closes, with a plain close', () => {
+	const raw = fakeSocket({
+		close(code, reason) {
+			if (code === 1005) throw new RangeError('reserved code');
+			this.calls.push(['close', code, reason]);
+			this.readyState = 3;
+		}
+	});
+	wsFacade(raw).end();
+	assert.deepEqual(raw.calls.at(-1), ['close', undefined, undefined]);
+});
+
+
+test('transport drop metrics count rejected UTF-8 bytes and exclude closed sends', () => {
+ const dropped = [];
+ const raw = fakeSocket({ send: () => 0, getBufferedAmount: () => 20 });
+ const socket = wsFacade(raw, undefined, () => ({ dropped: size => dropped.push(size) }));
+ assert.equal(socket.send('\u00e9'), 2);
+ assert.equal(socket.send(''), 2);
+ assert.deepEqual(dropped, [2, 0]);
+ raw.readyState = 3;
+ assert.throws(() => socket.send('later'), WsClosedError);
+ assert.deepEqual(dropped, [2, 0]);
 });

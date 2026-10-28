@@ -1,22 +1,6 @@
 /**
- * Validation for the two client-supplied resume quantities - the per-topic
- * watermark and the per-topic epoch - shared by BOTH lanes that feed them to
- * the app's `resume` hook: the `resume` frame's `lastSeenSeqs`/`lastSeenEpochs`
- * maps and the `subscribe` frame's `recover.offset`/`recover.epoch`.
- *
- * The two lanes hand the hook the SAME argument shape, so a value one lane
- * accepts and the other refuses makes the same client state produce two
- * different gap-fill decisions. They diverged once already - one lane tested
- * `Number.isFinite`, the other `Number.isInteger` - so the rules live here
- * rather than being restated per call site.
- *
- * Both rules are deliberately narrow. Refusing a value here does NOT clamp it:
- * it drops the topic from the map the hook gap-fills from, and the `resumed`
- * ack that follows still tells the client to switch to live. An over-strict
- * rule therefore MANUFACTURES the silent gap the resume barrier exists to
- * prevent. These check only what the wire itself cannot mean.
- *
- * Pure and dependency-free so the rules are unit-testable without a socket.
+ * Validation for subscribe recover offsets and epochs before the app resume hook.
+ * Resume frames forward their maps directly to the hook.
  */
 
 /**
@@ -58,41 +42,6 @@
  */
 export function isValidResumeSeq(v) {
 	return typeof v === 'number' && Number.isFinite(v) && v >= 0;
-}
-
-/**
- * A session id the client could legitimately be presenting: 1 to 128 characters
- * of printable ASCII, with no quote or backslash.
- *
- * The value is opaque to the adapter. Whatever issued the previous session
- * minted it, and this lane hands it straight to the app's resume hook, which
- * queries a backend with it - so the rules are the ones that hold whatever the
- * app does downstream: a length bound, so one frame cannot hand the app
- * kilobytes of lookup key, and the character scan the topic rule already
- * applies. 128 is generous against the server's own `crypto.randomUUID()`
- * at 36, and against every id scheme that reaches for a UUID, a nanoid, hex or
- * base64.
- *
- * Printable ASCII rather than "no control byte", because those are not the same
- * bound and only the first one closes the class that matters. Barring `< 32`
- * alone still admits DEL, the C1 block, the bidi overrides and the line
- * separators U+2028 / U+2029 - which `JSON.stringify` emits RAW - so a value
- * that survives the scan can still corrupt a log line or a rendered admin
- * table. It is also what makes the bound unambiguous: over printable ASCII a
- * character IS a byte, so this cannot be argued past with a multi-byte id the
- * way a UTF-16 length bound can (`ref` is capped in BYTES for exactly that
- * reason).
- *
- * @param {unknown} v
- * @returns {v is string}
- */
-export function isValidResumeSessionId(v) {
-	if (typeof v !== 'string' || v.length === 0 || v.length > 128) return false;
-	for (let i = 0; i < v.length; i++) {
-		const c = v.charCodeAt(i);
-		if (c < 32 || c > 126 || c === 34 || c === 92) return false;
-	}
-	return true;
 }
 
 /**

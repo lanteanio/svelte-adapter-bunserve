@@ -13,7 +13,7 @@ const { platform } = await import('../../src/runtime/handler/platform.js');
 const { configureEgress, egressGate, _resetEgressForSim } = await import(
 	'../../src/runtime/handler/publish-egress.js'
 );
-const { setServer, topicPublishStats, topicSeqs, wsCounters } = await import(
+const { setServer, topicPublishStats, topicSeqs, wsCounters, wsConnections } = await import(
 	'../../src/runtime/handler/ws-state.js'
 );
 
@@ -52,6 +52,51 @@ test('zero-config publishes are charged into the stats and window counters, neve
 		assert.equal(s.m, 1);
 		assert.equal(s.d, 4, 'deliveries ride the stats even with no ceiling armed');
 		assert.equal(wsCounters.egressDeliveriesWindow, 4);
+	} finally { restore(); }
+});
+
+test('every lane refuses data JSON has no form for, before anything reaches a socket', async () => {
+	// One builder serves them all, so one lane rebuilt with a raw
+	// JSON.stringify would send "data":undefined from that lane alone.
+	const { wsConnections } = await import('../../src/runtime/handler/ws-state.js');
+	try {
+		configureEgress(undefined, null);
+		const srv = fakeServer(1);
+		setServer(srv);
+		const frames = [];
+		const ws = { getUserData: () => ({}), send: (payload) => { frames.push(payload); return 1; } };
+		const wire = { capability: 'probe:1', schemaVersion: 1, encode: () => null };
+		// A stateful codec takes the batch lane's own envelope build; a
+		// stateless one is routed through publishWire per entry.
+		const stateful = { ...wire, state: { onAttach: () => ({}) } };
+		wsConnections.add(ws);
+		const lanes = {
+			publish: () => platform.publish('room', 'e', () => 1),
+			send: () => platform.send(ws, 'room', 'e', () => 1),
+			sendTo: () => platform.sendTo(() => true, 'room', 'e', () => 1),
+			sendWire: () => platform.sendWire(ws, 'room', 'e', () => 1, wire),
+			publishWire: () => platform.publishWire('room', 'e', () => 1, wire),
+			publishWireBatch: () => platform.publishWireBatch('room', 'e', [{ data: () => 1 }], wire),
+			'publishWireBatch, stateful codec': () => platform.publishWireBatch('room', 'e', [{ data: () => 1 }], stateful)
+		};
+		for (const [lane, call] of Object.entries(lanes)) {
+			assert.throws(call, TypeError, lane);
+		}
+		assert.equal(srv.published.length, 0, 'no topic frame');
+		assert.equal(frames.length, 0, 'no direct frame');
+		wsConnections.delete(ws);
+	} finally { restore(); }
+});
+
+test('a publish whose data has no JSON form throws to the caller and nothing is sent or charged', () => {
+	try {
+		configureEgress(undefined, null);
+		const srv = fakeServer(4);
+		setServer(srv);
+		assert.throws(() => platform.publish('room', 'tick', () => 1, { seq: true }), TypeError);
+		assert.throws(() => platform.publish('room', 'tick', Symbol('s')), TypeError);
+		assert.equal(srv.published.length, 0, 'no "data":undefined frame on the wire');
+		assert.equal(topicPublishStats.has('room'), false, 'nothing charged');
 	} finally { restore(); }
 });
 
@@ -169,5 +214,68 @@ test('the sim reset replays the configuration with fresh windows', () => {
 		restore();
 		// Leave the module unarmed for whatever runs after this file.
 		configureEgress(undefined, null);
+	}
+});
+
+function directedTarget(status) {
+	return { getUserData: () => ({}), frames: [], send(frame) {
+		if (status === 'throw') throw new Error('closed');
+		this.frames.push(frame);
+		return status;
+	} };
+}
+
+test('sendTo admits the full target set, then charges only non-throwing sends to the tenant', () => {
+	const targets = [directedTarget(1), directedTarget(2), directedTarget('throw')];
+	try {
+		configureEgress({ tenant: { deliveries: 4, bytes: 100000 } }, () => 'tenant');
+		setServer(fakeServer(0));
+		for (const ws of targets) wsConnections.add(ws);
+		const beforeDeliveries = wsCounters.egressDeliveriesWindow;
+		const beforeBytes = wsCounters.egressBytesWindow;
+		assert.equal(platform.sendTo(() => true, 'room', 'tick', 'Gr\u00f6\u00dfe'), 2);
+		assert.equal(wsCounters.egressDeliveriesWindow - beforeDeliveries, 2);
+		assert.equal(wsCounters.egressBytesWindow - beforeBytes, 2 * Buffer.byteLength(targets[0].frames[0]));
+		assert.equal(topicPublishStats.size, 0, 'direct sends do not charge publish-family stats');
+		wsConnections.delete(targets[2]);
+		assert.equal(platform.sendTo(() => true, 'other-room', 'tick', 'Gr\u00f6\u00dfe'), 2, 'only two deliveries spent the shared tenant window');
+		assert.equal(platform.sendTo(() => true, 'third-room', 'tick', 'Gr\u00f6\u00dfe'), 0, 'the tenant window is now spent');
+	} finally {
+		for (const ws of targets) wsConnections.delete(ws);
+		configureEgress(undefined, null);
+		restore();
+	}
+});
+
+test('sendTo refuses an oversized target set before any send or egress charge', () => {
+	const targets = [directedTarget(1), directedTarget(2), directedTarget('throw')];
+	try {
+		configureEgress({ tenant: { deliveries: 2 } }, () => 'tenant');
+		for (const ws of targets) wsConnections.add(ws);
+		const beforeDeliveries = wsCounters.egressDeliveriesWindow;
+		assert.equal(platform.sendTo(() => true, 'room', 'tick', 1), 0);
+		assert.equal(wsCounters.egressDeliveriesWindow, beforeDeliveries);
+		assert.ok(targets.every((ws) => ws.frames.length === 0));
+	} finally {
+		for (const ws of targets) wsConnections.delete(ws);
+		configureEgress(undefined, null);
+		restore();
+	}
+});
+
+test('reconnect advisory egress includes dropped frames and excludes throwing sends', () => {
+	const targets = [directedTarget(0), directedTarget(1), directedTarget(2), directedTarget('throw')];
+	try {
+		configureEgress({ topic: { bytes: 100000 } }, null);
+		for (const ws of targets) wsConnections.add(ws);
+		const beforeDeliveries = wsCounters.egressDeliveriesWindow;
+		const beforeBytes = wsCounters.egressBytesWindow;
+		assert.equal(platform.adviseReconnect({ windowMs: 100, close: false }), 3);
+		assert.equal(wsCounters.egressDeliveriesWindow - beforeDeliveries, 3);
+		assert.equal(wsCounters.egressBytesWindow - beforeBytes, 3 * Buffer.byteLength(targets[0].frames[0]));
+	} finally {
+		for (const ws of targets) wsConnections.delete(ws);
+		configureEgress(undefined, null);
+		restore();
 	}
 });

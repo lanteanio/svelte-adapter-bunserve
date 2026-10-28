@@ -4,15 +4,9 @@ import {
 	CONTROL_FLOOD_CLOSE_CODE,
 	CONTROL_FRAME_LIMIT,
 	MAX_BATCH_TOPICS,
-	batchTooLargeFrame,
-	controlFloodFrame,
 	controlFrameTooLargeFrame,
-	INVALID_SESSION_ID_FRAME,
-	RESUME_FAILED_FRAME,
-	RESUME_RATE_LIMITED_FRAME,
 	isConsumedControlType,
-	looksLikeControlFrame,
-	resumeTooLargeFrame
+	looksLikeControlFrame
 } from '../../src/runtime/utils/control-frame.js';
 
 test('the types the demux consumes are recognized', () => {
@@ -159,75 +153,12 @@ test('a pretty-printed control frame is recognised', () => {
 	assert.equal(isConsumedControlType(pretty), true);
 });
 
-test('the control-flood refusal carries the code the client gates on', () => {
-	// Same `code` key as the oversize refusal: the family client discards a
-	// frame whose `code` is not a string, so a differently-shaped refusal is
-	// one the developer never sees.
-	assert.deepEqual(JSON.parse(controlFloodFrame(4 * 1024 * 1024)), {
-		type: 'error',
-		code: 'CONTROL_FLOOD',
-		limit: 4 * 1024 * 1024
-	});
-	assert.ok(controlFloodFrame(1).startsWith('{"type":"'));
-});
-
-test('an oversized batch is refused with one frame that answers for no topic', () => {
-	// Deliberately NOT a subscribe-denied: a denial answers for one topic and
-	// the family client keys its denial store by topic name, so the two earlier
-	// attempts to say "the whole batch" in a denial shape - both carrying
-	// topic: null - were discarded without a trace. `code` is the field those
-	// clients gate on for frames that answer for no topic.
-	assert.deepEqual(JSON.parse(batchTooLargeFrame(4008)), {
-		type: 'error',
-		code: 'BATCH_TOO_LARGE',
-		limit: 256,
-		size: 4008
-	});
-	assert.ok(!batchTooLargeFrame(300).includes('"topic"'));
-	assert.ok(batchTooLargeFrame(300).startsWith('{"type":"'));
-});
-
 test('the batch limit stays under what the family clients chunk to', () => {
 	// They chunk at 200 topics and 8000 bytes explicitly to stay below this and
-	// the parse ceiling, so the refusal above is unreachable for them. Lowering
+	// the parse ceiling, so overflow is unreachable for them. Lowering
 	// this below 200 would start refusing ordinary reconnects.
 	assert.equal(MAX_BATCH_TOPICS, 256);
 	assert.ok(MAX_BATCH_TOPICS > 200);
-});
-
-test('the oversized-resume refusal answers for no topic, like its siblings', () => {
-	// Same property the batch refusal carries: a client keys its denial store by
-	// topic name, so a frame that answers for the WHOLE frame must not look like
-	// a per-topic denial. It reports the limit and what was actually named.
-	assert.deepEqual(JSON.parse(resumeTooLargeFrame(600)), {
-		type: 'error',
-		code: 'RESUME_TOO_LARGE',
-		limit: MAX_BATCH_TOPICS,
-		size: 600
-	});
-	assert.ok(!resumeTooLargeFrame(600).includes('"topic"'));
-	assert.ok(resumeTooLargeFrame(600).startsWith('{"type":"'));
-	// One cap for both lanes, so a client needs one chunking rule.
-	assert.ok(resumeTooLargeFrame(600).includes('"limit":256'));
-});
-
-test('the payload-free resume refusals answer for no topic and echo nothing', () => {
-	// Same contract as the builders above: an `error` carrying a `code`, which is
-	// the field a client gates on for frames that answer for no single topic.
-	for (const [name, frame] of [
-		['INVALID_SESSION_ID', INVALID_SESSION_ID_FRAME],
-		['RESUME_RATE_LIMITED', RESUME_RATE_LIMITED_FRAME],
-		['RESUME_FAILED', RESUME_FAILED_FRAME]
-	]) {
-		assert.deepEqual(JSON.parse(frame), { type: 'error', code: name }, name);
-		assert.ok(!frame.includes('"topic"'), `${name} answers for no topic`);
-		assert.ok(frame.startsWith('{"type":"'), `${name} puts type first`);
-	}
-	// Three distinct codes, because the client's move differs for each.
-	assert.equal(
-		new Set([INVALID_SESSION_ID_FRAME, RESUME_RATE_LIMITED_FRAME, RESUME_FAILED_FRAME]).size,
-		3
-	);
 });
 
 test('the control-flood cut is a throttle code, never a terminal one', () => {

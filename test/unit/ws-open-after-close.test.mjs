@@ -12,8 +12,8 @@ import assert from 'node:assert/strict';
 //
 // Announcing that connection to the app's `open` hook anyway is wrong in every
 // direction: `close` arrives before `open`, and the hook's first
-// `ws.getUserData()` throws, which the hook-error reporter then describes as
-// "the connection was left open".
+// `ws.getUserData()` throws, which the hook boundary then reports as a failed
+// open hook on a connection that never opened.
 
 globalThis.ENV_PREFIX = '';
 globalThis.WS_PATH = '/ws';
@@ -31,11 +31,12 @@ const { websocketHandlers } = await import('../../src/runtime/handler/ws.js');
 const { MAX_CONTROL_EGRESS_BYTES, chargeControlEgress, wsConnections } =
 	await import('../../src/runtime/handler/ws-state.js');
 const { __setHooks } = await import('../helpers/ws-handler-stub.mjs');
+const { upgradeData } = await import('../helpers/upgrade-data.mjs');
 
 /** The minimum of Bun's ServerWebSocket the open and close paths touch. */
 function rawSocket() {
 	const raw = {
-		data: {},
+		data: upgradeData(),
 		readyState: 1,
 		sent: [],
 		closedWith: null,
@@ -81,7 +82,7 @@ test('an open hook is not called for a connection the welcome frame already clos
 
 		assert.equal(raw.closedWith?.code, 4429, 'the welcome frame was refused and cut the socket');
 		assert.deepEqual(seen, ['close'], 'the app saw a close and no open');
-		assert.equal(errors.length, 0, 'and no hook-error line claiming the connection was left open');
+		assert.equal(errors.length, 0, 'and no open-hook error line for a connection that never opened');
 		assert.equal(wsConnections.size, 0, 'the registry is empty afterwards');
 	} finally {
 		console.error = realError;

@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { buildBinaryFrame } from '../../src/runtime/utils/wire.js';
 import assert from 'node:assert/strict';
 import {
 	EGRESS_ADMITTED,
@@ -194,10 +195,59 @@ test('the byte helpers price what the lanes send', () => {
 	assert.equal(envelopeWireBytes('abc', 3, false), 9, 'UTF-16 length when no bytes ceiling');
 	assert.equal(envelopeWireBytes('ä', 2, true), 4, 'exact UTF-8 bytes once one is armed');
 	assert.equal(envelopeWireBytes('abc', 0), 0, 'nobody receiving charges nothing');
-	assert.equal(binaryFrameChargeBytes(10, 0), 14, 'tag + version + id + 1-byte seq + payload');
-	assert.equal(binaryFrameChargeBytes(10, 128), 15, 'a wider seq varint is charged');
+	assert.equal(binaryFrameChargeBytes(10, 0, 1), 14, 'tag + version + id + 1-byte seq + payload');
+	assert.equal(binaryFrameChargeBytes(10, 128, 1), 15, 'a wider seq varint is charged');
+	// The topic id is a VARINT too. Counting it as a flat byte is right only
+	// while it stays under 128, so a shared wire id past the 127th shared topic
+	// paid less than it sent, on every frame, for as long as it lived.
+	assert.equal(binaryFrameChargeBytes(10, 0, 128), 15, 'and so is a wider topic-id varint');
+	assert.equal(binaryFrameChargeBytes(10, 128, 128), 16, 'both widen independently');
+	assert.equal(binaryFrameChargeBytes(10, 0, 16384), 16, 'three-byte id');
+	// Exactly what the encoder writes, checked against it rather than against
+	// arithmetic that could drift from it.
+	for (const [seq, id] of [[0, 1], [128, 1], [0, 128], [200000, 70000]]) {
+		assert.equal(
+			binaryFrameChargeBytes(4, seq, id),
+			buildBinaryFrame(1, id, seq, new Uint8Array(4)).length,
+			`charge matches the frame the encoder builds (seq=${seq} id=${id})`
+		);
+	}
 });
 
 test('EGRESS_ADMITTED is a symbol, so no client payload can carry it', () => {
 	assert.equal(typeof EGRESS_ADMITTED, 'symbol');
+});
+
+test('a refused decision leaves the ledger exactly as it found it', () => {
+	// The topic half of the decision used to run through the mutating window
+	// lookup, so it inserted a key - reclaiming and, at the cap, EVICTING
+	// another to make room - before the tenant half could refuse. A tenant
+	// already over its ceiling could then churn the topic ledger with fresh
+	// topic names and reset other topics' accounting on the way through.
+	const { account, evicted } = harness(
+		{ maxKeys: 1024, topic: { messages: 100 }, tenant: { messages: 1 } },
+		{ tenantOf: () => 'ten-1', memoize: false }
+	);
+	// Spend the tenant's whole allowance, so every later publish is refused by
+	// the tenant half after the topic half has already been consulted.
+	assert.equal(account.admit('t0', 'ten-1', 1, 0), true);
+	account.charge('t0', 'ten-1', 1, 0, 0);
+	assert.equal(account.admit('t0', 'ten-1', 1, 0), false, 'the tenant window is spent');
+
+	// Now drive far more refused publishes, each naming a fresh topic, than the
+	// ledger could hold. None of them may seat a key.
+	for (let i = 0; i < 4000; i++) {
+		assert.equal(account.admit('fresh' + i, 'ten-1', 1, 0), false, `refused at ${i}`);
+	}
+	assert.deepEqual(evicted, [], 'a refused publish evicted nothing');
+
+	// And the topic that DID spend still holds its charge: a refused decision
+	// must not have rotated its window and handed its allowance back.
+	const snapshot = account.snapshot ? account.snapshot() : null;
+	if (snapshot === null) {
+		// No introspection surface - assert behaviourally instead: t0 has spent
+		// 1 of 100 messages, so 99 more fit and the 100th does not.
+		assert.equal(account.admitTopic('t0', 99, 0), true, 'the earlier charge is still counted');
+		assert.equal(account.admitTopic('t0', 100, 0), false, 'and it is counted exactly once');
+	}
 });

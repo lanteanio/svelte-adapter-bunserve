@@ -10,23 +10,20 @@
 //   1. A full batch of ordinary topic names with a `ref`: the amplification a
 //      real client sees. Per-entry acks are what the family client needs, so
 //      this factor cannot be driven to 1 without breaking resume.
-//   2. The WORST-shaped legal batch - shortest possible entries, longest ref
-//      the adapter will echo. This is the number to quote a bound from; (1) is
-//      the best case, and quoting the best case as the measurement is exactly
-//      how the figures this file replaced were wrong.
+//   2. Short entries with a maximal ref, and a near-8-KiB frame padded with
+//      empty overflow entries. Both are legal amplification shapes.
 //   3. The same batch with no `ref`: the channel is silent, which is what makes
 //      the factor a property of asking for acks rather than of subscribing.
-//   4. A batch one entry past the limit, and a maximal frame packed entirely
-//      with entries past it: both must cost exactly ONE frame. That is the
-//      whole point of refusing an oversized batch whole - the reply must not
-//      scale with the inbound frame.
-//   5. A sustained run of (2): how much a socket can extract before the budget
-//      cuts it, and with which close code.
+//   4. A batch one entry past the limit: the first 256 entries install and
+//      every extra string entry receives its own BATCH_OVERFLOW denial.
+//   5. Sustained numeric-ref overflow: how much a socket can extract before
+//      the budget cuts it, and with which close code.
 //
 // Needs a built fixture: cd test/fixture && npm run build
 // Run: bun bench/control-egress.mjs
 
 import { fileURLToPath } from 'node:url';
+import { assertPortFree, serverEnv } from '../test/live/harness.mjs';
 
 const PORT = 8807;
 // fileURLToPath, not `pathname`: on POSIX the pathname is already absolute and
@@ -44,11 +41,10 @@ function batchFrame(topics, ref) {
 }
 
 /**
- * The worst-shaped LEGAL batch: every entry as short as a topic can be, so the
+ * A short-entry LEGAL batch: every entry as short as a topic can be, so the
  * per-frame overhead dominates, and the longest ref the adapter will echo, so
- * every answer carries it. This is the shape to quote a worst case from - a
- * batch of ordinary topic names is the best case, and quoting that as the
- * measurement is how the earlier numbers here were wrong.
+ * every answer carries it. Overflow frames are measured separately because
+ * they buy many more replies and can amplify further.
  */
 function adversarialBatch() {
 	const ref = 'r'.repeat(128);
@@ -56,14 +52,24 @@ function adversarialBatch() {
 	return { frame: batchFrame(topics, ref), entries: topics.length };
 }
 
-const proc = Bun.spawn(['bun', BUILD], {
-	env: { ...process.env, HOST: '127.0.0.1', PORT: String(PORT) },
+// The family's numeric-ref overflow shape. Maximal string refs amplify still
+// further; measure those separately instead of presenting this as a hard bound.
+function overflowBatch(ref = 1) {
+	const topics = Array.from({ length: MAX_BATCH_TOPICS }, (_, i) => String(i));
+	while (Buffer.byteLength(batchFrame([...topics, ''], ref)) < CONTROL_FRAME_LIMIT) topics.push('');
+	return { frame: batchFrame(topics, ref), entries: topics.length };
+}
+
+await assertPortFree(PORT);
+const proc = Bun.spawn([process.execPath, BUILD], {
+	env: serverEnv({ HOST: '127.0.0.1', PORT: String(PORT) }),
 	stdout: 'pipe',
 	stderr: 'pipe'
 });
 
 async function waitForServer() {
 	for (let i = 0; i < 100; i++) {
+		if (proc.exitCode !== null) throw new Error('fixture exited before startup');
 		try {
 			const res = await fetch(`http://127.0.0.1:${PORT}/healthz`);
 			if (res.ok) return true;
@@ -135,13 +141,13 @@ try {
 	const hostile = await openCounted();
 	hostile.send(worst.frame);
 	await settle(hostile.tally);
-	console.log('worst-shaped legal batch (256 one-char entries, 128-byte ref)');
+	console.log('short-entry batch (256 one-char entries, 128-byte ref)');
 	console.log(`  bytes in         ${hostile.tally.in}`);
 	console.log(`  bytes out        ${hostile.tally.out} in ${hostile.tally.frames} frames`);
 	console.log(`  amplification    ${(hostile.tally.out / hostile.tally.in).toFixed(1)}x`);
 	hostile.ws.close();
 
-	// --- one entry past the limit, refused whole ---------------------------
+	// --- one entry past the per-batch processing limit ---------------------
 	const over = batchFrame(
 		Array.from({ length: MAX_BATCH_TOPICS + 1 }, (_, i) => 'o' + i),
 		9
@@ -154,18 +160,17 @@ try {
 	console.log(`  bytes out        ${overflow.tally.out} in ${overflow.tally.frames} frames`);
 	overflow.ws.close();
 
-	// --- a frame packed with entries, all past the limit -------------------
-	// The shape the per-entry overflow answer turned into an 800KB reply. It
-	// must now cost exactly one frame no matter how many entries arrive.
-	const packed = [];
-	while (Buffer.byteLength(batchFrame(packed, 10)) < CONTROL_FRAME_LIMIT - 8) packed.push('0');
-	const flood = await openCounted();
-	flood.send(batchFrame(packed, 10));
-	await settle(flood.tally);
-	console.log(`a maximal frame of ${packed.length} entries, all past the limit`);
-	console.log(`  bytes in         ${flood.tally.in}`);
-	console.log(`  bytes out        ${flood.tally.out} in ${flood.tally.frames} frames`);
-	flood.ws.close();
+	for (const ref of [1, 'r'.repeat(128)]) {
+		const packed = overflowBatch(ref);
+		const flood = await openCounted();
+		flood.send(packed.frame);
+		await settle(flood.tally);
+		console.log(`near-8-KiB batch: ${packed.entries} entries, ${typeof ref === 'number' ? 'numeric' : '128-byte'} ref`);
+		console.log(`  bytes in         ${flood.tally.in}`);
+		console.log(`  bytes out        ${flood.tally.out} in ${flood.tally.frames} frames`);
+		console.log(`  amplification    ${(flood.tally.out / flood.tally.in).toFixed(1)}x`);
+		flood.ws.close();
+	}
 
 	// --- the same frame with no ref ----------------------------------------
 	const silent = await openCounted();
@@ -177,14 +182,13 @@ try {
 	silent.ws.close();
 
 	// --- sustained, until the budget cuts it -------------------------------
-	// The worst-shaped LEGAL frame, because that is what can still drive the
-	// channel: an oversized batch now costs one frame however it is packed, so
-	// sending those would measure the refusal, not the budget.
+	// Repeat the numeric-ref overflow frame until the per-connection ceiling.
 	const sustained = await openCounted();
+	const sustainedFrame = overflowBatch().frame;
 	const startedAt = performance.now();
 	let sent = 0;
 	for (let i = 0; i < 4000 && sustained.tally.closeCode === null; i++) {
-		sustained.send(adversarialBatch().frame);
+		sustained.send(sustainedFrame);
 		sent++;
 		// Yield so the reader can keep up; without it the send loop starves the
 		// event loop and nothing is counted until the end.
@@ -194,13 +198,14 @@ try {
 	const elapsed = (performance.now() - startedAt) / 1000;
 	console.log('sustained until the budget cuts the connection');
 	console.log(`  frames sent      ${sent}`);
-	console.log(`  bytes in         ${(sustained.tally.in / 1024 / 1024).toFixed(2)} MB`);
-	console.log(`  bytes out        ${(sustained.tally.out / 1024 / 1024).toFixed(2)} MB`);
+	console.log(`  bytes in         ${(sustained.tally.in / 1024 / 1024).toFixed(2)} MiB`);
+	console.log(`  bytes out        ${(sustained.tally.out / 1024 / 1024).toFixed(2)} MiB`);
 	// Harness-paced, NOT a server throughput figure: the send loop yields every
 	// eight frames so the reader can keep up. Quote the cut, not this.
-	console.log(`  egress rate      ${(sustained.tally.out / 1024 / 1024 / elapsed).toFixed(1)} MB/s (harness-paced)`);
+	console.log(`  egress rate      ${(sustained.tally.out / 1024 / 1024 / elapsed).toFixed(1)} MiB/s (harness-paced)`);
 	console.log(`  close code       ${sustained.tally.closeCode}`);
 	sustained.ws.close();
 } finally {
 	proc.kill();
+	await proc.exited;
 }
