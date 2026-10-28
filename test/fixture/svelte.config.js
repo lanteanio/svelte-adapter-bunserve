@@ -8,7 +8,8 @@
 // `npm install` here fail outright on any clone without that sibling three
 // levels up, which took the whole live test lane - the thing that defends the
 // wire contract - with it.
-import bunserve from 'svelte-adapter-bunserve';
+import bunserve from '../../src/index.js';
+import { websocketOptions } from './websocket-options.mjs';
 
 const which = process.env.ADAPTER || 'bunserve';
 
@@ -21,6 +22,7 @@ const admission = process.env.WS_ADMISSION === '1' || process.env.WS_ADMISSION =
 const upgradeTimeout = process.env.WS_UPGRADE_TIMEOUT === '1' || process.env.WS_UPGRADE_TIMEOUT === 'true';
 const rateLimit = process.env.WS_RATE_LIMIT === '1' || process.env.WS_RATE_LIMIT === 'true';
 const backpressure = process.env.WS_BACKPRESSURE === '1' || process.env.WS_BACKPRESSURE === 'true';
+const warmupHang = process.env.WARMUP_HANG === '1' || process.env.WARMUP_HANG === 'true';
 
 let adapter;
 if (which === 'bunserve' && dotfiles) {
@@ -29,11 +31,9 @@ if (which === 'bunserve' && dotfiles) {
 	// takes a second build of the same static/ tree with the option on.
 	adapter = bunserve({ out: 'build-dotfiles', staticDotfiles: true });
 } else if (which === 'bunserve' && noWs) {
-	// The no-handler regression build for test/live/no-ws-check.mjs:
-	// `websocket.handler` points at a file the fixture does not have. That is
-	// the same no-handler state as an app that never opted into the realtime
-	// tier, without touching src/ws-handler.js.
-	adapter = bunserve({ out: 'build-no-ws', websocket: { handler: 'src/no-ws-handler.js' } });
+	// Disable realtime explicitly even though src/hooks.ws.js exists and the
+	// Vite plugin is installed, as proved by test/live/no-ws-check.mjs.
+	adapter = bunserve({ out: 'build-no-ws', websocket: false });
 } else if (which === 'bunserve' && admission) {
 	// The admission build for test/live/admission-check.mjs. A ceiling of TWO,
 	// which is the whole point: the default is unlimited, so a gate regression
@@ -64,6 +64,16 @@ if (which === 'bunserve' && dotfiles) {
 			authPathRateLimitWindow: 10
 		}
 	});
+} else if (which === 'bunserve' && warmupHang) {
+	// The build for test/live/warmup-check.mjs. Its warmup points at a route
+	// whose body never ends, which is the one shape that could hang readiness:
+	// draining it would await forever, behind a render nobody is asking for.
+	// The warmup has to cancel the body instead and commit readiness anyway.
+	// Its own build - every other suite would pay that render at boot.
+	adapter = bunserve({
+		out: 'build-warmup-hang',
+		warmup: { paths: ['/warmup-hang'] }
+	});
 } else if (which === 'bunserve' && backpressure) {
 	// The build for test/live/resume-backpressure-check.mjs. A backpressure
 	// limit small enough that a resume flush can actually fill it, which is the
@@ -89,29 +99,19 @@ if (which === 'bunserve' && dotfiles) {
 		websocket: { upgradeTimeout: 0.3, upgradeAdmission: { maxConnections: 2 } }
 	});
 } else if (which === 'bunserve') {
-	// A deliberately small subscription cap so the live smoke tests can prove the
-	// bound actually holds. At the 10,000 default a cap regression is invisible:
-	// no test would ever reach it.
 	adapter = bunserve({
-		out: 'build',
+		out: process.env.FIXTURE_BASE_PATH ? 'build-base' : 'build',
+		envPrefix: process.env.FIXTURE_ENV_PREFIX || '',
+		staticCacheControl: [{ pattern: '/test.txt', cacheControl: 'public, max-age=600' }],
+		staticHeaders: {
+			'strict-transport-security': 'max-age=31536000',
+			'content-security-policy': "default-src 'self'",
+			'x-frame-options': 'DENY',
+			'referrer-policy': 'no-referrer'
+		},
 		websocket: {
-			// OFF. Every suite and the leak lane drive this build from one
-			// address - the leak lane at 50 rps for minutes - which is precisely
-			// the traffic shape the per-address limit exists to refuse. Left at
-			// its default the lane measures the limiter instead of memory: 240 of
-			// 250 warmup requests refused, a 98% error rate, and a verdict that
-			// cannot vouch for anything. A test harness on one machine is one
-			// client by this measure, which is a real property worth knowing
-			// rather than a quirk of the fixture. The limit gets its own build
-			// (WS_RATE_LIMIT) where it is the subject.
-			upgradeRateLimit: 0,
-			maxSubscriptionsPerConnection: 20,
-			// A NON-DEFAULT pressure block, so the live suite proves the whole
-			// round trip - normalize, serialize into the build, read back at
-			// boot, resolve into the sampler - and not just its two ends. The
-			// faster interval also lets that suite watch several real samples
-			// without sleeping for seconds.
-			pressure: { sampleIntervalMs: 200 }
+			...websocketOptions,
+			...(process.env.FIXTURE_ENV_PREFIX ? { upgradeRateLimit: 1, upgradeRateLimitWindow: 60 } : {})
 		}
 	});
 } else if (which === 'node') {
@@ -126,5 +126,5 @@ if (which === 'bunserve' && dotfiles) {
 }
 
 export default {
-	kit: { adapter }
+	kit: { adapter, paths: { base: process.env.FIXTURE_BASE_PATH || '' } }
 };

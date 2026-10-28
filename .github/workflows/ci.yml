@@ -21,6 +21,8 @@ jobs:
       # ERR_MODULE_NOT_FOUND and every later step is skipped.
       - name: Install the adapter's dependencies
         run: npm install --no-audit --no-fund
+      - name: Check the public platform inventory
+        run: npm run check:platform
       - name: Run the unit suite
         run: npm test
       # The determinism ratchet: every clock/rng/timer read under src/ goes
@@ -40,7 +42,7 @@ jobs:
       # with, and fails on any fingerprint drift. `adapter-single`'s entries are
       # fingerprint-identical to svelte-adapter-uws's corpus of the same name at
       # the parity pin (verified locally via
-      # `node scripts/sim-golden.js --corpus adapter-single --against <uws corpus>`,
+      # `node -C bunserve-sim --import ./test/helpers/test-env.mjs scripts/sim-golden.js --corpus adapter-single --against <uws corpus>`,
       # the same local-ritual shape as probe:uws); this job holds THIS repo to
       # that blessed baseline on every push. `adapter-admission` has no sibling
       # to compare against - it drives this adapter's upgrade ceiling, an app
@@ -53,15 +55,11 @@ jobs:
     name: Bun runtime gates (pinned Bun)
     runs-on: ubuntu-latest
     strategy:
-      # 1.3.14 is the engines floor; 1.4.0 is the first release of the
-      # Zig-to-Rust rewrite and runs as a SECOND lane, not a replacement. The
-      # floor moves only after the rewrite has had time in the wild with both
-      # lanes green.
-      # fail-fast off: a broken 1.4 lane must not cancel the floor lane's
-      # verdict, which is the one that decides whether main is releasable.
+      # The minimum runtime closes incomplete uploads after an early response.
+      # Keep the native transport assertion pinned alongside the runtime gates.
       fail-fast: false
       matrix:
-        bun-version: ['1.3.14', '1.4.0']
+        bun-version: ['1.4.4']
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -96,6 +94,11 @@ jobs:
       - name: Sim lane
         run: bun scripts/bun-test-lane.mjs sim
       - name: Golden corpora
+        # Test mode, as on the Node lane: a framework assertion inside a seed
+        # throws, and the simulator records it as a violation of the run even
+        # where a boundary contains the throw, so the fingerprint moves.
+        env:
+          NODE_ENV: test
         run: |
           bun --conditions=bunserve-sim scripts/sim-golden.js --corpus adapter-single
           bun --conditions=bunserve-sim scripts/sim-golden.js --corpus adapter-admission
@@ -124,13 +127,10 @@ jobs:
     name: Live wire contract (Bun on Linux)
     runs-on: ubuntu-latest
     strategy:
-      # Both generations, same suite: a new runtime implementation is exactly
-      # what a wire-contract lane exists to hold still. The floor stays 1.3.14.
-      # fail-fast off: a broken 1.4 lane must not cancel the floor lane's
-      # verdict, which is the one that decides whether main is releasable.
+      # Exercise the supported minimum against actual native transport behavior.
       fail-fast: false
       matrix:
-        bun-version: ['1.3.14', '1.4.0']
+        bun-version: ['1.4.4']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -162,20 +162,31 @@ jobs:
       # this job is the only thing that proves it.
       - name: Run the live lane
         run: npm run test:live
+      - name: Install body-budget fixture dependencies
+        working-directory: test/fixtures/body-budget
+        run: npm install --no-audit --no-fund
+      - name: Build body-budget fixture
+        working-directory: test/fixtures/body-budget
+        run: node node_modules/vite/bin/vite.js build
+      - name: Native request body budgets and incomplete-upload close
+        run: bun test/live/body-budget-check.mjs
+      - name: Public native server and wire contracts
+        run: npm run test:public-native
 
   leak:
     name: Standing leak gate (Bun on Linux)
     runs-on: ubuntu-latest
+    # The lane's own runner bounds the gate at its planned worst case, about
+    # 38 minutes at the default window, plus a 3-minute build bound; this sits
+    # far enough above that sum, and the installs before it, that a wedged run
+    # is killed by the runner - which reports WHY, with an exit code - and not
+    # by GitHub, which reports nothing.
+    timeout-minutes: 70
     strategy:
-      # The gates are ratio-based, so they survive 1.4's lower absolute
-      # baselines (Bun.serve idle memory dropped by roughly a third); what
-      # they watch for - a slope - is exactly what a rewritten runtime could
-      # reintroduce. The floor stays 1.3.14.
-      # fail-fast off: a broken 1.4 lane must not cancel the floor lane's
-      # verdict, which is the one that decides whether main is releasable.
+      # Keep retention and response-lifetime gates on the supported minimum.
       fail-fast: false
       matrix:
-        bun-version: ['1.3.14', '1.4.0']
+        bun-version: ['1.4.4']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -199,7 +210,23 @@ jobs:
       # minutes by design, because a memory trend needs a window to be fitted
       # over, and a gate that slow inside the dev loop is a gate people stop
       # running. It ends with a self-check that arms a deliberate leak and
-      # requires the verdict to fail, so a lane that has quietly stopped being
-      # able to fail reports that rather than passing.
+      # requires the growth gate to have detected it, so a lane that has
+      # quietly stopped being able to fail reports that rather than passing.
+      # Exit 1 is the server's problem, exit 2 the lane's (it could not
+      # measure); both fail the job.
+      # The rules first and separately. They run in milliseconds, and a lane
+      # whose verdict logic is broken cannot be trusted to report on anything -
+      # so it is better to learn that here than from a green window.
+      - name: Check the verdict rules
+        run: node -C bunserve-test --import ./test/helpers/test-env.mjs --test test/unit/leak-lane-rules.test.mjs test/unit/leak-detect.test.mjs test/unit/leak-knob.test.mjs test/unit/leak-cli.test.mjs
       - name: Run the leak lane
-        run: npm run test:leak
+        run: npm run test:leak -- --out "$RUNNER_TEMP/leak-lane"
+      # Uploaded whether the lane passed or failed: the sample series is the
+      # evidence either way, and a failing run is exactly when someone wants
+      # it. Named per Bun version so the two legs do not overwrite each other.
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leak-lane-record-bun-${{ matrix.bun-version }}
+          path: ${{ runner.temp }}/leak-lane
+          if-no-files-found: warn

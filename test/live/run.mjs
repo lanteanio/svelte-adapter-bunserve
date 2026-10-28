@@ -1,7 +1,7 @@
 // The live wire-contract lane. Runs the send-result suite (which boots its own
 // bare Bun.serve and needs no build), then builds the fixture, runs the
 // WebSocket suites against it, then builds the fixture's NO_WS variant and runs
-// the no-handler regression. Every suite boots its own server, so this asserts
+// the disabled-WebSocket regression. Every suite boots its own server, so this asserts
 // the contract end to end: a change to the demux in handler/ws.js that the unit
 // suite cannot see fails here.
 //
@@ -55,11 +55,18 @@ const buildEnv = {
 	WS_UPGRADE_TIMEOUT: '',
 	WS_RATE_LIMIT: '',
 	WS_BACKPRESSURE: '',
+	FIXTURE_ENV_PREFIX: '',
+	FIXTURE_BASE_PATH: '',
 	NODE_ENV: 'production'
 };
 
 // Independent of the fixture: it drives the real facade over its own server.
 await run('send-result-check', [process.execPath, suite('send-result-check.mjs')]);
+await run('coalesced-check', [process.execPath, suite('coalesced-check.mjs')]);
+await run('delivery-authorization-check', [process.execPath, suite('delivery-authorization-check.mjs')]);
+await run('unsubscribe-check', [process.execPath, suite('unsubscribe-check.mjs')]);
+await run('request-body-rejection-check', [process.execPath, suite('request-body-rejection-check.mjs')]);
+await run('response-stream-failure-check', [process.execPath, suite('response-stream-failure-check.mjs')]);
 
 const built = await run('build fixture', [process.execPath, 'run', 'build'], {
 	cwd: fixtureDir,
@@ -67,16 +74,47 @@ const built = await run('build fixture', [process.execPath, 'run', 'build'], {
 });
 if (built) {
 	await run('ws-smoke', [process.execPath, suite('ws-smoke.mjs')]);
+	await run('client-check', [process.execPath, suite('client-check.mjs')]);
+	await run('runtime-control-check', [process.execPath, suite('runtime-control-check.mjs')]);
+	await run('platform-contract-check', [process.execPath, suite('platform-contract-check.mjs')]);
 	await run('cap-check', [process.execPath, suite('cap-check.mjs')]);
 	await run('origin-check', [process.execPath, suite('origin-check.mjs')]);
 	await run('wire-check', [process.execPath, suite('wire-check.mjs')]);
 	await run('pressure-check', [process.execPath, suite('pressure-check.mjs')]);
+	await run('response-framing-check', [process.execPath, suite('response-framing-check.mjs')]);
+	await run('static-overflow-check', [process.execPath, suite('static-overflow-check.mjs')]);
 	await run('head-check', [process.execPath, suite('head-check.mjs')]);
+	await run('ssr-coding-check', [process.execPath, suite('ssr-coding-check.mjs')]);
+	await run('response-contract-check', [process.execPath, suite('response-contract-check.mjs')]);
+	await run('identity-headers-check', [process.execPath, suite('identity-headers-check.mjs')]);
+	await run('admin-check', [process.execPath, suite('admin-check.mjs')]);
+	await run('canonical-host-check', [process.execPath, suite('canonical-host-check.mjs')]);
+	await run('http-pipelining-check', [process.execPath, suite('http-pipelining-check.mjs')]);
 	await run('static-preconditions-check', [process.execPath, suite('static-preconditions-check.mjs')]);
+	await run('static-cache-control-check', [process.execPath, suite('static-cache-control-check.mjs')]);
+	await run('static-text-charset-check', [process.execPath, suite('static-text-charset-check.mjs')]);
+	await run('static-date-check', [process.execPath, suite('static-date-check.mjs')]);
+	await run('shared-handler-check', [process.execPath, suite('shared-handler-check.mjs')]);
 	await run('auth-endpoint-check', [process.execPath, suite('auth-endpoint-check.mjs')]);
 	await run('metrics-check', [process.execPath, suite('metrics-check.mjs')]);
+	await run('handshake-check', [process.execPath, suite('handshake-check.mjs')]);
+	await run('upgrade-response-check', [process.execPath, suite('upgrade-response-check.mjs')]);
+	await run('request-signal-check', [process.execPath, suite('request-signal-check.mjs')]);
+	await run('request-target-check', [process.execPath, suite('request-target-check.mjs')]);
+	// The ./subscriptions entry, imported by the fixture as another package
+	// would, moving the built runtime's state.
+	await run('subscriptions-check', [process.execPath, suite('subscriptions-check.mjs')]);
+	await run('subscription-release-check', [process.execPath, suite('subscription-release-check.mjs')]);
+	// The __ entries a Vite plugin adds to the server build, found, bundled and
+	// run at startup ahead of the WebSocket handler.
+	await run('extra-entries-check', [process.execPath, suite('extra-entries-check.mjs')]);
+	// The leak lane's probe route: unreachable on a server that was not armed
+	// for it, which is every server this lane boots.
+	await run('leak-probe-check', [process.execPath, suite('leak-probe-check.mjs')]);
 	// Skips itself on Windows, where the signal never reaches the handler.
 	await run('shutdown-check', [process.execPath, suite('shutdown-check.mjs')]);
+	await run('shutdown-handler-check', [process.execPath, suite('shutdown-handler-check.mjs')]);
+	await run('shutdown-repeat-signal-check', [process.execPath, suite('shutdown-repeat-signal-check.mjs')]);
 }
 
 // Runs its own builds rather than borrowing the one above: it needs BOTH
@@ -91,6 +129,14 @@ await run('xff-duplicate-check', [process.execPath, suite('xff-duplicate-check.m
 // The boot banner against the built server: version and protocol revision
 // read from the deployed meta files, sibling resolution answered honestly.
 await run('version-banner-check', [process.execPath, suite('version-banner-check.mjs')]);
+
+// The request id across the upgrade, with a preload that puts an accessor on
+// Object.prototype for the string key it used to ride.
+await run('upgrade-carry-check', [process.execPath, suite('upgrade-carry-check.mjs')]);
+
+// The close rule on the wire, read off a raw socket: codes, reasons cut at a
+// character, byte reasons, the no-status close and the hard close.
+await run('close-frame-check', [process.execPath, suite('close-frame-check.mjs')]);
 
 const builtNoWs = await run('build fixture (NO_WS)', [process.execPath, 'run', 'build'], {
 	cwd: fixtureDir,
@@ -153,6 +199,31 @@ const builtBackpressure = await run('build fixture (WS_BACKPRESSURE)', [process.
 if (builtBackpressure) {
 	await run('resume-backpressure-check', [process.execPath, suite('resume-backpressure-check.mjs')]);
 }
+
+// Its own build because its warmup points at a route whose body never ends:
+// every other suite's server would pay that render at boot, for a route none
+// of them ask about.
+const builtWarmupHang = await run('build fixture (WARMUP_HANG)', [process.execPath, 'run', 'build'], {
+	cwd: fixtureDir,
+	env: { ...buildEnv, WARMUP_HANG: '1' }
+});
+if (builtWarmupHang) {
+	await run('warmup-check', [process.execPath, suite('warmup-check.mjs')]);
+}
+
+const builtPrefixed = await run('build fixture (envPrefix)', [process.execPath, 'run', 'build'], {
+	cwd: fixtureDir,
+	env: { ...buildEnv, FIXTURE_ENV_PREFIX: 'MY_APP_' }
+});
+if (builtPrefixed) {
+	await run('env-prefix-check', [process.execPath, suite('env-prefix-check.mjs')]);
+}
+
+const builtBase = await run('build fixture (paths.base)', [process.execPath, 'run', 'build'], {
+	cwd: fixtureDir,
+	env: { ...buildEnv, FIXTURE_BASE_PATH: '/foo' }
+});
+if (builtBase) await run('static-base-cache-check', [process.execPath, suite('static-base-cache-check.mjs')]);
 
 if (failures.length) {
 	console.log(`\nlive lane FAILED:\n  ${failures.join('\n  ')}`);

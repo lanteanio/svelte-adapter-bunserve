@@ -30,11 +30,16 @@ const files = readdirSync(lane.dir)
 	.sort();
 let failed = 0;
 for (const f of files) {
-	const path = `${lane.dir}/${f}`;
+	// A ./ prefix makes Bun run this file instead of filtering every checkout
+	// below cwd for a matching path.
+	const path = `./${lane.dir}/${f}`;
 	const r = spawnSync(
 		process.execPath,
 		['test', `--conditions=${lane.condition}`, path],
-		{ stdio: ['ignore', 'inherit', 'inherit'] }
+		// Test mode, set rather than left to `bun test`'s default, which yields
+		// to an inherited NODE_ENV: the suites assume a framework assertion
+		// throws (test/helpers/test-env.mjs is the Node lane's twin of this).
+		{ stdio: ['ignore', 'inherit', 'inherit'], env: { ...process.env, NODE_ENV: 'test' } }
 	);
 	if (r.status !== 0) {
 		failed++;

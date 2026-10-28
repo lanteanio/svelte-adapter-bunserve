@@ -5,11 +5,13 @@
 // up with its dead-child guard inside the `try {} catch {}` that swallows fetch
 // errors, so it could never fire.
 
+import { connect } from 'node:net';
 import { fileURLToPath } from 'node:url';
 
 /** Runtime environment variables that change how the built server behaves. */
 const RUNTIME_ENV_KEYS = [
 	'ORIGIN',
+	'CANONICAL_HOST_ALIASES',
 	'XFF_DEPTH',
 	'ADDRESS_HEADER',
 	'TRUSTED_PROXIES',
@@ -28,15 +30,14 @@ const RUNTIME_ENV_KEYS = [
 	// exported in a shell it arms the never-settling shutdown hook in every
 	// fixture server of every suite.
 	'FIXTURE_HANG_SHUTDOWN',
-	// The leak lane's two, stripped for that reason and one worse. Exported,
-	// LEAK_INJECT makes every fixture server retain memory per connection, so
-	// the leak lane reports a defect in the adapter that the harness planted -
-	// and its self-check, which needs an UNinjected control to mean anything,
-	// stops proving what it claims. LEAK_PROBE exported arms an endpoint that
-	// forces a synchronous full collection on request, in every suite's server.
-	// Each is set deliberately by the leak lane, per spawn, and by nothing else.
-	'LEAK_PROBE',
-	'LEAK_INJECT'
+	'FIXTURE_HANG_INIT',
+	'FIXTURE_SHUTDOWN_DRIVER',
+	// The leak lane's, stripped for that reason and one worse: exported, it
+	// arms an endpoint that forces a synchronous full collection on request -
+	// and retains memory on request, for the lane's self-check - in every
+	// suite's server. The lane sets it deliberately, per spawn, and nothing
+	// else does.
+	'LEAK_PROBE'
 ];
 
 /**
@@ -128,4 +129,52 @@ export async function waitForServer(proc, port, probePath = '/healthz') {
  */
 export function buildPath(out = 'build') {
 	return fileURLToPath(new URL(`../fixture/${out}/index.js`, import.meta.url));
+}
+
+/**
+ * Send one request with exactly these header lines over a raw socket, and read
+ * the status line and headers of the answer.
+ *
+ * For the handshake cases a client library will not send - a repeated line, a
+ * key with its unused bits set - and for reading the status of a handshake: a
+ * WebSocket client reports a refusal as an opaque error, and `fetch` never hands
+ * its caller a 101. A Host line comes first, as every client sends one.
+ *
+ * @param {number} port
+ * @param {Array<[string, string]>} headers
+ * @param {{ path?: string, method?: string }} [opts]
+ * @returns {Promise<{ status: number, headers: Record<string, string> }>}
+ */
+export function rawExchange(port, headers, { path = '/ws', method = 'GET' } = {}) {
+	return new Promise((resolve, reject) => {
+		const socket = connect(port, '127.0.0.1');
+		let buf = '';
+		const timer = setTimeout(() => {
+			socket.destroy();
+			reject(new Error(`no answer to ${method} ${path} ${JSON.stringify(headers)}`));
+		}, 3000);
+		socket.on('data', (d) => {
+			buf += d.toString('latin1');
+			const end = buf.indexOf('\r\n\r\n');
+			if (end < 0) return;
+			clearTimeout(timer);
+			socket.destroy();
+			const [statusLine, ...lines] = buf.slice(0, end).split('\r\n');
+			/** @type {Record<string, string>} */
+			const parsed = {};
+			for (const line of lines) {
+				const at = line.indexOf(':');
+				parsed[line.slice(0, at).trim().toLowerCase()] = line.slice(at + 1).trim();
+			}
+			resolve({ status: Number(statusLine.split(' ')[1]), headers: parsed });
+		});
+		socket.on('error', (err) => { clearTimeout(timer); reject(err); });
+		socket.on('connect', () => {
+			socket.write(
+				`${method} ${path} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
+				headers.map(([k, v]) => `${k}: ${v}\r\n`).join('') +
+				'\r\n'
+			);
+		});
+	});
 }

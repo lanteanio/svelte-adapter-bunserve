@@ -1,34 +1,19 @@
+import { identityResponseHeaders } from './identity-headers.js';
+import { nextCounter } from '$lib/server/shared-counter.js';
 // Fixture WebSocket handler. Exercises every hook the adapter delegates to,
 // and refuses one topic so the authorization gate is covered by the live smoke
 // test rather than only by unit tests.
 
-/**
- * A DELIBERATE leak, armed only by the leak harness's self-check.
- *
- * A gate that has never been seen to fail is a gate nobody can trust. This
- * retains `LEAK_INJECT` bytes per connection and never releases them, which is
- * the plainest leak an app can have, so the harness can prove its verdict
- * fires on one. Unset - which is every other run, and every real build - the
- * array is never touched.
- *
- * Refused rather than coerced, because the failure is so misleading: a value
- * like `64k` becomes NaN, `NaN > 0` is false, nothing is injected, and the lane
- * then reports that its memory gates could not catch a leak. That accuses the
- * gates of the bug when the typo was in the arming.
- */
-const LEAK_INJECT = readInjectBytes();
+// By package name, as a plugin in another package imports it: this resolves
+// to the adapter's source through node_modules, a separate module instance
+// from the runtime the build copied, which is the case the entry exists for.
+import { trackedSubscribe, trackedUnsubscribe } from 'svelte-adapter-bunserve/subscriptions';
+import * as releaseProbe from './subscription-release.js';
+import { registerIngress } from '../../../src/runtime/handler/ingress.js';
 
-function readInjectBytes() {
-	const raw = process.env.LEAK_INJECT?.trim();
-	if (raw === undefined || raw === '') return 0;
-	const bytes = Number(raw);
-	if (!Number.isFinite(bytes) || bytes < 0) {
-		throw new Error(`LEAK_INJECT=${JSON.stringify(raw)} is not a byte count`);
-	}
-	return bytes;
-}
-/** @type {Uint8Array[]} */
-const leaked = [];
+// Read by the extra server entries vite.config.js adds, which record whether
+// this module had loaded when they ran (test/live/extra-entries-check.mjs).
+/** @type {any} */ (globalThis).__fixtureWsHandlerLoaded = true;
 
 /**
  * A STATEFUL wire codec: the payload's first byte is this connection's own
@@ -68,13 +53,20 @@ const snapWire = {
 
 /** Once at boot, after the listener is up. The family's arming point. */
 export function init({ platform }) {
+	registerIngress('fixture.input:1', {
+		decode: (payload, schemaVersion, seq) => ({ bytes: [...payload], schemaVersion, seq }),
+		route: (ws, target, value, ingressPlatform) => ingressPlatform.send(ws, '__fixture', 'ingress', { target, value })
+	});
+	platform.registerWireCodec(releaseProbe.wire);
 	platform.registerWireCodec(xyWire);
 	platform.registerWireCodec(snapWire);
-	// An APP instrument on the adapter's registry, so the live lane can prove
-	// the app's own metrics land in the same document as the adapter's - which
-	// is the thing a registry the app imported for itself could not do.
-	fixtureOpens = platform.metrics.counter('fixture_opens_total', 'sockets opened, counted by the app');
+	// Application instruments stay in the configured registry, outside snapshots.
+	fixtureOpens = platform.metrics?.counter('fixture_opens_total', 'sockets opened, counted by the app') ?? null;
 	console.log(`[fixture] init connections=${platform.connections}`);
+	if (process.env.FIXTURE_HANG_INIT === '1') {
+		console.log('[shutdown-probe] init held');
+		return new Promise(() => {});
+	}
 }
 
 /** @type {{ inc: (labels?: any, value?: number) => void } | null} */
@@ -112,7 +104,12 @@ const resumeScripts = new Map();
  * the covered watermark - anything the runtime buffered past it must then
  * arrive after these frames and before the ack.
  */
-export async function resume(ws, { sessionId, lastSeenSeqs, platform }) {
+export async function resume(ws, { sessionId, lastSeenSeqs, lastSeenEpochs, platform }) {
+	if (ws.getUserData().user === 'control-contract') {
+		platform.send(ws, '__fixture', 'raw-resume', { sessionId, lastSeenSeqs, lastSeenEpochs });
+		if (sessionId === 'fixture:throw') throw new Error('fixture resume failure');
+		return;
+	}
 	await new Promise((resolve) => setTimeout(resolve, 30));
 	const covered = {};
 	for (const [topic, since] of Object.entries(lastSeenSeqs)) {
@@ -156,8 +153,14 @@ export async function resume(ws, { sessionId, lastSeenSeqs, platform }) {
 }
 
 /** Once at graceful shutdown, BEFORE the sockets are drained. */
-export function shutdown({ platform }) {
+export async function shutdown({ platform, reason, signal, deadline }) {
 	console.log(`[fixture] shutdown connections=${platform.connections}`);
+	if (process.env.FIXTURE_SHUTDOWN_DRIVER) {
+		globalThis.__shutdownHookContext = { reason, signal, deadline };
+		console.log('[shutdown-probe] hook ' + JSON.stringify({ reason, signal: signal === null ? null : 'AbortSignal', deadline }));
+		await new Promise(resolve => setTimeout(resolve, process.env.FIXTURE_SHUTDOWN_DRIVER === 'shared' ? 600 : 40));
+		console.log('[shutdown-probe] hook done');
+	}
 	// Armed per spawn: a hook that never settles, so the live suite can prove
 	// the shutdown deadline cuts a misbehaving hook instead of letting it hold
 	// the process open.
@@ -166,19 +169,16 @@ export function shutdown({ platform }) {
 
 /**
  * Runs before the handshake. Whatever object this returns becomes the
- * connection's userData; returning a Response rejects the upgrade with exactly
- * that response.
+ * connection's userData; returning false rejects the upgrade with 401.
  *
  * Async behind a real timer on purpose: the adapter promises the hook may
  * await freely, and only an actually-awaited hook makes the live suite prove
- * the handshake survives it. The subprotocol selection goes through the
- * context headers channel for the same reason - the client can read the
- * negotiated protocol off its own socket, so the 101 carrying what this hook
- * set is observable end to end.
+ * the handshake survives it. Custom headers travel on the handshake and can be read over a raw socket.
  */
-export async function upgrade(request, { headers }) {
+export async function upgrade({ url: target, headers: requestHeaders }) {
+	const headers = {};
 	await new Promise((resolve) => setTimeout(resolve, 5));
-	const url = new URL(request.url);
+	const url = new URL(target, 'http://localhost');
 	// A handshake the caller can hold open for as long as it asks for. The
 	// window while this hook awaits is the one where the server is carrying
 	// admission counters on behalf of a client that may already have gone, and
@@ -195,13 +195,24 @@ export async function upgrade(request, { headers }) {
 		return { closeOnOpen: true };
 	}
 	if (url.searchParams.get('deny') === '1') {
-		return new Response('nope', { status: 401 });
+		return false;
 	}
-	const offered = request.headers.get('sec-websocket-protocol');
-	if (offered) {
-		headers['sec-websocket-protocol'] = offered.split(',')[0].trim();
+	if (url.searchParams.get('returnResponse') === '1') {
+		return new Response('not a refusal', { status: 403, headers: { 'x-refusal': 'must-not-send' } });
 	}
-	return { user: url.searchParams.get('user') || 'anon' };
+	if (url.searchParams.has('identityHeaders')) Object.assign(headers, identityResponseHeaders(requestHeaders));
+	if (requestHeaders['x-probe-url'] === '1') headers['x-hook-url'] = target;
+	if (url.searchParams.get('responseHeaders') === '1') {
+		headers['set-cookie'] = ['first=1', 'second=2'];
+		headers['x-upgrade-value'] = 'tab\tvalue';
+		headers['x-utf8'] = 'caf\u00e9';
+		headers['x-values'] = ['first', 'second'];
+		headers['x-duplicate'] = 'one';
+		headers['X-Duplicate'] = 'two';
+		headers['x-spaces'] = ' \ttrimmed\t ';
+		headers['x-hook-url'] = target;
+	}
+	return { __upgradeResponse: true, userData: { user: url.searchParams.get('user') || 'anon' }, headers };
 }
 
 /**
@@ -211,9 +222,12 @@ export async function upgrade(request, { headers }) {
  * answer with a Response of its own, or throw. Which one it takes is chosen by
  * the query string, so one build covers all of them.
  */
-export async function authenticate(request, { cookies, platform, getClientAddress }) {
-	const url = new URL(request.url);
+export async function authenticate({ url: target, headers, request, cookies, platform, getClientAddress }) {
+	const url = new URL(target, 'http://localhost');
 	const mode = url.searchParams.get('mode') || 'ok';
+	if (headers['x-auth-echo'] === '1') return Response.json({ requestUrl: request.url });
+	if (mode === 'identity-headers') return new Response('ok', { headers: identityResponseHeaders(headers) });
+	if (mode === 'shared-counter') return Response.json({ value: nextCounter() });
 	if (mode === 'throw') throw new Error('the app hook exploded');
 	if (mode === 'deny') {
 		// A refusal that still clears the stale session, which is what a real one
@@ -225,7 +239,7 @@ export async function authenticate(request, { cookies, platform, getClientAddres
 		cookies.set('fixture_session', 'from-jar', { path: '/' });
 		return new Response(JSON.stringify({ requestId: platform.requestId, address: getClientAddress() }), {
 			status: 200,
-			headers: { 'content-type': 'application/json' }
+			headers: { 'content-type': 'application/json', ...(url.searchParams.has('te') ? { 'transfer-encoding': 'chunked' } : {}) }
 		});
 	}
 	// The ordinary path: a refreshed session cookie on an ordinary HTTP
@@ -244,13 +258,6 @@ export function open(ws, { platform }) {
 		return;
 	}
 	fixtureOpens?.inc();
-	// Retained on purpose and never released; see LEAK_INJECT. Filled so the
-	// bytes are unambiguously touched on any allocator that maps lazily. On Bun
-	// it made no measurable difference across four isolated trials - the filled
-	// and unfilled readings agreed in rss, heapUsed and external - so this is
-	// belt and braces for a runtime that behaves otherwise, not a load-bearing
-	// detail. The gate itself runs on Linux in CI, where it was not measured.
-	if (LEAK_INJECT > 0) leaked.push(new Uint8Array(LEAK_INJECT).fill(1));
 	// Echo the connection count back so the smoke test can assert the registry
 	// tracks opens.
 	platform.send(ws, '__fixture', 'opened', {
@@ -259,7 +266,57 @@ export function open(ws, { platform }) {
 	});
 }
 
+// Held authorization is released by an ordered message, independent of CI timing.
+const heldSubscribes = new WeakMap();
+const platformForwarders = new WeakMap();
+
 export function message(ws, { data, isBinary, msg, platform }) {
+	if (msg?.type === 'fixture-platform-contract') {
+		const memberSet = new Set();
+		for (let current = platform; current && current !== Object.prototype; current = Object.getPrototypeOf(current)) {
+			for (const name of Object.getOwnPropertyNames(current)) memberSet.add(name);
+		}
+		const members = [...memberSet];
+		let forwarded = platformForwarders.get(ws.getUserData());
+		if (!forwarded) {
+			forwarded = {};
+			for (const name of members) {
+				Object.defineProperty(forwarded, name, {
+					enumerable: true,
+					get() {
+						const value = platform[name];
+						return typeof value === 'function' ? value.bind(platform) : value;
+					}
+				});
+			}
+			platformForwarders.set(ws.getUserData(), forwarded);
+		}
+		forwarded.send(ws, '__fixture', 'platform-contract', {
+			ref: msg.ref, members: members.sort(), forwardedMembers: Object.keys(forwarded).sort(),
+			requestId: forwarded.requestId, contextualRequestId: Object.hasOwn(platform, 'requestId'),
+			connections: forwarded.connections,
+			hasLiveConnectionGetter: typeof Object.getOwnPropertyDescriptor(forwarded, 'connections').get === 'function'
+		});
+		return;
+	}
+	if (msg?.type === 'fixture-release') return releaseProbe.message(ws, msg, platform);
+	// The client probe sends JSON commands as text and as application binary.
+	// Decode that application's binary form before replying with a topic event.
+	let clientProbe = msg;
+	if (isBinary) {
+		try { clientProbe = JSON.parse(new TextDecoder().decode(data)); } catch {}
+	}
+	if (clientProbe?.type === 'fixture-client-echo') {
+		platform.send(ws, '__client-test', 'echo', clientProbe.payload);
+		return;
+	}
+	if (msg?.type === 'fixture-release-subscribes') {
+		const pending = heldSubscribes.get(ws.getUserData()) || [];
+		heldSubscribes.delete(ws.getUserData());
+		platform.send(ws, '__fixture', 'subscribe-gates-released', { count: pending.length });
+		for (const release of pending) release();
+		return;
+	}
 	if (isBinary) {
 		ws.send(data, true, false);
 		return;
@@ -352,6 +409,45 @@ export function message(ws, { data, isBinary, msg, platform }) {
 		});
 		return;
 	}
+	if (msg && msg.type === 'fixture-end') {
+		// The close rule, driven from a client: end(code, reason) as given, a
+		// reason sent as UTF-8 bytes when asked, or the hard close().
+		const reason = msg.reasonBytes !== undefined ? new TextEncoder().encode(msg.reasonBytes) : msg.reason;
+		try {
+			if (msg.hard) ws.close(msg.code, reason);
+			else ws.end(msg.code, reason);
+		} catch (err) {
+			platform.send(ws, '__fixture', 'end-refused', { name: err?.name ?? null });
+		}
+		return;
+	}
+	// Membership changed by the app, outside the wire protocol - the way a
+	// plugin joins a connection to a topic. `tracked` and `tracked-leave` use
+	// the ./subscriptions entry; `raw` and `raw-leave` write the connection's
+	// registry by hand next to a bare ws.subscribe, the shape the entry
+	// replaces, so the live suite can show what that leaves behind. Answered
+	// once the operation has run, so the suite waits on the answer.
+	if (msg && msg.type === 'fixture-membership') {
+		const registry = ws.getUserData()[Symbol.for('adapter-uws.ws.subscriptions')];
+		let ok = null;
+		if (msg.mode === 'tracked') ok = trackedSubscribe(ws, msg.topic);
+		else if (msg.mode === 'tracked-leave') ok = trackedUnsubscribe(ws, msg.topic);
+		else if (msg.mode === 'raw') {
+			ws.subscribe(msg.topic);
+			registry.add(msg.topic);
+			ok = true;
+		} else if (msg.mode === 'raw-leave') {
+			registry.delete(msg.topic);
+			ws.unsubscribe(msg.topic);
+			ok = true;
+		}
+		platform.send(ws, '__fixture', 'membership', { nonce: msg.nonce, ok });
+		return;
+	}
+	if (msg && msg.type === 'fixture-request-id') {
+		platform.send(ws, '__fixture', 'request-id', { requestId: platform.requestId ?? null });
+		return;
+	}
 	if (msg && msg.type === 'fixture-stats') {
 		platform.send(ws, '__fixture', 'stats', {
 			connections: platform.connections,
@@ -376,8 +472,15 @@ export function message(ws, { data, isBinary, msg, platform }) {
  * path the per-connection cap has to bound, and it cannot be reached with a
  * synchronous hook: microtask-only awaits still serialize.
  */
-export async function subscribe(ws, topic) {
+export async function subscribe(ws, topic, context) {
+	if (releaseProbe.handles(topic)) return releaseProbe.subscribe(ws, topic, context);
 	if (topic === 'forbidden') return 'FORBIDDEN';
+	if (topic.startsWith('held:')) {
+		const data = ws.getUserData();
+		let pending = heldSubscribes.get(data);
+		if (!pending) heldSubscribes.set(data, pending = []);
+		await new Promise(resolve => pending.push(resolve));
+	}
 	if (topic.startsWith('slow:')) {
 		await new Promise((resolve) => setTimeout(resolve, 40));
 	}
@@ -394,11 +497,13 @@ export async function subscribe(ws, topic) {
  * close hook being told about it.
  */
 export function unsubscribe(ws, topic, { platform }) {
+	if (releaseProbe.handles(topic)) return releaseProbe.unsubscribe(ws);
 	platform.send(ws, '__fixture', 'unsubscribe-hook', { topic });
 	if (topic.startsWith('hang:')) return new Promise(() => {});
 }
 
 export async function close(ws, ctx) {
+	releaseProbe.close(ws);
 	const topics = [...ctx.subscriptions].sort().join(',');
 	console.log(
 		`[fixture] close code=${ctx.code} subs=${ctx.subscriptions.size} topics=${topics} in=${ctx.messagesIn} out=${ctx.messagesOut}`

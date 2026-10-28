@@ -5,3 +5,4 @@
 export const manifest = { appPath: '_app' };
 export const prerendered = new Set();
 export const base = '';
+export const appPath = '_app';

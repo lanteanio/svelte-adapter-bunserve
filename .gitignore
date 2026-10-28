@@ -11,3 +11,6 @@ coverage
 .DS_Store
 *.log
 source
+
+# The leak lane's per-run records (test/leak/plan.mjs, --out to move them).
+test/leak/records/

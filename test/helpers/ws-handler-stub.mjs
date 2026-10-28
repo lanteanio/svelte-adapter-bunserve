@@ -30,6 +30,9 @@ export let message;
 export let close;
 
 /** @type {undefined | ((ws: any, ctx: any) => unknown)} */
+export let drain;
+
+/** @type {undefined | ((ws: any, ctx: any) => unknown)} */
 export let resume;
 
 /**
@@ -49,11 +52,13 @@ export let upgrade;
  * @type {undefined | ((req: Request, ctx: any) => unknown)}
  */
 export let authenticate;
+export let attribution;
+export let admin;
 
 /**
  * @param {{ subscribe?: any, subscribeBatch?: any, unsubscribe?: any,
- *   open?: any, message?: any, close?: any, resume?: any, upgrade?: any,
- *   authenticate?: any }} hooks
+ *   open?: any, message?: any, close?: any, drain?: any, resume?: any,
+ *   upgrade?: any, authenticate?: any }} hooks
  */
 export function __setHooks(hooks) {
 	subscribe = hooks.subscribe;
@@ -62,7 +67,10 @@ export function __setHooks(hooks) {
 	open = hooks.open;
 	message = hooks.message;
 	close = hooks.close;
+	drain = hooks.drain;
 	resume = hooks.resume;
 	upgrade = hooks.upgrade;
 	authenticate = hooks.authenticate;
+	attribution = hooks.attribution;
+	admin = hooks.admin;
 }
