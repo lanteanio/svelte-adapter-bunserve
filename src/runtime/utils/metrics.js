@@ -1,27 +1,4 @@
-/**
- * The adapter's own metrics registry, and the Prometheus document it renders.
- *
- * THE ADAPTER OWNS THE REGISTRY HERE, where svelte-adapter-uws takes one from a
- * module the operator names. That is not a simplification for its own sake - it
- * is what makes a single registry possible at all on this runtime. Measured: a
- * module imported by BOTH a SvelteKit route and the WebSocket handler ends up as
- * two copies in the build, because `writeServer` hands the adapter Vite's
- * already-bundled output (the route's import inlined into a chunk) while the
- * adapter's own bundling pass reads the same file again from source. An app that
- * imported the registry to serve `/metrics` would therefore render a registry
- * the adapter never wrote to. Owning it, and handing it to the app through
- * `platform` - which IS shared with SSR - removes the failure instead of
- * documenting it.
- *
- * The interface is the sibling's `MetricsRegistry` (`counter(name, help,
- * labelNames)`, `gauge(name, help)`, optional `histogram`, optional
- * `serialize()`), so an app that wrote a scrape route against that contract does
- * not care which adapter is underneath, and an app's OWN instruments can be
- * registered on the same registry and land in the same document.
- *
- * Pure: no clock, no timers, no globals, no runtime imports. Every value comes
- * from a caller.
- */
+/** Built-in Prometheus registry, used when no external registry is configured. */
 
 import { SIGNALS, SIGNALS_BY_NAME, SNAPSHOT_SIGNALS } from '../observability-manifest.js';
 
@@ -300,7 +277,7 @@ export function createMetricRegistry(options = {}) {
 	 * The registry is shared with the app, and the classic way to melt a metrics
 	 * system is one label carrying request-derived data - a path, an id, a topic.
 	 * Unbounded, that is a leak with no ceiling and a scrape whose cost grows
-	 * with it. The adapter's own families are far below this (eleven refusal
+	 * with it. The adapter's own families are far below this (twelve refusal
 	 * reasons, two doors, at most 49 transitions), so the cap can only ever bind
 	 * on an app's.
 	 */
@@ -361,6 +338,9 @@ export function createMetricRegistry(options = {}) {
 					const target = resolve(name, 'gauge', help, null);
 					if (target === null || typeof value !== 'number') return;
 					record(target, undefined, value, true);
+				},
+				remove() {
+					if (families.get(name)?.type === 'gauge') families.delete(name);
 				}
 			};
 		},

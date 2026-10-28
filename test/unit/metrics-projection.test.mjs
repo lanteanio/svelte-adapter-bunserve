@@ -1,3 +1,4 @@
+import '../helpers/configured-metrics.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizeWsOptions } from '../../src/runtime/utils/ws-options.js';
@@ -14,12 +15,13 @@ globalThis.WS_PATH = '/ws';
 globalThis.WS_OPTIONS = normalizeWsOptions({
 	path: '/ws',
 	handler: 'src/ws-handler.js',
-	allowUnauthenticatedSubscribe: true
 }).options;
 
 
 const { metricsSnapshot, metricsRegistry } = await import('../../src/runtime/handler/metrics.js');
-const { SIGNALS } = await import('../../src/runtime/observability-manifest.js');
+const { runtimeMetricProfile } = await import('../../src/runtime/handler/metric-profile.js');
+const { SIGNALS, SIGNALS_BY_NAME } = await import('../../src/runtime/observability-manifest.js');
+const { processMemoryWall } = await import('../../src/runtime/utils/memory-wall.js');
 const { httpPlatform, platform } = await import('../../src/runtime/handler/platform.js');
 const {
 	UPGRADE_REJECTION_REASONS, pressureSnapshot, recordUpgradeRejection, wsCounters
@@ -36,6 +38,22 @@ function family(text, name) {
 	return text.split('\n').filter((l) => l.startsWith(name + '{') || l.startsWith(name + ' '));
 }
 
+/**
+ * Count the shared memory-wall reader's reads while fn runs, with the
+ * reader answering `reading`.
+ */
+async function readsDuring(reading, fn) {
+	const real = processMemoryWall.measure;
+	let reads = 0;
+	processMemoryWall.measure = () => { reads++; return reading; };
+	try {
+		await fn();
+	} finally {
+		processMemoryWall.measure = real;
+	}
+	return reads;
+}
+
 // DECLARED FIRST, and it has to be: `lastSampleWallMs` only ever goes from zero
 // to a time, so the window this describes exists once per process and any test
 // that sets it closes the window for every test after it.
@@ -45,12 +63,14 @@ test('nothing the sampler produces is published before its first tick', async ()
 	// scrape lands inside exactly this window.
 	assert.equal(wsCounters.lastSampleWallMs, 0, 'no sample has been taken yet');
 	const text = await metricsSnapshot();
+	assert.equal(value(text, 'metrics_snapshot_workers_reporting'), '0', 'supported gauges remain required before sampling');
 	for (const name of [
 		'pressure_sample_timestamp_seconds',
 		'pressure_saturation',
 		'pressure_reason',
 		'ws_backpressure_max_bytes',
-		'ws_backpressure_connections'
+		'ws_backpressure_connections',
+		'heap_used_ratio'
 	]) {
 		assert.equal(family(text, name).length, 0, `${name} is absent until something measures it`);
 	}
@@ -61,8 +81,33 @@ test('nothing the sampler produces is published before its first tick', async ()
 	// they are read from the process when something scrapes, so an instance that
 	// runs no sampler at all still answers them.
 	assert.ok(Number(value(text, 'resident_memory_bytes')) > 0, 'resident memory is a real reading');
-	const ratio = Number(value(text, 'heap_used_ratio'));
-	assert.ok(ratio > 0 && ratio <= 1, `heap ratio is a fraction, got ${ratio}`);
+	// heap_used_ratio is the sampler's reading here, so it waits for the tick
+	// like the gauges above: a live read in this window would be a value the
+	// MEMORY reason and the send gate never used. Only the stamp says a
+	// reading exists - a figure in the counter without one is not served.
+	wsCounters.lastMeasuredHeapUsedRatio = 0.5;
+	const reads = await readsDuring(0.75, async () => {
+		assert.equal(value(await metricsSnapshot(), 'heap_used_ratio'), undefined);
+	});
+	assert.equal(reads, 0, 'and the scrape takes no reading of its own');
+	wsCounters.lastMeasuredHeapUsedRatio = 0;
+});
+
+test('every family rendered by a default WebSocket build has a manifest entry', async () => {
+	// Run before an app registers its own families on the shared registry.
+	const text = await metricsSnapshot();
+	const families = text.split('\n').filter(line => line.startsWith('# TYPE ')).map(line => line.split(' ')[2]);
+	assert.ok(families.includes('egress_refused_total'));
+	assert.ok(families.includes('egress_window_evicted_total'));
+	assert.deepEqual(families.filter(name => !SIGNALS_BY_NAME.has(name)), []);
+	for (const name of ['egress_refused_total', 'egress_window_evicted_total']) {
+		const signal = SIGNALS_BY_NAME.get(name);
+		assert.equal(signal.type, 'counter');
+		assert.deepEqual(signal.labels, ['scope']);
+		assert.equal(signal.unit, null);
+		assert.notEqual(signal.optional, true);
+		assert.ok(text.includes(`# HELP ${name} ${signal.help}\n`));
+	}
 });
 
 test('the refusal bag is published under every reason, zeroes included', async () => {
@@ -96,7 +141,7 @@ test('the counters follow the runtime rather than a parallel tally', async () =>
 	wsCounters.totalSubscriptions = 40;
 	const text = await metricsSnapshot();
 	assert.equal(value(text, 'ws_publishes_total'), '12');
-	assert.equal(value(text, 'ws_closed_socket_aborts_total'), '3');
+	assert.doesNotMatch(text, /ws_closed_socket_aborts_total/);
 	assert.equal(value(text, 'ws_subscriptions'), '40');
 });
 
@@ -146,17 +191,49 @@ test('the pressure gauges carry the last sample', async () => {
 	assert.equal(value(text, 'ws_backpressure_connections'), '2');
 });
 
-test('the memory gauges are the process, not the sampler', async () => {
-	// They used to be republished from the sampler's cache, which meant a build
+test('resident memory is the process, not the sampler', async () => {
+	// It used to be republished from the sampler's cache, which meant a build
 	// with no WebSocket handler - where no sampler ever runs - could not answer
-	// them at all. They are read at projection time now, so a stale cache cannot
-	// be served and no realtime tier is needed to have them.
-	wsCounters.lastResidentBytes = 123456;
-	wsCounters.lastHeapUsedRatio = 0.25;
+	// it at all. It is read at projection time now, so a stale cache cannot be
+	// served and no realtime tier is needed to have it.
 	const text = await metricsSnapshot();
-	assert.notEqual(value(text, 'resident_memory_bytes'), '123456', 'not the cached figure');
 	assert.ok(Number(value(text, 'resident_memory_bytes')) > 1_000_000, 'a real resident size');
-	assert.notEqual(value(text, 'heap_used_ratio'), '0.25');
+});
+
+test("heap_used_ratio is the sampler's reading once there is one", async () => {
+	// The family contract feeds the gauge and the MEMORY reason from one
+	// reading, so the gauge publishes the value the reason was decided on -
+	// the two cannot disagree near the threshold - and the scrape does no
+	// cgroup reads of its own.
+	wsCounters.lastSampleWallMs = 1_700_000_000_000;
+	wsCounters.lastMeasuredHeapUsedRatio = 0.25;
+	const reads = await readsDuring(0.75, async () => {
+		assert.equal(value(await metricsSnapshot(), 'heap_used_ratio'), '0.25');
+		wsCounters.lastMeasuredHeapUsedRatio = 0;
+		assert.equal(value(await metricsSnapshot(), 'heap_used_ratio'), '0', 'a measured zero remains present');
+	});
+	assert.equal(reads, 0, 'the scrape reads no cgroup file where the sampler has read them');
+	// A reset stamp (the simulator zeroes it between runs) withdraws the series
+	// rather than leaving the last reading up.
+	wsCounters.lastSampleWallMs = 0;
+	assert.equal(value(await metricsSnapshot(), 'heap_used_ratio'), undefined);
+	wsCounters.lastSampleWallMs = 1_700_000_000_000;
+});
+
+test('heap_used_ratio is declared as svelte-adapter-uws declares it', () => {
+	const signal = SIGNALS.find((s) => s.name === 'heap_used_ratio');
+	assert.equal(signal?.optional, true, 'an unknown wall has no measurement');
+	assert.equal(signal?.help,
+		'Used fraction of the nearest memory wall (heap vs the V8 limit, resident set vs the cgroup memory limit, worst-of)');
+});
+
+test('a value written under heap_used_ratio is never served as the reading', async () => {
+	// An app holding its own handle on the name cannot publish under it: the
+	// next scrape sets the reading over whatever was written.
+	wsCounters.lastSampleWallMs = 1_700_000_000_000;
+	wsCounters.lastMeasuredHeapUsedRatio = 0.125;
+	metricsRegistry.gauge('heap_used_ratio').set(0.4242);
+	assert.equal(value(await metricsSnapshot(), 'heap_used_ratio'), '0.125');
 });
 
 test('a reason transition is counted from and to', async () => {
@@ -169,12 +246,12 @@ test('a reason transition is counted from and to', async () => {
 
 // - what is absent ------------------------------------------------------------
 
-test('the admission gauges are absent on a server with no ceiling', async () => {
-	// There is no in-flight ledger to read without one, and a zero would say "no
-	// upgrades in flight" on a server that simply does not count them.
+test('ungated upgrades and an absent pacing queue have measured idle state', async () => {
+	// The independent handshake tracker is idle; no pacing queue exists.
 	const text = await metricsSnapshot();
-	assert.doesNotMatch(text, /upgrade_inflight/);
-	assert.doesNotMatch(text, /upgrade_deferred_depth/);
+	assert.equal(value(text, 'upgrade_inflight'), '0');
+	assert.equal(value(text, 'upgrade_deferred_depth'), '0');
+	assert.equal(value(text, 'upgrade_deferred_oldest_age_seconds'), '0');
 	assert.doesNotMatch(text, /ws_connection_headroom/);
 });
 
@@ -265,10 +342,9 @@ test('the eviction counter names every door that meters', async () => {
 test('the platform exposes the registry an app registers on', async () => {
 	assert.equal(platform.metrics, metricsRegistry);
 	platform.metrics.counter('orders_placed_total', 'orders placed').inc({ tier: 'pro' }, 2);
-	const text = await platform.metricsSnapshot();
-	assert.equal(value(text, 'orders_placed_total{tier="pro"}'), '2');
-	// After the adapter's own, so the document still starts with the manifest.
-	assert.ok(text.indexOf('orders_placed_total') > text.indexOf('upgrade_admitted_total'));
+	assert.equal(value(platform.metrics.serialize(), 'orders_placed_total{tier="pro"}'), '2');
+	assert.doesNotMatch(await platform.metricsSnapshot(), /orders_placed_total/,
+		'application metrics stay in the operator registry, outside the adapter mirror');
 });
 
 test('a build with no realtime tier serves the same two members', async () => {
@@ -280,7 +356,7 @@ test('a build with no realtime tier serves the same two members', async () => {
 	const requestPlatform = Object.assign(Object.create(httpPlatform), { requestId: 'r-1' });
 	assert.equal(requestPlatform.metrics, metricsRegistry);
 	assert.equal(typeof requestPlatform.metricsSnapshot, 'function');
-	assert.match(await requestPlatform.metricsSnapshot(), /^# HELP /);
+	assert.match(await requestPlatform.metricsSnapshot(), /^# HELP /m);
 	// The realtime platform serves the SAME members, not copies of them.
 	assert.equal(
 		Object.getOwnPropertyDescriptor(platform, 'metrics').get,
@@ -289,55 +365,57 @@ test('a build with no realtime tier serves the same two members', async () => {
 	assert.equal(platform.metricsSnapshot, httpPlatform.metricsSnapshot);
 });
 
-test('every signal the manifest does not call optional actually renders', async () => {
-	// The flag is the manifest's own statement about which families a build may
-	// legitimately lack, and nothing read it - so it could disagree with the code
-	// in either direction with no mechanism able to report it. This is the
-	// direction that matters here: a default build, everything configured, and a
-	// declared signal still missing means the manifest is describing a document
-	// this adapter does not produce.
-	wsCounters.lastSampleWallMs = 1_700_000_000_000;
-	const text = await metricsSnapshot();
-	const missing = SIGNALS
-		.filter((s) => !s.optional)
-		.map((s) => s.name)
-		.filter((name) => family(text, name).length === 0);
-	assert.deepEqual(missing, [], 'declared, not optional, and absent');
+test('a sampled runtime renders every required supported family and reports complete', async () => {
+ wsCounters.lastSampleWallMs = 1_700_000_000_000;
+ const text = await metricsSnapshot();
+ assert.deepEqual(runtimeMetricProfile.sources, [
+  'http', 'upgrade', 'upgrade-rate-limit', 'upgrade-admission', 'upgrade-pacing',
+  'websocket', 'subscriptions', 'publish', 'backpressure', 'drops', 'egress',
+  'pressure', 'process-memory', 'os-pressure', 'framework-assertions'
+ ]);
+ assert.deepEqual(runtimeMetricProfile.requiredWorkerSignals.map(signal => signal.name).sort(), [
+  'http_requests_total', 'upgrade_admitted_total', 'upgrade_rejected_total',
+  'upgrade_rate_map_evicted_total', 'upgrade_inflight', 'upgrade_deferred_depth',
+  'upgrade_deferred_oldest_age_seconds', 'upgrade_deferred_rejected_total',
+  'ws_connections', 'ws_messages_total', 'ws_subscriptions', 'ws_publishes_total',
+  'ws_publish_outcomes_total', 'ws_backpressure_max_bytes', 'ws_backpressure_connections',
+  'ws_dropped_frames_total', 'ws_dropped_bytes_total', 'egress_refused_total',
+  'egress_window_evicted_total', 'pressure_saturation', 'pressure_reason',
+  'pressure_reason_transitions_total', 'pressure_sample_timestamp_seconds',
+  'framework_assertion_violations_total'
+ ].sort());
+ const missing = runtimeMetricProfile.requiredWorkerSignals.filter(signal =>
+  !text.includes(`# TYPE ${signal.name} ${signal.type}\n`));
+ assert.deepEqual(missing, [], 'every implemented required source must render');
+ for (const source of ['relay_', 'state_divergence_total', 'waiting_room_queue_depth',
+  'protection_posture_', 'ws_message_admission_rejected_total']) {
+  assert.ok(!text.includes(source), source);
+ }
+ assert.equal(value(text, 'metrics_snapshot_workers_expected'), '1');
+ assert.equal(value(text, 'metrics_snapshot_workers_reporting'), '1');
+ assert.equal(value(text, 'metrics_snapshot_degraded'), '0');
+ assert.match(text, /^# ws_dropped_coverage direct-sends$/m);
 });
 
-test('serializing the registry directly projects too', async () => {
-	// `platform.metrics` is documented, and the registry it hands back is this
-	// one - so an app that renders it in a route, or a library handed the
-	// registry, must not get a document whose adapter families are whatever the
-	// last scrape left. The counter below moves with nothing scraping in
-	// between.
+test('the sampler projects current adapter values into the operator registry', async () => {
 	wsCounters.publishCount = 4242;
+	assert.equal(typeof wsCounters.metricsSampleHook, 'function');
+	wsCounters.metricsSampleHook();
 	const direct = platform.metrics.serialize();
 	assert.equal(value(direct, 'ws_publishes_total'), '4242');
-	// The same families, from the same projection. Compared family by family
-	// rather than as whole documents: the memory gauges are read from the
-	// process on every projection, so two documents taken a microsecond apart
-	// legitimately differ in those two lines and an equality over the whole text
-	// would be a test that fails on a true reading.
 	const snapshot = await platform.metricsSnapshot();
 	for (const name of ['ws_publishes_total', 'upgrade_admitted_total', 'ws_connections']) {
 		assert.equal(value(direct, name), value(snapshot, name), name);
 	}
-	assert.deepEqual(
-		direct.split('\n').filter((l) => l.startsWith('# TYPE ')),
-		snapshot.split('\n').filter((l) => l.startsWith('# TYPE ')),
-		'and the same families in the same order'
-	);
+	assert.equal(value(direct, 'orders_placed_total{tier="pro"}'), '2');
+	assert.doesNotMatch(snapshot, /orders_placed_total/);
 });
 
-test('the snapshot is a promise resolving to text, never null', async () => {
-	// The sibling can answer null (no registry configured) and its collection is
-	// a round trip that can fail; here there is one process and the answer is in
-	// memory. A route written against the sibling awaits either way.
+test('a configured snapshot is a promise resolving to canonical adapter text', async () => {
 	const promise = platform.metricsSnapshot();
 	assert.ok(promise instanceof Promise);
 	const text = await promise;
 	assert.equal(typeof text, 'string');
-	assert.match(text, /^# HELP /);
+	assert.match(text, /^# HELP /m);
 	assert.match(text, /^metrics_snapshot_degraded 0$/m);
 });

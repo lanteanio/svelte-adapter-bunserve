@@ -384,6 +384,20 @@ test('a unit-suffixed name matches its declared unit', () => {
 		if (signal.name.endsWith('_seconds')) assert.equal(signal.unit, 'seconds', signal.name);
 		if (signal.name.endsWith('_bytes')) assert.equal(signal.unit, 'bytes', signal.name);
 		if (signal.unit === 'seconds') assert.match(signal.name, /_seconds$/, signal.name);
-		if (signal.unit === 'bytes') assert.match(signal.name, /_bytes$/, signal.name);
+		if (signal.unit === 'bytes') assert.match(signal.name, /_bytes(?:_total)?$/, signal.name);
 	}
+});
+
+test('runtime signals use the exact public names, HELP text and aggregation laws', async () => {
+ const publicManifest = await import('../../src/runtime/public-observability-manifest.js');
+ assert.strictEqual(SIGNALS, publicManifest.SIGNALS);
+ assert.strictEqual(SIGNALS_BY_NAME, publicManifest.SIGNALS_BY_NAME);
+ for (const signal of SIGNALS) {
+  const registry = createMetricRegistry();
+  const labels = Object.fromEntries(signal.labels.map(name => [name, 'test']));
+  if (signal.type === 'histogram') registry.histogram(signal.name, signal.help, { buckets: signal.buckets }).observe(labels, 0);
+  else if (signal.type === 'counter') registry.counter(signal.name, signal.help, signal.labels).inc(labels, 0);
+  else registry.gauge(signal.name, signal.help, signal.labels).set(0);
+  assert.ok(registry.serialize().includes(`# HELP ${signal.name} ${signal.help}\n`), signal.name);
+ }
 });

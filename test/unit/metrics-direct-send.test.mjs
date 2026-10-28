@@ -1,0 +1,21 @@
+import '../helpers/configured-metrics.mjs';
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+globalThis.ENV_PREFIX = ''; globalThis.WS_PATH = '/ws'; globalThis.WS_OPTIONS = {};
+const { metricsSnapshot } = await import('../../src/runtime/handler/metrics.js');
+const { wsCounters } = await import('../../src/runtime/handler/ws-state.js');
+const { wsFacade } = await import('../../src/runtime/handler/ws-facade.js');
+test('direct-send drops count exact bytes while publish outcomes never invent recipient drops', async () => {
+ let result = 4, buffered = 0;
+ const raw = { data: {}, readyState: 1, send: () => result, publish: () => 0, getBufferedAmount: () => buffered };
+ const ws = wsFacade(raw, () => ({}), () => wsCounters.transportMetricHooks);
+ ws.send('okay');
+ result = -1; ws.send('queued');
+ result = 0; ws.send('Gr' + String.fromCharCode(252) + 'n');
+ buffered = 1; ws.send('');
+ ws.publish('no-subscriber', 'ignored');
+ const text = await metricsSnapshot();
+ assert.match(text, /^ws_dropped_frames_total 2$/m);
+ assert.match(text, /^ws_dropped_bytes_total 5$/m);
+ assert.match(text, /^# ws_dropped_coverage direct-sends$/m);
+});

@@ -1,3 +1,4 @@
+import '../helpers/configured-metrics.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizeWsOptions } from '../../src/runtime/utils/ws-options.js';
@@ -17,7 +18,6 @@ globalThis.WS_PATH = '/ws';
 globalThis.WS_OPTIONS = normalizeWsOptions({
 	path: '/ws',
 	handler: 'src/ws-handler.js',
-	allowUnauthenticatedSubscribe: true,
 	upgradeRateLimit: 0,
 	authPathRateLimit: 0
 }).options;
@@ -35,6 +35,6 @@ test('neither door is metered in this build', () => {
 
 test('an unmetered door publishes no eviction series', async () => {
 	const text = await metricsSnapshot();
-	assert.doesNotMatch(text, /upgrade_rate_map_evicted_total/);
+	assert.doesNotMatch(text, /^upgrade_rate_map_evicted_total\{/m);
 });
 

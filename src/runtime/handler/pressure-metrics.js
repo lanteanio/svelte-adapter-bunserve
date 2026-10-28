@@ -10,9 +10,10 @@
 import { computePressureReason, computeTopPublishers, applyCapacityReason } from '../utils/pressure.js';
 import { foldConnectionBackpressure, BACKPRESSURE_SAMPLE_CAP, BACKPRESSURE_SAMPLE_THRESHOLD_BYTES } from '../utils/backpressure.js';
 import { DEFAULT_GRANT, leaseGrantSize, samplePressureValue } from '../utils/lease.js';
-import { now, setIntervalTimer, clearIntervalTimer } from '../runtime.js';
+import { now, setIntervalTimer, clearIntervalTimer, subscribeMemoryPressure } from '../runtime.js';
 import { createOsPressureSampler } from '../utils/os-pressure.js';
 import { sweepRateLimits } from './rate-limit.js';
+import { processMemoryWall } from '../utils/memory-wall.js';
 import { PRESSURE_INTERVAL_MAX_MS, PRESSURE_INTERVAL_MIN_MS } from '../utils/ws-options.js';
 import {
 	lastPublishWarnAt,
@@ -44,6 +45,8 @@ const PUBLISH_WARN_DEDUP_MAX = 1_000_000;
 
 /** @type {ReturnType<typeof setIntervalTimer> | null} */
 let pressureTimer = null;
+/** @type {(() => void) | null} */
+let stopMemoryHint = null;
 
 /**
  * Default pressure thresholds. Designed to be safe rather than tight: the
@@ -51,28 +54,31 @@ let pressureTimer = null;
  * not "perfectly tuned for sustained five-figure publish rates." Override
  * per-deployment via the `pressure` field on the WebSocket options.
  */
+/**
+ * The memory-wall reader, the process's one. The `heap_used_ratio` gauge
+ * publishes this sampler's reading; only on a build with no WebSocket tier
+ * does the metrics scrape read the reader itself. Stateful: it sweeps the cgroup
+ * limit files of the process's group and its ancestors on each read, reads
+ * the group list itself only when due, and stands a file that fails to read
+ * at its last value. Nothing here sits on a frame path.
+ */
+const pressureSources = {
+	memoryWall: processMemoryWall,
+	osPressure,
+	memoryUsage: () => process.memoryUsage()
+};
+
 const DEFAULT_PRESSURE_THRESHOLDS = {
-	// OFF BY DEFAULT ON THIS RUNTIME, and the one place this adapter's
-	// defaults deliberately differ from the sibling's (which ships 0.85).
-	//
-	// heapUsed/heapTotal is a saturation measure only where the engine
-	// over-allocates its heap. It does not here: a freshly booted, idle
-	// server measured 0.90 to 0.94 on Bun 1.3.14 and 0.81 on 1.4.0
-	// (test/live/pressure-check.mjs pins that it stays high), because this
-	// engine keeps heapTotal fitted close to heapUsed on both generations.
-	// Against the family's 0.85 the signal therefore fires on an idle 1.3
-	// process and never clears, and on 1.4 idles a whisker under the
-	// threshold, where ordinary allocation churn crosses it with no real
-	// pressure behind it - `platform.pressure.active` would be true or
-	// flapping for the life of every zero-config app, `onPressure` would
-	// announce MEMORY without meaning it, and a posture machine reading it
-	// could never settle. A signal that is always or arbitrarily on carries
-	// no information and actively misleads, so it is off until the family
-	// settles on a memory reading that means the same thing on both engines.
-	//
-	// Set `websocket: { pressure: { memoryHeapUsedRatio: 0.85 } }` to opt
-	// back into the sibling's exact threshold.
-	memoryHeapUsedRatio: false,
+	// The family default, on both adapters, now that the reading underneath it
+	// means the same thing on both engines. It was OFF here while the basis was
+	// arena fullness: JavaScriptCore fits heapTotal close to heapUsed, so an
+	// idle server measured 0.90-0.94 on Bun 1.3.14 and 0.81 on 1.4.0 - against
+	// 0.85 the signal fired on an idle 1.3 process and never cleared, and on
+	// 1.4 idled a whisker under it where ordinary churn crossed it with no
+	// pressure behind it. The basis is distance to the nearest memory WALL now
+	// (utils/memory-wall.js), which idles near zero on both engines, so the
+	// threshold measures what it always claimed to.
+	memoryHeapUsedRatio: 0.85,
 	publishRatePerSec: 10000,
 	subscriberRatio: 50,
 	sampleIntervalMs: 1000,
@@ -105,7 +111,7 @@ const DEFAULT_PRESSURE_THRESHOLDS = {
  *
  * @param {{ memoryHeapUsedRatio: number | false, publishRatePerSec: number | false, subscriberRatio: number | false, sampleIntervalMs: number, topicPublishRatePerSec: number | false, topicPublishBytesPerSec: number | false }} thresholds
  */
-function samplePressure(thresholds) {
+function samplePressure(thresholds, sources) {
 	const interval = thresholds.sampleIntervalMs / 1000;
 	const publishRate = interval > 0 ? wsCounters.publishCountWindow / interval : 0;
 	// Retain the raw window count before it is zeroed. The metrics hook exports
@@ -146,22 +152,38 @@ function samplePressure(thresholds) {
 		wsConnections, BACKPRESSURE_SAMPLE_CAP, BACKPRESSURE_SAMPLE_THRESHOLD_BYTES
 	);
 
-	// Host memory read, deliberately not seam-routed (matching the sibling):
-	// the figure is telemetry about the REAL process, and a simulated value
-	// would only report the simulator's own heap.
-	const mem = process.memoryUsage();
-	const heapUsedRatio = mem.heapTotal > 0 ? mem.heapUsed / mem.heapTotal : 0;
+	// Production reads the real process. Controlled runs inject both memory
+	// sources and notifications so host conditions cannot shape their trace.
+	const mem = sources.memoryUsage();
+	// DISTANCE TO THE NEAREST MEMORY WALL, not arena fullness. `heapUsed /
+	// heapTotal` measures how tightly the engine keeps its arena fitted, which
+	// is not memory pressure and on this runtime is close to its inverse:
+	// JavaScriptCore fits the arena to usage, so an idle server read 0.90-0.94
+	// and the ratio FELL as the arena grew. The MEMORY signal fired on a
+	// sleeping process and could not see the kill that actually happens - the
+	// kernel's OOM killer charges the resident set against the cgroup limit,
+	// which no heap ratio observes.
+	//
+	// The family contract (svelte-adapter-uws docs/architecture.md#memory-pressure-signal)
+	// is the worst of two walls, each measured with the quantity its wall kills
+	// on. JavaScriptCore reports no allocation ceiling, so the engine arm is
+	// absent here and the container arm carries the reading; with no wall on
+	// either arm the signal degrades to silence rather than to a false alarm.
+	// The option name and its default are unchanged, and one reading feeds the
+	// MEMORY reason, the value fold, the gauge and the grant sizing, so no
+	// consumer is calibrated against a different basis.
+	const measuredHeapUsedRatio = sources.memoryWall.measure(mem);
+	const heapUsedRatio = measuredHeapUsedRatio ?? 0;
 	const memoryMB = mem.rss / (1024 * 1024);
-	// Both retained for the metrics hook. Resident memory is process-wide (worker
-	// threads share one address space); the heap ratio is per-isolate, so each
-	// worker thread reports its own.
+	// Retained for the consumers that read between ticks: the send-gate window
+	// sizer and the heap_used_ratio gauge.
 	wsCounters.lastHeapUsedRatio = heapUsedRatio;
-	wsCounters.lastResidentBytes = mem.rss;
+	wsCounters.lastMeasuredHeapUsedRatio = measuredHeapUsedRatio;
 
 	// Kernel signals for this window. Null per source when unavailable; the
 	// sample fields stay absent then, so every downstream comparison and the
 	// saturation fold skip them without a branch of their own.
-	const os = osPressure.sample(thresholds.sampleIntervalMs);
+	const os = sources.osPressure.sample(thresholds.sampleIntervalMs);
 	/** @type {{ heapUsedRatio: number, publishRate: number, subscriberRatio: number, psiCpuSome10?: number, psiMemoryFull10?: number, psiIoFull10?: number, cpuThrottledRatio?: number }} */
 	const sampleReadings = { heapUsedRatio, publishRate, subscriberRatio };
 	if (os.psi !== null) {
@@ -261,7 +283,12 @@ function samplePressure(thresholds) {
 	if (wsCounters.postureExportHook !== null) wsCounters.postureExportHook();
 
 	if (transitioned) {
-		for (const cb of pressureListeners) {
+		// SNAPSHOT, not the live Set. A listener that registers a listener from
+		// inside its own callback extends the very sweep it is running in, and a
+		// Set iterator visits entries added during iteration - so one such
+		// listener turns a bounded fan-out into an unbounded one, inside the 1 Hz
+		// sampler. Allocation only on a transition, which is rare by construction.
+		for (const cb of [...pressureListeners]) {
 			try {
 				cb(pressureSnapshot);
 			} catch (err) {
@@ -272,7 +299,9 @@ function samplePressure(thresholds) {
 
 	if (overThreshold.length > 0) {
 		if (publishRateListeners.size > 0) {
-			for (const cb of publishRateListeners) {
+			// Snapshotted for the reason the pressure sweep above is, and
+			// allocated only when a topic is actually over its threshold.
+			for (const cb of [...publishRateListeners]) {
 				try {
 					cb(overThreshold);
 				} catch (err) {
@@ -314,27 +343,49 @@ function samplePressure(thresholds) {
 }
 
 /**
- * Size the next send-gate window for an opted-in connection: per-connection
- * subscriber load narrows the window, so a worker carrying heavy fan-out
- * hands out smaller ones. Zero-config; never user exposed. Always floors to a
- * window large enough that a connection makes forward progress, and costs no
- * syscall - the reading it needs is bookkeeping this process already keeps.
+ * Size the next send-gate window for an opted-in connection: memory headroom
+ * and per-connection subscriber load narrow the window, so a worker near a
+ * wall or carrying heavy fan-out hands out smaller ones. Zero-config; never
+ * user exposed. Always floors to a window large enough that a connection
+ * makes forward progress, and costs no syscall - the readings it needs are
+ * bookkeeping this process already keeps.
+ *
+ * The heap reading is the sampler's cached ratio, never a live
+ * `process.memoryUsage()`: this runs per inbound `request-n` frame, so a
+ * syscall here would sit on the replenish hot path, and a live read would
+ * make grant sizes depend on the host heap while every other input under the
+ * sim is virtualized through the deterministic seam. Its staleness is the
+ * sample interval, so a configured `sampleIntervalMs` is also how old a
+ * window's memory reading may be; before the first sample, and throughout the
+ * sim, which starts no sampler, the cache reads 0 and the full base window is
+ * handed out.
  *
  * @returns {{ count: number, ttlMs: number }}
  */
 export function grantSizeFor() {
+	// Distance to the nearest memory wall, the same reading the MEMORY
+	// threshold and the value fold take, so no consumer is calibrated against
+	// a different basis. WHERE A WALL EXISTS it idles near zero and the 0.7
+	// knee inside leaseGrantSize is crossed by a worker actually approaching
+	// an out-of-memory death - which an arena-fullness reading cannot tell
+	// apart on this engine, where an idle server measures 0.90 to 0.94 on Bun
+	// 1.3.14 and 0.81 on 1.4.0.
+	//
+	// Where NO wall is discoverable this reads 0 and contributes nothing,
+	// which is the contract (utils/memory-wall.js): this engine reports no
+	// allocation ceiling, so the cgroup arm carries the reading alone, and a
+	// process with no memory limit on its cgroup or any ancestor has no wall
+	// to measure a distance to. The signal degrades to silence rather than to
+	// a fabricated one, and the window is then sized by subscriber load alone.
+	// So this narrows windows only where a memory limit applies - a limited
+	// container, or a service given one (systemd MemoryMax=) - and since the
+	// reader keeps looking on any host with cgroups, a limit set on a running
+	// process takes effect. Without one the memory term is inert and the
+	// fan-out term is the whole sizer.
+	const heapRatio = wsCounters.lastHeapUsedRatio;
 	const conns = wsConnections.size || 1;
 	const subRatio = wsCounters.totalSubscriptions / conns;
-	// No heap term, for the same measured reason the memory THRESHOLD is off
-	// by default above: leaseGrantSize narrows the window once the ratio
-	// passes 0.7, a knee calibrated against an over-allocating heap. This
-	// engine reports 0.90 to 0.94 on an IDLE server on Bun 1.3.14 and 0.81
-	// on 1.4.0, so feeding it either reading collapses the window on a
-	// server under no load at all - to 15-26 permits instead of 256 across
-	// the older generation's range, about a fifth of the base (~49) on the
-	// newer - the opposite of the "healthy worker hands out the full window"
-	// contract. Subscriber load is engine-independent and still narrows it.
-	const count = leaseGrantSize({ heapRatio: 0, subscriberRatio: subRatio });
+	const count = leaseGrantSize({ heapRatio, subscriberRatio: subRatio });
 	return { count, ttlMs: DEFAULT_GRANT.ttlMs };
 }
 
@@ -368,14 +419,46 @@ export function resolvePressureThresholds(opts) {
  *
  * @param {Parameters<typeof resolvePressureThresholds>[0]} opts
  */
+let testPressureSources = null;
+
+// Internal sampler seam; the public simulation environment does not accept it.
+export function setPressureSourcesForTest(sources) {
+	testPressureSources = sources;
+}
+
 export function startPressureSampling(opts) {
 	const thresholds = resolvePressureThresholds(opts);
-	if (pressureTimer) clearIntervalTimer(pressureTimer);
-	pressureTimer = setIntervalTimer(() => samplePressure(thresholds), thresholds.sampleIntervalMs);
-	if (pressureTimer && typeof pressureTimer.unref === 'function') pressureTimer.unref();
+	stopPressureSampling();
+	const controlled = testPressureSources;
+	const sources = controlled ? { ...pressureSources, ...controlled } : pressureSources;
+	let active = true;
+	let pending = false;
+	const detach = (controlled?.subscribe ?? subscribeMemoryPressure)(level => {
+		if (active && (level === 'warning' || level === 'critical')) pending = true;
+	});
+	stopMemoryHint = () => { active = false; pending = false; if (typeof detach === 'function') detach(); };
+	try {
+		pressureTimer = setIntervalTimer(() => {
+			if (!active) return;
+			if (pending) {
+				pending = false;
+				sources.memoryWall.refresh();
+			}
+			samplePressure(thresholds, sources);
+		}, thresholds.sampleIntervalMs);
+		if (pressureTimer && typeof pressureTimer.unref === 'function') pressureTimer.unref();
+	} catch (error) {
+		stopPressureSampling();
+		throw error;
+	}
 }
 
 export function stopPressureSampling() {
+	if (stopMemoryHint) {
+		const stop = stopMemoryHint;
+		stopMemoryHint = null;
+		stop();
+	}
 	if (pressureTimer) {
 		clearIntervalTimer(pressureTimer);
 		pressureTimer = null;

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Metric registries and source profiles expose available runtime measurements without inventing unavailable samples.
+
 - Added typed webhooks plugin entries with portable and native regression coverage.
 
 - Added typed throttle plugin entries with portable and native regression coverage.

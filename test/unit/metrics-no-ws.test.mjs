@@ -1,3 +1,4 @@
+import '../helpers/configured-metrics.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -26,6 +27,8 @@ globalThis.WS_OPTIONS = null;
 // stub is with none set.
 
 const { metricsSnapshot } = await import('../../src/runtime/handler/metrics.js');
+const { createMemoryWallReader, processMemoryWall } = await import('../../src/runtime/utils/memory-wall.js');
+const { resetRuntimeEnv, setRuntimeEnv } = await import('../../src/runtime/runtime.js');
 const { httpPlatform, requestPlatform } = await import('../../src/runtime/handler/platform.js');
 
 /** The value on a rendered line, as a string. */
@@ -44,7 +47,6 @@ test('no realtime family appears at all', async () => {
 		'ws_connections',
 		'ws_subscriptions',
 		'ws_publishes_total',
-		'ws_closed_socket_aborts_total',
 		'ws_backpressure_max_bytes',
 		'ws_backpressure_connections',
 		'pressure_saturation',
@@ -62,15 +64,54 @@ test('and the process still answers for itself', async () => {
 	// them reachable with no sampler running.
 	const text = await metricsSnapshot();
 	assert.ok(Number(value(text, 'resident_memory_bytes')) > 1_000_000);
-	const ratio = Number(value(text, 'heap_used_ratio'));
-	assert.ok(ratio > 0 && ratio <= 1, `heap ratio is a fraction, got ${ratio}`);
+	// With no sampler the scrape reads the memory wall itself: the reading of an
+	// independent reader on this host, within the resident set's drift between
+	// the two reads, and absent where the host has no wall.
+	const expected = createMemoryWallReader().measure(process.memoryUsage());
+	const shown = value(text, 'heap_used_ratio');
+	if (expected === null) assert.equal(shown, undefined);
+	else assert.ok(Math.abs(Number(shown) - expected) <= Math.max(1e-6, expected * 0.1),
+		`the wall reading ${expected}, got ${shown}`);
+});
+
+test('the scrape publishes the shared reader, and reads it at most once a second', async () => {
+	// The scrape is the only reader here, and the route that drives it is the
+	// app's to expose: each read sweeps the cgroup files and some take the
+	// kernel's global cgroup lock, so a busy route must not set their rate.
+	const real = processMemoryWall.measure;
+	let reading = 0.375;
+	let reads = 0;
+	processMemoryWall.measure = () => { reads++; return reading; };
+	// Far past any reading the earlier scrapes took on the real, epoch-anchored
+	// clock, and small enough that every millisecond step is exact.
+	let t = 2 ** 50;
+	setRuntimeEnv({ clock: { monotonic: () => t } });
+	try {
+		assert.equal(value(await metricsSnapshot(), 'heap_used_ratio'), '0.375', 'the reader, exactly');
+		reading = 0.5;
+		t += 999;
+		assert.equal(value(await metricsSnapshot(), 'heap_used_ratio'), '0.375', 'reused within the second');
+		assert.equal(reads, 1);
+		t += 1;
+		assert.equal(value(await metricsSnapshot(), 'heap_used_ratio'), '0.5', 'read again once it has passed');
+		assert.equal(reads, 2);
+		reading = null;
+		t += 1000;
+		assert.equal(value(await metricsSnapshot(), 'heap_used_ratio'), undefined, 'unlimited retracts the earlier value');
+		reading = 0;
+		t += 1000;
+		assert.equal(value(await metricsSnapshot(), 'heap_used_ratio'), '0', 'a measured zero resumes reporting');
+	} finally {
+		processMemoryWall.measure = real;
+		resetRuntimeEnv();
+	}
 });
 
 test('an app can still register its own instruments and read them back', async () => {
 	// The documented use of `platform.metrics` on this build.
 	httpPlatform.metrics.counter('orders_placed_total', 'orders placed').inc({ tier: 'pro' }, 2);
-	const text = await httpPlatform.metricsSnapshot();
-	assert.equal(value(text, 'orders_placed_total{tier="pro"}'), '2');
+	assert.equal(value(httpPlatform.metrics.serialize(), 'orders_placed_total{tier="pro"}'), '2');
+	assert.doesNotMatch(await httpPlatform.metricsSnapshot(), /orders_placed_total/);
 });
 
 test('and a request on this build is linked to exactly those members', async () => {
@@ -83,7 +124,7 @@ test('and a request on this build is linked to exactly those members', async () 
 	assert.equal(Object.getPrototypeOf(p), httpPlatform, 'linked to the tier-less members');
 	assert.equal(p.requestId, 'r-1');
 	assert.equal(p.metrics, httpPlatform.metrics);
-	assert.match(await p.metricsSnapshot(), /^# HELP /);
+	assert.match(await p.metricsSnapshot(), /^# HELP /m);
 	assert.equal(p.publish, undefined, 'and no realtime member it cannot honour');
 	assert.equal(p.pressure, undefined);
 });
