@@ -113,8 +113,8 @@ test('isBinary picks the opcode and every recognized string keeps its bytes on t
 		assert.equal(peer.isSubscribed(new Uint8Array([0xff])), true);
 		assert.equal(peer.isSubscribed('\x00ff'), false);
 
-		// Socket publication, then the server fallback once the publisher holds
-		// no membership of its own.
+		// Publication while the publisher holds a membership, then while it
+		// holds none.
 		ws.subscribe('own');
 		const publications = [
 			[['bytes-topic', 'x', true], { opcode: BINARY, bytes: [0x78] }],

@@ -213,29 +213,29 @@ test('empty publication excludes the sender when resolving zero-byte success', (
 	}
 });
 
-test('a publisher that released its memberships broadcasts without changing subscriptions', () => {
-	const raw = fakeSocket({ publish: () => 0 });
-	const broadcasts = [];
+test('a publisher that released its memberships publishes once, through its own socket', () => {
+	const published = [];
 	let accepted = 5;
+	const raw = fakeSocket({ publish(...args) { published.push(args); return accepted; } });
 	const ws = wsFacade(raw, () => ({
 		subscriberCount: () => 1,
-		publish(...args) { broadcasts.push(args); return accepted; }
+		publish() { assert.fail('the socket publication already reached every peer'); }
 	}));
 	for (const payload of ['hello', '', new Uint8Array(0)]) assert.equal(ws.publish('room', payload), false);
-	assert.deepEqual(broadcasts, []);
+	assert.deepEqual(published, []);
 	ws.subscribe('other');
 	ws.unsubscribe('other');
 	raw.calls.length = 0;
 	assert.equal(ws.publish('room', 'hello', false, true), true);
-	assert.deepEqual(broadcasts, [['room', 'hello', true]]);
+	assert.deepEqual(published, [['room', 'hello', true]]);
 	assert.deepEqual(raw.subscriptions, []);
 	assert.deepEqual(raw.calls, [], 'no temporary subscribe or unsubscribe');
 	accepted = 0;
 	assert.equal(ws.publish('room', 'hello'), false);
-	assert.equal(ws.publish('room', ''), true, 'empty broadcast remains a publication');
+	assert.equal(ws.publish('room', ''), true, 'an empty frame to a peer remains a publication');
 	raw.readyState = 3;
 	assert.throws(() => ws.publish('room', 'hello'), WsClosedError);
-	assert.equal(broadcasts.length, 3, 'closed publication never reaches the server');
+	assert.equal(published.length, 3, 'closed publication never reaches the socket');
 });
 
 test('readyState and raw are exposed for code that needs the real socket', () => {

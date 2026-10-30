@@ -218,12 +218,10 @@ export function wsFacade(raw, getServer, getMetricHooks, recordDrop) {
 			const server = getServer();
 			const peers = server.subscriberCount(topic) - Number(raw.isSubscribed(topic));
 			if (peers <= 0) return false;
-			// Bun requires the publisher to hold a native membership. A socket
-			// that released every membership cannot receive a server broadcast; this fallback
-			// preserves exclusion without changing any subscriptions.
-			if (raw.subscriptions.length === 0) {
-				return server.publish(topic, payload, compress) !== 0 || isEmptyPayload(payload);
-			}
+			// The socket publication above already reached every peer, whether
+			// or not this socket holds a membership of its own (Bun 1.4 and
+			// later; test/unit/ws-facade-native.test.mjs). Publishing again would
+			// deliver the frame twice.
 			// Zero bytes can still be a published empty frame. As with uWS,
 			// true describes a publication, not delivery past backpressure.
 			return isEmptyPayload(payload);
