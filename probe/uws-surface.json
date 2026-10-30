@@ -355,14 +355,17 @@
 			"send": {
 				"parameters": [
 					{
+						"type": "string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView",
 						"optional": false,
 						"rest": false
 					},
 					{
+						"type": "boolean",
 						"optional": true,
 						"rest": false
 					},
 					{
+						"type": "boolean",
 						"optional": true,
 						"rest": false
 					}
@@ -376,10 +379,12 @@
 			"end": {
 				"parameters": [
 					{
+						"type": "number",
 						"optional": true,
 						"rest": false
 					},
 					{
+						"type": "string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView",
 						"optional": true,
 						"rest": false
 					}
@@ -393,6 +398,7 @@
 			"ping": {
 				"parameters": [
 					{
+						"type": "string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView",
 						"optional": true,
 						"rest": false
 					}
@@ -402,6 +408,7 @@
 			"subscribe": {
 				"parameters": [
 					{
+						"type": "string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView",
 						"optional": false,
 						"rest": false
 					}
@@ -411,6 +418,7 @@
 			"unsubscribe": {
 				"parameters": [
 					{
+						"type": "string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView",
 						"optional": false,
 						"rest": false
 					}
@@ -420,6 +428,7 @@
 			"isSubscribed": {
 				"parameters": [
 					{
+						"type": "string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView",
 						"optional": false,
 						"rest": false
 					}
@@ -433,18 +442,22 @@
 			"publish": {
 				"parameters": [
 					{
+						"type": "string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView",
 						"optional": false,
 						"rest": false
 					},
 					{
+						"type": "string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView",
 						"optional": false,
 						"rest": false
 					},
 					{
+						"type": "boolean",
 						"optional": true,
 						"rest": false
 					},
 					{
+						"type": "boolean",
 						"optional": true,
 						"rest": false
 					}
@@ -454,6 +467,7 @@
 			"cork": {
 				"parameters": [
 					{
+						"type": "() => void",
 						"optional": false,
 						"rest": false
 					}
@@ -479,14 +493,17 @@
 			"sendFirstFragment": {
 				"parameters": [
 					{
+						"type": "string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView",
 						"optional": false,
 						"rest": false
 					},
 					{
+						"type": "boolean",
 						"optional": true,
 						"rest": false
 					},
 					{
+						"type": "boolean",
 						"optional": true,
 						"rest": false
 					}
@@ -496,10 +513,12 @@
 			"sendFragment": {
 				"parameters": [
 					{
+						"type": "string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView",
 						"optional": false,
 						"rest": false
 					},
 					{
+						"type": "boolean",
 						"optional": true,
 						"rest": false
 					}
@@ -509,10 +528,12 @@
 			"sendLastFragment": {
 				"parameters": [
 					{
+						"type": "string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView",
 						"optional": false,
 						"rest": false
 					},
 					{
+						"type": "boolean",
 						"optional": true,
 						"rest": false
 					}

@@ -40,6 +40,7 @@
 
 import { mapSendResult, SEND_DROPPED, SEND_SUCCESS } from '../utils/send-result.js';
 import { NO_STATUS_CLOSE_CODE, closeFrameReason } from '../utils/close-frame.js';
+import { framePayload, nativeTopic } from '../utils/recognized-string.js';
 
 /**
  * @param {string | Uint8Array | ArrayBuffer} payload
@@ -156,20 +157,19 @@ export function wsFacade(raw, getServer, getMetricHooks, recordDrop) {
 		 * Send one frame. Returns the uWS tri-state (0 enqueued / 1 sent /
 		 * 2 dropped), NOT Bun's byte count.
 		 *
-		 * `isBinary` is accepted for call-site compatibility but does not select
-		 * the opcode: Bun derives that from the payload type, so a string is a
-		 * text frame and a Uint8Array/ArrayBuffer is a binary frame. Passing
-		 * isBinary=true with a string payload does NOT produce a binary frame -
-		 * pass bytes instead.
+		 * `isBinary` selects the opcode, as on uWS, whatever the payload's
+		 * type: the payload is converted to the one Bun sends with that opcode
+		 * (utils/recognized-string.js), keeping its bytes.
 		 *
-		 * @param {string | Uint8Array | ArrayBuffer} payload
+		 * @param {string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView} message
 		 * @param {boolean} [isBinary]
 		 * @param {boolean} [compress]
 		 * @returns {0 | 1 | 2}
 		 */
-		send(payload, isBinary, compress) {
+		send(message, isBinary, compress) {
 			// ORDERING: closed first, mapping second. See the module comment.
 			assertOpen('send');
+			const payload = framePayload(message, isBinary);
 			const result = raw.send(payload, compress);
 			// A zero-length payload defeats the byte-count mapping: Bun returns
 			// 0 ("zero bytes accepted") both when the empty frame is written to
@@ -198,14 +198,19 @@ export function wsFacade(raw, getServer, getMetricHooks, recordDrop) {
 		 * Publish to a topic from this connection. Excludes this socket by
 		 * default (Bun's publishToSelf defaults to false - probed).
 		 *
-		 * @param {string} topic
-		 * @param {string | Uint8Array | ArrayBuffer} payload
+		 * Topic and message take any recognized string, and `isBinary` selects
+		 * the opcode, as for send.
+		 *
+		 * @param {string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView} name
+		 * @param {string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView} message
 		 * @param {boolean} [isBinary]
 		 * @param {boolean} [compress]
 		 * @returns {boolean} whether the publication has an eligible recipient
 		 */
-		publish(topic, payload, isBinary, compress) {
+		publish(name, message, isBinary, compress) {
 			assertOpen('publish');
+			const topic = nativeTopic(name);
+			const payload = framePayload(message, isBinary);
 			if (!hadMembership) return false;
 			const result = raw.publish(topic, payload, compress);
 			if (result !== 0) return true;
@@ -225,7 +230,7 @@ export function wsFacade(raw, getServer, getMetricHooks, recordDrop) {
 		},
 
 		/**
-		 * @param {string} topic
+		 * @param {string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView} topic
 		 * @returns {boolean}
 		 */
 		subscribe(topic) {
@@ -234,18 +239,18 @@ export function wsFacade(raw, getServer, getMetricHooks, recordDrop) {
 			// throw. The whole reason this facade exists; the closed check makes
 			// the runtime's choice of boolean unobservable.
 			assertOpen('subscribe');
-			const subscribed = raw.subscribe(topic);
+			const subscribed = raw.subscribe(nativeTopic(topic));
 			if (subscribed) hadMembership = true;
 			return subscribed;
 		},
 
 		/**
-		 * @param {string} topic
+		 * @param {string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView} topic
 		 * @returns {boolean}
 		 */
 		unsubscribe(topic) {
 			assertOpen('unsubscribe');
-			return raw.unsubscribe(topic);
+			return raw.unsubscribe(nativeTopic(topic));
 		},
 
 		/**
@@ -253,12 +258,12 @@ export function wsFacade(raw, getServer, getMetricHooks, recordDrop) {
 		 * closed socket is subscribed to nothing, and that is a meaningful
 		 * answer rather than an error. Bun already returns false (probed).
 		 *
-		 * @param {string} topic
+		 * @param {string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView} topic
 		 * @returns {boolean}
 		 */
 		isSubscribed(topic) {
 			if (closed || raw.readyState !== OPEN) return false;
-			return raw.isSubscribed(topic);
+			return raw.isSubscribed(nativeTopic(topic));
 		},
 
 		/** @returns {number} bytes queued but not yet written */

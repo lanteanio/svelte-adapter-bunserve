@@ -53,7 +53,7 @@ test('native socket publish preserves peer delivery, exclusion and boolean resul
 		const ws = wsFacade(raw[0], () => server);
 		raw[1].subscribe('room');
 		for (const payload of ['', new Uint8Array(0), 'never-member']) {
-			assert.equal(ws.publish('room', payload), false);
+			assert.equal(ws.publish('room', payload, typeof payload !== 'string'), false);
 			await flush();
 			assert.deepEqual(received, [[], []]);
 		}
@@ -71,7 +71,7 @@ test('native socket publish preserves peer delivery, exclusion and boolean resul
 			const before = raw.map(socket => [...socket.subscriptions]);
 			for (const payload of ['', new Uint8Array(0), 'hello']) {
 				received[0].length = received[1].length = 0;
-				assert.equal(ws.publish('room', payload), peer, memberships);
+				assert.equal(ws.publish('room', payload, typeof payload !== 'string'), peer, memberships);
 				await flush();
 				assert.deepEqual(received[0], [], 'publisher never receives its own message');
 				assert.deepEqual(received[1], peer ? [typeof payload === 'string' ? payload : []] : []);
@@ -84,14 +84,14 @@ test('native socket publish preserves peer delivery, exclusion and boolean resul
 		for (let i = 0; i < 32 && raw[1].getBufferedAmount() < 1024; i++) raw[1].send(megabyte);
 		assert.ok(raw[1].getBufferedAmount() >= 1024, 'peer is beyond its backpressure limit');
 		for (const payload of ['', new Uint8Array(0), 'hello', megabyte]) {
-			assert.equal(ws.publish('room', payload), true, 'publication is not a delivery receipt');
+			assert.equal(ws.publish('room', payload, typeof payload !== 'string'), true, 'publication is not a delivery receipt');
 		}
 		ws.unsubscribe('room');
 		ws.unsubscribe('other');
 		assert.deepEqual(raw[0].subscriptions, []);
 		assert.ok(raw[1].getBufferedAmount() >= 1024);
 		for (const payload of ['', new Uint8Array(0), 'hello', megabyte]) {
-			assert.equal(ws.publish('room', payload), true, 'unsubscribed publication keeps the same pressured-peer result');
+			assert.equal(ws.publish('room', payload, typeof payload !== 'string'), true, 'unsubscribed publication keeps the same pressured-peer result');
 		}
 		assert.deepEqual(raw[0].subscriptions, [], 'pressure fallback does not add membership');
 	} finally {

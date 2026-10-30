@@ -4,13 +4,13 @@ import type { upgradeResponse } from './upgrade-response.js';
 /** The supported connection methods exposed to WebSocket hooks. */
 export interface WebSocket<UserData> {
 	getUserData(): UserData;
-	send(message: string | ArrayBuffer | ArrayBufferView, isBinary?: boolean, compress?: boolean): number;
-	publish(topic: string, message: string | ArrayBuffer | ArrayBufferView, isBinary?: boolean, compress?: boolean): boolean;
-	subscribe(topic: string): boolean;
-	unsubscribe(topic: string): boolean;
-	isSubscribed(topic: string): boolean;
+	send(message: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView, isBinary?: boolean, compress?: boolean): number;
+	publish(topic: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView, message: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView, isBinary?: boolean, compress?: boolean): boolean;
+	subscribe(topic: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView): boolean;
+	unsubscribe(topic: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView): boolean;
+	isSubscribed(topic: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView): boolean;
 	getBufferedAmount(): number;
-	end(code?: number, message?: string | ArrayBuffer | ArrayBufferView): void;
+	end(code?: number, message?: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView): void;
 	close(): void;
 }
 
