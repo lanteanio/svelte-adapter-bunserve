@@ -8,6 +8,7 @@ import { nextCounter } from '$lib/server/shared-counter.js';
 // to the adapter's source through node_modules, a separate module instance
 // from the runtime the build copied, which is the case the entry exists for.
 import { trackedSubscribe, trackedUnsubscribe } from 'svelte-adapter-bunserve/subscriptions';
+import { assertPlatformContract, PLATFORM_CONTRACT } from 'svelte-adapter-bunserve/platform-contract';
 import * as releaseProbe from './subscription-release.js';
 import { registerIngress } from '../../../src/runtime/handler/ingress.js';
 
@@ -53,6 +54,7 @@ const snapWire = {
 
 /** Once at boot, after the listener is up. The family's arming point. */
 export function init({ platform }) {
+	assertPlatformContract(platform, PLATFORM_CONTRACT, { context: 'worker' });
 	registerIngress('fixture.input:1', {
 		decode: (payload, schemaVersion, seq) => ({ bytes: [...payload], schemaVersion, seq }),
 		route: (ws, target, value, ingressPlatform) => ingressPlatform.send(ws, '__fixture', 'ingress', { target, value })
@@ -277,6 +279,8 @@ export function message(ws, { data, isBinary, msg, platform }) {
 			for (const name of Object.getOwnPropertyNames(current)) memberSet.add(name);
 		}
 		const members = [...memberSet];
+		let contract = 'ok';
+		try { assertPlatformContract(platform, PLATFORM_CONTRACT, { context: 'connection' }); } catch (error) { contract = error.message; }
 		let forwarded = platformForwarders.get(ws.getUserData());
 		if (!forwarded) {
 			forwarded = {};
@@ -292,7 +296,7 @@ export function message(ws, { data, isBinary, msg, platform }) {
 			platformForwarders.set(ws.getUserData(), forwarded);
 		}
 		forwarded.send(ws, '__fixture', 'platform-contract', {
-			ref: msg.ref, members: members.sort(), forwardedMembers: Object.keys(forwarded).sort(),
+			ref: msg.ref, contract, members: members.sort(), forwardedMembers: Object.keys(forwarded).sort(),
 			requestId: forwarded.requestId, contextualRequestId: Object.hasOwn(platform, 'requestId'),
 			connections: forwarded.connections,
 			hasLiveConnectionGetter: typeof Object.getOwnPropertyDescriptor(forwarded, 'connections').get === 'function'

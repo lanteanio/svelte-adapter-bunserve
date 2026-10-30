@@ -1969,7 +1969,7 @@ Every entry below includes TypeScript declarations and uses the
 | `./plugins/webhooks` | Controlled outbound webhook delivery |
 | `./safe-url` | URL and IP policy checks, including resolved-address validation |
 | `./observability` | Telemetry declarations, diagnostic envelopes and trace-context helpers |
-| `./platform-contract` | Generated public Platform member inventory |
+| `./platform-contract` | Explicit platform capability contracts and member inventory |
 | `./testing` | A native Bun test server and protocol helpers |
 | `./sim` | Seeded in-memory simulation, replay and golden comparisons |
 
@@ -2004,45 +2004,25 @@ retention, connection and measurement-health checks for custom leak lanes.
 `npm test` includes public plugin and simulator tests. `npm run test:public-native`
 checks native server and wire contracts under Bun.
 
-## Platform member inventory
+## Platform capability contracts
 
 `svelte-adapter-bunserve/platform-contract` exports the frozen
-`PLATFORM_MEMBERS` array and the TypeScript `PlatformMember` name union.
-They are generated from this adapter's complete public `Platform` declaration,
-including contextual `requestId`. Symbol-keyed internals and plugin-added
-members are outside the inventory.
+`PLATFORM_MEMBERS` inventory and its `PlatformMember` name union, generated from
+this adapter's complete public `Platform` declaration. It also exports
+`PLATFORM_CONTRACT` and `TEST_PLATFORM_CONTRACT`, positive declarations of each
+member's runtime kind and worker or connection scope for the production
+platform and for `createTestServer`, `definePlatformContract` for other
+adapters, and `assertPlatformContract(platform, contract, { context })`, which
+reports every missing or wrong-kind member in one error with a stable `code`.
+Pass the contract explicitly; a platform object's method presence does not
+identify its adapter. Members this adapter does not provide, such as `batch` or
+`request`, are absent from its contract. See
+[Platform capability contracts](./docs/platform-contract.md) for validation,
+forwarding wrappers and alternate declarations.
 
-Wrappers read through the original object to retain live getters and invoke
-methods with their original receiver:
-
-```js
-import { PLATFORM_MEMBERS } from 'svelte-adapter-bunserve/platform-contract';
-
-export function forwardPlatform(source) {
-	const forwarded = {};
-	for (const name of PLATFORM_MEMBERS) {
-		if (!(name in source)) continue;
-		Object.defineProperty(forwarded, name, {
-			enumerable: true,
-			get() {
-				const value = source[name];
-				return typeof value === 'function' ? value.bind(source) : value;
-			}
-		});
-	}
-	return forwarded;
-}
-```
-
-The inventory describes declared members. It does not certify an arbitrary
-object or infer which adapter produced it. Preserve absent members: HTTP-only
-builds have a smaller surface, and per-request fields belong to a request or
-connection platform. Require only capabilities supplied by the adapter and
-context in use; plugin-added fields follow their plugin's contract.
-
-After changing `Platform`, run `node scripts/generate-platform-contract.js`.
-`npm run check:platform` rejects stale generated files, and the native suite
-compares the inventory with a production connection platform.
+After changing `Platform` or the test platform types, run
+`node scripts/generate-platform-contract.js`. `npm run check:platform` rejects
+stale generated files.
 
 ## Versions at boot
 

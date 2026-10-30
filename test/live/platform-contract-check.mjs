@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { PLATFORM_MEMBERS } from 'svelte-adapter-bunserve/platform-contract';
+import { PLATFORM_CONTRACT, PLATFORM_MEMBERS } from 'svelte-adapter-bunserve/platform-contract';
 import { assertPortFree, buildPath, serverEnv, waitForServer } from './harness.mjs';
 
 const port = 8875;
@@ -33,6 +33,8 @@ try {
 	await waitForServer(proc, port);
 	const first = await connect();
 	const before = await probe(first, 1);
+	assert.equal(before.contract, 'ok', 'the production connection platform satisfies its contract');
+	assert.deepEqual(Object.keys(PLATFORM_CONTRACT.members), [...PLATFORM_MEMBERS]);
 	assert.deepEqual(before.members, PLATFORM_MEMBERS);
 	assert.deepEqual(before.forwardedMembers, PLATFORM_MEMBERS);
 	assert.equal(typeof before.requestId, 'string');

@@ -1,4 +1,8 @@
-// Generated from src/index.d.ts by scripts/generate-platform-contract.js.
+// Generated from src/index.d.ts and src/testing.d.ts by scripts/generate-platform-contract.js.
+import { definePlatformContract } from './platform-contract-validation.js';
+import { CANONICAL_PLATFORM_CONTRACTS } from './runtime/platform-contract-data.js';
+export { definePlatformContract, assertPlatformContract, INVALID_PLATFORM_CONTRACT, PLATFORM_ACTIVATION_FAILED } from './platform-contract-validation.js';
+
 /**
  * All public Platform member names, including per-request and per-connection
  * context fields. This inventory describes the Bun contract, not the
@@ -47,3 +51,9 @@ export const PLATFORM_MEMBERS = Object.freeze([
 	"topicEpoch",
 	"unsubscribe"
 ]);
+
+/** Complete production platform requirements, including connection context. */
+export const PLATFORM_CONTRACT = definePlatformContract(CANONICAL_PLATFORM_CONTRACTS['svelte-adapter-bunserve']);
+
+/** Capabilities supplied by the in-process test server. */
+export const TEST_PLATFORM_CONTRACT = definePlatformContract(CANONICAL_PLATFORM_CONTRACTS['svelte-adapter-bunserve/testing']);

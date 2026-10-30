@@ -52,6 +52,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inventory and its exact TypeScript name union for wrappers and mocks.
   Contextual fields are included; absent runtime capabilities remain absent.
 
+- `./platform-contract` exports `PLATFORM_CONTRACT` and `TEST_PLATFORM_CONTRACT`,
+  positive capability declarations giving each member's runtime kind and worker
+  or connection scope, plus `definePlatformContract` for other adapters and
+  `assertPlatformContract(platform, contract, { context })`, which reports every
+  missing, unreadable or wrong-kind member of an incomplete platform in one
+  error. Errors carry the stable codes `INVALID_PLATFORM_CONTRACT` and
+  `PLATFORM_ACTIVATION_FAILED` (the latter with a `failures` list), and the
+  `svelte-adapter-bunserve` adapter-name namespace is reserved for the canonical
+  contracts. Members this adapter does not provide stay absent from them.
+
 - Bun 1.4 `memoryPressure` notifications coalesce into a cgroup discovery
   refresh on the next regular pressure tick. Warning and critical notifications
   share this hint, without an extra timer, sample or invented pressure level.
