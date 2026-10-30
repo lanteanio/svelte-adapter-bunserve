@@ -1986,6 +1986,14 @@ address and use it in the returned URLs; omission keeps the wildcard listener
 and `localhost` URLs. The optional `ws` peer supports Node-style client sockets
 in test code.
 
+Annotate handlers with `TestWebSocketHandler`; its user-data type flows
+through `createTestServer`. Connection and request callbacks expose the clock,
+RNG and connection request ID; `server.platform`, `init` and `shutdown` have no
+request ID. The harness runs no pressure sampler, so `onPressure` and
+`onPublishRate` are absent: exercise those subscriptions in the built runtime.
+`isWarmupRequest()` returns `false` because this server renders no warmup
+requests.
+
 Use `runSim`, `runSimMany` and `replaySim` from
 `svelte-adapter-bunserve/sim` for deterministic protocol scenarios without
 opening a network listener. Public simulator helpers and the production

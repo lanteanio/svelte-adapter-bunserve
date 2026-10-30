@@ -3,10 +3,10 @@ import { responseConnectionHeaders, responseContentLength, isResponseHopHeader, 
 import { createDeliveryAuthorization, DEFAULT_DELIVERY_PENDING_BYTES } from './runtime/utils/delivery-authorization.js';
 import { activeTraceContext, trace } from './runtime/tracing.js';
 import { createUnaccountedSubscriptionRegistry, addLogicalSubscription, removeLogicalSubscription, accountClosedLogicalSubscriptions } from './runtime/utils/ws-symbols.js';
-import { completeSerializedEnvelope, envelopeData } from './runtime/utils/epoch.js';
+import { completeSerializedEnvelope, envelopeData, createHlc } from './runtime/utils/epoch.js';
 import { copyUpgradeUserData } from './runtime/utils/upgrade-user-data.js';
 import { isSet, isUint8Array, isNativeError } from 'node:util/types';
-import { now, monotonicNow, wallEpoch, setTimer, clearTimer, randomUuid } from './runtime/runtime.js';
+import { now, monotonicNow, processMonotonicNow, wallEpoch, setTimer, clearTimer, randomFloat, randomU32, randomUuid, randomBytes } from './runtime/runtime.js';
 import { assertMountPath, assertDistinctMounts } from './runtime/utils/mount-path.js';
 import { parseCookies } from './runtime/cookies.js';
 import { collectRequestHeaders, framingRefusal, isFramingHeader } from './runtime/utils/request-headers.js';
@@ -1194,7 +1194,25 @@ export async function createTestServer(options = {}) {
 		return undefined;
 	}
 
+	let testHlc;
 	const platform = {
+		// The same clock and RNG seams the production platform reads, so an
+		// injected runtime environment drives both identically.
+		now() { return wallEpoch(); },
+		monotonic() { return processMonotonicNow(); },
+		random: {
+			float: () => randomFloat(),
+			u32: () => randomU32(),
+			uuid: () => randomUuid(),
+			bytes: (n) => new Uint8Array(randomBytes(n))
+		},
+		hlc() {
+			// Allocate the node identity on first use so unused clocks consume no RNG.
+			testHlc ??= createHlc();
+			return testHlc();
+		},
+		// This server renders no warmup requests.
+		isWarmupRequest() { return false; },
 		authorizeDelivery(callback, options) { deliveryAuthorization.configure(callback, options); },
 		get traceContext() { return activeTraceContext(); },
 		trace,

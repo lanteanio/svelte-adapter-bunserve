@@ -712,6 +712,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A hook socket that released all its subscriptions no longer delivers an empty
   `publish()` frame to its peers twice.
 
+- The test server exposes the shared clock, RNG, HLC and warmup predicate. Its
+  handler types omit unavailable pressure subscriptions and worker-level
+  request IDs.
+
 - Duplicate CRDT updates and already-held resync snapshots skip fan-out and
   persistence. Pending inserts, deletes and formatted-text changes still relay
   and persist before their dependencies or cleanup transactions finish.

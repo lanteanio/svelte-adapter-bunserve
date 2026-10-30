@@ -11,7 +11,7 @@ import type {
 	UpgradeContext
 } from './index.js';
 
-export interface TestServerOptions {
+export interface TestServerOptions<UserData = unknown> {
 	/** Port to listen on. Defaults to 0 (random available port). */
 	port?: number;
 	/** Optional bind address. Omit to preserve the native wildcard listener. */
@@ -19,7 +19,7 @@ export interface TestServerOptions {
 	/** WebSocket endpoint path. @default '/ws' */
 	wsPath?: string;
 	/** WebSocket handler hooks (same shape as hooks.ws.ts exports). */
-	handler?: Partial<WebSocketHandler>;
+	handler?: TestWebSocketHandler<UserData>;
 	/**
 	 * Arm wire-subscribe authorization, mirroring
 	 * `adapter({ websocket: { authorizeWireSubscribe: true } })`. A client may
@@ -164,13 +164,14 @@ export type ChaosScenario =
 	| { scenario: 'worker-flap'; code?: number; reason?: string };
 
 /**
- * Platform exposed by `createTestServer`. Adds the `__chaos` fault-injection
- * setter on top of the production `Platform` surface. Tests can use the
+ * Worker platform exposed by `createTestServer`. Request IDs belong to hook
+ * connection contexts. This server has no pressure sampler: use the built
+ * runtime to test `onPressure` and `onPublishRate` subscriptions. Tests can use the
  * harness to simulate broken-network conditions while exercising protocol
  * code (subscribe acks, session resume, sendCoalesced under backpressure,
  * request/reply timeouts, etc).
  */
-export interface TestPlatform extends Platform {
+export interface TestPlatform extends Omit<TestConnectionPlatform, 'requestId'> {
 	/**
 	 * Validated W3C context for the currently active HTTP, WebSocket, RPC, bus,
 	 * or durable-work operation. Concurrent operations on one connection remain
@@ -567,6 +568,24 @@ export interface TestPlatform extends Platform {
 	__chaos(cfg: ChaosScenario | null): void;
 }
 
+/** Connection-scoped platform with a request ID and no pressure sampler. */
+export type TestConnectionPlatform = Omit<Platform, 'onPressure' | 'onPublishRate'>;
+
+type TestHookArgument<Argument, ContextPlatform> = Argument extends { platform: Platform }
+	? Omit<Argument, 'platform'> & { platform: ContextPlatform }
+	: Argument;
+type TestHook<Hook, ContextPlatform> = Hook extends (...args: infer Arguments) => infer Result
+	? (...args: { [Index in keyof Arguments]: TestHookArgument<Arguments[Index], ContextPlatform> }) => Result
+	: Hook;
+
+/** Handler hooks with the platform members this in-process server supplies. */
+export type TestWebSocketHandler<UserData = unknown> = {
+	[Key in keyof WebSocketHandler<UserData>]: TestHook<
+		WebSocketHandler<UserData>[Key],
+		Key extends 'init' | 'shutdown' ? TestPlatform : TestConnectionPlatform
+	>;
+};
+
 export interface TestServer {
 	/** HTTP URL of the test server (e.g. 'http://localhost:12345'). */
 	url: string;
@@ -657,7 +676,7 @@ export interface TestServer {
  * });
  * ```
  */
-export function createTestServer(options?: TestServerOptions): Promise<TestServer>;
+export function createTestServer<UserData = unknown>(options?: TestServerOptions<UserData>): Promise<TestServer>;
 
 // - Re-exported pure helpers -----------------------------------------------
 // Curated for downstream test code asserting on wire shape, userData
@@ -780,7 +799,7 @@ export const WS_PENDING_REQUESTS: unique symbol;
 /** Per-connection traffic counters. Only allocated when a `close` hook is registered. */
 export const WS_STATS: unique symbol;
 
-/** Per-connection `Platform` clone carrying the connection's `requestId`. */
+/** Per-connection `TestConnectionPlatform` clone carrying the connection's `requestId`. */
 export const WS_PLATFORM: unique symbol;
 
 /** Set of capabilities the client advertised via `{type:'hello', caps:[...]}`. */
