@@ -20,6 +20,7 @@ export const PLATFORM_MEMBERS = Object.freeze([
 	"connections",
 	"forEachSubscriber",
 	"grantPublish",
+	"hlc",
 	"isWarmupRequest",
 	"maxPayloadLength",
 	"metrics",

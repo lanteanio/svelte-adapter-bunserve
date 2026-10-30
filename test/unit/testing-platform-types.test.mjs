@@ -32,7 +32,6 @@ import { createTestServer, type TestWebSocketHandler } from '../../src/testing.j
 const handler: TestWebSocketHandler<{ account: string }> = {
 	init({ platform }) {
 		const wall: number = platform.now();
-		const stamp: { wall: number; logical: number; nodeId: string } = platform.hlc();
 		// @ts-expect-error Worker callbacks have no request ID.
 		platform.requestId;
 		// @ts-expect-error The test server has no pressure sampler.
@@ -45,7 +44,7 @@ const handler: TestWebSocketHandler<{ account: string }> = {
 	message(ws, { platform }) {
 		const id: string = platform.requestId;
 		const account: string = ws.getUserData().account;
-		const monotonic: number = platform.monotonic();
+		const stamp: { wall: number; logical: number; nodeId: string } = platform.hlc();
 		// @ts-expect-error Connection callbacks have no publish-rate sampler.
 		platform.onPublishRate(() => {});
 	}

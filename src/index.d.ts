@@ -840,6 +840,7 @@ export interface Platform {
 	bumpTopicEpoch(topic: string): number;
 	now(): number;
 	monotonic(): number;
+	hlc(): { wall: number; logical: number; nodeId: string };
 	random: {
 		float(): number;
 		u32(): number;

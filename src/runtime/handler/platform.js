@@ -2,7 +2,7 @@ import { deliveryAuthorization, publishAuthorized } from './delivery-authorizati
 /** Realtime topic delivery, connection state, and request observability. */
 
 import { isUint8Array } from 'node:util/types';
-import { completeGameEnvelope, assertStampableSeq, wrapBatchEnvelope } from '../utils/epoch.js';
+import { completeGameEnvelope, assertStampableSeq, wrapBatchEnvelope, createHlc } from '../utils/epoch.js';
 import { registerGameIngress, assertGameLaneClusterSafe, GAME_FANOUT_CAP, GAME_FANOUT_SCHEMA_VERSION, encodeGameFanoutPayload } from './game-ingress.js';
 import { completeEnvelope, completeSerializedEnvelope, envelopeData } from '../utils/envelope.js';
 import { assert, fatal, readAssertionCounts } from '../utils/assertions.js';
@@ -689,6 +689,9 @@ function collapseByCoalesceKey(messages) {
 
 
 registerGameIngress();
+
+/** The per-process hybrid logical clock behind platform.hlc(), created on first read. */
+let processHlc;
 
 export const platform = {
 	authorizeDelivery(callback, options) { deliveryAuthorization.configure(callback, options); },
@@ -2898,6 +2901,17 @@ export const platform = {
 
 	monotonic() {
 		return processMonotonicNow();
+	},
+
+	/**
+	 * Hybrid logical clock stamp: a non-decreasing wall value with a logical
+	 * tiebreaker and a per-process node id. Read only when an event needs a
+	 * causal stamp, never on the per-publish hot path.
+	 */
+	hlc() {
+		// Allocate the node identity on first use so unused clocks consume no RNG.
+		processHlc ??= createHlc();
+		return processHlc();
 	},
 
 	/**

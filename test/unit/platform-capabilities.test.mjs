@@ -93,7 +93,8 @@ test('the contracts declare exactly the inventory, less the sampler subscription
 	assert.equal(TEST_PLATFORM_CONTRACT.adapter, 'svelte-adapter-bunserve/testing');
 	assert.deepEqual(PLATFORM_CONTRACT.members.requestId, { kind: 'string', context: 'connection' });
 	assert.deepEqual(PLATFORM_CONTRACT.members.metrics, { kind: 'object|null', context: 'worker' });
-	for (const name of ['batch', 'request', 'requestTopic', 'hlc', 'trace', 'traceContext', 'introspect', 'diagnostic']) {
+	assert.deepEqual(PLATFORM_CONTRACT.members.hlc, { kind: 'function', context: 'worker' });
+	for (const name of ['batch', 'request', 'requestTopic', 'trace', 'traceContext', 'introspect', 'diagnostic']) {
 		assert.equal(Object.hasOwn(PLATFORM_CONTRACT.members, name), false, name);
 	}
 });

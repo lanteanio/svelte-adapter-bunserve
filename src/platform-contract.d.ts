@@ -20,6 +20,7 @@ export declare const PLATFORM_MEMBERS: readonly [
 	"connections",
 	"forEachSubscriber",
 	"grantPublish",
+	"hlc",
 	"isWarmupRequest",
 	"maxPayloadLength",
 	"metrics",

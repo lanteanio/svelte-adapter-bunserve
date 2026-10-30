@@ -43,16 +43,16 @@ an unbound worker platform. Validation reads getters with their original
 receiver and never calls methods. It checks top-level runtime kinds, not nested
 object shape, method signatures or behavior.
 
-This adapter's contract declares only the members its platform provides.
-`batch`, `request`, `requestTopic`, `hlc`, `trace`, `traceContext`,
+This adapter's contract declares only the members its production platform
+provides. `batch`, `request`, `requestTopic`, `trace`, `traceContext`,
 `introspect` and `diagnostic` are not part of the Bun `Platform` and are absent
-from `PLATFORM_CONTRACT`; a consumer that activates against it never receives
-them.
+from `PLATFORM_CONTRACT`, so activating against it neither requires nor
+certifies them.
 
 ## Activating and forwarding
 
-For the built runtime or the Vite dev plugin, which serves the same members,
-pass `PLATFORM_CONTRACT`. For `createTestServer`, pass `TEST_PLATFORM_CONTRACT`.
+For the built runtime or the Vite dev plugin, which serves every production
+member, pass `PLATFORM_CONTRACT`. For `createTestServer`, pass `TEST_PLATFORM_CONTRACT`.
 Another adapter supplies its own positive contract; consumers use that
 declaration without guessing from absent methods. A plugin or library that
 activates against whatever platform it is handed takes the contract from its

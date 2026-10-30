@@ -533,25 +533,6 @@ export interface TestPlatform extends Omit<TestConnectionPlatform, 'requestId'> 
 		id?: number | string
 	): { seq: number | null; delivered: number };
 	/**
-	 * A hybrid logical clock stamp for events that must order consistently
-	 * across workers (or across a coarse / briefly-backward wall clock).
-	 *
-	 * - `wall` is a non-decreasing wall-clock value in epoch milliseconds,
-	 *   sourced from the injectable runtime clock. It never moves backward:
-	 *   a same-millisecond or backward clock read holds the previous value.
-	 * - `logical` is a tiebreaker that resets to `0` whenever `wall` advances
-	 *   and increments when two stamps share a millisecond, so the
-	 *   `(wall, logical)` pair is a strict per-process ordering.
-	 * - `nodeId` is a short, stable per-process identity assigned once at
-	 *   init from the injectable runtime RNG (a seeded harness reproduces it);
-	 *   in clustered mode it is effectively the worker identity.
-	 *
-	 * Call only when an event needs a causal stamp - it is intentionally off
-	 * the per-publish hot path.
-	 */
-	hlc(): { wall: number; logical: number; nodeId: string };
-
-	/**
 	 * Activate or clear a chaos / fault-injection scenario. Pass `null`
 	 * to reset; the harness returns to its zero-overhead fast paths.
 	 *

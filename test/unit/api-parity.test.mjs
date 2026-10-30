@@ -52,7 +52,6 @@ const PLATFORM_GAPS = {
 	request: 'RPC over the socket',
 	requestTopic: 'RPC over the socket',
 	batch: 'batched publish API',
-	hlc: 'hybrid logical clock (cluster ordering)',
 
 
 

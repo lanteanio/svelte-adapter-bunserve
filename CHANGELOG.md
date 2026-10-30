@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `platform.hlc()` returns a hybrid logical clock stamp `{ wall, logical, nodeId }`
+  whose wall value never decreases and whose logical counter breaks ties, read
+  from the injectable runtime clock and RNG.
+
 - `SmoothDrainError` exposes committed updates, acknowledgements and events when
   an authority callback fails, preserving its exact cause and bounded retries
   without replaying output already returned.
