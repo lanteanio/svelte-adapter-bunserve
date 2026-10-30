@@ -29,10 +29,6 @@ function exchange(ws, frame, expected) {
 		const message = ({ data }) => {
 			let msg;
 			try { msg = JSON.parse(data); } catch { return; }
-			if (expected === 'unsubscribe-hook') {
-				if (msg?.topic === '__fixture' && msg.event === expected && msg.data?.topic === frame.topic) finish();
-				return;
-			}
 			if (!msg || msg.ref !== frame.ref || msg.topic !== frame.topic) return;
 			if (msg.type === expected) finish();
 			else if (msg.type === 'subscribe-denied') finish(new Error('subscription denied'));
@@ -55,7 +51,12 @@ export async function churnConnection(url, topic) {
 	}
 }
 
-/** Held sockets exercise bounded topic registries without handshake churn. */
+/**
+ * Held sockets exercise bounded topic registries without handshake churn: each
+ * unit subscribes, has the server publish to the topic and revoke it, without
+ * waiting for any reply. The connections do not move, so anything that grows
+ * grows per topic rather than per socket.
+ */
 export async function topicWorkload(url, count = 4) {
 	const sockets = [];
 	let cursor = 0;
@@ -70,9 +71,10 @@ export async function topicWorkload(url, count = 4) {
 			const ref = ++cursor;
 			const ws = sockets[ref % sockets.length];
 			const topic = `leak-lane-${ref % 512}`;
-			await exchange(ws, { type: 'subscribe', topic, ref }, 'subscribed');
-			ws.send(JSON.stringify({ type: 'fixture-publish', topic, data: { i: ref } }));
-			await exchange(ws, { type: 'unsubscribe', topic, ref }, 'unsubscribe-hook');
+			ws.send(JSON.stringify({ type: 'subscribe', topic, ref }));
+			ws.send(JSON.stringify({ type: 'broadcast', topic, payload: { i: ref } }));
+			ws.send(JSON.stringify({ type: 'revoke-topic', topic }));
+			if (ws.readyState !== WebSocket.OPEN) throw new Error('WebSocket closed during an operation');
 		},
 		close() {
 			for (const ws of sockets) ws.close();

@@ -322,6 +322,21 @@ export function message(ws, { data, isBinary, msg, platform }) {
 		return;
 	}
 	// A control-shaped frame the adapter did not consume arrives pre-parsed.
+	if (msg && msg.type === 'broadcast') {
+		// `inflate` synthesizes a large payload server-side, past the inbound
+		// frame cap a client could send.
+		const payload = typeof msg.inflate === 'number'
+			? { ...msg.payload, big: 'x'.repeat(msg.inflate) }
+			: msg.payload;
+		platform.publish(msg.topic || 'test-topic', msg.event || 'broadcast', payload, msg.options ?? { seq: false });
+		return;
+	}
+	// Server-side revocation, the shape a kick, ban or lease expiry uses.
+	if (msg && msg.type === 'revoke-topic') {
+		const removed = platform.unsubscribe(ws, msg.topic);
+		platform.send(ws, 'probe', 'revoked', { topic: msg.topic, removed });
+		return;
+	}
 	if (msg && msg.type === 'fixture-publish') {
 		platform.publish(msg.topic, 'said', msg.data, { seq: true });
 		return;

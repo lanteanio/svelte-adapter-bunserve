@@ -82,8 +82,8 @@ export const RESETTLE_MS = 20_000;
  * rule, set against V8's plateaus: two or three rounds inside the band were
  * satisfied by the middle of a plateau and opened the window just before the
  * next step. Kept here as spelled, so the two lanes open their windows on the
- * same definition of steady. Measured here: http settles in 19 rounds, ws in
- * 9 or 10, a clean server under the self-check's warm traffic in 9 to 14.
+ * same definition of steady. Measured here: http settles in 19 rounds, and a
+ * clean server under the self-check's warm traffic in 9 to 14.
  */
 export const SETTLE_ROUND_MS = 4_000;
 export const SETTLE_STABLE_ROUNDS = 8;

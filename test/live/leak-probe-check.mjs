@@ -98,7 +98,7 @@ await withServer({ LEAK_PROBE: '1' }, async (base) => {
 	try {
 		check('topic workload holds four live connections', (await call('op=mem')).body.connections === 4);
 		await Promise.all(Array.from({ length: 32 }, () => workload.unit()));
-		check('topic workload completes acknowledged subscribe/publish/unsubscribe cycles', true);
+		check('topic workload sends subscribe/broadcast/revoke cycles on held connections', true);
 	} finally { workload.close(); }
 	check('topic workload releases every held connection', await connectionsClosed());
 	await churnConnection(wsURL, 'leak-churn-check');
