@@ -20,16 +20,66 @@ const encoder = new TextEncoder();
 
 /**
  * The bytes of a non-string recognized string, as a view over the caller's
- * memory (no copy).
+ * memory (no copy). `undefined` and a detached buffer read as no bytes, as
+ * uWS reads them.
  *
  * @param {unknown} value
  * @returns {Uint8Array}
  */
 export function recognizedBytes(value) {
 	if (value instanceof Uint8Array) return value;
-	if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-	if (types.isAnyArrayBuffer(value)) return new Uint8Array(/** @type {ArrayBuffer} */ (value));
+	if (ArrayBuffer.isView(value)) {
+		return value.buffer.detached ? EMPTY : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+	}
+	if (types.isAnyArrayBuffer(value)) {
+		return /** @type {ArrayBuffer} */ (value).detached ? EMPTY : new Uint8Array(/** @type {ArrayBuffer} */ (value));
+	}
+	if (value === undefined) return EMPTY;
 	throw new Error(NOT_RECOGNIZED);
+}
+
+const EMPTY = new Uint8Array(0);
+
+/**
+ * Read bytes as uWS reads a string's encoding back: UTF-8 in which a
+ * surrogate code unit may stand alone in its three-byte form. Returns null
+ * for anything else, including a surrogate pair written as two such units,
+ * which no string encodes to.
+ *
+ * @param {Uint8Array} bytes
+ * @returns {string | null}
+ */
+function decodeLoneSurrogates(bytes) {
+	const units = [];
+	let previousHigh = false;
+	for (let i = 0; i < bytes.length;) {
+		const lead = bytes[i];
+		let code;
+		let size;
+		if (lead < 0x80) { code = lead; size = 1; }
+		else if (lead >= 0xc2 && lead <= 0xdf) { code = lead & 0x1f; size = 2; }
+		else if (lead >= 0xe0 && lead <= 0xef) { code = lead & 0x0f; size = 3; }
+		else if (lead >= 0xf0 && lead <= 0xf4) { code = lead & 0x07; size = 4; }
+		else return null;
+		if (i + size > bytes.length) return null;
+		for (let k = 1; k < size; k++) {
+			const next = bytes[i + k];
+			if ((next & 0xc0) !== 0x80) return null;
+			code = (code << 6) | (next & 0x3f);
+		}
+		if ((size === 3 && code < 0x800) || (size === 4 && (code < 0x10000 || code > 0x10ffff))) return null;
+		const low = code >= 0xdc00 && code <= 0xdfff;
+		if (low && previousHigh) return null;
+		previousHigh = code >= 0xd800 && code <= 0xdbff;
+		if (code >= 0x10000) {
+			code -= 0x10000;
+			units.push(0xd800 + (code >> 10), 0xdc00 + (code & 0x3ff));
+		} else units.push(code);
+		i += size;
+	}
+	let text = '';
+	for (let i = 0; i < units.length; i += 4096) text += String.fromCharCode(...units.slice(i, i + 4096));
+	return text;
 }
 
 /**
@@ -115,17 +165,17 @@ function escapeTopic(bytes) {
  * The Bun topic for a recognized-string topic, so two topics are the same
  * native topic exactly when uWS would treat them as the same bytes.
  *
- * A string is its own name, and bytes that are valid UTF-8 name the topic
- * their decoding names. What Bun cannot take as a name - the empty topic,
- * which Bun refuses, and bytes that are not valid UTF-8, which have no string
- * spelling - is written as a NUL followed by the bytes in lowercase hex. A
- * string that already has that shape is escaped the same way, so an escaped
- * name never coincides with a topic spelled that way by the caller. No topic
- * the platform publishes to can start with a NUL, since topic names refuse
- * control characters.
+ * A string is its own name, and bytes name the topic of the string they
+ * encode (UTF-8, with an unpaired surrogate in its three-byte form). What Bun
+ * cannot take as a name - the empty topic, which Bun refuses, and bytes no
+ * string encodes to - is written as a NUL followed by the bytes in lowercase
+ * hex. A string that already has that shape is escaped the same way, so an
+ * escaped name never coincides with a topic spelled that way by the caller.
+ * Every native publish, subscriber count and membership call, from the socket
+ * and from the platform, names its topic through here.
  *
  * Bun stores an unpaired surrogate in a topic name as U+FFFD, so such a name
- * is passed through: the platform's publish path names it the same way.
+ * and the same name with U+FFFD in its place are one native topic.
  *
  * @param {unknown} topic
  * @returns {string}
@@ -140,7 +190,8 @@ export function nativeTopic(topic) {
 	try {
 		decoded = utf8.decode(bytes);
 	} catch {
-		return escapeTopic(bytes);
+		decoded = decodeLoneSurrogates(bytes);
+		if (decoded === null) return escapeTopic(bytes);
 	}
 	return nativeTopic(decoded);
 }

@@ -23,11 +23,25 @@ test('every recognized string reads as exactly its own bytes', () => {
 });
 
 test('anything else is refused with the uWS message', () => {
-	for (const value of [undefined, null, 1, true, {}, [1, 2], new Blob(['x'])]) {
+	for (const value of [null, 1, true, {}, [1, 2], new Blob(['x'])]) {
 		assert.throws(() => recognizedBytes(value), {
 			name: 'Error',
 			message: 'Text and data can only be passed by String, ArrayBuffer or ArrayBufferView.'
 		});
+	}
+});
+
+test('undefined and a detached buffer read as no bytes, as uWS reads them', () => {
+	assert.deepEqual(bytes(recognizedBytes(undefined)), []);
+	assert.equal(framePayload(undefined, false), '');
+	assert.deepEqual(bytes(framePayload(undefined, true)), []);
+	assert.equal(nativeTopic(undefined), nativeTopic(''));
+	const detached = new ArrayBuffer(4);
+	const views = [new DataView(detached, 1, 2), new Int16Array(detached, 0, 2)];
+	structuredClone(detached, { transfer: [detached] });
+	for (const value of [detached, ...views]) {
+		assert.deepEqual(bytes(recognizedBytes(value)), []);
+		assert.equal(framePayload(value, false), '');
 	}
 });
 
@@ -68,6 +82,17 @@ test('a string topic names itself and UTF-8 bytes name the topic they spell', ()
 		assert.equal(nativeTopic(new TextEncoder().encode(topic).buffer), topic);
 	}
 	assert.equal(nativeTopic(HIGH), HIGH);
+});
+
+test('bytes encoding an unpaired surrogate name the same topic as the string', () => {
+	assert.equal(nativeTopic(new Uint8Array([0xed, 0xa0, 0x80])), HIGH);
+	assert.equal(nativeTopic(stringBytes('a' + LOW + 'b')), 'a' + LOW + 'b');
+	assert.equal(nativeTopic(stringBytes(unit(0x20ac) + HIGH)), unit(0x20ac) + HIGH);
+	// A surrogate pair written as two three-byte units is no string's encoding.
+	assert.equal(nativeTopic(new Uint8Array([0xed, 0xa0, 0xbd, 0xed, 0xb8, 0x80])), '\x00eda0bdedb880');
+	for (const invalid of [[0xc0, 0x80], [0xe0, 0x80, 0x80], [0xf4, 0x90, 0x80, 0x80], [0xed, 0xa0], [0x80]]) {
+		assert.equal(nativeTopic(new Uint8Array(invalid)), '\x00' + Buffer.from(invalid).toString('hex'));
+	}
 });
 
 test('names Bun cannot take are escaped, and the escape never meets a caller spelling', () => {

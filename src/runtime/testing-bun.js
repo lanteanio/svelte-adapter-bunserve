@@ -1,5 +1,6 @@
 import { wsFacade } from './handler/ws-facade.js';
 import { now } from './runtime.js';
+import { nativeTopic } from './utils/recognized-string.js';
 
 // Transport bridge for the public test server. The dispatch and hook contract
 // use the family socket facade; Bun owns the listener and WebSocket frames.
@@ -30,11 +31,11 @@ export function App() {
 		get(path, handler) { routes.push({ method: 'GET', path, handler }); return app; },
 		head(path, handler) { routes.push({ method: 'HEAD', path, handler }); return app; },
 		any(path, handler) { routes.push({ method: '*', path, handler }); return app; },
-		numSubscribers(topic) { return server?.subscriberCount(topic) ?? 0; },
+		numSubscribers(topic) { return server?.subscriberCount(nativeTopic(topic)) ?? 0; },
 		publish(topic, message, binary = false) {
-			if (!server || server.subscriberCount(topic) === 0) return false;
+			if (!server || server.subscriberCount(nativeTopic(topic)) === 0) return false;
 			const value = payload(message, binary);
-			return server.publish(topic, value) !== 0 || (typeof value === 'string' ? value.length === 0 : value.byteLength === 0);
+			return server.publish(nativeTopic(topic), value) !== 0 || (typeof value === 'string' ? value.length === 0 : value.byteLength === 0);
 		},
 		listen(host, port, callback) {
 			if (callback === undefined) { callback = port; port = host; host = '0.0.0.0'; }

@@ -116,7 +116,7 @@ try {
 	// byte until it ends - that is what makes it a slow consumer.
 	const results = [];
 	for (let i = 0; i < BURST_FRAMES; i++) {
-		results.push(facade.send(indexedFrame(i)));
+		results.push(facade.send(indexedFrame(i), true));
 	}
 
 	// While the socket is still saturated (nothing drains until this synchronous

@@ -21,6 +21,7 @@ import { isAuthorizationHook, releaseDerivedSubscriptions, beginPendingSubscribe
 import { runUnsubscribeHook } from './runtime/utils/unsubscribe-hook.js';
 import { runOpenHook, runCloseHook } from './runtime/utils/hook-boundary.js';
 import { closeFrameReason } from './runtime/utils/testing-close-frame.js';
+import { framePayload, nativeTopic, recognizedBytes } from './runtime/utils/recognized-string.js';
 import { carriesPreParsedEnvelope, deniesWireSystemTopicSubscribe, deniesWireSubscribePreHook, deniesWireSubscribeLanding, wantsRecover, recoverIsRevoked, deniesRefLessRecover, deniesRefLessRecoverBatch, recoverRequiresRefFrame, exceedsSubscriptionCap, exceedsPendingSubscribeCap, deniesUngrantedObserve } from './runtime/utils/subscribe-policy.js';
 import {
 	assertWireSubscribeAuthorization,
@@ -521,13 +522,24 @@ export default function uws(options = {}) {
 	 * @param {import('ws').WebSocket} rawWs
 	 * @param {unknown} userData
 	 */
+	/**
+	 * The dev subscription key for a socket topic: the production native name,
+	 * except that the empty topic stays '' because the dev registry, unlike
+	 * Bun, takes it as it is.
+	 */
+	function devTopic(topic) {
+		if (topic === '' || (typeof topic !== 'string' && recognizedBytes(topic).byteLength === 0)) return '';
+		return nativeTopic(topic);
+	}
+
 	function wrapWebSocket(rawWs, userData) {
 		const topics = subscriptions.get(rawWs) || new Set();
 		return {
 			send(message, isBinary = false, _compress = false) {
 				if (rawWs.readyState !== 1) throw new Error('Cannot send on a closed WebSocket');
+				const payload = framePayload(message, isBinary);
 				if (rawWs.bufferedAmount > DEFAULT_DELIVERY_PENDING_BYTES) return 2;
-				rawWs.send(typeof message === 'string' ? message : Buffer.from(message), () => {
+				rawWs.send(payload, () => {
 					const wrapped = wsWrappers.get(rawWs);
 					if (wrapped) deliveryAuthorization.drain(wrapped);
 				});
@@ -548,10 +560,11 @@ export default function uws(options = {}) {
 				else if (reason === undefined) rawWs.close(code);
 				else rawWs.close(code, typeof reason === 'string' ? reason : Buffer.from(reason.buffer, reason.byteOffset, reason.byteLength));
 			},
-			subscribe(topic) { topics.add(topic); return true; },
-			unsubscribe(topic) { topics.delete(topic); return true; },
-			publish(topic, message, isBinary = false, _compress = false) {
-				const msg = typeof message === 'string' ? message : Buffer.from(message);
+			subscribe(topic) { topics.add(devTopic(topic)); return true; },
+			unsubscribe(topic) { topics.delete(devTopic(topic)); return true; },
+			publish(name, message, isBinary = false, _compress = false) {
+				const topic = devTopic(name);
+				const msg = framePayload(message, isBinary);
 				// A raw socket publish, like the native one, is outside the
 				// delivery policy: only adapter platform methods pass it.
 				for (const [ws, wsTopics] of subscriptions) {
@@ -565,7 +578,7 @@ export default function uws(options = {}) {
 				}
 				return true;
 			},
-			isSubscribed(topic) { return topics.has(topic); },
+			isSubscribed(topic) { return topics.has(devTopic(topic)); },
 			getTopics() { return [...topics]; },
 			getUserData() { return userData; },
 			getBufferedAmount() { return rawWs.bufferedAmount || 0; },

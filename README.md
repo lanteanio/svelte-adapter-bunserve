@@ -153,13 +153,15 @@ continues to return its numeric status: 0 buffered, 1 sent, or 2 dropped.
 
 As on uWS, its `send`, `publish`, `subscribe`, `unsubscribe`, `isSubscribed` and
 `end` take a topic or message as a string, `ArrayBuffer`, `SharedArrayBuffer` or
-view, using exactly the view's bytes. `isBinary` selects the frame type whatever
-the message's type, and a string sent as binary goes out as its UTF-8 bytes.
-Bytes sent as text must be valid UTF-8: a peer must fail the connection on any
-other text frame, so the call throws a `TypeError` instead. A topic given as bytes
-is the topic its UTF-8 text names, and the empty topic is an ordinary topic. Bun
-stores an unpaired surrogate in a topic name as U+FFFD, so two names that differ
-only there are one topic.
+view, using exactly the view's bytes; `undefined` and a detached buffer read as
+empty. `isBinary` selects the frame type whatever the message's type, and a
+string sent as binary goes out as its UTF-8 bytes. Bytes sent as text must be
+valid UTF-8: a peer must fail the connection on any other text frame, so the call
+throws a `TypeError` instead. A topic given as bytes is the topic of the string
+they encode, and the empty topic is an ordinary topic the platform publishes to.
+The Vite dev server's socket behaves the same way. Bun stores an unpaired
+surrogate in a topic name as U+FFFD, so two names that differ only there are one
+topic.
 
 ## WebSockets
 

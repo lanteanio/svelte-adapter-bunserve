@@ -255,9 +255,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **BREAKING:** the hook socket's `isBinary` selects the frame type, as on uWS:
   bytes sent without it go out as a text frame and a string sent with it as
-  binary. Text bytes that are not valid UTF-8 throw a `TypeError`. Topics and
-  messages accept `SharedArrayBuffer` and byte topics, and `subscribe('')`
-  succeeds; anything that is not a string, buffer or view throws the uWS error.
+  binary, in production and under Vite dev. Text bytes that are not valid UTF-8
+  throw a `TypeError`. Topics and messages accept `SharedArrayBuffer` and byte
+  topics, `undefined` reads as empty, and the empty topic can be subscribed and
+  published to; anything else that is not a string, buffer or view throws the
+  uWS error.
 
 - Raised the supported Bun minimum to 1.4.4. Native incomplete uploads now close
   after an early response; Bun 1.3.14 leaves those connections open even with

@@ -2,6 +2,7 @@
 import { createDeliveryAuthorization } from '../utils/delivery-authorization.js';
 import { recordBackpressureDrop } from '../utils/backpressure.js';
 import { wsCounters } from './ws-state.js';
+import { nativeTopic } from '../utils/recognized-string.js';
 
 // The worker's one delivery boundary. Its pending-byte bound defaults to the
 // transport's own (maxBackpressure) and, like that bound, closes the connection
@@ -22,12 +23,12 @@ const publishSurfaces = new WeakMap();
 
 /** Preserve native Bun publish results on the unarmed path. */
 export function publishAuthorized(server, connections, topic, payload, binary, compress, logicalTopic = topic) {
-	if (!deliveryAuthorization.armed) return server.publish(topic, payload, compress);
+	if (!deliveryAuthorization.armed) return server.publish(nativeTopic(topic), payload, compress);
 	let surface = publishSurfaces.get(server);
 	if (surface === undefined) {
 		surface = {
-			numSubscribers: (name) => server.subscriberCount(name),
-			publish: (name, value, _binary, compression) => server.publish(name, value, compression)
+			numSubscribers: (name) => server.subscriberCount(nativeTopic(name)),
+			publish: (name, value, _binary, compression) => server.publish(nativeTopic(name), value, compression)
 		};
 		publishSurfaces.set(server, surface);
 	}

@@ -112,6 +112,7 @@ import {
 	unwindRevokedMembership
 } from '../utils/ws-symbols.js';
 import { dispatchServerUnsubscribeHook, dispatchUnsubscribeHook } from './unsubscribe-hook.js';
+import { nativeTopic } from '../utils/recognized-string.js';
 
 // Seed the live arming from the build. Raises after this come through
 // `platform.authorizeWireSubscribe()`; nothing ever lowers it.
@@ -646,7 +647,7 @@ function admitBatchEgress(messages, sharedRecipients) {
 	/** @type {Map<string, { m: number, d: number, topic: string }> | null} */
 	const perTenant = egressGate.tenantArmed ? new Map() : null;
 	for (const [t, c] of perTopic) {
-		const recipients = sharedRecipients === null ? (getServer().subscriberCount(t)) : sharedRecipients;
+		const recipients = sharedRecipients === null ? (getServer().subscriberCount(nativeTopic(t))) : sharedRecipients;
 		const deliveries = c * recipients;
 		if (!egressGate.account.admitTopic(t, c, deliveries)) return false;
 		if (perTenant === null) continue;
@@ -749,7 +750,7 @@ export const platform = {
 			const captured = { seq: seqOpt, jitterMs: jitterOpt, compress: compressOpt };
 			if (options?.[EGRESS_ADMITTED]) captured[EGRESS_ADMITTED] = true;
 			deliveryAuthorization.deferOperation(() => platform.publish(topic, event, data, captured));
-			return getServer().subscriberCount(topic) > 0;
+			return getServer().subscriberCount(nativeTopic(topic)) > 0;
 		}
 		const deliveryOperation = deliveryAuthorization.begin();
 		try {
@@ -760,7 +761,7 @@ export const platform = {
 			// and getServer moving up here keeps every refusal ahead of every
 			// record exactly as the comment below requires.
 			const server = getServer();
-			const recipients = server.subscriberCount(topic);
+			const recipients = server.subscriberCount(nativeTopic(topic));
 			const egressTenant = resolvePublishTenant(topic);
 			if (egressGate.armed && !options?.[EGRESS_ADMITTED] && !admitPublishEgress(topic, egressTenant, 1, recipients)) return false;
 			const body = envelopePrefix(topic, event) + envelopeData(data);
@@ -804,7 +805,7 @@ export const platform = {
 			}
 			const result = deliveryAuthorization.armed
 				? publishAuthorized(server, wsConnections, topic, envelope, false, compress)
-				: server.publish(topic, envelope, compress);
+				: server.publish(nativeTopic(topic), envelope, compress);
 			const reached = publishReached(result);
 			wsCounters.transportMetricHooks?.publishOutcome(reached);
 			return reached;
@@ -1051,7 +1052,7 @@ export const platform = {
 			const captured = { seq: seqOpt, compress: compressOpt, excludeWs: excludeOpt };
 			if (options?.[EGRESS_ADMITTED]) captured[EGRESS_ADMITTED] = true;
 			deliveryAuthorization.deferOperation(() => platform.publishWire(topic, event, data, wire, captured));
-			return getServer().subscriberCount(topic) > 0;
+			return getServer().subscriberCount(nativeTopic(topic)) > 0;
 		}
 		const deliveryOperation = deliveryAuthorization.begin();
 		try {
@@ -1062,7 +1063,7 @@ export const platform = {
 			// for all its entries at once; it still charges below.
 			const server = getServer();
 			const recipients =
-				server.subscriberCount(topic) - (excludedRecipient(excludeOpt, topic) ? 1 : 0);
+				server.subscriberCount(nativeTopic(topic)) - (excludedRecipient(excludeOpt, topic) ? 1 : 0);
 			const egressTenant = resolvePublishTenant(topic);
 			if (
 				egressGate.armed &&
@@ -1112,7 +1113,7 @@ export const platform = {
 				);
 				const result = deliveryAuthorization.armed
 				? publishAuthorized(server, wsConnections, topic, envelope, false, compress)
-				: server.publish(topic, envelope, compress);
+				: server.publish(nativeTopic(topic), envelope, compress);
 				return publishReached(result);
 			}
 
@@ -1265,7 +1266,7 @@ export const platform = {
 				if (excludeWs === null) {
 					const result = deliveryAuthorization.armed
 				? publishAuthorized(server, wsConnections, topic, envelope, false, compress)
-				: server.publish(topic, envelope, compress);
+				: server.publish(nativeTopic(topic), envelope, compress);
 					return publishReached(result);
 				}
 				// Declined frame with sender exclusion: the same JSON envelope the
@@ -1577,7 +1578,7 @@ export const platform = {
 		}
 		if (deliveryAuthorization.deciding) {
 			deliveryAuthorization.deferOperation(() => platform.publishWireBatch(topic, event, entries, wire, options));
-			return getServer().subscriberCount(topic) > 0;
+			return getServer().subscriberCount(nativeTopic(topic)) > 0;
 		}
 		const deliveryOperation = deliveryAuthorization.begin();
 		try {
@@ -1589,7 +1590,7 @@ export const platform = {
 			// decision, each entry's exclusion discounted only when the excluded
 			// socket actually holds the topic.
 			const server = getServer();
-			const baseRecipients = server.subscriberCount(topic);
+			const baseRecipients = server.subscriberCount(nativeTopic(topic));
 			const entryRecipients = new Array(n);
 			let egressDeliveries = 0;
 			for (let i = 0; i < n; i++) {
@@ -2414,7 +2415,7 @@ export const platform = {
 			// the whole batch (its atomicity contract). The slow path above takes
 			// the same decision through the same helper, reading each topic's own
 			// count, and marks its events so they charge without re-deciding.
-			const recipients = getServer().subscriberCount(messages[0].topic);
+			const recipients = getServer().subscriberCount(nativeTopic(messages[0].topic));
 			const gateArmed = egressGate.armed;
 			let egressTenant = null;
 			if (gateArmed) {
@@ -2583,7 +2584,7 @@ export const platform = {
 		// is the one publish with a socket in hand - its tenant is the SENDER's
 		// frozen attribution, never the topic resolver: the client relaying
 		// through this lane is the party whose budget the fan-out spends.
-		let recipients = getServer().subscriberCount(topic);
+		let recipients = getServer().subscriberCount(nativeTopic(topic));
 		if (excludedRecipient(senderWs, topic)) recipients--;
 		let egressTenant = null;
 		if (egressGate.armed) {
@@ -2754,7 +2755,7 @@ export const platform = {
 	 * @returns {number}
 	 */
 	subscribers(topic) {
-		return getServer().subscriberCount(topic);
+		return getServer().subscriberCount(nativeTopic(topic));
 	},
 
 	/**
