@@ -204,3 +204,13 @@ test('refuses to generate an optional Platform member as a required capability',
 		rmSync(temp, { recursive: true, force: true });
 	}
 });
+
+test('accepts a forwarding Proxy through its has trap, except for built-in prototype names', () => {
+	const source = { publish() { return 'sent'; } };
+	const forward = new Proxy({}, { has: (_target, name) => name in source, get: (_target, name) => source[name] });
+	assert.doesNotThrow(() => assertPlatformContract(forward, define({ publish: { kind: 'function', context: 'worker' } }), { context: 'worker' }));
+	assert.throws(() => assertPlatformContract(forward, define({ batch: { kind: 'function', context: 'worker' } }), { context: 'worker' }), /batch: missing function/);
+	// A has trap that claims everything cannot satisfy a name Object.prototype carries.
+	const claimsAll = new Proxy({}, { has: () => true, get: () => () => {} });
+	assert.throws(() => assertPlatformContract(claimsAll, define({ toString: { kind: 'function', context: 'worker' } }), { context: 'worker' }), /toString: missing function/);
+});

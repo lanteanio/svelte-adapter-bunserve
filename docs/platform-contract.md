@@ -34,8 +34,11 @@ identify its adapter.
   'wrong-kind', expected }`. Branch on `code`, not on the message.
 - A member counts when the platform or an object it inherits from defines it;
   `Object.prototype` and `Function.prototype` members never satisfy a
-  requirement. A declaration `definePlatformContract` returned is not
-  validated again, so activation checks cost a walk over the members only.
+  requirement. A forwarding Proxy that answers only `has` and `get` counts
+  through its `has` trap, except for a member whose name a built-in prototype
+  also carries, which must be a real own or inherited property. A
+  declaration `definePlatformContract` returned is not validated again, so
+  activation checks cost a walk over the members only.
 
 `context: 'worker'` requires worker members. `context: 'connection'` also
 requires connection members. `requestId` is connection-scoped; it is absent on

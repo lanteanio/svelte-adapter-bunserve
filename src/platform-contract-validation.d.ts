@@ -56,7 +56,8 @@ export function definePlatformContract<const Contract extends PlatformContract &
  * members for this context. Reads live getters with their source receiver, never
  * invokes platform methods, and does not certify nested values or behavior. A
  * member counts when the platform or an object it inherits from defines it;
- * `Object.prototype` and `Function.prototype` members do not.
+ * `Object.prototype` and `Function.prototype` members do not. A Proxy that
+ * answers only `has` counts through it, except for built-in prototype names.
  *
  * @throws {PlatformActivationError} `code` {@link PLATFORM_ACTIVATION_FAILED}.
  * @throws {TypeError} `code` {@link INVALID_PLATFORM_CONTRACT}, before the

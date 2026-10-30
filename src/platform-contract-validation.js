@@ -79,13 +79,15 @@ export function definePlatformContract(input) {
 
 // A member counts when the platform or an object it inherits from defines it,
 // short of the built-in prototypes: `toString` on a plain object is not a
-// platform capability.
+// platform capability. A forwarding Proxy that answers `has` without
+// describing properties counts through the `in` operator, except for a name
+// the built-in prototypes also carry, which must be a real property.
 function definesMember(platform, name) {
 	for (let object = platform; object !== null; object = Object.getPrototypeOf(object)) {
-		if (object === Object.prototype || object === Function.prototype) return false;
+		if (object === Object.prototype || object === Function.prototype) break;
 		if (Object.hasOwn(object, name)) return true;
 	}
-	return false;
+	return !(name in Object.prototype) && !(name in Function.prototype) && name in platform;
 }
 
 /** Check top-level member kinds at activation without invoking platform methods. */

@@ -64,7 +64,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error. Errors carry the stable codes `INVALID_PLATFORM_CONTRACT` and
   `PLATFORM_ACTIVATION_FAILED` (the latter with a `failures` list), and the
   `svelte-adapter-bunserve` adapter-name namespace is reserved for the canonical
-  contracts. Members this adapter does not provide stay absent from them.
+  contracts. Members this adapter does not provide stay absent from them. A
+  forwarding Proxy that answers only `has` counts through it, except for names
+  the built-in prototypes carry.
 
 - Bun 1.4 `memoryPressure` notifications coalesce into a cgroup discovery
   refresh on the next regular pressure tick. Warning and critical notifications
