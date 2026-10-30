@@ -166,8 +166,9 @@ export function assertScalarOptions(opts) {
 
 	// Liveness path, held to the rule the readiness path already states. A path
 	// without the leading slash can never match: the pathname compared against
-	// it always starts with one, so the probe silently 404s forever.
-	if ('healthCheckPath' in opts && opts.healthCheckPath !== false) {
+	// it always starts with one, so the probe silently 404s forever. `null` and
+	// `''` disable the route as `false` does, as svelte-adapter-uws reads them.
+	if ('healthCheckPath' in opts && opts.healthCheckPath !== false && opts.healthCheckPath !== null && opts.healthCheckPath !== '') {
 		const value = opts.healthCheckPath;
 		if (typeof value !== 'string' || value[0] !== '/') {
 			throw new Error(

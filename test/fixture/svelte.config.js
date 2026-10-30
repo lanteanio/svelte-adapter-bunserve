@@ -23,6 +23,7 @@ const upgradeTimeout = process.env.WS_UPGRADE_TIMEOUT === '1' || process.env.WS_
 const rateLimit = process.env.WS_RATE_LIMIT === '1' || process.env.WS_RATE_LIMIT === 'true';
 const backpressure = process.env.WS_BACKPRESSURE === '1' || process.env.WS_BACKPRESSURE === 'true';
 const warmupHang = process.env.WARMUP_HANG === '1' || process.env.WARMUP_HANG === 'true';
+const mountSpelling = process.env.MOUNT_SPELLING === '1' || process.env.MOUNT_SPELLING === 'true';
 
 let adapter;
 if (which === 'bunserve' && dotfiles) {
@@ -73,6 +74,16 @@ if (which === 'bunserve' && dotfiles) {
 	adapter = bunserve({
 		out: 'build-warmup-hang',
 		warmup: { paths: ['/warmup-hang'] }
+	});
+} else if (which === 'bunserve' && mountSpelling) {
+	// The build for test/live/mount-spelling-check.mjs: probes spelled with an
+	// escape and with router syntax inside a segment, for the guard that keeps
+	// other spellings of a mounted path out of the app.
+	adapter = bunserve({
+		out: 'build-mount-spelling',
+		healthCheckPath: '/gesundheit-pr%C3%BCfung',
+		readinessCheckPath: '/status:ready',
+		websocket: false
 	});
 } else if (which === 'bunserve' && backpressure) {
 	// The build for test/live/resume-backpressure-check.mjs. A backpressure

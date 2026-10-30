@@ -11,7 +11,7 @@ import { response400, response500 } from './handler/http-helpers.js';
 import { auth_path, admin_path, is_tls, ssl_cert, ssl_key, body_size_limit, idle_timeout, ws_options, ws_path } from './handler/config.js';
 import { countRefusedHandshakeTarget, tryUpgrade } from './handler/upgrade.js';
 import { invalidHost, invalidRequestTarget, requestTarget } from './utils/request-target.js';
-import { ownExactMounts, shadowsExactMount } from './utils/exact-mount.js';
+import { ownExactMounts, shadowsExactMount, splitExactMounts } from './utils/exact-mount.js';
 import { windowsReservedPath } from './utils/windows-path.js';
 import { upgradeAdmission } from './handler/admission.js';
 import { authEndpointMounted, tryAuthEndpoint } from './handler/auth.js';
@@ -42,13 +42,16 @@ if (adminRouteMounted()) {
 
 const IS_WIN32 = process.platform === 'win32';
 
-/** The paths answered ahead of the app's routes; see `ownExactMounts`. */
-const exactMounts = ownExactMounts({
+/**
+ * The paths answered ahead of the app's routes, see `ownExactMounts`, split
+ * into those written without an escape and those written with one.
+ */
+const { plain: exactMounts, escaped: escapedMounts } = splitExactMounts(ownExactMounts({
 	healthPath,
 	readinessPath,
 	authPath: authEndpointMounted() ? auth_path : null,
 	wsPath: ws_options !== null && upgradeAdmission !== null ? ws_path : null
-});
+}));
 
 /**
  * A liveness/readiness probe answer, with the HEAD form carrying the same
@@ -199,7 +202,7 @@ function routeRequest(req, srv) {
 	// without spelling it - `/healthz/__data.json`, `/%68ealthz` - is refused,
 	// as svelte-adapter-uws refuses it: it would reach the app's router as that
 	// path. Every method, since it is read as that path whichever it is.
-	if (shadowsExactMount(exactMounts, pathname, search)) return response400();
+	if (shadowsExactMount(exactMounts, pathname, search, escapedMounts)) return response400();
 
 	if (adminRouteMounted() && !pathname.startsWith(admin_path + '/') && pathname.includes('%')) {
 		const decoded = pathname.replace(/%([0-7][0-9a-f])/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));

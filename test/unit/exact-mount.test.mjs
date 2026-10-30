@@ -87,3 +87,43 @@ test('the mount set is the probes that are on, a mounted auth path and a limited
 		'no authenticate export, no admission limit');
 	assert.equal(ownExactMounts({ healthPath: false, readinessPath: false, authPath: null, wsPath: null }).size, 0);
 });
+
+test('refuses other spellings of a mount written with escapes, and never the written one', async () => {
+	const { splitExactMounts } = await import('../../src/runtime/utils/exact-mount.js');
+	const { plain, escaped } = splitExactMounts(new Set(['/files/x%20y', '/gesundheit-pr%C3%BCfung', '/a%22b', '/odd%25zz', '/status:ready', '/healthz']));
+	assert.deepEqual([...plain].sort(), ['/healthz', '/status:ready'], 'a mount with an escape is kept out of the plain set');
+	assert.equal(escaped.get('/gesundheit-pr' + String.fromCharCode(0xfc) + 'fung'), '/gesundheit-pr%C3%BCfung');
+	const enters = (path, raw, query) => entersExactMount(plain, path, raw, query, escaped);
+	const shadows = (pathname, search = '') => shadowsExactMount(plain, pathname, search, escaped);
+
+	// Another spelling of the same decoded path, and never the mount's own.
+	assert.equal(enters('/gesundheit-pr%c3%bcfung', '/gesundheit-pr%c3%bcfung'), true, 'lowercase hex');
+	assert.equal(enters('/a"b', '/a"b'), true, 'the raw character, no escape at all');
+	assert.equal(enters('/gesundheit-pr%C3%BCfung/__data.json', '/gesundheit-pr%C3%BCfung/__data.json'), true, 'its data');
+	assert.equal(enters('/gesundheit-pr%C3%BCfung', '/gesundheit-pr%C3%BCfung'), false);
+	assert.equal(enters('/files/x%20y', '/files/x%20y'), false);
+	assert.equal(shadows('/gesundheit-pr%C3%BCfung'), false, 'the mount itself, for a method it does not answer');
+	assert.equal(shadows('/gesundheit-pr%C3%bcfung'), true, 'mixed case');
+	assert.equal(shadows('/%67esundheit-pr%C3%BCfung'), true, 'an escaped letter beside the mount\'s own escapes');
+	assert.equal(shadows('/gesundheit-pr%c3%bcfung/__route.js'), true);
+	assert.equal(shadows('/gesundheit-pr%C3%BCfung/__data.json', '?x-sveltekit-trailing-slash=1'), true,
+		'a data request carries the slash only for a page the plain set holds');
+	assert.equal(shadows('/status%3Aready'), true);
+	assert.equal(shadows('/status:ready/__data.json'), true);
+	assert.equal(enters('/status:ready', '/x/../status:ready'), true, 'a colon inside a segment is part of a plain mount');
+	assert.equal(shadows('/gesundheit-pr%C3%BCfung/'), false, 'a page one slash further on stays the app\'s');
+	assert.equal(shadows('/gesundheit-pr%C3%A9fung'), false, 'another path');
+
+	// A path that only decodes to the mount's spelling is another path.
+	assert.equal(enters('/files/x%2520y', '/files/x%2520y'), false);
+	assert.equal(shadows('/files/x%2520y'), false);
+	assert.equal(shadows('/gesundheit-pr%25C3%25BCfung'), false);
+
+	// Each run of escapes is decoded on its own, so a malformed one does not
+	// hide the rest, and none of it throws.
+	assert.equal(enters('/odd%zz', '/odd%zz'), true, 'a target reading as the mount with its bad escape kept');
+	assert.equal(shadows('/%E0%A4%A'), false);
+
+	assert.equal(splitExactMounts(new Set(['/healthz', '/readyz'])).escaped.size, 0, 'empty unless a mount carries an escape');
+	assert.equal(shadowsExactMount(new Set(), '/gesundheit-pr%c3%bcfung', '', escaped), true, 'an escaped mount alone is still guarded');
+});

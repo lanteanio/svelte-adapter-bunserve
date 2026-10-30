@@ -365,9 +365,11 @@ const ADMISSION_KEYS = new Set([
  *
  * @param {unknown} value
  * @param {string[]} warnings
+ * @param {Array<[string, unknown]>} roomMounts - receives the waiting-room paths
+ *   svelte-adapter-uws mounts for this block, as [option, path]
  * @returns {{ maxConcurrent?: number, maxConnections?: number, perTickBudget?: number, maxDeferred?: number, cursorLane?: { fraction?: number } }}
  */
-function requireUpgradeAdmission(value, warnings) {
+function requireUpgradeAdmission(value, warnings, roomMounts) {
 	// The copy comes FIRST: Array.isArray on a revoked Proxy throws before the
 	// refusal below could name the option. A copy of `null` and an array copy
 	// are both refused; everything after reads the copy.
@@ -446,6 +448,18 @@ function requireUpgradeAdmission(value, warnings) {
 			'adapter option `websocket.upgradeAdmission.waitingRoom` is not implemented by this adapter: ' +
 			'a crossed ceiling answers 503 with retry-after rather than serving a holding page. ' +
 			'svelte-adapter-uws serves one; set it to `false` to state that intent explicitly here.'
+		);
+	}
+	// The pages svelte-adapter-uws mounts while a ceiling engages its room,
+	// with its defaults. None is mounted here, but their paths are held to its
+	// mount rule so a config built here builds there too.
+	if ((Number(out.maxConcurrent) > 0 || Number(out.maxConnections) > 0 || Number(out.perTickBudget) > 0) && raw.waitingRoom !== false) {
+		const room = raw.waitingRoom !== null && typeof raw.waitingRoom === 'object' ? readableCopy(raw.waitingRoom) : null;
+		/** @type {Record<string, unknown>} */
+		const cfg = room !== null && !Array.isArray(room) ? room : {};
+		roomMounts.push(
+			['websocket.upgradeAdmission.waitingRoom.path', cfg.path ?? '/__waiting-room'],
+			['websocket.upgradeAdmission.waitingRoom.admitCheckPath', cfg.admitCheckPath ?? '/__admit-check']
 		);
 	}
 	return out;
@@ -704,6 +718,8 @@ function requirePressureThresholds(value, warnings) {
  * @property {Record<string, any>} options - adapter-shaped, fully defaulted
  * @property {string[]} warnings - build-time warnings (best-effort translations)
  * @property {string[]} unknownKeys - keys the adapter does not consume
+ * @property {Array<[string, unknown]>} waitingRoomMounts - [option, path] of each
+ *   waiting-room page svelte-adapter-uws would mount for this config
  */
 
 /**
@@ -724,6 +740,8 @@ export function normalizeWsOptions(input) {
 	const raw = /** @type {Record<string, unknown>} */ (copied || {});
 	/** @type {string[]} */
 	const warnings = [];
+	/** @type {Array<[string, unknown]>} */
+	const waitingRoomMounts = [];
 	const options = { ...DEFAULTS };
 
 	// INTEGERS, and for two different reasons now.
@@ -904,7 +922,7 @@ export function normalizeWsOptions(input) {
 		options.pressure = requirePressureThresholds(raw.pressure, warnings);
 	}
 	if (raw.upgradeAdmission !== undefined) {
-		options.upgradeAdmission = requireUpgradeAdmission(raw.upgradeAdmission, warnings);
+		options.upgradeAdmission = requireUpgradeAdmission(raw.upgradeAdmission, warnings, waitingRoomMounts);
 	}
 	if (raw.egress !== undefined) {
 		options.egress = requireEgress(raw.egress, warnings);
@@ -1056,7 +1074,7 @@ export function normalizeWsOptions(input) {
 
 	const unknownKeys = Object.keys(raw).filter((k) => !KNOWN_WS_OPTION_KEYS.has(k));
 
-	return { options, warnings, unknownKeys };
+	return { options, warnings, unknownKeys, waitingRoomMounts };
 }
 
 /**

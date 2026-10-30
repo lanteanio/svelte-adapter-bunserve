@@ -253,13 +253,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **BREAKING:** the hook socket's `isBinary` selects the frame type, as on uWS:
+- **BREAKING** The hook socket's `isBinary` selects the frame type, as on uWS:
   bytes sent without it go out as a text frame and a string sent with it as
   binary, in production and under Vite dev. Text bytes that are not valid UTF-8
   throw a `TypeError`. Topics and messages accept `SharedArrayBuffer` and byte
   topics, `undefined` reads as empty, and the empty topic can be subscribed and
   published to; anything else that is not a string, buffer or view throws the
   uWS error.
+
+- **BREAKING** Mounted paths (`healthCheckPath`, `readinessCheckPath`,
+  `websocket.path`, `authPath`, `adminPath`, `waitingRoom.path`,
+  `waitingRoom.admitCheckPath`, the dev dashboard path and the matching
+  `createTestServer` options) must be spelled the way a client sends them: the
+  WHATWG URL spelling with uppercase escapes, and no segment starting with `:`
+  or `*`. The error names the spelling to use, such as `/pr%C3%BCfung` for
+  `/prüfung`; a literal `%` is written `%25`, and a tab, line feed or carriage
+  return is refused outright. The admin prefix and the dashboard path take no
+  escapes, and their error lists the plain ASCII they may use. Two exact mounts
+  with one spelling, and an exact mount at or under the admin prefix or the
+  dashboard, are refused when the config is read; the probes no longer collide
+  with the WebSocket paths when `websocket` is off. Other spellings of an
+  escaped mount are refused with `400`, as they are for plain ones, while a
+  target that only decodes to its spelling still reaches the app.
+  `healthCheckPath: null` or `''` disables the liveness route.
 
 - Raised the supported Bun minimum to 1.4.4. Native incomplete uploads now close
   after an early response; Bun 1.3.14 leaves those connections open even with

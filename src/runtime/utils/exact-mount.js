@@ -36,6 +36,49 @@ export function ownExactMounts({ healthPath, readinessPath, authPath, wsPath }) 
 	return mounts;
 }
 
+const ESCAPE_RUN = /(?:%[0-9A-Fa-f]{2})+/g;
+
+/**
+ * `path` with each run of escapes decoded where it forms UTF-8 text, and left
+ * as written where it does not, so a malformed escape does not hide the rest.
+ * @param {string} path
+ */
+function decodedReading(path) {
+	return path.replace(ESCAPE_RUN, (run) => {
+		try { return decodeURIComponent(run); } catch { return run; }
+	});
+}
+
+/** @type {Map<string, string>} */
+const NO_ESCAPED_MOUNTS = new Map();
+
+/**
+ * The mounts split by spelling: `plain`, written without a percent-escape, and
+ * `escaped`, the rest by their decoded reading. A mount is answered only in its
+ * written spelling, while SvelteKit's router reads the decoded path, so any
+ * other spelling decoding onto an escaped one - lowercase hex, the raw
+ * character an escape stands for - would reach the app as the mounted path.
+ * The two are kept apart because the plain set is also checked against an
+ * ASCII-decoded reading of the target: an escaped spelling there would match a
+ * target that only decodes to that spelling (`%2520` to `%20`), a different
+ * path. `escaped` is empty unless a mount carries an escape, so a request pays
+ * for the lookup only on a deployment that has one.
+ *
+ * @param {Set<string>} mounts
+ * @returns {{ plain: Set<string>, escaped: Map<string, string> }}
+ */
+export function splitExactMounts(mounts) {
+	/** @type {Set<string>} */
+	const plain = new Set();
+	/** @type {Map<string, string>} */
+	const escaped = new Map();
+	for (const mount of mounts) {
+		if (mount.includes('%')) escaped.set(decodedReading(mount), mount);
+		else plain.add(mount);
+	}
+	return { plain, escaped };
+}
+
 /**
  * An escape of an ASCII character. A target reaches the handler in visible
  * ASCII, every other byte re-escaped by Bun, so a mount is reached through its
@@ -80,16 +123,22 @@ function kitPagePath(mounts, path, query) {
 
 /**
  * Whether `path`, read as SvelteKit's router reads it, is an exact mount that
- * the target `raw` does not spell.
+ * the target `raw` does not spell. A mount spelled with escapes is judged by
+ * decoded readings instead: without one that costs one size check, and a page
+ * carrying no escape is its own decoded reading and costs one lookup.
  *
- * @param {Set<string>} mounts
- * @param {string} path the target, or a decoded reading of it
+ * @param {Set<string>} mounts the plain mounts
+ * @param {string} path the target, or its ASCII-decoded reading (then without `escaped`)
  * @param {string} raw the target
  * @param {string | undefined} query the query without its `?`
+ * @param {Map<string, string>} [escaped] the escaped mounts, from `splitExactMounts`
  */
-export function entersExactMount(mounts, path, raw, query) {
+export function entersExactMount(mounts, path, raw, query, escaped = NO_ESCAPED_MOUNTS) {
 	const page = kitPagePath(mounts, path, query);
-	return page !== raw && mounts.has(page);
+	if (page !== raw && mounts.has(page)) return true;
+	if (escaped.size === 0) return false;
+	const mount = escaped.get(page.includes('%') ? decodedReading(page) : page);
+	return mount !== undefined && mount !== raw;
 }
 
 /**
@@ -100,14 +149,18 @@ export function entersExactMount(mounts, path, raw, query) {
  * decodes an escaped `/` and an escaped suffix, which the router leaves alone -
  * and is kept wide to answer as that adapter does.
  *
- * @param {Set<string>} mounts
+ * @param {Set<string>} mounts the plain mounts
  * @param {string} pathname the path as Bun hands it on
  * @param {string} search the query with its `?`, or ''
+ * @param {Map<string, string>} [escaped] the escaped mounts, from
+ *   `splitExactMounts`: their other spellings are refused too. Only the
+ *   target itself is read against them; its ASCII-decoded reading is checked
+ *   against the plain mounts alone.
  */
-export function shadowsExactMount(mounts, pathname, search) {
-	if (mounts.size === 0) return false;
+export function shadowsExactMount(mounts, pathname, search, escaped = NO_ESCAPED_MOUNTS) {
+	if (mounts.size === 0 && escaped.size === 0) return false;
 	const query = search === '' ? undefined : search.slice(1);
-	if (entersExactMount(mounts, pathname, pathname, query)) return true;
+	if (entersExactMount(mounts, pathname, pathname, query, escaped)) return true;
 	return pathname.includes('%') &&
 		entersExactMount(mounts, pathname.replace(ASCII_ESCAPE, asciiFromEscape), pathname, query);
 }

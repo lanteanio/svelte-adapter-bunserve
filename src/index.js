@@ -14,6 +14,7 @@ import { writeAndCloseRollupBundle, extraEntryImports } from './build-rollup-lif
 import { assertScalarOptions, unknownOptionWarnings } from './adapter-options.js';
 import { describeValue, normalizeWsOptions, readableCopy } from './runtime/utils/ws-options.js';
 import { normalizeBodyLimits, serializeBodyLimits } from './runtime/utils/body-limits.js';
+import { assertMountPath, assertDistinctMounts } from './runtime/utils/mount-path.js';
 
 const runtimeDir = fileURLToPath(new URL('./runtime', import.meta.url).href);
 
@@ -130,24 +131,10 @@ export default function (opts = {}) {
 
 	const wsTransportConfigured = Boolean(websocket);
 
-	if (websocketPath === healthCheckPath || websocketPath === readinessCheckPath) {
-		throw new Error(
-			`adapter option \`websocket.path\` ('${websocketPath}') collides with a probe route. ` +
-			'The probe routes are matched first, so the WebSocket endpoint would never be reached.'
-		);
-	}
-
-	// The same collision, and the same reason: the probes are matched first, so
-	// an auth preflight sharing a probe's path would be answered with the probe's
-	// 200 and the sign-in would fail with nothing naming the cause.
-	const websocketAuthPath = wsResult.options.authPath;
-	if (websocketAuthPath === healthCheckPath || websocketAuthPath === readinessCheckPath) {
-		throw new Error(
-			`adapter option \`websocket.authPath\` ('${websocketAuthPath}') collides with a probe route. ` +
-			'The probe routes are matched first, so the auth preflight endpoint would never be reached.'
-		);
-	}
-
+	// `false` disables the liveness route, and so do `null` and `''`, which the
+	// runtime has always read as no route at all.
+	const healthCheckMounted = healthCheckPath !== false && healthCheckPath !== null && healthCheckPath !== '';
+	if (healthCheckMounted) assertMountPath('healthCheckPath', healthCheckPath);
 	// Readiness probe path (distinct from the `healthCheckPath` liveness probe):
 	// reports 503 once graceful shutdown begins so a load balancer drains the
 	// instance. Default `/readyz`; set `false` to disable. Validated here so a
@@ -160,6 +147,7 @@ export default function (opts = {}) {
 				`got ${describeValue(readinessCheckPath)}.`
 			);
 		}
+		assertMountPath('readinessCheckPath', readinessCheckPath);
 		if (healthCheckPath !== false && readinessCheckPath === healthCheckPath) {
 			throw new Error(
 				`readinessCheckPath ('${readinessCheckPath}') must differ from healthCheckPath ('${healthCheckPath}') - ` +
@@ -167,6 +155,28 @@ export default function (opts = {}) {
 			);
 		}
 	}
+
+	// The characters of every mounted path, then their overlaps, checked when
+	// the config is read so a misspelled mount fails `vite dev` and the build
+	// alike. Without WebSockets only the probes are mounted. The waiting-room
+	// pages are the ones svelte-adapter-uws mounts while an admission ceiling
+	// engages its room: none is mounted here, but a config this adapter builds
+	// has to build there too.
+	const wsAdminPath = wsResult.options.adminPath;
+	assertMountPath('websocket.path', websocketPath);
+	assertMountPath('websocket.authPath', wsResult.options.authPath);
+	if (wsAdminPath !== false) assertMountPath('websocket.adminPath', wsAdminPath, Error, { prefix: true });
+	/** @type {Array<[string, string]>} */
+	const exactMounts = wsTransportConfigured
+		? [['websocket.path', websocketPath], ['websocket.authPath', wsResult.options.authPath]]
+		: [];
+	if (healthCheckMounted) exactMounts.push(['healthCheckPath', healthCheckPath]);
+	if (readinessCheckPath !== false) exactMounts.push(['readinessCheckPath', readinessCheckPath]);
+	for (const [option, roomPath] of wsResult.waitingRoomMounts) {
+		assertMountPath(option, roomPath);
+		exactMounts.push([option, /** @type {string} */ (roomPath)]);
+	}
+	assertDistinctMounts(exactMounts, wsTransportConfigured && wsAdminPath !== false ? [['websocket.adminPath', wsAdminPath]] : []);
 
 	// Validate `staticHeaders` eagerly so a misshaped value fails before any
 	// build work. The reserved-key warning needs builder.log, so it is emitted

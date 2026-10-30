@@ -868,9 +868,40 @@ export async function handle({ event, resolve }) {
 two distinct probes, so they must differ, and the build fails if they do not. A
 readiness 503 during a drain is a signal to stop routing new traffic; if a
 liveness probe read the same route, that drain would be answered with a restart
-instead. Neither may collide with `websocket.path` or `websocket.authPath`: the
-probe routes are matched first, so the endpoint behind the collision would never
-be reached, and that fails the build rather than going quiet.
+instead. While WebSockets are on, neither may collide with `websocket.path` or
+`websocket.authPath`: the probe routes are matched first, so the endpoint behind
+the collision would never be reached, and that fails the build rather than going
+quiet. `healthCheckPath: false`, `null` or `''` turns the liveness route off.
+
+Because a mount is matched as sent, every mounted path (`healthCheckPath`,
+`readinessCheckPath`, `websocket.path`, `websocket.authPath`,
+`websocket.adminPath`, and `waitingRoom.path` and `waitingRoom.admitCheckPath`
+while an `upgradeAdmission` ceiling is set) must be spelled the way a client
+sends it: the WHATWG URL spelling browsers, fetch and the `ws` client produce,
+with uppercase escapes. Write `/gesundheit-pr%C3%BCfung` rather than
+`/gesundheit-prüfung`, `/a%20b` rather than `/a b`, and a literal `%` as `%25`;
+a raw character clients encode, an escape in lowercase hex, an escape of a
+character clients send as it is (`%70`, `%2F`), a `%` that starts no escape, a
+tab, line feed or carriage return (which the URL parser drops, so no spelling
+can carry one), a `.` or `..` segment or a `\` fails the build with an error
+naming the option and the spelling to use. A segment may not start with `:` or
+`*`, which svelte-adapter-uws's router reads as a parameter and a wildcard;
+inside a segment both are plain characters (`/v1/items:get`).
+`websocket.adminPath` and the dev plugin's `dashboard.path` take no escapes at
+all, because the guard that keeps encoded spellings out of a prefix reads ASCII
+escapes only: spell them with letters, digits and
+`- . _ ~ ! $ & ' ( ) * + , ; = : @ | [ ]`. Two exact mounts may not share a spelling, and
+no mount may sit at or under `websocket.adminPath` or the dashboard path, which
+answer every path beneath them; exact mounts may nest, and `/healthz` and
+`/healthz/` are two routes. A mount that is not in use - the WebSocket paths
+with `websocket: false`, the admin prefix when disabled, the waiting-room pages
+without a ceiling, a liveness route turned off - is not checked for overlaps.
+This adapter serves no waiting room, but its paths are held to the rule so the
+config builds on svelte-adapter-uws too. `createTestServer` applies the same
+rule to its own path options. A mount spelled with escapes is refused with
+`400` in every other spelling that decodes onto it (`/gesundheit-pr%c3%bcfung`),
+as a plain one is; a target that only decodes to its spelling, such as `%2520`
+next to a `%20` mount, is another path and reaches your routes.
 
 A request target that carries a `#` is refused with `400` on every path - the
 probes, the auth path, the WebSocket handshake, the built assets and your own

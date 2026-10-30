@@ -13,6 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { validateHeaderValue } from 'node:http';
 import { authRequestBody } from './vite-request-body.js';
 import { normalizeBodyLimits, requestBodyLimit } from './runtime/utils/body-limits.js';
+import { assertMountPath, assertDistinctMounts } from './runtime/utils/mount-path.js';
 import { bodylessCanClose, declaresBody } from './runtime/handler/http-helpers.js';
 import { parseCookies, createCookies } from './runtime/cookies.js';
 import { parse_as_bytes, parse_origin, esc, isValidWireTopic, createScopedTopic, createTopicHelperCache, resolveRequestId, completeEnvelope, completeGameEnvelope, wrapBatchEnvelope, nextTopicSeq, stampSeq, resolveEntrySeq, resolveSendSeq, throwInvalidSeq, createHlc, processEpoch, topicEpochValue, mintTopicEpoch, isAuthOriginAccepted, isOriginAllowed, WS_SUBSCRIPTIONS, WS_PUBLISH_GRANT, WS_SESSION_ID, WS_PENDING_REQUESTS, WS_STATS, WS_PLATFORM, CARRY_REQUEST_ID, WS_CAPS, WS_ATTRIBUTION, WS_LEASE, WS_CONTROL_BUDGET, declareConnectionSlots, MAX_SUBSCRIPTIONS_PER_CONNECTION, MAX_PENDING_SUBSCRIBES_PER_CONNECTION, MAX_PENDING_REQUESTS_PER_CONNECTION, MAX_COALESCED_KEYS_PER_CONNECTION, PUBLISH_WARN_DEDUP_MAX } from './runtime/utils.js';
@@ -225,6 +226,7 @@ export default function uws(options = {}) {
 		// would point them off-machine.
 		throw new TypeError('the uws() dev plugin option dashboard.path must be a local pathname starting with a single "/"');
 	}
+	if (dashboardOptions.path !== undefined) assertMountPath('the uws() dev plugin option dashboard.path', dashboardOptions.path, TypeError, { prefix: true });
 	// A trailing slash is dropped, as for adminPath: the dashboard answers the
 	// path and the paths under it, and the page builds its links on it.
 	const dashboardPath = options.dashboard === false ? null : (dashboardOptions.path || '/__uws/dashboard').replace(/\/+$/, '');
@@ -238,6 +240,7 @@ export default function uws(options = {}) {
 			if (typeof value !== 'string' || !value.startsWith('/')) {
 				throw new TypeError(`websocket.${name} must be a path string starting with '/'`);
 			}
+			assertMountPath(`websocket.${name}`, value, TypeError);
 			return value;
 		};
 		wsPath = endpoint('path', adapterOption.path, '/ws');
@@ -247,6 +250,14 @@ export default function uws(options = {}) {
 			(dashboardPath === wsPath.replace(/\/+$/, '') || dashboardPath === wsAuthPath.replace(/\/+$/, ''))) {
 			throw new TypeError('the uws() dev plugin option dashboard.path collides with the WebSocket or auth path');
 		}
+		assertDevMounts([['websocket.path', wsPath], ['websocket.authPath', wsAuthPath]]);
+	}
+	// The dashboard answers its path and every path under it, so neither
+	// endpoint may sit beneath it.
+	/** @param {Array<[string, string]>} endpoints */
+	function assertDevMounts(endpoints) {
+		if (dashboardPath === null) return;
+		assertDistinctMounts(endpoints, [['the uws() dev plugin option dashboard.path', dashboardPath]], TypeError);
 	}
 	for (const name of ['path', 'authPath']) {
 		const value = options[name];
@@ -254,10 +265,15 @@ export default function uws(options = {}) {
 		if (typeof value !== 'string' || !value.startsWith('/')) {
 			throw new TypeError(`websocket.${name} must be a path string starting with '/'`);
 		}
+		assertMountPath(`websocket.${name}`, value, TypeError);
 		if (dashboardPath !== null && dashboardPath === value.replace(/\/+$/, '')) {
 			throw new TypeError('the uws() dev plugin option dashboard.path collides with the WebSocket or auth path');
 		}
 	}
+	// The endpoints the plugin names itself; the adapter's are checked once read.
+	assertDevMounts(/** @type {Array<[string, string]>} */ (['path', 'authPath']
+		.filter((name) => options[name] != null)
+		.map((name) => ['websocket.' + name, options[name]])));
 	// One source of truth for both the actual ws receiver cap and the value app
 	// code reads from platform. Production uses the same 1 MiB default.
 	const MAX_PAYLOAD_LENGTH_V = options.maxPayloadLength ?? DEFAULT_MAX_PAYLOAD_LENGTH;

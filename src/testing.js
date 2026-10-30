@@ -7,6 +7,7 @@ import { completeSerializedEnvelope, envelopeData } from './runtime/utils/epoch.
 import { copyUpgradeUserData } from './runtime/utils/upgrade-user-data.js';
 import { isSet, isUint8Array, isNativeError } from 'node:util/types';
 import { now, monotonicNow, wallEpoch, setTimer, clearTimer, randomUuid } from './runtime/runtime.js';
+import { assertMountPath, assertDistinctMounts } from './runtime/utils/mount-path.js';
 import { parseCookies } from './runtime/cookies.js';
 import { collectRequestHeaders, framingRefusal, isFramingHeader } from './runtime/utils/request-headers.js';
 import { stampSeq, resolveEntrySeq, resolveSendSeq, assertStampableSeq, throwInvalidSeq, processEpoch, topicEpochValue, mintTopicEpoch, completeEnvelope, completeGameEnvelope, wrapBatchEnvelope, esc, isValidWireTopic, createScopedTopic, createTopicHelperCache, resolveRequestId, createChaosState, containMetricInstrument, mirrorRegistry, readMetricMirror, applyCapacityReason, createPosture, WS_SUBSCRIPTIONS, WS_PUBLISH_GRANT, WS_COALESCED, WS_SESSION_ID, WS_PENDING_REQUESTS, WS_STATS, WS_PLATFORM, WS_REQUEST_ID_KEY, CARRY_REQUEST_ID, WS_CONNECTION_PERMIT, WS_CAPS, WS_ATTRIBUTION, WS_TOPIC_IDS, WS_WIRE_STATE, WS_LEASE, WS_SHARED_COHORTS, WS_CONTROL_BUDGET, declareConnectionSlots, MAX_SUBSCRIPTIONS_PER_CONNECTION, MAX_PENDING_SUBSCRIBES_PER_CONNECTION, MAX_PENDING_REQUESTS_PER_CONNECTION, MAX_COALESCED_KEYS_PER_CONNECTION, TOPIC_SEQS_WARN_THRESHOLD, PUBLISH_WARN_DEDUP_MAX } from './runtime/utils.js';
@@ -179,6 +180,47 @@ function whenAbortedT(signal) {
 }
 
 /**
+ * `false` disables the liveness route, and `null` and `''` read the same
+ * way, as the adapter reads them.
+ * @param {unknown} value
+ */
+function probeMounted(value) {
+	return value !== false && value !== null && value !== '';
+}
+
+/**
+ * Refuse the mounts the adapter build refuses: a path no client can request
+ * as spelled, or two mounts claiming the same requests.
+ *
+ * @param {unknown} wsPath
+ * @param {unknown} adminPath
+ * @param {unknown} healthCheckPath
+ * @param {unknown} readinessCheckPath
+ * @param {any} upgradeAdmission
+ */
+function assertTestServerMounts(wsPath, adminPath, healthCheckPath, readinessCheckPath, upgradeAdmission) {
+	/** @type {Array<[string, string]>} */
+	const exact = [];
+	for (const [option, value] of [['wsPath', wsPath], ['healthCheckPath', healthCheckPath], ['readinessCheckPath', readinessCheckPath]]) {
+		if (option === 'healthCheckPath' ? !probeMounted(value) : option === 'readinessCheckPath' && value === false) continue;
+		assertMountPath('the createTestServer option ' + option, value, TypeError);
+		exact.push(['the createTestServer option ' + option, /** @type {string} */ (value)]);
+	}
+	const room = upgradeAdmission?.waitingRoom;
+	if (upgradeAdmission && (upgradeAdmission.maxConcurrent > 0 || upgradeAdmission.maxConnections > 0 || upgradeAdmission.perTickBudget > 0) && room !== false) {
+		const cfg = room && typeof room === 'object' ? room : {};
+		for (const [key, fallback] of [['path', '/__waiting-room'], ['admitCheckPath', '/__admit-check']]) {
+			const option = 'the createTestServer option upgradeAdmission.waitingRoom.' + key;
+			const value = cfg[key] ?? fallback;
+			assertMountPath(option, value, TypeError);
+			exact.push([option, value]);
+		}
+	}
+	if (adminPath !== false) assertMountPath('the createTestServer option adminPath', adminPath, TypeError, { prefix: true });
+	assertDistinctMounts(exact, adminPath !== false ? [['the createTestServer option adminPath', /** @type {string} */ (adminPath)]] : [], TypeError);
+}
+
+/**
  * Create a lightweight test server backed by a native Bun server.
  *
  * Starts on a random port and provides a Platform-compatible API for
@@ -213,6 +255,7 @@ export async function createTestServer(options = {}) {
 	// test suite can never certify a config the production build rejects.
 	assertSharedOptionValues(options, (key) => `the createTestServer option ${key}`);
 	const { port = 0, host, wsPath = '/ws', handler = {}, upgradeAdmission, messageAdmission: messageAdmissionOptions, protection, metrics, adminPath = '/__realtime', readinessCheckPath = '/readyz', healthCheckPath = '/healthz', primaryInit } = options;
+	assertTestServerMounts(wsPath, adminPath, healthCheckPath, readinessCheckPath, upgradeAdmission);
 	// Read with `??`, not as a destructuring default. Every other surface folds
 	// `null` into the default - assertProtectiveNumber returns early for it as an
 	// absent value, and the adapter and Vite both use `??`. A destructuring
@@ -4108,7 +4151,7 @@ export async function createTestServer(options = {}) {
 	// instance mid-shutdown), so it does NOT consult the lifecycle state.
 	// GET and HEAD, as production registers them: a HEAD-probing balancer reads
 	// the same status with no body.
-	if (healthCheckPath !== false) {
+	if (probeMounted(healthCheckPath)) {
 		const liveness = (res, req) => {
 			const headOnly = req.getMethod() === 'head';
 			res.onAborted(() => {});

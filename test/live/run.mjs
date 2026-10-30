@@ -55,6 +55,7 @@ const buildEnv = {
 	WS_UPGRADE_TIMEOUT: '',
 	WS_RATE_LIMIT: '',
 	WS_BACKPRESSURE: '',
+	MOUNT_SPELLING: '',
 	FIXTURE_ENV_PREFIX: '',
 	FIXTURE_BASE_PATH: '',
 	NODE_ENV: 'production'
@@ -209,6 +210,16 @@ const builtWarmupHang = await run('build fixture (WARMUP_HANG)', [process.execPa
 });
 if (builtWarmupHang) {
 	await run('warmup-check', [process.execPath, suite('warmup-check.mjs')]);
+}
+
+// Its own build: its probes are spelled with an escape and with router syntax,
+// where every other suite probes the default paths.
+const builtMountSpelling = await run('build fixture (MOUNT_SPELLING)', [process.execPath, 'run', 'build'], {
+	cwd: fixtureDir,
+	env: { ...buildEnv, MOUNT_SPELLING: '1' }
+});
+if (builtMountSpelling) {
+	await run('mount-spelling-check', [process.execPath, suite('mount-spelling-check.mjs')]);
 }
 
 const builtPrefixed = await run('build fixture (envPrefix)', [process.execPath, 'run', 'build'], {
