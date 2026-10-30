@@ -63,10 +63,15 @@ describe('Vite dev hook socket arguments', () => {
 				ws.send(new DataView(new Uint8Array([0, 0x7a]).buffer, 1, 1), false);
 				try { ws.send(new Uint8Array([0xff]), false); } catch (error) { results.push(error.name); }
 				try { ws.send(42); } catch (error) { results.push(error.message); }
+				const scratch = new Uint8Array([0x71]);
+				ws.send(scratch, true);
+				scratch[0] = 0;
 			}
 			if (command === 'topics') {
 				ws.subscribe(new TextEncoder().encode('bytes-topic'));
 				ws.subscribe('');
+				ws.subscribe('\x00ab');
+				results.push(platform.subscribers('\x00ab'));
 				results.push(ws.isSubscribed('bytes-topic'), ws.isSubscribed(new Uint8Array(0)));
 				platform.publish('bytes-topic', 'probe', 1);
 				platform.publish('', 'probe', 2);
@@ -75,12 +80,12 @@ describe('Vite dev hook socket arguments', () => {
 		const frames = [];
 		const ws = await connect(port, frames);
 		ws.send('sends');
-		await until(frames, 3);
-		expect(frames.slice(0, 3)).toEqual([['text', 'x'], ['binary', [0x79]], ['text', 'z']]);
+		await until(frames, 4);
+		expect(frames.slice(0, 4)).toEqual([['text', 'x'], ['binary', [0x79]], ['text', 'z'], ['binary', [0x71]]]);
 		expect(results).toEqual(['TypeError', 'Text and data can only be passed by String, ArrayBuffer or ArrayBufferView.']);
 		ws.send('topics');
-		await until(frames, 5);
-		expect(results.slice(2)).toEqual([true, true]);
-		expect(frames.slice(3).map(([, text]) => JSON.parse(text)).map(({ topic, data }) => [topic, data])).toEqual([['bytes-topic', 1], ['', 2]]);
+		await until(frames, 6);
+		expect(results.slice(2)).toEqual([1, true, true]);
+		expect(frames.slice(4).map(([, text]) => JSON.parse(text)).map(({ topic, data }) => [topic, data])).toEqual([['bytes-topic', 1], ['', 2]]);
 	});
 });

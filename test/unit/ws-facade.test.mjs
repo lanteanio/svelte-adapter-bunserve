@@ -309,6 +309,17 @@ test('getUserData throws once the connection is detached', () => {
 	assert.deepEqual(ws._rawUserData(), { user: 'u1' });
 });
 
+test('a detached close reason reads as no reason, as on uWS', () => {
+	const buffer = new ArrayBuffer(4);
+	const view = new DataView(buffer, 1, 2);
+	structuredClone(buffer, { transfer: [buffer] });
+	for (const reason of [buffer, view]) {
+		const raw = fakeSocket();
+		wsFacade(raw).end(1000, reason);
+		assert.deepEqual(raw.calls, [['close', 1000, undefined]]);
+	}
+});
+
 test('an unsendable close code throws a TypeError and leaves the connection open', () => {
 	// Bun would put 999 on the wire as it is, which a conforming peer answers
 	// by failing the connection; the rule refuses it before anything is sent.

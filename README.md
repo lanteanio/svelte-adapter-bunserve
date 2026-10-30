@@ -159,9 +159,9 @@ string sent as binary goes out as its UTF-8 bytes. Bytes sent as text must be
 valid UTF-8: a peer must fail the connection on any other text frame, so the call
 throws a `TypeError` instead. A topic given as bytes is the topic of the string
 they encode, and the empty topic is an ordinary topic the platform publishes to.
-The Vite dev server's socket behaves the same way. Bun stores an unpaired
-surrogate in a topic name as U+FFFD, so two names that differ only there are one
-topic.
+The Vite dev server's socket follows the same rules. A built server runs on
+Bun, which stores an unpaired surrogate in a topic name as U+FFFD, so there two
+names that differ only in that character are one topic.
 
 ## WebSockets
 

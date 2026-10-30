@@ -553,7 +553,9 @@ export default function uws(options = {}) {
 		return {
 			send(message, isBinary = false, _compress = false) {
 				if (rawWs.readyState !== 1) throw new Error('Cannot send on a closed WebSocket');
-				const payload = framePayload(message, isBinary);
+				// Copied, as uWS copies a frame when it is sent: the caller may reuse its buffer.
+				const framed = framePayload(message, isBinary);
+				const payload = typeof framed === 'string' ? framed : Buffer.from(framed);
 				if (rawWs.bufferedAmount > DEFAULT_DELIVERY_PENDING_BYTES) return 2;
 				rawWs.send(payload, () => {
 					const wrapped = wsWrappers.get(rawWs);
@@ -580,7 +582,8 @@ export default function uws(options = {}) {
 			unsubscribe(topic) { topics.delete(devTopic(topic)); return true; },
 			publish(name, message, isBinary = false, _compress = false) {
 				const topic = devTopic(name);
-				const msg = framePayload(message, isBinary);
+				const framed = framePayload(message, isBinary);
+				const msg = typeof framed === 'string' ? framed : Buffer.from(framed);
 				// A raw socket publish, like the native one, is outside the
 				// delivery policy: only adapter platform methods pass it.
 				for (const [ws, wsTopics] of subscriptions) {
@@ -1745,9 +1748,12 @@ export default function uws(options = {}) {
 			};
 		},
 		subscribers(topic) {
+			// Counted by the name a socket subscription is stored under, as the
+			// native subscriber count is.
+			const key = devTopic(topic);
 			let count = 0;
 			for (const [, topics] of subscriptions) {
-				if (topics.has(topic)) count++;
+				if (topics.has(key)) count++;
 			}
 			return count;
 		},

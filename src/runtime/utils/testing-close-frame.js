@@ -71,10 +71,11 @@ export function closeFrameReason(code, reason) {
 		if (code !== undefined && reason.length * 3 <= MAX_CLOSE_REASON_BYTES && reason.isWellFormed()) return reason;
 		bytes = Buffer.from(reason, 'utf8');
 	} else if (ArrayBuffer.isView(reason)) {
-		bytes = new Uint8Array(reason.buffer, reason.byteOffset, reason.byteLength);
+		// A detached buffer reads as no bytes, as on uWS.
+		bytes = reason.buffer.detached ? new Uint8Array(0) : new Uint8Array(reason.buffer, reason.byteOffset, reason.byteLength);
 		if (bytes.length > 0 && !isUtf8(bytes)) throw new TypeError('a close reason must be UTF-8 text');
 	} else if (types.isAnyArrayBuffer(reason)) {
-		bytes = new Uint8Array(reason);
+		bytes = reason.detached ? new Uint8Array(0) : new Uint8Array(reason);
 		if (bytes.length > 0 && !isUtf8(bytes)) throw new TypeError('a close reason must be UTF-8 text');
 	} else {
 		throw new TypeError(`a close reason must be a string or UTF-8 bytes; got ${typeof reason}`);
