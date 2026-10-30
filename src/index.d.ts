@@ -838,7 +838,19 @@ export interface Platform {
 	topic(topic: string): TopicHelper;
 	topicEpoch(topic: string): number;
 	bumpTopicEpoch(topic: string): number;
+
+	/**
+	 * Current wall-clock time in milliseconds since the epoch, read through the
+	 * adapter's injectable runtime so plugins and app code share one swappable
+	 * clock a controlled harness can seed. Coarsely cached (about 1 Hz), so it
+	 * is for timestamps and throttle windows rather than sub-millisecond timing.
+	 */
 	now(): number;
+
+	/**
+	 * Strictly-forward monotonic time in milliseconds, immune to wall-clock
+	 * steps. Use for measuring durations; pair two reads and subtract.
+	 */
 	monotonic(): number;
 	/**
 	 * A hybrid logical clock stamp for events that must order consistently

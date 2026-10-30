@@ -10,7 +10,7 @@ import { isSystemTopic, isValidWireTopic, createTopicHelperCache } from '../util
 import { SEND_DROPPED, publishReached } from '../utils/send-result.js';
 import { isValidResumeEpoch, isValidResumeSeq } from '../utils/resume-input.js';
 import { createLogThrottle } from '../utils/log-throttle.js';
-import { processMonotonicNow, randomBytes as randomOctets, randomFloat, randomU32, randomUuid, wallEpoch } from '../runtime.js';
+import { now, monotonicNow, processMonotonicNow, randomBytes as randomOctets, randomFloat, randomU32, randomUuid } from '../runtime.js';
 import {
 	denyAllBatch,
 	isReadableVerdict,
@@ -2906,11 +2906,11 @@ export const platform = {
 	 * simulation substitutes all three - no globals are ever patched.
 	 */
 	now() {
-		return wallEpoch();
+		return now();
 	},
 
 	monotonic() {
-		return processMonotonicNow();
+		return monotonicNow();
 	},
 
 	/**

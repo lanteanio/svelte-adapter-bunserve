@@ -6,7 +6,7 @@ import { createUnaccountedSubscriptionRegistry, addLogicalSubscription, removeLo
 import { completeSerializedEnvelope, envelopeData, createHlc } from './runtime/utils/epoch.js';
 import { copyUpgradeUserData } from './runtime/utils/upgrade-user-data.js';
 import { isSet, isUint8Array, isNativeError } from 'node:util/types';
-import { now, monotonicNow, processMonotonicNow, wallEpoch, setTimer, clearTimer, randomFloat, randomU32, randomUuid, randomBytes } from './runtime/runtime.js';
+import { now, monotonicNow, wallEpoch, setTimer, clearTimer, randomFloat, randomU32, randomUuid, randomBytes } from './runtime/runtime.js';
 import { assertMountPath, assertDistinctMounts } from './runtime/utils/mount-path.js';
 import { parseCookies } from './runtime/cookies.js';
 import { collectRequestHeaders, framingRefusal, isFramingHeader } from './runtime/utils/request-headers.js';
@@ -1198,8 +1198,8 @@ export async function createTestServer(options = {}) {
 	const platform = {
 		// The same clock and RNG seams the production platform reads, so an
 		// injected runtime environment drives both identically.
-		now() { return wallEpoch(); },
-		monotonic() { return processMonotonicNow(); },
+		now() { return now(); },
+		monotonic() { return monotonicNow(); },
 		random: {
 			float: () => randomFloat(),
 			u32: () => randomU32(),

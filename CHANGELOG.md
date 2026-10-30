@@ -269,6 +269,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING** `platform.now()` in production and `createTestServer` reads the
+  coarsely cached (about 1 Hz) runtime wall clock instead of an exact
+  `Date.now()`, so it matches the Vite dev platform and the wall component of
+  `platform.hlc()`. `platform.monotonic()` is epoch-anchored strictly-forward
+  time immune to wall-clock steps instead of milliseconds since process start;
+  differences between two reads are unchanged.
+
 - **BREAKING** The hook socket's `isBinary` selects the frame type, as on uWS:
   bytes sent without it go out as a text frame and a string sent with it as
   binary, in production and under Vite dev. Text bytes that are not valid UTF-8
