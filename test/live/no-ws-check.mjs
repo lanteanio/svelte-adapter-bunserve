@@ -24,7 +24,9 @@ const proc = Bun.spawn([process.execPath, BUILD], {
 });
 
 try {
-	await waitForServer(proc, PORT);
+	// Readiness waits for the boot warmup, which can finish after liveness
+	// answers, so wait on the probe the checks below assert.
+	await waitForServer(proc, PORT, '/readyz');
 
 	// Re-fetched rather than asserting the retry loop's own success: `true` was
 	// a check that could not fail, and a check that cannot fail is not one.
