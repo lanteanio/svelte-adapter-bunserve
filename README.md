@@ -567,6 +567,7 @@ these helpers moves this runtime's state the same way.
 | `topic(name)` | scoped publisher: `platform.topic('chat').created(data)` |
 | `requestId` | per-connection / per-request identity |
 | `now()` / `monotonic()` / `random.float()` `.u32()` `.uuid()` `.bytes(n)` | determinism seams |
+| `hlc()` | hybrid logical clock stamp `{ wall, logical, nodeId }`: `wall` never moves backward, `logical` breaks ties within a millisecond, `nodeId` is a per-process identity drawn once from the runtime RNG. For events that must order consistently across workers; not on the publish path |
 | `publishWire(topic, event, data, wire, options?)` | binary fan-out through a codec: capable clients get the `0x03` frame, everyone else the `publish()` envelope with the SAME seq; `{ seq, compress, excludeWs }` |
 | `publishWireBatch(topic, event, entries, wire, options?)` | one tick's updates as ONE batch frame per capable connection (the codec's `<event>-batch` form), per-entry envelopes and seqs for the rest; per-entry `excludeWs` and `seq` |
 | `sendWire(ws, topic, event, data, wire, options?)` | single-target codec frame (seq 0 unless an explicit seq is supplied), or the JSON envelope for a caps-less / degraded connection; returns the send tri-state; codec exceptions propagate |

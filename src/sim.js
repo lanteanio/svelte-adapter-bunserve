@@ -53,7 +53,7 @@ process.env.ORIGIN = SIM_ORIGIN;
 const { __setSimHooks } = await import('./runtime/sim-hooks.js');
 const { websocketHandlers } = await import('./runtime/handler/ws.js');
 const { tryUpgrade } = await import('./runtime/handler/upgrade.js');
-const { platform } = await import('./runtime/handler/platform.js');
+const { platform, _resetHlcForSim } = await import('./runtime/handler/platform.js');
 const {
 	WS_SUBSCRIPTIONS,
 	capCounts,
@@ -119,6 +119,7 @@ function resetSimState() {
 	// reset above: a seed inheriting another seed's refusals is a fingerprint
 	// that depends on swarm order.
 	_resetEgressForSim();
+	_resetHlcForSim();
 	_resetSharedWireIds();
 	// The upgrade ceiling, on the servers that have one. It is built once per
 	// PROCESS from the options, and the sim runs a corpus of servers in one

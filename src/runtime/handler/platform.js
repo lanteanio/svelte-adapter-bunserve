@@ -693,6 +693,16 @@ registerGameIngress();
 /** The per-process hybrid logical clock behind platform.hlc(), created on first read. */
 let processHlc;
 
+/**
+ * Forget the clock, so the next read builds one from the then-current random
+ * source. The sim drives this platform for many seeds in one process, and a
+ * clock kept from an earlier seed would carry its node id and logical count
+ * into the next.
+ */
+export function _resetHlcForSim() {
+	processHlc = undefined;
+}
+
 export const platform = {
 	authorizeDelivery(callback, options) { deliveryAuthorization.configure(callback, options); },
 	[WS_RELEASE_MEMBERSHIP](ws, ud, topic) {
